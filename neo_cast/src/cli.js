@@ -64,7 +64,7 @@ Usage:
   neo-cast runner ref-test [--run-id 20260424-...]
   neo-cast runner blind-test [--run-id 20260424-...]
   neo-cast runner status
-  neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3] [--mock-llm] [--use-mutation]
+  neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3] [--mock-llm] [--use-mutation] [--stop-on-keep]
 
 Commands:
   doctor         Check python3, uv, API key, and resolved config
@@ -463,7 +463,7 @@ async function handleDesign(positionals, rawFlags) {
       break;
     }
 
-    if (lastExitCode === 0 && !rawFlags["force-all-candidates"]) {
+    if (lastExitCode === 0 && rawFlags["stop-on-keep"]) {
       break;
     }
   }

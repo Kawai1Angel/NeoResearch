@@ -508,6 +508,72 @@ describe("Research service", () => {
     })
   })
 
+  test("executeRun reuses a queued prepared run instead of tripping the parallel budget", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "prepare then direct run",
+              domainID: "tsf",
+              mode: "review",
+              taskSpec: validTsfTaskSpec({
+                bridgeOnly: true,
+                neoCastProjectRoot: fakeNeoCastRoot,
+                pythonExecutable: "bash",
+              }),
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+            }),
+          ),
+        )
+        const candidate = await createCandidate({ taskID: task.id })
+
+        const prepared = await runResearch(
+          Research.Service.use((svc) =>
+            svc.prepareRun({
+              taskID: task.id,
+              candidateID: candidate.id,
+              stage: "smoke",
+              description: "queued handoff",
+            }),
+          ),
+        )
+
+        const executed = await runResearch(
+          Research.Service.use((svc) =>
+            svc.executeRun({
+              taskID: task.id,
+              candidateID: candidate.id,
+              stage: "smoke",
+              description: "direct execution after prepare",
+            }),
+          ),
+        )
+
+        expect(executed.run.id).toBe(prepared.run.id)
+        expect(executed.run.status).toBe("succeeded")
+        expect(executed.run.metrics.val_avg_mse).toBe(0.123)
+
+        const runs = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+        expect(runs).toHaveLength(1)
+        const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
+        expect(approvals.filter((approval) => approval.kind === "budget")).toHaveLength(0)
+
+        const runtime = createFileResearchRuntime(path.join(tmp.path, ".neo-research", "runtime"))
+        expect(
+          await runtime.queue.lease({ workerID: "worker-after-direct-run", now: Number.MAX_SAFE_INTEGER }),
+        ).toBeUndefined()
+      },
+    })
+  })
+
   test("records reusable candidate recipes in run memory", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 

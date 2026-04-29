@@ -48,6 +48,12 @@ class MutateRecipeTest(unittest.TestCase):
     def assert_valid_recipe(self, recipe: dict[str, Any]) -> None:
         self.assertEqual(validate_recipe_against_registry(recipe, input_len=512), [])
 
+    def architecture_signature(self, recipe: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: recipe[key]
+            for key in ("preprocessing", "embedding", "backbone", "fusion", "prediction_head")
+        }
+
     def test_patch_recipe_mutates_to_multiscale_and_shared(self) -> None:
         mutated = mutate_recipe(base_recipe(), {"val_avg_mse": 1.2})
 
@@ -82,6 +88,23 @@ class MutateRecipeTest(unittest.TestCase):
         self.assertLess(mutated["backbone"]["n_layers"], 3)
         self.assertEqual(mutated["embedding"]["d_model"], mutated["backbone"]["d_model"])
         self.assertEqual(mutated["training_strategy"]["optimizer"]["type"], "adamw")
+        self.assert_valid_recipe(mutated)
+
+    def test_linear_none_near_poor_threshold_still_explores_backbone(self) -> None:
+        recipe = base_recipe(
+            embedding={"type": "none"},
+            backbone={"type": "linear", "shared": False, "bias": True},
+        )
+        before_architecture = self.architecture_signature(recipe)
+
+        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.09177}, index=1)
+
+        self.assertNotEqual(self.architecture_signature(mutated), before_architecture)
+        self.assertNotEqual(mutated["backbone"]["type"], "linear")
+        self.assertIn(
+            mutated["backbone"]["type"],
+            {"tcn", "rnn", "ssm", "mixer", "transformer", "dlinear", "nbeats", "timesnet"},
+        )
         self.assert_valid_recipe(mutated)
 
     def test_cli_writes_schema_valid_recipe(self) -> None:

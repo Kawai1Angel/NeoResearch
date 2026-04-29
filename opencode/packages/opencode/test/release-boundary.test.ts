@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "fs"
+import { spawnSync } from "child_process"
 import path from "path"
 
 const root = path.resolve(import.meta.dir, "..")
@@ -47,6 +48,21 @@ describe("NeoResearch npm package boundary", () => {
       expect(index).toContain(command)
       expect(index).toContain(`.command(${command})`)
     }
+  })
+
+  test("bin wrapper executes under the package module type", () => {
+    const result = spawnSync("node", [path.join(root, "bin/neo-research"), "--version"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        NEO_RESEARCH_BIN_PATH: process.execPath,
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stderr).not.toContain("require is not defined")
   })
 
   test("README is written for NeoResearch installation and TSF runner setup", () => {

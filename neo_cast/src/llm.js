@@ -206,7 +206,7 @@ You must output a module-level CandidateRecipe, not Python code.
 
 - preprocessing: none, instance_norm, series_decomposition, seasonal_differencing, missing_mask, sample_reweighting
 - embedding: none, patch, multiscale_patch, invert, frequency, calendar
-- backbone: linear, mlp, transformer, rnn, dlinear, tcn, nbeats, timesnet, ssm, mixer
+- backbone: linear, mlp, transformer, dlinear, tcn, nbeats, timesnet, rnn, ssm, mixer
 - fusion: temporal, feature, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
 - prediction_head: linear, direct_multi_horizon, quantile, gaussian, residual_correction
 - output_distribution: point, quantile, gaussian

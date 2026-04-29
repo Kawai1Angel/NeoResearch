@@ -17,6 +17,15 @@ function missingValues(prompt, values) {
   return values.filter((value) => !prompt.includes(value));
 }
 
+function promptActionList(prompt, section) {
+  const match = prompt.match(new RegExp(`^- ${section}: (.+)$`, "m"));
+  assert.ok(match, `${section} action list is missing from prompt`);
+  return match[1]
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 test("LLM system prompt exposes recipe schema action spaces", () => {
   assert.equal(typeof _buildSystemPrompt, "function");
   const schema = recipeSchema();
@@ -36,4 +45,46 @@ test("LLM system prompt exposes recipe schema action spaces", () => {
   for (const [section, values] of Object.entries(expected)) {
     assert.deepEqual(missingValues(prompt, values), [], `${section} prompt values are missing`);
   }
+});
+
+test("LLM system prompt lists the full factory backbone action space", () => {
+  const prompt = _buildSystemPrompt();
+
+  assert.deepEqual(promptActionList(prompt, "backbone"), [
+    "linear",
+    "mlp",
+    "transformer",
+    "dlinear",
+    "tcn",
+    "nbeats",
+    "timesnet",
+    "rnn",
+    "ssm",
+    "mixer",
+  ]);
+});
+
+test("LLM system prompt exposes advanced fusion and probabilistic heads", () => {
+  const prompt = _buildSystemPrompt();
+
+  assert.deepEqual(promptActionList(prompt, "fusion"), [
+    "temporal",
+    "feature",
+    "temporal_then_feature",
+    "feature_then_temporal",
+    "graph",
+    "gated_hybrid",
+  ]);
+  assert.deepEqual(promptActionList(prompt, "prediction_head"), [
+    "linear",
+    "direct_multi_horizon",
+    "quantile",
+    "gaussian",
+    "residual_correction",
+  ]);
+  assert.deepEqual(promptActionList(prompt, "output_distribution"), [
+    "point",
+    "quantile",
+    "gaussian",
+  ]);
 });

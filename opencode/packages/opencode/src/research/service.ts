@@ -1,6 +1,6 @@
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
-import { mkdir, writeFile } from "fs/promises"
+import { mkdir, readFile, writeFile } from "fs/promises"
 import path from "path"
 import z from "zod"
 import { and, desc, eq, inArray, isNull, ne, Database, NotFoundError } from "@/storage"
@@ -55,6 +55,7 @@ import {
 } from "./schema"
 import { Event } from "./event"
 import {
+  DomainRunPlan as DomainRunPlanSchema,
   issue,
   type DomainCandidateRanking,
   type DomainRunEvaluation,
@@ -2029,6 +2030,47 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       return yield* prepareRunInternal(input, { enqueueRuntimeJob: true })
     })
 
+    const loadQueuedPreparedRun = Effect.fn("Research.loadQueuedPreparedRun")(function* (input: PrepareRunInput) {
+      const stage = input.stage ?? "smoke"
+      const row = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchRunTable)
+          .where(
+            and(
+              eq(ResearchRunTable.task_id, input.taskID),
+              eq(ResearchRunTable.candidate_id, input.candidateID),
+              eq(ResearchRunTable.stage, stage),
+              eq(ResearchRunTable.status, "queued"),
+            ),
+          )
+          .orderBy(desc(ResearchRunTable.time_created))
+          .get(),
+      )
+      if (!row) return undefined
+      const run = mapRun(row)
+
+      const artifactRow = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchArtifactTable)
+          .where(and(eq(ResearchArtifactTable.run_id, run.id), eq(ResearchArtifactTable.kind, "runner_plan_json")))
+          .orderBy(desc(ResearchArtifactTable.time_created))
+          .get(),
+      )
+      if (!artifactRow) return undefined
+
+      const artifact = mapArtifact(artifactRow)
+      if (!artifact.uri.startsWith("file://")) return undefined
+      const payload = yield* Effect.promise(async () =>
+        JSON.parse(await readFile(artifact.uri.slice("file://".length), "utf8")),
+      )
+      return {
+        run,
+        runPlan: DomainRunPlanSchema.parse((payload as { runPlan?: unknown }).runPlan),
+      } satisfies PreparedRun
+    })
+
     const evaluateSucceededRun = Effect.fn("Research.evaluateSucceededRun")(function* (run: ResearchRun) {
       const task = yield* getTask(run.taskID)
       if (!run.candidateID) return
@@ -2097,8 +2139,23 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       })
     })
 
-    const executeRun = Effect.fn("Research.executeRun")(function* (input: PrepareRunInput) {
-      const prepared = yield* prepareRunInternal(input, { enqueueRuntimeJob: false })
+    const executePreparedRun = Effect.fn("Research.executePreparedRun")(function* (
+      prepared: PreparedRun,
+      options: { readonly completeQueuedRuntimeJob?: boolean } = {},
+    ) {
+      if (options.completeQueuedRuntimeJob) {
+        yield* Effect.promise(async () => {
+          const runtime = createFileResearchRuntime(runnerPath(Instance.directory, ".neo-research/runtime"))
+          const job = researchJobFromRunPlan({
+            taskID: prepared.run.taskID,
+            runID: prepared.run.id,
+            runPlan: prepared.runPlan,
+            now: prepared.run.time.created,
+          })
+          await runtime.queue.complete(job.id)
+        })
+      }
+
       const running = yield* updateRunStatus({ runID: prepared.run.id, status: "running" })
       const execution = yield* Effect.promise(() => executeRunnerPlan(prepared.runPlan))
       const metrics = metricsFromRecords(execution.records)
@@ -2179,6 +2236,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       })
 
       return { run, runPlan: prepared.runPlan }
+    })
+
+    const executeRun = Effect.fn("Research.executeRun")(function* (input: PrepareRunInput) {
+      const queued = yield* loadQueuedPreparedRun(input)
+      if (queued !== undefined) return yield* executePreparedRun(queued, { completeQueuedRuntimeJob: true })
+
+      const prepared = yield* prepareRunInternal(input, { enqueueRuntimeJob: false })
+      return yield* executePreparedRun(prepared)
     })
 
     const executeSeedSweep = Effect.fn("Research.executeSeedSweep")(function* (input: ExecuteSeedSweepInput) {

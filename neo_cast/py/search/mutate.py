@@ -182,6 +182,24 @@ def _switch_to_timesnet(recipe: dict[str, Any]) -> str | None:
     )
 
 
+def _explore_alternate_raw_backbone(recipe: dict[str, Any]) -> str | None:
+    if recipe.get("embedding", {}).get("type") != "none":
+        return None
+
+    switches_by_current = {
+        "linear": (_switch_to_tcn, _switch_to_dlinear, _switch_to_nbeats, _switch_to_timesnet),
+        "dlinear": (_switch_to_tcn, _switch_to_nbeats, _switch_to_timesnet),
+        "tcn": (_switch_to_nbeats, _switch_to_timesnet, _switch_to_dlinear),
+        "nbeats": (_switch_to_timesnet, _switch_to_tcn, _switch_to_dlinear),
+        "timesnet": (_switch_to_tcn, _switch_to_nbeats, _switch_to_dlinear),
+    }
+    for switch in switches_by_current.get(str(recipe.get("backbone", {}).get("type")), ()):
+        note = switch(recipe)
+        if note:
+            return note
+    return None
+
+
 def _switch_optimizer(recipe: dict[str, Any], policy: MutationPolicy, *, direction: str) -> str:
     _ensure_training_defaults(recipe)
     optimizer = recipe["training_strategy"]["optimizer"]
@@ -205,7 +223,13 @@ def _switch_loss(recipe: dict[str, Any]) -> str | None:
     return "switch_loss_huber"
 
 
-def _mutation_steps(recipe: dict[str, Any], metrics: dict[str, Any], policy: MutationPolicy) -> list[str]:
+def _mutation_steps(
+    recipe: dict[str, Any],
+    metrics: dict[str, Any],
+    policy: MutationPolicy,
+    *,
+    index: int = 1,
+) -> list[str]:
     val_avg_mse = _metric(metrics, "val_avg_mse")
     status = str(metrics.get("status", "")).lower()
     model_family = recipe.get("backbone", {}).get("type", "")
@@ -215,6 +239,11 @@ def _mutation_steps(recipe: dict[str, Any], metrics: dict[str, Any], policy: Mut
         if note:
             return [note, _switch_optimizer(recipe, policy, direction="down")]
         return [_switch_optimizer(recipe, policy, direction="down")]
+
+    if index >= 1 and (val_avg_mse is None or val_avg_mse > policy.good_val_mse):
+        note = _explore_alternate_raw_backbone(recipe)
+        if note:
+            return [note]
 
     note = _to_multiscale_patch(recipe)
     if note:
@@ -243,6 +272,10 @@ def _mutation_steps(recipe: dict[str, Any], metrics: dict[str, Any], policy: Mut
         note = _reduce_transformer_cost(recipe)
         if note:
             return [note]
+
+    note = _explore_alternate_raw_backbone(recipe)
+    if note:
+        return [note]
 
     if val_avg_mse is None or val_avg_mse > policy.poor_val_mse:
         for switch in (_switch_to_dlinear, _switch_to_tcn, _switch_to_nbeats, _switch_to_timesnet):
@@ -273,7 +306,7 @@ def mutate_recipe(
     mutated = copy.deepcopy(recipe)
     _ensure_training_defaults(mutated)
 
-    notes = _mutation_steps(mutated, metrics, policy)
+    notes = _mutation_steps(mutated, metrics, policy, index=index)
     mutation_note = "+".join(note for note in notes if note)
     _set_recipe_id(mutated, parent_id, mutation_note or "noop", index)
     mutated["hypothesis"] = (
