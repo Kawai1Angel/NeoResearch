@@ -8,7 +8,7 @@ import { CommandProvider, useCommandDialog } from "../../../src/cli/cmd/tui/comp
 import { KeybindProvider } from "../../../src/cli/cmd/tui/context/keybind"
 import { KVProvider } from "../../../src/cli/cmd/tui/context/kv"
 import { ProjectProvider } from "../../../src/cli/cmd/tui/context/project"
-import { RouteProvider, type Route } from "../../../src/cli/cmd/tui/context/route"
+import { RouteProvider, useRoute, type Route } from "../../../src/cli/cmd/tui/context/route"
 import { SDKProvider } from "../../../src/cli/cmd/tui/context/sdk"
 import { ThemeProvider } from "../../../src/cli/cmd/tui/context/theme"
 import { TuiConfigProvider } from "../../../src/cli/cmd/tui/context/tui-config"
@@ -200,8 +200,18 @@ function CommandProbe(props: { onReady: (command: CommandDialog) => void }) {
   return null
 }
 
+function RouteProbe(props: { onReady: (route: ReturnType<typeof useRoute>) => void }) {
+  props.onReady(useRoute())
+  return null
+}
+
 function ResearchCockpitHarness(
-  props: { fetch?: typeof fetch; onCommand?: (command: CommandDialog) => void; initialRoute?: Route } = {},
+  props: {
+    fetch?: typeof fetch
+    onCommand?: (command: CommandDialog) => void
+    onRoute?: (route: ReturnType<typeof useRoute>) => void
+    initialRoute?: Route
+  } = {},
 ) {
   return (
     <KVProvider>
@@ -221,6 +231,7 @@ function ResearchCockpitHarness(
                       <CommandProvider>
                         <ResearchCockpit />
                         {props.onCommand ? <CommandProbe onReady={props.onCommand} /> : null}
+                        {props.onRoute ? <RouteProbe onReady={props.onRoute} /> : null}
                       </CommandProvider>
                     </DialogProvider>
                   </KeybindProvider>
@@ -686,6 +697,33 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("Task 2/2")
       expect(frame).toContain("Previous Task")
       expect(frame).toContain("Next Task")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("command palette can navigate back to the home launcher", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    let command: CommandDialog | undefined
+    let route: ReturnType<typeof useRoute> | undefined
+    const app = await testRender(
+      () => (
+        <ResearchCockpitHarness
+          onCommand={(value) => (command = value)}
+          onRoute={(value) => (route = value)}
+        />
+      ),
+      { width: 160, height: 48 },
+    )
+
+    try {
+      await waitForFrame(app, "phase2_frequency_rnn_quantile")
+      command?.trigger("research.home")
+      await app.renderOnce()
+
+      expect(route?.data.type).toBe("home")
     } finally {
       app.renderer.destroy()
     }

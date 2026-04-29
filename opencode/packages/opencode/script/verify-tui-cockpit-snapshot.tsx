@@ -7,6 +7,7 @@ import { CommandProvider } from "../src/cli/cmd/tui/component/dialog-command"
 import { KeybindProvider } from "../src/cli/cmd/tui/context/keybind"
 import { KVProvider } from "../src/cli/cmd/tui/context/kv"
 import { ProjectProvider } from "../src/cli/cmd/tui/context/project"
+import { RouteProvider } from "../src/cli/cmd/tui/context/route"
 import { SDKProvider } from "../src/cli/cmd/tui/context/sdk"
 import { ThemeProvider } from "../src/cli/cmd/tui/context/theme"
 import { TuiConfigProvider } from "../src/cli/cmd/tui/context/tui-config"
@@ -203,26 +204,28 @@ function ResearchCockpitHarness() {
   return (
     <KVProvider>
       <ToastProvider>
-        <TuiConfigProvider config={{ theme: "opencode" }}>
-          <SDKProvider
-            url="http://mock.local"
-            directory="/tmp/neo-cast-research"
-            fetch={mockResearchFetch as typeof fetch}
-            events={{ subscribe: async () => () => {} }}
-          >
-            <ProjectProvider>
-              <ThemeProvider mode="dark">
-                <KeybindProvider>
-                  <DialogProvider>
-                    <CommandProvider>
-                      <ResearchCockpit />
-                    </CommandProvider>
-                  </DialogProvider>
-                </KeybindProvider>
-              </ThemeProvider>
-            </ProjectProvider>
-          </SDKProvider>
-        </TuiConfigProvider>
+        <RouteProvider initialRoute={{ type: "cockpit" }}>
+          <TuiConfigProvider config={{ theme: "opencode" }}>
+            <SDKProvider
+              url="http://mock.local"
+              directory="/tmp/neo-cast-research"
+              fetch={mockResearchFetch as typeof fetch}
+              events={{ subscribe: async () => () => {} }}
+            >
+              <ProjectProvider>
+                <ThemeProvider mode="dark">
+                  <KeybindProvider>
+                    <DialogProvider>
+                      <CommandProvider>
+                        <ResearchCockpit />
+                      </CommandProvider>
+                    </DialogProvider>
+                  </KeybindProvider>
+                </ThemeProvider>
+              </ProjectProvider>
+            </SDKProvider>
+          </TuiConfigProvider>
+        </RouteProvider>
       </ToastProvider>
     </KVProvider>
   )
@@ -260,17 +263,24 @@ async function main() {
   try {
     const frame = await waitForFrame(app, "phase2_frequency_rnn_quantile")
     const required = [
-      "NeoResearch Cockpit",
-      "Research Tasks",
+      "NeoResearch Workspace",
       "Neo-Cast Autonomous TSF",
-      "Candidates",
+      "State",
+      "Next Action",
+      "Forecaster",
+      "Champion",
+      "Progress",
+      "Context",
       "Smoke Prep",
       "Smoke Exec",
+      "Ref Gate",
       "Ref Prep",
       "Ref Exec",
+      "Blind Gate",
       "Blind Prep",
       "Blind Exec",
-      "Profile",
+      "metric=0.1234",
+      "utility=0.88",
       "Memory",
       "Artifacts",
       "ranker=tsf_profile_learned_memory_ranker_v1",
