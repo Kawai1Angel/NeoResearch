@@ -66,6 +66,8 @@ Usage:
   neo-cast runner status
   neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3]
                   [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep]
+  neo-cast design --requirement "small transformer for ETTh1" --autonomous [--time-budget 2h]
+                  [--max-no-improve 8] [--mock-llm] [--use-reflection] [--use-mutation]
 
 Commands:
   doctor         Check python3, uv, API key, and resolved config
@@ -80,6 +82,9 @@ Commands:
 Design flags:
   --use-reflection   After each run, ask the reflection agent to analyze results and propose the next candidate
                      (takes priority over --use-mutation; falls back to mutation on reflection failure)
+  --autonomous       Continue iterating until budget, plateau, or crash stopping conditions are met
+  --time-budget      Autonomous wall-clock budget, e.g. 2h, 90m, 3600s
+  --max-no-improve   Autonomous plateau limit; defaults to 8 consecutive non-improving runs
 `.trim();
   console.log(helpText);
 }
@@ -368,6 +373,7 @@ async function handleDesign(positionals, rawFlags) {
     console.error("--max-candidates must be a positive integer");
     return 1;
   }
+  const isAutonomous = Boolean(rawFlags.autonomous);
 
   const configResult = resolveConfig({
     projectRoot,
@@ -395,12 +401,43 @@ async function handleDesign(positionals, rawFlags) {
     }
   } else {
     requirementBundle = buildCompanionRequirement(rawRequirement, rawFlags);
-    printCompanionHeader(rawRequirement, maxCandidates);
+    printCompanionHeader(rawRequirement, isAutonomous ? "autonomous" : maxCandidates);
   }
   printRequirementSummary(mode, requirementBundle.summary);
 
   let history = loadResults(projectRoot);
   const taskContext = loadPreparedDatasetSpec(projectRoot);
+
+  if (isAutonomous) {
+    const { parseTimeBudget, runAutonomousLoop } = require("./loop");
+    const maxNoImprove = Number(rawFlags["max-no-improve"] || 8);
+    if (!Number.isFinite(maxNoImprove) || maxNoImprove < 1) {
+      console.error("--max-no-improve must be a positive integer");
+      return 1;
+    }
+    const timeBudgetMs = parseTimeBudget(rawFlags["time-budget"]);
+    const bestRow = await runAutonomousLoop(requirementBundle, configResult.resolved, {
+      projectRoot,
+      taskContext,
+      timeBudgetMs,
+      maxNoImprove,
+      maxCandidates: Infinity,
+      mockLlm: Boolean(rawFlags["mock-llm"]),
+      useReflection: Boolean(rawFlags["use-reflection"]),
+      useMutation: Boolean(rawFlags["use-mutation"]),
+      skipSmoke: Boolean(rawFlags["skip-smoke"]),
+      onRoundComplete: mode === "companion" ? (_attempt, row) => printCompanionResult(row) : null,
+    });
+    const paths = getProjectPaths(projectRoot);
+    if (mode === "companion") {
+      printCompanionFinalSummary(bestRow);
+    } else {
+      printFinalSummary(bestRow);
+    }
+    console.log(`results_path=${paths.resultsPath}`);
+    return 0;
+  }
+
   let lastExitCode = 0;
   let hadHardFailure = false;
   let stopRequested = false;
@@ -437,6 +474,7 @@ async function handleDesign(positionals, rawFlags) {
           const candidate = await mutateCandidate(projectRoot, {
             metricsPath: latestValMetricsPath(projectRoot, previousRow),
             index: attempt - 1,
+            statePath: getProjectPaths(projectRoot).runnerStatePath,
           });
           result = { candidate, source: "mutation_policy" };
         } catch (error) {
@@ -461,6 +499,7 @@ async function handleDesign(positionals, rawFlags) {
         const candidate = await mutateCandidate(projectRoot, {
           metricsPath: latestValMetricsPath(projectRoot, previousRow),
           index: attempt - 1,
+          statePath: getProjectPaths(projectRoot).runnerStatePath,
         });
         result = { candidate, source: "mutation_policy" };
       } catch (error) {

@@ -15,6 +15,12 @@ test("package metadata uses an explicit npm file boundary", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
 
   assert.equal(pkg.bin["neo-cast"], "bin/neo-cast.js");
+  assert.deepEqual(pkg.publishConfig, { access: "public" });
+  assert.equal(pkg.scripts.prepublishOnly, "node scripts/prepublish-only.js");
+  assert.match(pkg.scripts["test:publish"], /--tag alpha/);
+  assert.match(pkg.scripts["test:publish"], /--cache \.artifacts\/npm-cache/);
+  assert.match(pkg.scripts["publish:alpha"], /--tag alpha/);
+  assert.match(pkg.scripts["publish:alpha"], /--cache \.artifacts\/npm-cache/);
   assert.ok(Array.isArray(pkg.files));
   assert.ok(pkg.files.includes("bin/"));
   assert.ok(pkg.files.includes("src/"));
@@ -22,6 +28,14 @@ test("package metadata uses an explicit npm file boundary", () => {
   assert.ok(pkg.files.includes("runner-manifest.json"));
   assert.ok(!pkg.files.includes("test/"));
   assert.ok(!pkg.files.includes("datasets (1)/"));
+});
+
+test("publish guard requires the alpha npm tag", () => {
+  const guard = fs.readFileSync(path.join(REPO_ROOT, "scripts/prepublish-only.js"), "utf8");
+
+  assert.match(guard, /npm_config_tag/);
+  assert.match(guard, /tag === "alpha"/);
+  assert.match(guard, /process\.exit\(1\)/);
 });
 
 test("help exposes the blind-test runner subcommand", () => {
@@ -48,6 +62,22 @@ test("help exposes the reflection design flag", () => {
   }
 
   assert.match(logs.join("\n"), /--use-reflection/);
+});
+
+test("help exposes autonomous design flags", () => {
+  const logs = [];
+  const originalLog = console.log;
+  try {
+    console.log = (message) => logs.push(String(message));
+    printHelp();
+  } finally {
+    console.log = originalLog;
+  }
+
+  const help = logs.join("\n");
+  assert.match(help, /--autonomous/);
+  assert.match(help, /--time-budget/);
+  assert.match(help, /--max-no-improve/);
 });
 
 test("python runner processes receive the user project root in environment", async () => {

@@ -42,11 +42,26 @@ The npm package boundary is intentionally narrow. It includes `bin/`, `src/`, ru
 `src/`, `README.md`, `LICENSE`, and `package.json`. It does not publish the full monorepo, test
 artifacts, datasets, generated runtimes, or the Neo-Cast Python project.
 
-Before publishing, run:
+The source package root is not the release artifact. The published package is generated under
+`dist/neo-research` by the release publisher so npm receives a clean JavaScript wrapper package plus
+platform binary optional dependencies, without monorepo `workspace:` or `catalog:` dependency
+specifiers.
+
+Before publishing, run the dist dry run:
 
 ```bash
-npm pack --dry-run
+bun run build
+NEO_RESEARCH_PUBLISH_DRY_RUN=1 bun run script/publish.ts
 ```
+
+For a full multi-platform release, release automation should build all platform packages first:
+
+```bash
+bun run build:all
+bun run script/publish.ts
+```
+
+Direct `npm publish` from this source package is intentionally blocked by `prepublishOnly`.
 
 ## TSF Runner Configuration
 

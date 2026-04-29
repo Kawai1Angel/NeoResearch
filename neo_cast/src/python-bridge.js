@@ -215,6 +215,18 @@ function loadResults(projectRoot = process.cwd()) {
   });
 }
 
+function readRunnerState(projectRoot = process.cwd()) {
+  const paths = getProjectPaths(projectRoot);
+  if (!fs.existsSync(paths.runnerStatePath)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(paths.runnerStatePath, "utf8"));
+  } catch (_error) {
+    return null;
+  }
+}
+
 function loadArtifactData(projectRoot, runId) {
   const artifactDir = path.join(projectRoot, ".neo-cast", "artifacts", `run_${runId}`);
   const result = {};
@@ -248,6 +260,9 @@ async function mutateCandidate(projectRoot, options = {}) {
   if (metricsPath) {
     args.push("--metrics", metricsPath);
   }
+  if (options.statePath) {
+    args.push("--state-path", options.statePath);
+  }
   const result = await runPythonCapture(projectRoot, path.join("search", "mutate.py"), args, options);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
@@ -264,6 +279,7 @@ module.exports = {
   loadArtifactData,
   loadResults,
   mutateCandidate,
+  readRunnerState,
   runPython,
   runPythonCapture,
   runPythonCommand,

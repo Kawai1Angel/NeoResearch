@@ -60,6 +60,17 @@ class RunnerState:
     crash_streak: int
     candidate_counter: int
     initialized_at: str
+    session_started_at: str
+    no_improve_streak: int = 0
+    last_improve_at: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RunnerState":
+        if "session_started_at" not in payload:
+            payload = {**payload, "session_started_at": payload.get("initialized_at", _now_iso())}
+        payload.setdefault("no_improve_streak", 0)
+        payload.setdefault("last_improve_at", None)
+        return cls(**payload)
 
 
 def _make_session_id() -> str:
@@ -90,7 +101,7 @@ def load_state() -> RunnerState:
     if not STATE_PATH.exists():
         raise FileNotFoundError(f"{STATE_PATH} not found. Run `python runner.py init` first.")
     with STATE_PATH.open("r", encoding="utf-8") as handle:
-        return RunnerState(**json.load(handle))
+        return RunnerState.from_dict(json.load(handle))
 
 
 def save_state(state: RunnerState) -> None:
@@ -109,6 +120,9 @@ def init_state(force: bool) -> RunnerState:
         crash_streak=0,
         candidate_counter=0,
         initialized_at=_now_iso(),
+        session_started_at=_now_iso(),
+        no_improve_streak=0,
+        last_improve_at=None,
     )
     if STATE_PATH.exists() and not force:
         raise FileExistsError(f"{STATE_PATH} already exists. Use --force to overwrite it.")
@@ -407,8 +421,11 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         state.best_run_id = run_id
         state.keep_count += 1
         state.crash_streak = 0
+        state.no_improve_streak = 0
+        state.last_improve_at = _now_iso()
     else:
         state.crash_streak = 0
+        state.no_improve_streak += 1
     save_state(state)
 
     _write_result_row(

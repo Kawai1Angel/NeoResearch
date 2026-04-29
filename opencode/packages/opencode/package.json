@@ -17,7 +17,9 @@
     "dev:root": "bun run --conditions=browser ./script/debug-root.ts",
     "dev:temporary": "bun run --conditions=browser ./src/temporary.ts",
     "db": "bun drizzle-kit",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "bun run build && NEO_RESEARCH_PUBLISH_DRY_RUN=1 bun run script/publish.ts",
+    "prepublishOnly": "bun run script/prepublish-only.ts",
+    "prepublish:check": "bun run script/prepublish-check.ts"
   },
   "bin": {
     "neo-research": "bin/neo-research"

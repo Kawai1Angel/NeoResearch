@@ -14,7 +14,7 @@ if str(PY_ROOT) not in sys.path:
     sys.path.insert(0, str(PY_ROOT))
 
 from registry.action_specs import validate_recipe_against_registry  # noqa: E402
-from search.mutate import mutate_recipe  # noqa: E402
+from search.mutate import make_policy_from_state, mutate_recipe  # noqa: E402
 from validate import validate_payload  # noqa: E402
 
 
@@ -107,6 +107,46 @@ class MutateRecipeTest(unittest.TestCase):
         )
         self.assert_valid_recipe(mutated)
 
+    def test_policy_from_state_uses_relative_thresholds(self) -> None:
+        policy = make_policy_from_state({"best_val_avg_mse": 1.09177})
+
+        self.assertEqual(policy.baseline_val_mse, 1.09177)
+        self.assertAlmostEqual(policy.baseline_val_mse * policy.poor_rel_threshold, 1.1463585)
+        self.assertAlmostEqual(policy.baseline_val_mse * policy.good_rel_threshold, 1.0371815)
+
+    def test_state_path_policy_keeps_baseline_relative_pressure(self) -> None:
+        recipe = base_recipe(
+            embedding={"type": "none"},
+            backbone={"type": "linear", "shared": False, "bias": True},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "runner_state.json"
+            state_path.write_text('{"best_val_avg_mse": 1.09177}\n', encoding="utf-8")
+
+            mutated = mutate_recipe(recipe, {"val_avg_mse": 1.09177}, index=1, state_path=state_path)
+
+        self.assertNotEqual(mutated["backbone"]["type"], "linear")
+        self.assert_valid_recipe(mutated)
+
+    def test_relative_poor_threshold_reduces_transformer_below_legacy_absolute_threshold(self) -> None:
+        recipe = base_recipe(
+            embedding={
+                "type": "multiscale_patch",
+                "scales": [{"patch_len": 8, "stride": 4}, {"patch_len": 16, "stride": 8}],
+                "d_model": 128,
+            },
+            backbone={"type": "transformer", "d_model": 128, "n_heads": 8, "n_layers": 3, "dropout": 0.1, "ffn_mult": 4.0},
+            channel_mode="shared",
+        )
+        recipe["preprocessing"] = {"actions": [{"type": "instance_norm", "affine": False, "eps": 1e-5}]}
+        policy = make_policy_from_state({"best_val_avg_mse": 1.0})
+
+        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.08}, index=2, policy=policy)
+
+        self.assertLess(mutated["backbone"]["d_model"], 128)
+        self.assertLess(mutated["backbone"]["n_layers"], 3)
+        self.assert_valid_recipe(mutated)
+
     def test_cli_writes_schema_valid_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -124,6 +164,8 @@ class MutateRecipeTest(unittest.TestCase):
                     str(recipe_path),
                     "--metrics",
                     str(metrics_path),
+                    "--state-path",
+                    str(tmp_path / "missing_state.json"),
                     "--output",
                     str(output_path),
                 ],

@@ -10,6 +10,7 @@ run.log
 results.tsv
 promotion.tsv
 artifacts/
+.artifacts/
 .neo_runner_state.json
 datasets (1)/
 datasets (1).zip

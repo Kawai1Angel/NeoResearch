@@ -8,7 +8,9 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:pack": "npm pack --dry-run",
-    "test:publish": "npm publish --dry-run",
+    "test:publish": "npm publish --dry-run --tag alpha --access public --cache .artifacts/npm-cache",
+    "publish:alpha": "npm publish --tag alpha --access public --cache .artifacts/npm-cache",
+    "prepublishOnly": "node scripts/prepublish-only.js",
     "test:watch": "node --test --watch test/*.test.js",
     "dev": "node bin/neo-cast.js",
     "dev:debug": "node --inspect-brk bin/neo-cast.js",
@@ -31,6 +33,9 @@
     "runner-manifest.json",
     "docs/runtime_deployment.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

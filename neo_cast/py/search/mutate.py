@@ -22,8 +22,9 @@ class MutationPolicy:
     max_depth: int = 4
     min_lr: float = 1e-4
     max_lr: float = 3e-3
-    poor_val_mse: float = 1.1
-    good_val_mse: float = 0.9
+    poor_rel_threshold: float = 1.05
+    good_rel_threshold: float = 0.95
+    baseline_val_mse: float | None = None
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -49,6 +50,31 @@ def _metric(metrics: dict[str, Any], key: str) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def make_policy_from_state(state_dict: dict[str, Any]) -> MutationPolicy:
+    best = _metric(state_dict, "best_val_avg_mse")
+    if best is None:
+        return MutationPolicy()
+    return MutationPolicy(baseline_val_mse=best)
+
+
+def _policy_from_state_path(state_path: str | Path | None) -> MutationPolicy | None:
+    if state_path is None:
+        return None
+    try:
+        return make_policy_from_state(load_json(state_path))
+    except Exception:
+        return MutationPolicy()
+
+
+def _get_thresholds(policy: MutationPolicy) -> tuple[float, float]:
+    if policy.baseline_val_mse is not None:
+        return (
+            policy.baseline_val_mse * policy.poor_rel_threshold,
+            policy.baseline_val_mse * policy.good_rel_threshold,
+        )
+    return 1.1, 0.9
 
 
 def _append_note(recipe: dict[str, Any], note: str) -> None:
@@ -231,6 +257,7 @@ def _mutation_steps(
     index: int = 1,
 ) -> list[str]:
     val_avg_mse = _metric(metrics, "val_avg_mse")
+    poor_threshold, good_threshold = _get_thresholds(policy)
     status = str(metrics.get("status", "")).lower()
     model_family = recipe.get("backbone", {}).get("type", "")
 
@@ -240,7 +267,7 @@ def _mutation_steps(
             return [note, _switch_optimizer(recipe, policy, direction="down")]
         return [_switch_optimizer(recipe, policy, direction="down")]
 
-    if index >= 1 and (val_avg_mse is None or val_avg_mse > policy.good_val_mse):
+    if index >= 1 and (val_avg_mse is None or val_avg_mse > good_threshold):
         note = _explore_alternate_raw_backbone(recipe)
         if note:
             return [note]
@@ -263,12 +290,12 @@ def _mutation_steps(
         if note:
             return [note]
 
-    if model_family == "mlp" and (val_avg_mse is None or val_avg_mse > policy.good_val_mse):
+    if model_family == "mlp" and (val_avg_mse is None or val_avg_mse > good_threshold):
         note = _increase_mlp_capacity(recipe, policy)
         if note:
             return [note]
 
-    if model_family == "transformer" and val_avg_mse is not None and val_avg_mse > policy.poor_val_mse:
+    if model_family == "transformer" and val_avg_mse is not None and val_avg_mse > poor_threshold:
         note = _reduce_transformer_cost(recipe)
         if note:
             return [note]
@@ -277,7 +304,7 @@ def _mutation_steps(
     if note:
         return [note]
 
-    if val_avg_mse is None or val_avg_mse > policy.poor_val_mse:
+    if val_avg_mse is None or val_avg_mse > poor_threshold:
         for switch in (_switch_to_dlinear, _switch_to_tcn, _switch_to_nbeats, _switch_to_timesnet):
             note = switch(recipe)
             if note:
@@ -296,11 +323,12 @@ def mutate_recipe(
     *,
     policy: MutationPolicy | None = None,
     index: int = 1,
+    state_path: str | Path | None = None,
 ) -> dict[str, Any]:
     if recipe.get("recipe_version") != "recipe_schema_v1":
         raise ValueError("mutate_recipe expects recipe_version='recipe_schema_v1'")
 
-    policy = policy or MutationPolicy()
+    policy = policy or _policy_from_state_path(state_path) or MutationPolicy()
     metrics = metrics or {}
     parent_id = str(recipe.get("recipe_id") or "recipe")
     mutated = copy.deepcopy(recipe)
@@ -323,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics", default=None, help="Optional metrics JSON path, e.g. val_metrics.json.")
     parser.add_argument("--output", required=True, help="Output mutated recipe JSON path.")
     parser.add_argument("--index", type=int, default=1, help="Mutation index suffix.")
+    parser.add_argument("--state-path", default=None, help="Optional runner_state.json path for relative thresholds.")
     return parser
 
 
@@ -330,7 +359,7 @@ def main() -> None:
     args = build_parser().parse_args()
     recipe = load_json(args.recipe)
     metrics = load_json(args.metrics) if args.metrics else {}
-    mutated = mutate_recipe(recipe, metrics, index=args.index)
+    mutated = mutate_recipe(recipe, metrics, index=args.index, state_path=args.state_path)
     write_json(args.output, mutated)
     print(json.dumps({"event": "recipe_mutated", "recipe_id": mutated["recipe_id"], "output": str(Path(args.output).expanduser())}))
 

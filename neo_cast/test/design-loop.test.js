@@ -14,6 +14,7 @@ function loadCliWithStubs(state = {}) {
   const generatedAttempts = [];
   const reflectedAttempts = [];
   const mutationAttempts = [];
+  const autonomousOptions = [];
   const logs = [];
 
   const stubs = {
@@ -37,6 +38,13 @@ function loadCliWithStubs(state = {}) {
             hypothesis: `candidate ${options.attempt}`,
           },
         };
+      },
+    },
+    "./loop": {
+      parseTimeBudget: (raw) => (raw === "30m" ? 1_800_000 : null),
+      runAutonomousLoop: async (_requirementBundle, _resolvedConfig, options) => {
+        autonomousOptions.push(options);
+        return { run_id: "run_auto", val_avg_mse: "0.8765" };
       },
     },
     "./modes/socratic": {
@@ -119,6 +127,7 @@ function loadCliWithStubs(state = {}) {
   return {
     cli,
     generatedAttempts,
+    autonomousOptions,
     logs,
     mutationAttempts,
     reflectedAttempts,
@@ -149,6 +158,41 @@ test("design honors max-candidates by default after a kept candidate", async () 
     assert.equal(exitCode, 0);
     assert.deepEqual(harness.generatedAttempts, [1, 2, 3]);
     assert.equal(harness.logs.filter((line) => line.startsWith("design_attempt=")).length, 3);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("design delegates autonomous mode to the autonomous loop with budgets", async () => {
+  const harness = loadCliWithStubs();
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "run until plateau",
+      "--mode",
+      "companion",
+      "--autonomous",
+      "--time-budget",
+      "30m",
+      "--max-no-improve",
+      "4",
+      "--mock-llm",
+      "--use-reflection",
+      "--use-mutation",
+      "--skip-smoke",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.equal(harness.generatedAttempts.length, 0);
+    assert.equal(harness.autonomousOptions.length, 1);
+    assert.equal(harness.autonomousOptions[0].timeBudgetMs, 1_800_000);
+    assert.equal(harness.autonomousOptions[0].maxNoImprove, 4);
+    assert.equal(harness.autonomousOptions[0].maxCandidates, Infinity);
+    assert.equal(harness.autonomousOptions[0].mockLlm, true);
+    assert.equal(harness.autonomousOptions[0].useReflection, true);
+    assert.equal(harness.autonomousOptions[0].useMutation, true);
+    assert.equal(harness.autonomousOptions[0].skipSmoke, true);
   } finally {
     harness.restore();
   }

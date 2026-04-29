@@ -246,13 +246,30 @@ for (const item of targets) {
   }
 
   await $`rm -rf ./dist/${name}/bin/tui`
+  await Bun.file(`dist/${name}/LICENSE`).write(await Bun.file("./LICENSE").text())
+  await Bun.file(`dist/${name}/README.md`).write(
+    [
+      `# ${name}`,
+      "",
+      `Native binary package for the NeoResearch CLI.`,
+      "",
+      `Install the main \`${pkg.name}\` package instead of depending on this package directly.`,
+      "",
+    ].join("\n"),
+  )
   await Bun.file(`dist/${name}/package.json`).write(
     JSON.stringify(
       {
         name,
         version: Script.version,
+        description: `${pkg.description} (${name})`,
+        license: pkg.license,
+        repository: pkg.repository,
+        bugs: pkg.bugs,
+        homepage: pkg.homepage,
         os: [item.os],
         cpu: [item.arch],
+        files: ["bin/", "README.md", "LICENSE", "package.json"],
       },
       null,
       2,

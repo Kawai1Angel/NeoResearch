@@ -30,8 +30,10 @@ describe("NeoResearch npm package boundary", () => {
     expect(pkg.publishConfig).toEqual({ access: "public", tag: "alpha" })
     expect(pkg.files).toEqual(["bin/", "src/", "README.md", "LICENSE", "package.json"])
     expect(pkg.scripts?.postinstall).toBeUndefined()
-    expect(pkg.scripts?.["pack:dry-run"]).toBe("npm pack --dry-run")
+    expect(pkg.scripts?.prepublishOnly).toBe("bun run script/prepublish-only.ts")
+    expect(pkg.scripts?.["pack:dry-run"]).toBe("bun run build && NEO_RESEARCH_PUBLISH_DRY_RUN=1 bun run script/publish.ts")
     expect(pkg.scripts?.["build:all"]).toBe("bun run script/build.ts --all-targets")
+    expect(pkg.scripts?.["prepublish:check"]).toBe("bun run script/prepublish-check.ts")
   })
 
   test("registers the expected NeoResearch CLI commands", () => {
@@ -93,7 +95,45 @@ describe("NeoResearch npm package boundary", () => {
     expect(publish).not.toContain("runners/")
     expect(publish).not.toContain("postinstall")
     expect(publish).not.toContain("neo_cast")
+    expect(publish).toContain('await Bun.file(`./dist/${pkg.name}/LICENSE`).write(await Bun.file("./LICENSE").text())')
+    expect(publish).toContain("optionalDependencies: binaries")
+    expect(publish).not.toContain("dependencies: pkg.dependencies")
+    expect(publish).not.toContain("devDependencies: pkg.devDependencies")
+    expect(publish).toContain("publishConfig")
+    expect(publish).toContain("type: pkg.type")
+    expect(publish).toContain("NEO_RESEARCH_PUBLISH_DRY_RUN")
+    expect(publish).toContain(".artifacts/npm-cache")
     expect(tsfDomain).not.toContain('path.join(process.env.NEO_RESEARCH_PACKAGE_ROOT, "runners", "neo_cast")')
+  })
+
+  test("prepublish check captures the alpha release gate commands", () => {
+    const check = readText("script/prepublish-check.ts")
+
+    for (const command of [
+      "bun test test/release-boundary.test.ts",
+      "bun test test/research/service.test.ts --timeout 30000",
+      "bun run typecheck",
+      "bun run build",
+      "NEO_RESEARCH_PUBLISH_DRY_RUN=1 bun run script/publish.ts",
+    ]) {
+      expect(check).toContain(command)
+    }
+  })
+
+  test("source package publish is blocked in favor of dist publisher", () => {
+    const guard = readText("script/prepublish-only.ts")
+
+    expect(guard).toContain("NEO_RESEARCH_ALLOW_SOURCE_PUBLISH")
+    expect(guard).toContain("packages/opencode/script/publish.ts")
+    expect(guard).toContain("process.exit(1)")
+  })
+
+  test("model snapshot generation can fall back to the checked-in snapshot", () => {
+    const generate = readText("script/generate.ts")
+
+    expect(generate).toContain("MODELS_DEV_API_JSON")
+    expect(generate).toContain("Using existing models-snapshot.js")
+    expect(generate).toContain("readExistingModelsSnapshot")
   })
 
   test("build script keeps local builds single-platform unless all targets are explicit", () => {
@@ -106,6 +146,47 @@ describe("NeoResearch npm package boundary", () => {
     expect(build).toContain("if (buildAllTargets && !skipInstall)")
     expect(build).toContain("const targets = buildAllTargets")
     expect(build).not.toContain("const targets = singleFlag")
+    expect(build).toContain('await Bun.file(`dist/${name}/LICENSE`).write(await Bun.file("./LICENSE").text())')
+    expect(build).toContain('files: ["bin/", "README.md", "LICENSE", "package.json"]')
     expect(publishWorkflow).toContain("./packages/opencode/script/build.ts --all-targets")
+  })
+
+  test("GitHub publish workflow is NeoResearch npm-only", () => {
+    const publishWorkflow = readFileSync(path.join(root, "../../.github/workflows/publish.yml"), "utf8")
+
+    for (const required of [
+      "name: publish-npm",
+      "NEO_RESEARCH_VERSION",
+      "NEO_RESEARCH_CHANNEL: alpha",
+      "./packages/opencode/script/build.ts --all-targets",
+      "./packages/opencode/script/publish.ts",
+      "NODE_AUTH_TOKEN",
+    ]) {
+      expect(publishWorkflow).toContain(required)
+    }
+
+    for (const forbidden of [
+      "anomalyco/opencode",
+      "opencode-cli",
+      "opencode-ai",
+      "build-tauri",
+      "build-electron",
+      "desktop-electron",
+      "packages/sdk",
+      "packages/plugin",
+      "AUR_KEY",
+    ]) {
+      expect(publishWorkflow).not.toContain(forbidden)
+    }
+  })
+
+  test("root publish entry delegates only to the NeoResearch CLI package publisher", () => {
+    const rootPublish = readFileSync(path.join(root, "../../script/publish.ts"), "utf8")
+
+    expect(rootPublish).toContain("packages/opencode/script/publish.ts")
+    expect(rootPublish).toContain("NeoResearch npm package")
+    expect(rootPublish).not.toContain("packages/sdk")
+    expect(rootPublish).not.toContain("packages/plugin")
+    expect(rootPublish).not.toContain("packages/desktop")
   })
 })
