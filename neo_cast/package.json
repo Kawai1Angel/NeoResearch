@@ -1,0 +1,41 @@
+{
+  "name": "neo-cast",
+  "version": "0.1.0",
+  "description": "CLI for small-model time-series design on ETTh1",
+  "bin": {
+    "neo-cast": "bin/neo-cast.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:pack": "npm pack --dry-run",
+    "test:publish": "npm publish --dry-run",
+    "test:watch": "node --test --watch test/*.test.js",
+    "dev": "node bin/neo-cast.js",
+    "dev:debug": "node --inspect-brk bin/neo-cast.js",
+    "link": "npm link",
+    "unlink": "npm unlink -g neo-cast",
+    "design:mock": "node bin/neo-cast.js design --mode companion --max-candidates 3 --mock-llm",
+    "doctor": "node bin/neo-cast.js doctor"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "py/",
+    "pyproject.toml",
+    "uv.lock",
+    "README.md",
+    "USAGE.md",
+    "runner-manifest.json",
+    "docs/runtime_deployment.md"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@inquirer/prompts": "^7.4.0",
+    "commander": "^13.1.0",
+    "picocolors": "^1.1.1"
+  }
+}

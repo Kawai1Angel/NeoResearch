@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/dataset_schema.json",
+  "title": "neo-cast Dataset Spec Schema",
+  "description": "Standard dataset loading contract consumed by prepare_tsf.py, train.py, runner.py, and export.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "timestamp_col",
+    "feature_columns",
+    "input_len",
+    "horizons",
+    "splits",
+    "normalization",
+    "missing",
+    "time"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "dataset.v1"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
+    },
+    "timestamp_col": {
+      "type": "string",
+      "minLength": 1
+    },
+    "feature_columns": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "input_len": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "horizons": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "train",
+        "val",
+        "ref_test"
+      ],
+      "properties": {
+        "train": {
+          "$ref": "#/$defs/rowRange"
+        },
+        "val": {
+          "$ref": "#/$defs/rowRange"
+        },
+        "ref_test": {
+          "$ref": "#/$defs/rowRange"
+        }
+      }
+    },
+    "normalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "fit_split"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "standard"
+        },
+        "fit_split": {
+          "type": "string",
+          "const": "train"
+        }
+      }
+    },
+    "missing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy"
+      ],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "reject",
+            "drop",
+            "forward_fill",
+            "mean_fill",
+            "linear_interpolate"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frequency",
+        "allow_irregular",
+        "irregular_ratio_warn"
+      ],
+      "properties": {
+        "frequency": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allow_irregular": {
+          "type": "boolean"
+        },
+        "irregular_ratio_warn": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "rowRange": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    }
+  }
+}

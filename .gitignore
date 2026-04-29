@@ -1,0 +1,20 @@
+.env.local
+.neo-research/
+.neo-cast/
+.DS_Store
+**/.DS_Store
+.vscode/
+.claude/
+
+# Local runtimes and generated artifacts
+node_modules/
+dist/
+*.tgz
+*.log
+*.tsbuildinfo
+
+# Python local state
+.venv/
+__pycache__/
+*.py[oc]
+*.egg-info/

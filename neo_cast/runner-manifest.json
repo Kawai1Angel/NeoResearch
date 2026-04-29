@@ -1,0 +1,33 @@
+{
+  "protocolVersion": "runner.v1",
+  "runnerID": "neo-cast-python",
+  "runnerKind": "subprocess",
+  "displayName": "Neo-Cast TSF Runner",
+  "domains": ["tsf"],
+  "commands": {
+    "smoke": {
+      "script": "py/validate.py",
+      "args": [
+        "smoke",
+        "--candidate-path",
+        "{currentCandidatePath}",
+        "--resolved-path",
+        "{resolvedCandidatePath}",
+        "--artifacts-dir",
+        "{artifactsDir}"
+      ]
+    },
+    "run": {
+      "script": "py/runner.py",
+      "args": ["run", "--description", "{description}"]
+    },
+    "ref_test": {
+      "script": "py/runner.py",
+      "args": ["ref-test"]
+    },
+    "blind_test": {
+      "script": "py/runner.py",
+      "args": ["blind-test"]
+    }
+  }
+}

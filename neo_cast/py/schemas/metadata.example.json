@@ -1,0 +1,59 @@
+{
+  "artifact_version": "artifact.v1",
+  "run_id": "run_20260424_001",
+  "session_id": "20260424-101530-ab12",
+  "candidate_id": "cand_tiny_transformer_001",
+  "task_id": "etth1",
+  "model_family": "tiny_transformer",
+  "model_impl_entry": "model_impl.py:build_model",
+  "state_dict_layout": "per_horizon",
+  "input_len": 512,
+  "horizons": [
+    96,
+    192,
+    336,
+    720
+  ],
+  "num_channels": 7,
+  "normalization_space": "standard_scaled",
+  "feature_names": ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"],
+  "preprocess_entry": "preprocess.json",
+  "val_metrics": {
+    "val_avg_mse": 0.4387,
+    "val_avg_mae": 0.4446,
+    "val_h96_mse": 0.3821,
+    "val_h96_mae": 0.3964,
+    "val_h192_mse": 0.4213,
+    "val_h192_mae": 0.4318,
+    "val_h336_mse": 0.458,
+    "val_h336_mae": 0.4621,
+    "val_h720_mse": 0.4932,
+    "val_h720_mae": 0.4879
+  },
+  "ref_test_metrics": {
+    "ref_test_avg_mse": 0.4465,
+    "ref_test_avg_mae": 0.4512,
+    "ref_test_h96_mse": 0.389,
+    "ref_test_h96_mae": 0.4021,
+    "ref_test_h192_mse": 0.428,
+    "ref_test_h192_mae": 0.4373,
+    "ref_test_h336_mse": 0.4651,
+    "ref_test_h336_mae": 0.4684,
+    "ref_test_h720_mse": 0.5038,
+    "ref_test_h720_mae": 0.4971
+  },
+  "training_summary": {
+    "training_seconds": 312.4,
+    "total_seconds": 318.8,
+    "peak_vram_mb": 824.6,
+    "num_params_M": 0.87
+  },
+  "files": {
+    "model_pt": "model.pt",
+    "preprocess_json": "preprocess.json",
+    "model_impl_py": "model_impl.py",
+    "inference_py": "inference.py",
+    "eval_report_md": "eval_report.md"
+  },
+  "created_at": "2026-04-24T10:15:30Z"
+}

@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/candidate_schema.json",
+  "title": "neo-cast Candidate Schema",
+  "description": "Structured candidate proposal consumed by the neo-cast validation and training pipeline.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "hypothesis",
+    "model_family",
+    "model_config",
+    "train_config"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "candidate.v1"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{2,63}$"
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 1000
+    },
+    "model_family": {
+      "type": "string",
+      "enum": [
+        "nlinear",
+        "tiny_transformer",
+        "patch_mlp",
+        "recipe_factory"
+      ]
+    },
+    "model_config": {
+      "type": "object"
+    },
+    "train_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lr",
+        "batch_size",
+        "max_epochs"
+      ],
+      "properties": {
+        "lr": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "max_epochs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "weight_decay": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "patience": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "params_max_million": {
+          "type": "number",
+          "exclusiveMinimum": 0.0
+        },
+        "time_budget_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "latency_priority": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 2000
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "model_family": {
+            "const": "nlinear"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "model_config": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "residual": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "model_family": {
+            "const": "tiny_transformer"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "model_config": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "d_model",
+              "n_heads",
+              "n_layers",
+              "dropout"
+            ],
+            "properties": {
+              "d_model": {
+                "type": "integer",
+                "minimum": 8,
+                "maximum": 1024
+              },
+              "n_heads": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32
+              },
+              "n_layers": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 24
+              },
+              "patch_size": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 512
+              },
+              "ffn_mult": {
+                "type": "number",
+                "minimum": 1.0,
+                "maximum": 16.0
+              },
+              "dropout": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 0.9
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "model_family": {
+            "const": "patch_mlp"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "model_config": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "patch_size",
+              "stride",
+              "hidden_dim",
+              "n_layers",
+              "dropout"
+            ],
+            "properties": {
+              "patch_size": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 512
+              },
+              "stride": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 512
+              },
+              "hidden_dim": {
+                "type": "integer",
+                "minimum": 8,
+                "maximum": 4096
+              },
+              "n_layers": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 24
+              },
+              "dropout": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 0.9
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

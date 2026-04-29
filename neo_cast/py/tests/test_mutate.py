@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any
+
+
+PY_ROOT = Path(__file__).resolve().parents[1]
+if str(PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(PY_ROOT))
+
+from registry.action_specs import validate_recipe_against_registry  # noqa: E402
+from search.mutate import mutate_recipe  # noqa: E402
+from validate import validate_payload  # noqa: E402
+
+
+def base_recipe(
+    *,
+    embedding: dict[str, Any] | None = None,
+    backbone: dict[str, Any] | None = None,
+    channel_mode: str = "independent",
+) -> dict[str, Any]:
+    return {
+        "recipe_version": "recipe_schema_v1",
+        "recipe_id": "recipe_base",
+        "hypothesis": "Base recipe used for mutation tests.",
+        "preprocessing": {"actions": [{"type": "none"}]},
+        "embedding": embedding or {"type": "patch", "patch_len": 16, "stride": 8, "d_model": 64},
+        "backbone": backbone or {"type": "mlp", "depth": 1, "hidden_dim": 64, "activation": "gelu", "dropout": 0.1},
+        "fusion": {"type": "temporal", "channel_mode": channel_mode},
+        "prediction_head": {"type": "linear", "output_distribution": "point", "share_across_horizons": False},
+        "training_strategy": {
+            "loss": {"base": "mse", "horizon_weighting": "uniform"},
+            "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
+            "scheduler": {"type": "none", "warmup_steps": 0},
+            "regularization": {"dropout": 0.1, "grad_clip": 1.0},
+            "budget": {"max_epochs": 2, "time_budget_s": 60, "batch_size": 16, "patience": 2, "seed": 42},
+        },
+        "constraints": {"max_params": 1000000, "latency_priority": "medium"},
+    }
+
+
+class MutateRecipeTest(unittest.TestCase):
+    def assert_valid_recipe(self, recipe: dict[str, Any]) -> None:
+        self.assertEqual(validate_recipe_against_registry(recipe, input_len=512), [])
+
+    def test_patch_recipe_mutates_to_multiscale_and_shared(self) -> None:
+        mutated = mutate_recipe(base_recipe(), {"val_avg_mse": 1.2})
+
+        self.assertEqual(mutated["embedding"]["type"], "multiscale_patch")
+        self.assertEqual(mutated["fusion"]["channel_mode"], "shared")
+        self.assertIn("patch_to_multiscale", mutated["notes"])
+        self.assert_valid_recipe(mutated)
+
+    def test_multiscale_independent_recipe_mutates_to_shared(self) -> None:
+        recipe = base_recipe(
+            embedding={
+                "type": "multiscale_patch",
+                "scales": [{"patch_len": 8, "stride": 4}, {"patch_len": 16, "stride": 8}],
+                "d_model": 64,
+            },
+            channel_mode="independent",
+        )
+        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.0})
+
+        self.assertEqual(mutated["embedding"]["type"], "multiscale_patch")
+        self.assertEqual(mutated["fusion"]["channel_mode"], "shared")
+        self.assert_valid_recipe(mutated)
+
+    def test_crashed_transformer_reduces_cost(self) -> None:
+        recipe = base_recipe(
+            embedding={"type": "patch", "patch_len": 16, "stride": 16, "d_model": 128},
+            backbone={"type": "transformer", "d_model": 128, "n_heads": 8, "n_layers": 3, "dropout": 0.1, "ffn_mult": 4.0},
+        )
+        mutated = mutate_recipe(recipe, {"status": "crash"})
+
+        self.assertLess(mutated["backbone"]["d_model"], 128)
+        self.assertLess(mutated["backbone"]["n_layers"], 3)
+        self.assertEqual(mutated["embedding"]["d_model"], mutated["backbone"]["d_model"])
+        self.assertEqual(mutated["training_strategy"]["optimizer"]["type"], "adamw")
+        self.assert_valid_recipe(mutated)
+
+    def test_cli_writes_schema_valid_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            recipe_path = tmp_path / "recipe.json"
+            metrics_path = tmp_path / "metrics.json"
+            output_path = tmp_path / "mutated.json"
+            recipe_path.write_text(f"{json.dumps(base_recipe())}\n", encoding="utf-8")
+            metrics_path.write_text('{"val_avg_mse": 1.2}\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PY_ROOT / "search" / "mutate.py"),
+                    "--recipe",
+                    str(recipe_path),
+                    "--metrics",
+                    str(metrics_path),
+                    "--output",
+                    str(output_path),
+                ],
+                cwd=str(PY_ROOT.parent),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual(validate_payload("recipe", output_path), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

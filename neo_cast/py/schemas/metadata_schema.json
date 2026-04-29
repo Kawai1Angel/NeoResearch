@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/metadata_schema.json",
+  "title": "neo-cast Metadata Schema",
+  "description": "Artifact metadata contract for exported neo-cast runs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact_version",
+    "run_id",
+    "task_id",
+    "model_family",
+    "model_impl_entry",
+    "state_dict_layout",
+    "input_len",
+    "horizons",
+    "num_channels",
+    "normalization_space",
+    "feature_names",
+    "preprocess_entry",
+    "val_metrics",
+    "files",
+    "created_at"
+  ],
+  "properties": {
+    "artifact_version": {
+      "type": "string",
+      "const": "artifact.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{2,63}$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^[0-9]{8}-[0-9]{6}-[a-zA-Z0-9]{4,16}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{2,63}$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
+    },
+    "model_family": {
+      "type": "string",
+      "enum": [
+        "nlinear",
+        "recipe_factory",
+        "tiny_transformer",
+        "patch_mlp"
+      ]
+    },
+    "model_impl_entry": {
+      "type": "string",
+      "pattern": "^[^:]+:[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "state_dict_layout": {
+      "type": "string",
+      "enum": [
+        "single_model",
+        "per_horizon",
+        "shared_backbone"
+      ]
+    },
+    "input_len": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "horizons": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "num_channels": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "normalization_space": {
+      "type": "string",
+      "enum": [
+        "standard_scaled"
+      ]
+    },
+    "feature_names": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "preprocess_entry": {
+      "type": "string",
+      "minLength": 1
+    },
+    "val_metrics": {
+      "$ref": "#/$defs/valMetricsBlock"
+    },
+    "ref_test_metrics": {
+      "$ref": "#/$defs/refTestMetricsBlock"
+    },
+    "training_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "training_seconds": {
+          "type": "number",
+          "minimum": 0.0
+        },
+        "total_seconds": {
+          "type": "number",
+          "minimum": 0.0
+        },
+        "peak_vram_mb": {
+          "type": "number",
+          "minimum": 0.0
+        },
+        "num_params_M": {
+          "type": "number",
+          "minimum": 0.0
+        },
+        "preprocessing_actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "embedding": {
+          "type": "string"
+        },
+        "backbone": {
+          "type": "string"
+        },
+        "fusion": {
+          "type": "string"
+        },
+        "prediction_head": {
+          "type": "string"
+        },
+        "output_distribution": {
+          "type": "string",
+          "enum": ["point", "quantile", "gaussian"]
+        },
+        "training_prediction": {
+          "type": "string",
+          "enum": ["point_forecast", "quantile_distribution", "gaussian_distribution"]
+        },
+        "loss": {
+          "type": "string"
+        },
+        "quantiles": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "exclusiveMaximum": 1
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_pt",
+        "preprocess_json",
+        "model_impl_py",
+        "inference_py",
+        "eval_report_md",
+        "model_spec_json",
+        "patch_bundle_json"
+      ],
+      "properties": {
+        "model_pt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "preprocess_json": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_impl_py": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inference_py": {
+          "type": "string",
+          "minLength": 1
+        },
+        "eval_report_md": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_spec_json": {
+          "type": "string",
+          "minLength": 1
+        },
+        "patch_bundle_json": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "valMetricsBlock": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      },
+      "required": [
+        "val_avg_mse"
+      ],
+      "properties": {
+        "val_avg_mse": {
+          "type": "number"
+        },
+        "val_avg_mae": {
+          "type": "number"
+        }
+      }
+    },
+    "refTestMetricsBlock": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      },
+      "required": [
+        "ref_test_avg_mse"
+      ],
+      "properties": {
+        "ref_test_avg_mse": {
+          "type": "number"
+        },
+        "ref_test_avg_mae": {
+          "type": "number"
+        }
+      }
+    }
+  }
+}

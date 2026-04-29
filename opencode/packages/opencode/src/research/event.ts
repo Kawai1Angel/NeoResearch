@@ -1,0 +1,53 @@
+import { Schema } from "effect"
+import { BusEvent } from "@/bus/bus-event"
+import {
+  ResearchArtifact,
+  ResearchApproval,
+  ResearchCandidate,
+  ResearchChampion,
+  ResearchMemory,
+  ResearchRun,
+  ResearchTask,
+} from "./schema"
+
+export class ResearchTaskChanged extends Schema.Class<ResearchTaskChanged>("ResearchTaskChanged")({
+  task: ResearchTask,
+}) {}
+
+export class ResearchCandidateChanged extends Schema.Class<ResearchCandidateChanged>("ResearchCandidateChanged")({
+  candidate: ResearchCandidate,
+}) {}
+
+export class ResearchRunChanged extends Schema.Class<ResearchRunChanged>("ResearchRunChanged")({
+  run: ResearchRun,
+}) {}
+
+export class ResearchArtifactChanged extends Schema.Class<ResearchArtifactChanged>("ResearchArtifactChanged")({
+  artifact: ResearchArtifact,
+}) {}
+
+export class ResearchMemoryChanged extends Schema.Class<ResearchMemoryChanged>("ResearchMemoryChanged")({
+  memory: ResearchMemory,
+}) {}
+
+export class ResearchChampionChanged extends Schema.Class<ResearchChampionChanged>("ResearchChampionChanged")({
+  champion: ResearchChampion,
+}) {}
+
+export class ResearchApprovalChanged extends Schema.Class<ResearchApprovalChanged>("ResearchApprovalChanged")({
+  approval: ResearchApproval,
+}) {}
+
+export const Event = {
+  TaskCreated: BusEvent.define("research.task.created", ResearchTaskChanged),
+  TaskUpdated: BusEvent.define("research.task.updated", ResearchTaskChanged),
+  CandidateCreated: BusEvent.define("research.candidate.created", ResearchCandidateChanged),
+  CandidateUpdated: BusEvent.define("research.candidate.updated", ResearchCandidateChanged),
+  RunCreated: BusEvent.define("research.run.created", ResearchRunChanged),
+  RunUpdated: BusEvent.define("research.run.updated", ResearchRunChanged),
+  ArtifactCreated: BusEvent.define("research.artifact.created", ResearchArtifactChanged),
+  MemoryCreated: BusEvent.define("research.memory.created", ResearchMemoryChanged),
+  ChampionUpdated: BusEvent.define("research.champion.updated", ResearchChampionChanged),
+  ApprovalCreated: BusEvent.define("research.approval.created", ResearchApprovalChanged),
+  ApprovalUpdated: BusEvent.define("research.approval.updated", ResearchApprovalChanged),
+}

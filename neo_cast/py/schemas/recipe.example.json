@@ -1,0 +1,69 @@
+{
+  "recipe_version": "recipe_schema_v1",
+  "recipe_id": "recipe_patch_mlp_temporal_example",
+  "hypothesis": "Patch MLP can capture local temporal motifs with lower latency than attention while keeping the training budget small.",
+  "preprocessing": {
+    "actions": [
+      {
+        "type": "none"
+      }
+    ]
+  },
+  "embedding": {
+    "type": "patch",
+    "patch_len": 16,
+    "stride": 8,
+    "d_model": 128
+  },
+  "backbone": {
+    "type": "mlp",
+    "depth": 2,
+    "hidden_dim": 128,
+    "activation": "gelu",
+    "dropout": 0.1
+  },
+  "fusion": {
+    "type": "temporal",
+    "channel_mode": "independent"
+  },
+  "prediction_head": {
+    "type": "linear",
+    "output_distribution": "point",
+    "share_across_horizons": false
+  },
+  "post_processing": {
+    "type": "auto"
+  },
+  "training_strategy": {
+    "loss": {
+      "base": "mse",
+      "horizon_weighting": "uniform"
+    },
+    "optimizer": {
+      "type": "adam",
+      "lr": 0.001,
+      "weight_decay": 0.0
+    },
+    "scheduler": {
+      "type": "none",
+      "warmup_steps": 0
+    },
+    "regularization": {
+      "dropout": 0.1,
+      "grad_clip": 1.0
+    },
+    "budget": {
+      "max_epochs": 2,
+      "time_budget_s": 600,
+      "batch_size": 16,
+      "patience": 2,
+      "seed": 42
+    }
+  },
+  "constraints": {
+    "max_params": 1000000,
+    "max_latency_ms": 50,
+    "latency_priority": "medium"
+  },
+  "notes": "Example native recipe-factory candidate."
+}

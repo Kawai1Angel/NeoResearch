@@ -1,0 +1,71 @@
+{
+  "schema_version": "benchmark_manifest.v1",
+  "description": "Supported time-series forecasting benchmark presets. This manifest records protocol metadata only and contains no measured results.",
+  "datasets": {
+    "etth1": {
+      "dataset_id": "etth1",
+      "display_name": "ETTh1",
+      "preset": "etth1",
+      "split_policy": "fixed_rows",
+      "default_context": 512,
+      "default_horizons": [96, 192, 336, 720],
+      "primary_metric": "mse",
+      "reference_metrics": ["mse", "mae"],
+      "requires_external_data_file": true,
+      "expected_data_files": ["ETTh1.csv"],
+      "notes": "Uses the canonical TSLib hourly ETT split encoded in the dataset preset."
+    },
+    "ettm1": {
+      "dataset_id": "ettm1",
+      "display_name": "ETTm1",
+      "preset": "ettm1",
+      "split_policy": "fixed_rows",
+      "default_context": 512,
+      "default_horizons": [96, 192, 336, 720],
+      "primary_metric": "mse",
+      "reference_metrics": ["mse", "mae"],
+      "requires_external_data_file": true,
+      "expected_data_files": ["ETTm1.csv"],
+      "notes": "Uses the canonical TSLib 15-minute ETT split encoded in the dataset preset."
+    },
+    "weather": {
+      "dataset_id": "weather",
+      "display_name": "Weather",
+      "preset": "weather",
+      "split_policy": "tsl_custom_70_10_20",
+      "default_context": 512,
+      "default_horizons": [96, 192, 336, 720],
+      "primary_metric": "mse",
+      "reference_metrics": ["mse", "mae"],
+      "requires_external_data_file": true,
+      "expected_data_files": ["weather.csv"],
+      "notes": "Uses contiguous 70/10/20 train/validation/reference-test rows; numeric features are inferred."
+    },
+    "traffic": {
+      "dataset_id": "traffic",
+      "display_name": "Traffic",
+      "preset": "traffic",
+      "split_policy": "tsl_custom_70_10_20",
+      "default_context": 512,
+      "default_horizons": [96, 192, 336, 720],
+      "primary_metric": "mse",
+      "reference_metrics": ["mse", "mae"],
+      "requires_external_data_file": true,
+      "expected_data_files": ["traffic.csv"],
+      "notes": "Uses contiguous 70/10/20 train/validation/reference-test rows; numeric features are inferred."
+    }
+  },
+  "result_table_expected_columns": [
+    "dataset_id",
+    "horizon",
+    "model_id",
+    "run_id",
+    "primary_metric",
+    "mse",
+    "mae",
+    "trained_at",
+    "data_file",
+    "git_commit",
+    "notes"
+  ]
+}

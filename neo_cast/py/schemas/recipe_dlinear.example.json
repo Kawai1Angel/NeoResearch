@@ -1,0 +1,64 @@
+{
+  "recipe_version": "recipe_schema_v1",
+  "recipe_id": "recipe_dlinear_example",
+  "hypothesis": "DLinear tests whether explicit moving-average trend decomposition plus linear seasonal/trend heads improves a compact ETTh-style forecasting baseline.",
+  "preprocessing": {
+    "actions": [
+      {
+        "type": "none"
+      }
+    ]
+  },
+  "embedding": {
+    "type": "none"
+  },
+  "backbone": {
+    "type": "dlinear",
+    "kernel_size": 25,
+    "bias": true
+  },
+  "fusion": {
+    "type": "temporal",
+    "channel_mode": "independent"
+  },
+  "prediction_head": {
+    "type": "linear",
+    "output_distribution": "point",
+    "share_across_horizons": false
+  },
+  "post_processing": {
+    "type": "auto"
+  },
+  "training_strategy": {
+    "loss": {
+      "base": "mse",
+      "horizon_weighting": "uniform"
+    },
+    "optimizer": {
+      "type": "adam",
+      "lr": 0.001,
+      "weight_decay": 0.0
+    },
+    "scheduler": {
+      "type": "none",
+      "warmup_steps": 0
+    },
+    "regularization": {
+      "dropout": 0.0,
+      "grad_clip": 1.0
+    },
+    "budget": {
+      "max_epochs": 2,
+      "time_budget_s": 120,
+      "batch_size": 16,
+      "patience": 2,
+      "seed": 42
+    }
+  },
+  "constraints": {
+    "max_params": 1000000,
+    "max_latency_ms": 50,
+    "latency_priority": "medium"
+  },
+  "notes": "DLinear requires embedding.type=none because it operates directly on raw per-channel sequences."
+}

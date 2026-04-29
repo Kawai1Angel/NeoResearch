@@ -1,0 +1,507 @@
+# neo-cast Modes and Training Constraints
+
+This document explains how the current `neo-cast` CLI works, especially how a small model is designed, constrained, trained, and evaluated.
+
+## Current Position
+
+`neo-cast` is currently a standardized numeric-CSV model design CLI with ETTh1 as the default task.
+
+It is not a general AutoML system yet. The current version fixes the prepared dataset spec, split, metric, candidate schema, and supported model families, then lets an LLM or mock designer propose a small model candidate inside those boundaries.
+
+The main loop is:
+
+```text
+user requirement
+  -> candidate JSON
+  -> renderer resolves defaults and budgets
+  -> validator / smoke gate
+  -> full training
+  -> val_avg_mse keep/discard
+  -> artifact export
+  -> optional final ref_test
+```
+
+## Two Design Modes
+
+### 1. Socratic Mode
+
+Command:
+
+```bash
+node ./bin/neo-cast.js design \
+  --requirement "design a compact ETTh1 forecasting model" \
+  --mode socratic
+```
+
+Socratic mode is intended for requirement clarification. It summarizes the user requirement and can ask clarifying questions before running the candidate loop.
+
+Use it when the requirement is still vague.
+
+### 2. Companion Mode
+
+Command:
+
+```bash
+node ./bin/neo-cast.js design \
+  --requirement "design a compact Transformer-like ETTh1 forecasting model with low validation MSE" \
+  --mode companion
+```
+
+Companion mode runs directly and prints each attempt in a readable trace:
+
+```text
+candidate source
+candidate id
+model family
+hypothesis
+learning rate
+batch size
+training progress
+keep/discard decision
+current best run
+```
+
+Use it for local debugging and iterative experiments.
+
+## Candidate Sources
+
+`neo-cast` can produce candidates from three paths.
+
+### Mock / Heuristic
+
+Command:
+
+```bash
+node ./bin/neo-cast.js design \
+  --requirement "small ETTh1 forecasting model" \
+  --mode companion \
+  --mock-llm
+```
+
+This does not call any external API. It uses local heuristic rules in `src/llm.js`.
+
+This is the preferred path for CI, smoke tests, and debugging the Python training pipeline.
+
+### Anthropic
+
+Default non-mock provider:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+node ./bin/neo-cast.js design \
+  --requirement "small ETTh1 forecasting model" \
+  --mode companion
+```
+
+This uses the Anthropic SDK.
+
+### GLM5 / OpenAI-Compatible Relay
+
+For a relay that exposes the OpenAI ChatCompletions API:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+
+node ./bin/neo-cast.js design \
+  --provider openai-compatible \
+  --base-url https://api2.aigcbest.top/v1 \
+  --model glm-5 \
+  --requirement "design a compact Transformer-like ETTh1 forecasting model with low validation MSE" \
+  --mode companion
+```
+
+Accepted key environment variables:
+
+```text
+NEO_CAST_LLM_API_KEY
+OPENAI_API_KEY
+AIGCBEST_API_KEY
+```
+
+## Supported Recipe Factory
+
+New design proposals should use `recipe_schema_v1`. Recipes are resolved to the native `recipe_factory` family, which composes bounded modules rather than asking the LLM to write arbitrary Python.
+
+```text
+preprocessing: none | instance_norm | series_decomposition
+embedding: none | patch | multiscale_patch
+backbone: linear | mlp | transformer | dlinear | tcn | nbeats | timesnet
+fusion: temporal, channel_mode=independent | shared
+head: linear point forecast
+loss: mse | mae | huber
+optimizer: adam | adamw | sgd
+scheduler: none | cosine
+```
+
+`dlinear`, `tcn`, `nbeats`, and `timesnet` currently operate on raw per-channel sequences and therefore require `embedding: none`. Patch-based embeddings remain reserved for `mlp` and `transformer` recipes.
+
+Native raw-sequence backbone examples:
+
+```json
+{ "type": "dlinear", "kernel_size": 25, "bias": true }
+{ "type": "tcn", "hidden_dim": 16, "n_layers": 1, "kernel_size": 3, "activation": "gelu", "dropout": 0.1 }
+{ "type": "nbeats", "hidden_dim": 128, "n_blocks": 3, "n_layers": 2, "activation": "gelu", "dropout": 0.1 }
+{ "type": "timesnet", "hidden_dim": 16, "n_layers": 1, "top_k": 1, "kernel_size": 3, "dropout": 0.1 }
+```
+
+TCN and TimesNet-lite are more expensive than DLinear/N-BEATS on CPU, so the default examples intentionally use small local-debug settings. Increase `hidden_dim`, `n_layers`, or `top_k` only after a candidate proves useful under the smoke gate.
+
+Legacy `candidate.v1` with `model_family` is still accepted for compatibility and can still run `nlinear`, `patch_mlp`, or `tiny_transformer` directly.
+
+### nlinear
+
+Channel-independent linear baseline.
+
+Config:
+
+```json
+{
+  "residual": true
+}
+```
+
+### tiny_transformer
+
+Patch-based Transformer encoder.
+
+Config fields:
+
+```json
+{
+  "d_model": 64,
+  "n_heads": 4,
+  "n_layers": 2,
+  "patch_size": 16,
+  "dropout": 0.1,
+  "ffn_mult": 2.0
+}
+```
+
+### patch_mlp
+
+Patch MLP-style model.
+
+Config fields:
+
+```json
+{
+  "patch_size": 16,
+  "stride": 8,
+  "hidden_dim": 128,
+  "n_layers": 2,
+  "dropout": 0.1
+}
+```
+
+## Dataset Constraints
+
+The executable loader now reads a project-local `dataset.v1` spec generated by `prepare-data`.
+ETTh1 remains the default prepared task:
+
+```text
+dataset: ETTh1
+input_len: 512
+channels: 7
+horizons: 96, 192, 336, 720
+metric: val_avg_mse
+train rows: [0, 8640)
+val rows: [8640, 11520)
+ref_test rows: [11520, 14400)
+```
+
+For non-ETTh1 CSVs, these values are supplied through `prepare-data` flags and stored in `.neo-cast/dataset/dataset_spec.json`. The agent or LLM still does not freely choose data splits during `design`; it receives the prepared dataset context and proposes model candidates inside that fixed contract.
+
+## How Long Does Each Candidate Run?
+
+Short answer: **a candidate stops when either `max_epochs` is reached, early stopping triggers, or the wall-clock time budget is reached.**
+
+It is not purely "10 minutes" and not purely "N epochs". It is both.
+
+## Full Training Budget
+
+The current code-level default is:
+
+```text
+TIME_BUDGET = 600 seconds
+```
+
+That means the platform cap is currently **10 minutes per full candidate run**.
+
+This value is defined in:
+
+```text
+py/prepare_tsf.py
+```
+
+A candidate may request a lower budget through:
+
+```json
+{
+  "constraints": {
+    "time_budget_seconds": 300
+  }
+}
+```
+
+But `py/renderer.py` only allows candidates to tighten the budget, not expand beyond the platform cap:
+
+```text
+effective_time_budget = min(candidate_time_budget, TIME_BUDGET)
+```
+
+So in the current code:
+
+```text
+effective time budget <= 600 seconds
+```
+
+## Epoch Budget
+
+Each candidate also carries:
+
+```json
+{
+  "train_config": {
+    "max_epochs": 50,
+    "patience": 5,
+    "batch_size": 32,
+    "lr": 0.001
+  }
+}
+```
+
+During full training, `py/train.py` loops:
+
+```text
+for epoch in 1..max_epochs:
+  stop if elapsed time >= time_budget_s
+  train each active horizon
+  validate each active horizon
+  apply early stopping by patience
+```
+
+So a run may stop because:
+
+- it finished `max_epochs`
+- all horizons early-stopped by `patience`
+- wall-clock time reached `time_budget_s`
+
+## Per-Horizon Training
+
+The current implementation trains one model per horizon:
+
+```text
+96
+192
+336
+720
+```
+
+Each epoch visits the active horizons. A horizon can early-stop independently.
+
+At the end, the models are evaluated on validation windows and aggregated:
+
+```text
+val_avg_mse = mean(val_h96_mse, val_h192_mse, val_h336_mse, val_h720_mse)
+```
+
+The runner uses `val_avg_mse` for keep/discard.
+
+## Smoke Run Budget
+
+Smoke run is a fast pre-check.
+
+Current smoke config in `py/renderer.py`:
+
+```text
+horizon: 96
+batch_size: 16
+max_epochs: 2
+timeout_s: 60
+```
+
+Smoke run checks whether the candidate can build, run, and produce the expected output shape.
+
+Smoke run also enforces a loose parameter check:
+
+```text
+num_params_m <= 2 * param_budget_m
+```
+
+The full training path currently records parameter count but does not hard-fail solely on parameter budget. The strictest hard gate is in smoke mode.
+
+## Parameter Budget
+
+The platform default is:
+
+```text
+PARAM_BUDGET = 10,000,000 parameters
+DEFAULT_PARAM_BUDGET_M = 10.0
+```
+
+But the LLM prompt and heuristic candidates usually request:
+
+```json
+{
+  "constraints": {
+    "params_max_million": 1.0
+  }
+}
+```
+
+The effective budget is:
+
+```text
+effective_param_budget_m = min(candidate_params_max_million, 10.0)
+```
+
+In practice, current candidate prompts prefer small models around or below 1M parameters.
+
+## Fast Debug Mode
+
+For local debugging, use:
+
+```bash
+export NEO_CAST_FAST_E2E=1
+```
+
+This affects candidate generation in `src/llm.js`.
+
+When enabled, generated candidates are clamped to:
+
+```text
+batch_size <= 16
+max_epochs <= 2
+patience <= 2
+```
+
+This is useful for testing the full CLI path with a real LLM without waiting for long training.
+
+Example:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export NEO_CAST_FAST_E2E=1
+
+node ./bin/neo-cast.js design \
+  --provider openai-compatible \
+  --base-url https://api2.aigcbest.top/v1 \
+  --model glm-5 \
+  --requirement "design a compact Transformer-like ETTh1 forecasting model with low validation MSE" \
+  --mode companion \
+  --max-candidates 1 \
+  --skip-smoke
+```
+
+## What `--skip-smoke` Means
+
+`--skip-smoke` skips the smoke pre-check.
+
+It does not skip full training.
+
+With `--skip-smoke`, the flow is:
+
+```text
+candidate
+  -> renderer
+  -> full train
+  -> export
+  -> keep/discard
+```
+
+Without `--skip-smoke`, the flow is:
+
+```text
+candidate
+  -> renderer
+  -> smoke train
+  -> full train
+  -> export
+  -> keep/discard
+```
+
+For fast local debugging with known-valid candidates, `--skip-smoke` is reasonable. For unknown LLM output, smoke is safer.
+
+## How Keep / Discard Works
+
+`py/runner.py` compares each successful run against the current best run in the active session.
+
+```text
+if candidate.val_avg_mse < best_val_avg_mse:
+  status = keep
+else:
+  status = discard
+```
+
+The result is written to:
+
+```text
+.neo-cast/results.tsv
+.neo-cast/runner_state.json
+```
+
+Discard does not delete the artifact. It only means the best pointer is not updated.
+
+## When `ref_test` Runs
+
+`ref_test` is not used during normal search.
+
+Run it explicitly:
+
+```bash
+node ./bin/neo-cast.js runner ref-test
+```
+
+This evaluates the current best artifact on the hidden reference-test split and writes:
+
+```text
+ref_test_metrics.json
+metadata.json
+eval_report.md
+```
+
+This keeps `val_avg_mse` as the search signal and `ref_test` as the final reporting signal.
+
+## Current Practical Defaults
+
+For a normal full candidate:
+
+```text
+max wall-clock time: 600 seconds
+epoch count: candidate-defined, often 8 to 50
+early stopping: candidate-defined, often patience 4 to 7
+batch size: candidate-defined, often 16 or 32
+horizons: 96, 192, 336, 720
+decision metric: val_avg_mse
+```
+
+For fast debug:
+
+```text
+NEO_CAST_FAST_E2E=1
+max_epochs <= 2
+batch_size <= 16
+patience <= 2
+```
+
+For smoke:
+
+```text
+one horizon: first configured horizon
+max_epochs: 2
+timeout: 60 seconds
+batch_size: 16
+```
+
+## Important Mismatch With ROADMAP
+
+`ROADMAP.md` currently mentions a `TIME_BUDGET = 1800` example in one section.
+
+The current executable code uses:
+
+```text
+TIME_BUDGET = 600
+```
+
+So the actual current behavior is **10 minutes max per full candidate**, unless the candidate requests a shorter time budget.

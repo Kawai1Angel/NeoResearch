@@ -1,0 +1,15 @@
+.DS_Store
+node_modules/
+.env
+__pycache__/
+*.py[oc]
+.venv/
+*.egg-info/
+.neo-cast/
+run.log
+results.tsv
+promotion.tsv
+artifacts/
+.neo_runner_state.json
+datasets (1)/
+datasets (1).zip

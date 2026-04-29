@@ -1,0 +1,79 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+
+const { printHelp, runPythonScript } = require("../src/cli");
+const { getRuntimeInstallRoot } = require("../src/runtime");
+
+const REPO_ROOT = path.resolve(__dirname, "..");
+
+test("package metadata uses an explicit npm file boundary", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+
+  assert.equal(pkg.bin["neo-cast"], "bin/neo-cast.js");
+  assert.ok(Array.isArray(pkg.files));
+  assert.ok(pkg.files.includes("bin/"));
+  assert.ok(pkg.files.includes("src/"));
+  assert.ok(pkg.files.includes("py/"));
+  assert.ok(pkg.files.includes("runner-manifest.json"));
+  assert.ok(!pkg.files.includes("test/"));
+  assert.ok(!pkg.files.includes("datasets (1)/"));
+});
+
+test("help exposes the blind-test runner subcommand", () => {
+  const logs = [];
+  const originalLog = console.log;
+  try {
+    console.log = (message) => logs.push(String(message));
+    printHelp();
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.match(logs.join("\n"), /neo-cast runner blind-test \[--run-id/);
+});
+
+test("python runner processes receive the user project root in environment", async () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-project-root-"));
+  const resolvedProjectRoot = fs.realpathSync(projectRoot);
+  const outputPath = path.join(projectRoot, "env.json");
+  const scriptPath = path.join(projectRoot, "write-env.js");
+  fs.writeFileSync(
+    scriptPath,
+    [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      "fs.writeFileSync(process.argv[2], JSON.stringify({",
+      "  cwd: process.cwd(),",
+      "  projectRoot: process.env.NEO_CAST_PROJECT_ROOT,",
+      "  packageRoot: process.env.NEO_CAST_PACKAGE_ROOT || null,",
+      "}));",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const exitCode = await runPythonScript([scriptPath, outputPath], {
+    projectRoot,
+    pythonCommand: process.execPath,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf8")), {
+    cwd: resolvedProjectRoot,
+    projectRoot: resolvedProjectRoot,
+    packageRoot: REPO_ROOT,
+  });
+});
+
+test("project runtime installs Python dependencies from the Neo-Cast package root", () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-runtime-install-root-"));
+  const installRoot = getRuntimeInstallRoot(projectRoot);
+
+  assert.equal(installRoot, REPO_ROOT);
+  assert.ok(fs.existsSync(path.join(installRoot, "pyproject.toml")));
+  assert.ok(!fs.existsSync(path.join(projectRoot, "pyproject.toml")));
+});

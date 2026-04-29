@@ -1,0 +1,71 @@
+{
+  "recipe_version": "recipe_schema_v1",
+  "recipe_id": "recipe_shared_channel_patch_mlp_example",
+  "hypothesis": "A residual channel mixer can expose cross-sensor correlations before the temporal patch MLP while keeping the search space bounded.",
+  "preprocessing": {
+    "actions": [
+      {
+        "type": "instance_norm",
+        "affine": false,
+        "eps": 0.00001
+      }
+    ]
+  },
+  "embedding": {
+    "type": "patch",
+    "patch_len": 16,
+    "stride": 8,
+    "d_model": 64
+  },
+  "backbone": {
+    "type": "mlp",
+    "depth": 2,
+    "hidden_dim": 64,
+    "activation": "gelu",
+    "dropout": 0.1
+  },
+  "fusion": {
+    "type": "temporal",
+    "channel_mode": "shared"
+  },
+  "prediction_head": {
+    "type": "linear",
+    "output_distribution": "point",
+    "share_across_horizons": false
+  },
+  "post_processing": {
+    "type": "auto"
+  },
+  "training_strategy": {
+    "loss": {
+      "base": "mse",
+      "horizon_weighting": "uniform"
+    },
+    "optimizer": {
+      "type": "adamw",
+      "lr": 0.001,
+      "weight_decay": 0.0001
+    },
+    "scheduler": {
+      "type": "none",
+      "warmup_steps": 0
+    },
+    "regularization": {
+      "dropout": 0.1,
+      "grad_clip": 1.0
+    },
+    "budget": {
+      "max_epochs": 2,
+      "time_budget_s": 120,
+      "batch_size": 16,
+      "patience": 2,
+      "seed": 42
+    }
+  },
+  "constraints": {
+    "max_params": 1000000,
+    "max_latency_ms": 80,
+    "latency_priority": "medium"
+  },
+  "notes": "Native factory example with residual channel mixing."
+}
