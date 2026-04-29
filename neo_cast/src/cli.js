@@ -64,7 +64,8 @@ Usage:
   neo-cast runner ref-test [--run-id 20260424-...]
   neo-cast runner blind-test [--run-id 20260424-...]
   neo-cast runner status
-  neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3] [--mock-llm] [--use-mutation] [--stop-on-keep]
+  neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3]
+                  [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep]
 
 Commands:
   doctor         Check python3, uv, API key, and resolved config
@@ -75,6 +76,10 @@ Commands:
   prepare-data   Materialize ETTh1 visible/ref-test splits into the dataset cache
   runner         Run the project-local smoke/full/ref-test experiment loop
   design         Generate candidates and run the local design loop
+
+Design flags:
+  --use-reflection   After each run, ask the reflection agent to analyze results and propose the next candidate
+                     (takes priority over --use-mutation; falls back to mutation on reflection failure)
 `.trim();
   console.log(helpText);
 }
@@ -410,7 +415,48 @@ async function handleDesign(positionals, rawFlags) {
     if (stopRequested) break;
 
     let result;
-    if (attempt > 1 && rawFlags["use-mutation"]) {
+    if (attempt > 1 && rawFlags["use-reflection"]) {
+      const { reflectAndPropose } = require("./reflect");
+      const reflected = await reflectAndPropose(
+        requirementBundle.requirementText,
+        history,
+        previousRow,
+        configResult.resolved,
+        {
+          projectRoot,
+          mockLlm: Boolean(rawFlags["mock-llm"]),
+          taskContext,
+          attempt,
+        }
+      );
+
+      if (reflected) {
+        result = reflected;
+      } else if (rawFlags["use-mutation"]) {
+        try {
+          const candidate = await mutateCandidate(projectRoot, {
+            metricsPath: latestValMetricsPath(projectRoot, previousRow),
+            index: attempt - 1,
+          });
+          result = { candidate, source: "mutation_policy" };
+        } catch (error) {
+          console.error(`[neo-cast] mutation also failed: ${error.message}`);
+          result = await generateCandidate(
+            requirementBundle.requirementText,
+            history,
+            configResult.resolved,
+            { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
+          );
+        }
+      } else {
+        result = await generateCandidate(
+          requirementBundle.requirementText,
+          history,
+          configResult.resolved,
+          { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
+        );
+      }
+    } else if (attempt > 1 && rawFlags["use-mutation"]) {
       try {
         const candidate = await mutateCandidate(projectRoot, {
           metricsPath: latestValMetricsPath(projectRoot, previousRow),

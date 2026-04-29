@@ -462,4 +462,11 @@ async function generateCandidate(requirement, history, resolvedConfig, options =
   }
 }
 
-module.exports = { generateCandidate, _buildSystemPrompt };
+module.exports = {
+  generateCandidate,
+  _buildHeuristicCandidate,
+  _buildSystemPrompt,
+  _buildUserMessage,
+  _ensureCandidateDefaults,
+  _extractJsonObject,
+};

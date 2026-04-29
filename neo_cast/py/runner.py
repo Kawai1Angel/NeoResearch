@@ -207,6 +207,32 @@ def _parse_eval_metrics(records: list[dict[str, Any]]) -> dict[str, float] | Non
     return None
 
 
+def _write_training_curves(records: list[dict[str, Any]], artifact_dir: Path | None) -> None:
+    if artifact_dir is None:
+        return
+    epoch_records = [record for record in records if record.get("event") == "epoch_end"]
+    if not epoch_records:
+        return
+
+    curves: dict[str, list[float]] = {}
+    for record in epoch_records:
+        horizon = str(record.get("horizon", "unknown"))
+        try:
+            value = float(record.get("val_loss", 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        curves.setdefault(horizon, []).append(value)
+
+    try:
+        training_curves_path = artifact_dir / "training_curves.json"
+        training_curves_path.write_text(
+            f"{json.dumps({'curves_by_horizon': curves}, indent=2)}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _resolve_candidate() -> int:
     renderer_cmd = [
         sys.executable,
@@ -355,6 +381,7 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
     training_summary = read_json(artifact_dir / "training_summary.json")
     params_m = float(training_summary.get("num_params_M", 0.0))
     val_avg_mse = float(val_metrics["val_avg_mse"])
+    _write_training_curves(train_records, artifact_dir)
 
     export_exit = _export_artifact(state=state, run_id=run_id, artifact_dir=artifact_dir)
     if export_exit != 0:

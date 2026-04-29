@@ -215,6 +215,23 @@ function loadResults(projectRoot = process.cwd()) {
   });
 }
 
+function loadArtifactData(projectRoot, runId) {
+  const artifactDir = path.join(projectRoot, ".neo-cast", "artifacts", `run_${runId}`);
+  const result = {};
+  const curvesPath = path.join(artifactDir, "training_curves.json");
+  const summaryPath = path.join(artifactDir, "training_summary.json");
+
+  try {
+    result.training_curves = JSON.parse(fs.readFileSync(curvesPath, "utf8"));
+  } catch (_error) {}
+
+  try {
+    result.training_summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+  } catch (_error) {}
+
+  return Object.keys(result).length > 0 ? result : null;
+}
+
 async function mutateCandidate(projectRoot, options = {}) {
   const paths = ensureProjectState(projectRoot);
   const recipePath = options.recipePath || paths.currentCandidatePath;
@@ -244,6 +261,7 @@ module.exports = {
   ensureProjectState,
   ensureRunnerInitialized,
   getProjectPaths,
+  loadArtifactData,
   loadResults,
   mutateCandidate,
   runPython,

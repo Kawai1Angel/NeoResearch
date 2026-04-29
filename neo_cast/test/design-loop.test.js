@@ -12,6 +12,8 @@ function loadCliWithStubs(state = {}) {
   const originalLoad = Module._load;
   const runDescriptions = [];
   const generatedAttempts = [];
+  const reflectedAttempts = [];
+  const mutationAttempts = [];
   const logs = [];
 
   const stubs = {
@@ -67,6 +69,8 @@ function loadCliWithStubs(state = {}) {
       getProjectPaths: () => ({ resultsPath: "/tmp/results.tsv" }),
       loadResults: () => [],
       mutateCandidate: async () => {
+        mutationAttempts.push(mutationAttempts.length + 1);
+        if (state.mutationCandidate) return state.mutationCandidate;
         throw new Error("mutation not used");
       },
       runPythonCommand: async () => ({ status: 0 }),
@@ -75,6 +79,20 @@ function loadCliWithStubs(state = {}) {
         return state.runnerExitCode ?? 0;
       },
       writeCurrentCandidate: (_projectRoot, candidate) => `/tmp/${candidate.candidate_id}.json`,
+    },
+    "./reflect": {
+      reflectAndPropose: async (_requirement, _history, _previousRow, _config, options) => {
+        reflectedAttempts.push(options.attempt);
+        if (Object.prototype.hasOwnProperty.call(state, "reflectionResult")) return state.reflectionResult;
+        return {
+          source: "llm_reflection",
+          candidate: {
+            candidate_id: `reflection_${options.attempt}`,
+            model_family: "reflection_family",
+            hypothesis: `reflection ${options.attempt}`,
+          },
+        };
+      },
     },
     "./runtime": {
       getRuntimePaths: () => ({ pythonPath: "/tmp/python" }),
@@ -102,6 +120,8 @@ function loadCliWithStubs(state = {}) {
     cli,
     generatedAttempts,
     logs,
+    mutationAttempts,
+    reflectedAttempts,
     restore() {
       console.log = originalLog;
       Module._load = originalLoad;
@@ -153,6 +173,65 @@ test("design can stop early on keep when requested", async () => {
     assert.equal(exitCode, 0);
     assert.deepEqual(harness.generatedAttempts, [1]);
     assert.equal(harness.logs.filter((line) => line.startsWith("design_attempt=")).length, 1);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("design uses reflection after the first attempt when requested", async () => {
+  const harness = loadCliWithStubs();
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "reflect on h720 failures",
+      "--mode",
+      "companion",
+      "--max-candidates",
+      "2",
+      "--mock-llm",
+      "--use-reflection",
+      "--skip-smoke",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(harness.generatedAttempts, [1]);
+    assert.deepEqual(harness.reflectedAttempts, [2]);
+    assert.match(harness.logs.join("\n"), /candidate_source=llm_reflection/);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("design falls back from reflection to mutation when both flags are set", async () => {
+  const harness = loadCliWithStubs({
+    reflectionResult: null,
+    mutationCandidate: {
+      candidate_id: "mutation_2",
+      model_family: "mutation_family",
+      hypothesis: "mutation fallback",
+    },
+  });
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "fallback chain",
+      "--mode",
+      "companion",
+      "--max-candidates",
+      "2",
+      "--mock-llm",
+      "--use-reflection",
+      "--use-mutation",
+      "--skip-smoke",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(harness.generatedAttempts, [1]);
+    assert.deepEqual(harness.reflectedAttempts, [2]);
+    assert.deepEqual(harness.mutationAttempts, [1]);
+    assert.match(harness.logs.join("\n"), /candidate_source=mutation_policy/);
   } finally {
     harness.restore();
   }

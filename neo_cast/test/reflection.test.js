@@ -99,3 +99,70 @@ test("reflectAndPropose mock mode returns a schema candidate without calling art
   assert.equal(result.candidate.recipe_version, "recipe_schema_v1");
   assert.match(result.candidate.recipe_id, /reflect_mock/);
 });
+
+test("reflectAndPropose real LLM path tags candidates as llm_reflection", async () => {
+  const projectRoot = tempProject("neo-cast-reflect-real-");
+  writeCurrentCandidate(projectRoot, {
+    recipe_version: "recipe_schema_v1",
+    recipe_id: "previous_linear",
+    preprocessing: { actions: [{ type: "none" }] },
+    embedding: { type: "none" },
+    backbone: { type: "linear" },
+    fusion: { type: "temporal", channel_mode: "independent" },
+    prediction_head: { type: "linear", output_distribution: "point" },
+  });
+  const artifactDir = path.join(projectRoot, ".neo-cast", "artifacts", "run_prev");
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(path.join(artifactDir, "training_curves.json"), JSON.stringify({ curves_by_horizon: { 720: [1.6] } }));
+
+  const originalFetch = global.fetch;
+  const originalKey = process.env.NEO_CAST_LLM_API_KEY;
+  process.env.NEO_CAST_LLM_API_KEY = "test-key";
+  global.fetch = async () => new Response(
+    JSON.stringify({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              recipe_version: "recipe_schema_v1",
+              recipe_id: "recipe_reflect_patch_transformer",
+              hypothesis: "Previous linear+none: h720 was much worse than h96. Diagnosis: temporal receptive field bottleneck. Proposed change: patch transformer because attention expands long-horizon context.",
+              preprocessing: { actions: [{ type: "instance_norm", affine: false, eps: 0.00001 }] },
+              embedding: { type: "patch", patch_len: 16, stride: 8, d_model: 64 },
+              backbone: { type: "transformer", d_model: 64, n_heads: 4, n_layers: 2, dropout: 0.1, ffn_mult: 4.0 },
+              fusion: { type: "temporal", channel_mode: "shared" },
+              prediction_head: { type: "linear", output_distribution: "point", share_across_horizons: false },
+              post_processing: { type: "auto" },
+              training_strategy: {
+                loss: { base: "mse", horizon_weighting: "uniform" },
+                optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.0 },
+                scheduler: { type: "none", warmup_steps: 0 },
+                regularization: { dropout: 0.1, grad_clip: 1.0 },
+                budget: { max_epochs: 10, time_budget_s: 600, batch_size: 32, patience: 5, seed: 42 },
+              },
+              constraints: { max_params: 1000000, max_latency_ms: 50, latency_priority: "medium" },
+            }),
+          },
+        },
+      ],
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+
+  try {
+    const result = await reflectAndPropose(
+      "improve long horizon",
+      [],
+      { run_id: "prev", val_h96_mse: "0.7", val_h720_mse: "1.6", status: "discard" },
+      { llm: { provider: "openai-compatible", base_url: "https://example.invalid/v1", model: "test" } },
+      { projectRoot, attempt: 2 },
+    );
+
+    assert.equal(result.source, "llm_reflection");
+    assert.equal(result.candidate.backbone.type, "transformer");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.NEO_CAST_LLM_API_KEY;
+    else process.env.NEO_CAST_LLM_API_KEY = originalKey;
+  }
+});

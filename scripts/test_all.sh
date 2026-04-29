@@ -71,6 +71,7 @@ print_step "Neo-Cast Python tests"
   py.tests.test_probabilistic_metrics \
   py.tests.test_export_contract \
   py.tests.test_recipe_factory \
+  py.tests.test_runner_curves \
   py.tests.test_train_execution \
   py.tests.test_mutate)
 

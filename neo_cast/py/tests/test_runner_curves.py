@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+PY_ROOT = Path(__file__).resolve().parents[1]
+if str(PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(PY_ROOT))
 
 import runner
 

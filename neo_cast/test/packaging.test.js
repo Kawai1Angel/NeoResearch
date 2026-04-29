@@ -37,6 +37,19 @@ test("help exposes the blind-test runner subcommand", () => {
   assert.match(logs.join("\n"), /neo-cast runner blind-test \[--run-id/);
 });
 
+test("help exposes the reflection design flag", () => {
+  const logs = [];
+  const originalLog = console.log;
+  try {
+    console.log = (message) => logs.push(String(message));
+    printHelp();
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.match(logs.join("\n"), /--use-reflection/);
+});
+
 test("python runner processes receive the user project root in environment", async () => {
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-project-root-"));
   const resolvedProjectRoot = fs.realpathSync(projectRoot);
