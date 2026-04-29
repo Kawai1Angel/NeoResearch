@@ -65,7 +65,7 @@ await Bun.file(`./dist/${pkg.name}/package.json`).write(
       description: pkg.description,
       type: pkg.type,
       bin: {
-        [pkg.name]: `./bin/${pkg.name}`,
+        [pkg.name]: `bin/${pkg.name}`,
       },
       version: version,
       license: pkg.license,

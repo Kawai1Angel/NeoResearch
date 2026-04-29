@@ -97,6 +97,8 @@ describe("NeoResearch npm package boundary", () => {
     expect(publish).not.toContain("neo_cast")
     expect(publish).toContain('await Bun.file(`./dist/${pkg.name}/LICENSE`).write(await Bun.file("./LICENSE").text())')
     expect(publish).toContain("optionalDependencies: binaries")
+    expect(publish).toContain("[pkg.name]: `bin/${pkg.name}`")
+    expect(publish).not.toContain("[pkg.name]: `./bin/${pkg.name}`")
     expect(publish).not.toContain("dependencies: pkg.dependencies")
     expect(publish).not.toContain("devDependencies: pkg.devDependencies")
     expect(publish).toContain("publishConfig")
