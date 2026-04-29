@@ -115,6 +115,8 @@ describe("NeoResearch npm package boundary", () => {
       "bun run typecheck",
       "bun run build",
       "NEO_RESEARCH_PUBLISH_DRY_RUN=1 bun run script/publish.ts",
+      "packageJson.version",
+      "packageJson.publishConfig?.tag",
     ]) {
       expect(check).toContain(command)
     }
