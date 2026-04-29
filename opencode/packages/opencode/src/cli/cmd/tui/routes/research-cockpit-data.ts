@@ -143,6 +143,19 @@ export type CreateResearchTaskInput = {
   budget: JsonRecord
 }
 
+export type ResearchCockpitWorkflowStatus = "done" | "active" | "todo"
+
+export type ResearchCockpitWorkflowItem = {
+  label: string
+  status: ResearchCockpitWorkflowStatus
+  detail?: string
+}
+
+export type ResearchCockpitRecommendation = {
+  title: string
+  detail: string
+}
+
 const researchRefreshEventTypes = new Set([
   "research.task.created",
   "research.task.updated",
@@ -183,6 +196,127 @@ export function buildResearchCockpitStats(input: {
     queuedOrRunningRuns: input.runs.filter((run) => run.status === "queued" || run.status === "running").length,
     succeededRuns: input.runs.filter((run) => run.status === "succeeded").length,
   }
+}
+
+type ResearchCockpitWorkflowInput = {
+  task?: ResearchCockpitTask
+  candidates: ResearchCockpitCandidate[]
+  runs: ResearchCockpitRun[]
+  artifacts: ResearchCockpitArtifact[]
+  approvals: ResearchCockpitApproval[]
+  champion?: ResearchCockpitChampion | null
+  fingerprint?: JsonRecord
+  runnerReady: boolean
+}
+
+export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput): ResearchCockpitWorkflowItem[] {
+  const hasTask = Boolean(input.task)
+  const hasProfile = hasCockpitDatasetProfile(input)
+  const hasCandidates = input.candidates.length > 0
+  const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
+  const hasPendingApproval = input.approvals.some((approval) => approval.status === "pending")
+  const hasReport = input.artifacts.some((artifact) => artifact.kind === "research_report_markdown")
+
+  return [
+    {
+      label: "Create research task",
+      status: hasTask ? "done" : "active",
+      detail: hasTask ? input.task?.title : "Bind a goal, dataset, objective, and execution budget.",
+    },
+    {
+      label: "Profile dataset",
+      status: hasProfile ? "done" : hasTask ? "active" : "todo",
+      detail: hasProfile ? "Dataset fingerprint available." : "Inspect horizon, targets, missingness, and seasonality.",
+    },
+    {
+      label: "Design candidates",
+      status: hasCandidates ? "done" : hasTask ? "active" : "todo",
+      detail: hasCandidates ? `${input.candidates.length} candidate recipes` : "Seed baselines or let the agent propose recipes.",
+    },
+    {
+      label: "Run smoke experiments",
+      status: hasSucceededRun ? "done" : hasCandidates && input.runnerReady ? "active" : "todo",
+      detail: hasSucceededRun ? "At least one non-profile run succeeded." : "Execute approved candidates against the runner.",
+    },
+    {
+      label: "Review gates",
+      status: hasPendingApproval ? "active" : hasSucceededRun ? "done" : "todo",
+      detail: hasPendingApproval ? "Approval required before promotion." : "Candidate, ref, and blind gates are clear.",
+    },
+    {
+      label: "Export report",
+      status: hasReport ? "done" : input.champion || hasSucceededRun ? "active" : "todo",
+      detail: hasReport ? "Report artifact available." : "Summarize winner, tradeoffs, and evidence.",
+    },
+  ]
+}
+
+export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflowInput): ResearchCockpitRecommendation {
+  const pendingApproval = input.approvals.find((approval) => approval.status === "pending")
+  const hasProfile = hasCockpitDatasetProfile(input)
+  const hasCandidates = input.candidates.length > 0
+  const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
+  const hasReport = input.artifacts.some((artifact) => artifact.kind === "research_report_markdown")
+  const runnableCandidate = input.candidates.find(canRunResearchCockpitCandidate)
+
+  if (!input.task) {
+    return {
+      title: "Create a dataset-backed TSF task",
+      detail: "Enter a research goal to create a full-recipe autonomous task, or use New CSV Task to bind a local CSV.",
+    }
+  }
+  if (pendingApproval) {
+    return {
+      title: "Approve pending gate",
+      detail: `${pendingApproval.kind} approval is waiting before the next promotion step.`,
+    }
+  }
+  if (!input.runnerReady) {
+    return {
+      title: "Configure Neo-Cast runner",
+      detail: "Set taskSpec.runtime.neoCastProjectRoot before executing candidate runs.",
+    }
+  }
+  if (!hasProfile) {
+    return {
+      title: "Profile dataset",
+      detail: "Generate the dataset fingerprint before comparing architectures.",
+    }
+  }
+  if (!hasCandidates) {
+    return {
+      title: "Seed baseline candidates",
+      detail: "Create initial recipes so the runner has concrete experiments to evaluate.",
+    }
+  }
+  if (input.task.mode === "autonomous") {
+    return {
+      title: "Run autonomous loop",
+      detail: "Let the manager iterate across design, runner, analyst, and memory steps.",
+    }
+  }
+  if (runnableCandidate) {
+    return {
+      title: "Run smoke execution",
+      detail: `Execute ${runnableCandidate.id} and compare the primary metric.`,
+    }
+  }
+  if (hasSucceededRun && !hasReport) {
+    return {
+      title: "Export research report",
+      detail: "Package the latest evidence into a markdown report.",
+    }
+  }
+  return {
+    title: "Review latest research state",
+    detail: hasReport ? "Inspect the exported report and decide whether to continue." : "No immediate blocking action is pending.",
+  }
+}
+
+function hasCockpitDatasetProfile(input: Pick<ResearchCockpitWorkflowInput, "artifacts" | "fingerprint">) {
+  if (input.artifacts.some((artifact) => artifact.kind === "task_profile_json")) return true
+  const fingerprint = input.fingerprint ?? {}
+  return Boolean(fingerprint.datasetProfile || fingerprint.datasetProfileWarning)
 }
 
 export function researchCockpitArtifactTarget(artifact: ResearchCockpitArtifact) {
@@ -472,6 +606,62 @@ export type TsfResearchTaskDefaults = {
   contextLength?: number
   predictionLengths?: number[]
   bridgeOnly?: boolean
+}
+
+export function parseTsfCsvTaskInput(value: string): TsfResearchTaskDefaults | undefined {
+  const parts = value.trim().split(/\s+/).filter(Boolean)
+  const datasetPath = parts.shift()
+  if (!datasetPath) return undefined
+
+  const result: TsfResearchTaskDefaults = { datasetPath }
+  for (const part of parts) {
+    if (part === "full") {
+      result.bridgeOnly = false
+      continue
+    }
+    if (part === "bridge") {
+      result.bridgeOnly = true
+      continue
+    }
+    const index = part.indexOf("=")
+    if (index === -1) continue
+    const key = part.slice(0, index).toLowerCase()
+    const raw = part.slice(index + 1)
+    if (!raw) continue
+    if (key === "target" || key === "targets") {
+      const targetCols = splitCsvOption(raw)
+      if (targetCols.length > 0) result.targetCols = targetCols
+      continue
+    }
+    if (key === "horizon" || key === "horizons" || key === "prediction" || key === "predictions") {
+      const predictionLengths = splitNumberOption(raw)
+      if (predictionLengths.length > 0) result.predictionLengths = predictionLengths
+      continue
+    }
+    if (key === "context" || key === "ctx") {
+      const contextLength = Number(raw)
+      if (Number.isFinite(contextLength) && contextLength > 0) result.contextLength = Math.floor(contextLength)
+      continue
+    }
+    if (key === "preset" || key === "loader") {
+      result.datasetPreset = raw
+    }
+  }
+  return result
+}
+
+function splitCsvOption(value: string) {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+}
+
+function splitNumberOption(value: string) {
+  return splitCsvOption(value)
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && item > 0)
+    .map((item) => Math.floor(item))
 }
 
 function tsfRuntime(neoCastProjectRoot?: string, bridgeOnly = true): JsonRecord {

@@ -7,6 +7,11 @@ export type HomeRoute = {
   prompt?: PromptInfo
 }
 
+export type CockpitRoute = {
+  type: "cockpit"
+  researchGoal?: string
+}
+
 export type SessionRoute = {
   type: "session"
   sessionID: string
@@ -19,7 +24,7 @@ export type PluginRoute = {
   data?: Record<string, unknown>
 }
 
-export type Route = HomeRoute | SessionRoute | PluginRoute
+export type Route = HomeRoute | CockpitRoute | SessionRoute | PluginRoute
 
 export const { use: useRoute, provider: RouteProvider } = createSimpleContext({
   name: "Route",

@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import {
   buildDefaultTsfResearchTask,
+  buildResearchCockpitRecommendation,
   buildResearchCockpitStats,
+  buildResearchCockpitWorkflow,
   canExecuteResearchCockpitTask,
   canRunResearchCockpitCandidate,
   formatResearchCockpitArtifactMetadata,
@@ -16,6 +18,7 @@ import {
   formatResearchCockpitSeedSweep,
   hasApprovedResearchCockpitBlindTestGate,
   hasApprovedResearchCockpitRefTestGate,
+  parseTsfCsvTaskInput,
   researchCockpitArtifactTarget,
   researchCockpitCandidatePipeline,
   researchCockpitCandidateTitle,
@@ -119,6 +122,97 @@ describe("research cockpit data helpers", () => {
     })
   })
 
+  test("builds an actionable empty cockpit workflow", () => {
+    const workflow = buildResearchCockpitWorkflow({
+      candidates: [],
+      runs: [],
+      artifacts: [],
+      approvals: [],
+      champion: null,
+      fingerprint: {},
+      runnerReady: false,
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
+      "active:Create research task",
+      "todo:Profile dataset",
+      "todo:Design candidates",
+      "todo:Run smoke experiments",
+      "todo:Review gates",
+      "todo:Export report",
+    ])
+    expect(
+      buildResearchCockpitRecommendation({
+        candidates: [],
+        runs: [],
+        artifacts: [],
+        approvals: [],
+        champion: null,
+        fingerprint: {},
+        runnerReady: false,
+      }),
+    ).toMatchObject({
+      title: "Create a dataset-backed TSF task",
+    })
+  })
+
+  test("builds cockpit workflow from real task state", () => {
+    const currentTask = task({
+      id: "task_a",
+      mode: "autonomous",
+      taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+      budget: { maxRuns: 12 },
+    })
+    const workflow = buildResearchCockpitWorkflow({
+      task: currentTask,
+      candidates: [candidate({ id: "candidate_a" })],
+      runs: [
+        {
+          id: "profile_run",
+          stage: "profile",
+          status: "succeeded",
+          metrics: {},
+          time: { created: 1, updated: 1 },
+        },
+        {
+          id: "smoke_run",
+          stage: "smoke",
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.12 },
+          time: { created: 1, updated: 2 },
+        },
+      ],
+      artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+      approvals: [],
+      champion: null,
+      fingerprint: { datasetProfile: { rowCount: 100 } },
+      runnerReady: true,
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
+      "done:Create research task",
+      "done:Profile dataset",
+      "done:Design candidates",
+      "done:Run smoke experiments",
+      "done:Review gates",
+      "active:Export report",
+    ])
+    expect(
+      buildResearchCockpitRecommendation({
+        task: currentTask,
+        candidates: [candidate({ id: "candidate_a" })],
+        runs: [{ id: "smoke_run", stage: "smoke", status: "succeeded", metrics: {}, time: { created: 1, updated: 1 } }],
+        artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+        approvals: [],
+        champion: null,
+        fingerprint: { datasetProfile: { rowCount: 100 } },
+        runnerReady: true,
+      }),
+    ).toMatchObject({
+      title: "Run autonomous loop",
+    })
+  })
+
   test("creates default TSF task payloads for review and autonomous modes", () => {
     expect(buildDefaultTsfResearchTask("review")).toMatchObject({
       title: "TSF Review Research",
@@ -170,6 +264,18 @@ describe("research cockpit data helpers", () => {
         },
       },
     })
+  })
+
+  test("parses CSV task dialog input with forecasting options", () => {
+    expect(parseTsfCsvTaskInput("/data/ETTh1.csv target=OT,HUFL horizon=24,48 context=192 preset=etth1 full")).toEqual({
+      datasetPath: "/data/ETTh1.csv",
+      targetCols: ["OT", "HUFL"],
+      predictionLengths: [24, 48],
+      contextLength: 192,
+      datasetPreset: "etth1",
+      bridgeOnly: false,
+    })
+    expect(parseTsfCsvTaskInput("   ")).toBeUndefined()
   })
 
   test("formats exported research artifact messages", () => {
