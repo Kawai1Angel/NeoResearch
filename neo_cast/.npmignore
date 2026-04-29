@@ -1,0 +1,12 @@
+.artifacts/
+.neo-cast/
+.pytest_cache/
+.venv/
+node_modules/
+test/
+tests/
+datasets (1)/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/

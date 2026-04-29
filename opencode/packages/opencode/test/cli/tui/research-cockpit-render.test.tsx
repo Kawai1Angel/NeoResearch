@@ -4,7 +4,7 @@ import { testRender } from "@opentui/solid"
 import { Global } from "@opencode-ai/core/global"
 import { mkdir, writeFile } from "fs/promises"
 import path from "path"
-import { CommandProvider } from "../../../src/cli/cmd/tui/component/dialog-command"
+import { CommandProvider, useCommandDialog } from "../../../src/cli/cmd/tui/component/dialog-command"
 import { KeybindProvider } from "../../../src/cli/cmd/tui/context/keybind"
 import { KVProvider } from "../../../src/cli/cmd/tui/context/kv"
 import { ProjectProvider } from "../../../src/cli/cmd/tui/context/project"
@@ -192,7 +192,14 @@ function mockResearchFetch(input: RequestInfo | URL, _init?: RequestInit) {
 
 const researchFetch = mockResearchFetch as typeof fetch
 
-function ResearchCockpitHarness() {
+type CommandDialog = ReturnType<typeof useCommandDialog>
+
+function CommandProbe(props: { onReady: (command: CommandDialog) => void }) {
+  props.onReady(useCommandDialog())
+  return null
+}
+
+function ResearchCockpitHarness(props: { fetch?: typeof fetch; onCommand?: (command: CommandDialog) => void } = {}) {
   return (
     <KVProvider>
       <ToastProvider>
@@ -200,7 +207,7 @@ function ResearchCockpitHarness() {
           <SDKProvider
             url="http://mock.local"
             directory="/tmp/neo-cast-research"
-            fetch={researchFetch}
+            fetch={props.fetch ?? researchFetch}
             events={{ subscribe: async () => () => {} }}
           >
             <ProjectProvider>
@@ -209,6 +216,7 @@ function ResearchCockpitHarness() {
                   <DialogProvider>
                     <CommandProvider>
                       <ResearchCockpit />
+                      {props.onCommand ? <CommandProbe onReady={props.onCommand} /> : null}
                     </CommandProvider>
                   </DialogProvider>
                 </KeybindProvider>
@@ -254,6 +262,62 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("domain_memory=5")
       expect(frame).toContain("rows=1024")
       expect(frame).toContain("Memory")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("command palette can create full-recipe TSF tasks", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const bodies: unknown[] = []
+    const fetchWithCreate = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (url.pathname === "/research/tasks" && init?.method === "POST") {
+        bodies.push(JSON.parse(String(init.body)))
+        return Promise.resolve(
+          response({
+            id: "task_full_recipe",
+            title: "TSF Autonomous Research",
+            domainID: "tsf",
+            mode: "autonomous",
+            status: "created",
+            taskSpec: {},
+            objective: {},
+            budget: {},
+            time: { created: now, updated: now },
+          }),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    let command: CommandDialog | undefined
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={fetchWithCreate} onCommand={(value) => (command = value)} />,
+      { width: 160, height: 48 },
+    )
+
+    try {
+      await waitForFrame(app, "phase2_frequency_rnn_quantile")
+      command?.trigger("research.create.autonomous.full")
+
+      for (let attempt = 0; attempt < 40 && bodies.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(bodies).toHaveLength(1)
+      expect(bodies[0]).toMatchObject({
+        mode: "autonomous",
+        taskSpec: {
+          runtime: {
+            bridgeOnly: false,
+            neoCastProjectRoot: "/tmp/neo-cast-research",
+          },
+        },
+      })
     } finally {
       app.renderer.destroy()
     }

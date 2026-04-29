@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
 const { printHelp, runPythonScript } = require("../src/cli");
@@ -16,6 +17,11 @@ test("package metadata uses an explicit npm file boundary", () => {
 
   assert.equal(pkg.bin["neo-cast"], "bin/neo-cast.js");
   assert.deepEqual(pkg.publishConfig, { access: "public" });
+  assert.equal(pkg.scripts.test, "npm run test:all");
+  assert.equal(pkg.scripts["test:node"], "node scripts/run-node-tests.js");
+  assert.equal(pkg.scripts["test:python"], "node --test test/python-unit.test.js");
+  assert.equal(pkg.scripts["test:all"], "npm run test:node && npm run test:python");
+  assert.match(pkg.scripts["test:pack"], /--cache \.artifacts\/npm-cache/);
   assert.equal(pkg.scripts.prepublishOnly, "node scripts/prepublish-only.js");
   assert.match(pkg.scripts["test:publish"], /--tag alpha/);
   assert.match(pkg.scripts["test:publish"], /--cache \.artifacts\/npm-cache/);
@@ -28,6 +34,34 @@ test("package metadata uses an explicit npm file boundary", () => {
   assert.ok(pkg.files.includes("runner-manifest.json"));
   assert.ok(!pkg.files.includes("test/"));
   assert.ok(!pkg.files.includes("datasets (1)/"));
+});
+
+test("node test runner excludes the Python unit test wrapper", () => {
+  const runner = fs.readFileSync(path.join(REPO_ROOT, "scripts/run-node-tests.js"), "utf8");
+
+  assert.match(runner, /python-unit\.test\.js/);
+  assert.match(runner, /--test/);
+});
+
+test("npm pack excludes generated and local-only artifacts", () => {
+  const result = spawnSync("npm", ["pack", "--dry-run", "--json", "--cache", ".artifacts/npm-cache"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const packed = JSON.parse(result.stdout)[0];
+  const files = packed.files.map((file) => file.path);
+
+  assert.ok(files.includes("src/cli.js"));
+  assert.ok(files.includes("py/runner.py"));
+  assert.ok(files.includes("runner-manifest.json"));
+  assert.ok(files.every((file) => !file.includes(".egg-info/")));
+  assert.ok(files.every((file) => !file.includes("__pycache__/")));
+  assert.ok(files.every((file) => !file.endsWith(".pyc")));
+  assert.ok(files.every((file) => !file.startsWith("test/")));
+  assert.ok(files.every((file) => !file.startsWith("datasets (1)/")));
 });
 
 test("publish guard requires the alpha npm tag", () => {

@@ -6,8 +6,11 @@
     "neo-cast": "bin/neo-cast.js"
   },
   "scripts": {
-    "test": "node --test test/*.test.js",
-    "test:pack": "npm pack --dry-run",
+    "test": "npm run test:all",
+    "test:node": "node scripts/run-node-tests.js",
+    "test:python": "node --test test/python-unit.test.js",
+    "test:all": "npm run test:node && npm run test:python",
+    "test:pack": "npm pack --dry-run --cache .artifacts/npm-cache",
     "test:publish": "npm publish --dry-run --tag alpha --access public --cache .artifacts/npm-cache",
     "publish:alpha": "npm publish --tag alpha --access public --cache .artifacts/npm-cache",
     "prepublishOnly": "node scripts/prepublish-only.js",

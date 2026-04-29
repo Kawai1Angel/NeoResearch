@@ -222,14 +222,14 @@ export function ResearchCockpit() {
     })
   }
 
-  async function createCsvTask(mode: ResearchCockpitTask["mode"]) {
+  async function createCsvTask(mode: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
     const value = await DialogPrompt.show(dialog, "CSV dataset path", {
       placeholder: "/path/to/ETTh1.csv",
       description: () => <text fg={theme.textMuted}>Preset etth1_tslib_v1, target OT, horizon 24.</text>,
     })
     const datasetPath = value?.trim()
     if (!datasetPath) return
-    await createTask(mode, { datasetPath, datasetPreset: "etth1_tslib_v1", targetCols: ["OT"] })
+    await createTask(mode, { ...defaults, datasetPath, datasetPreset: "etth1_tslib_v1", targetCols: ["OT"] })
     dialog.clear()
   }
 
@@ -416,10 +416,22 @@ export function ResearchCockpit() {
       onSelect: () => void createTask("review"),
     },
     {
+      title: "Create TSF full-recipe review task",
+      value: "research.create.review.full",
+      category: "Research",
+      onSelect: () => void createTask("review", { bridgeOnly: false }),
+    },
+    {
       title: "Create TSF review task from CSV",
       value: "research.create.review.csv",
       category: "Research",
       onSelect: () => void createCsvTask("review"),
+    },
+    {
+      title: "Create TSF full-recipe review task from CSV",
+      value: "research.create.review.csv.full",
+      category: "Research",
+      onSelect: () => void createCsvTask("review", { bridgeOnly: false }),
     },
     {
       title: "Create TSF autonomous task",
@@ -428,10 +440,22 @@ export function ResearchCockpit() {
       onSelect: () => void createTask("autonomous"),
     },
     {
+      title: "Create TSF full-recipe autonomous task",
+      value: "research.create.autonomous.full",
+      category: "Research",
+      onSelect: () => void createTask("autonomous", { bridgeOnly: false }),
+    },
+    {
       title: "Create TSF autonomous task from CSV",
       value: "research.create.autonomous.csv",
       category: "Research",
       onSelect: () => void createCsvTask("autonomous"),
+    },
+    {
+      title: "Create TSF full-recipe autonomous task from CSV",
+      value: "research.create.autonomous.csv.full",
+      category: "Research",
+      onSelect: () => void createCsvTask("autonomous", { bridgeOnly: false }),
     },
     {
       title: "Seed TSF baselines",

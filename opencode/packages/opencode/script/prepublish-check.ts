@@ -22,6 +22,34 @@ const checks = [
     run: () => $`bun test test/release-boundary.test.ts`.env(releaseEnv),
   },
   {
+    name: "TSF domain tests",
+    command: "bun test test/research/tsf-domain.test.ts",
+    run: () => $`bun test test/research/tsf-domain.test.ts`.env(releaseEnv),
+  },
+  {
+    name: "Neo-Cast runner client tests",
+    command: "bun test test/research/neo-cast-runner-client.test.ts",
+    run: () => $`bun test test/research/neo-cast-runner-client.test.ts`.env(releaseEnv),
+  },
+  {
+    name: "research CLI tests",
+    command: "bun test test/cli/research-command.test.ts --timeout 30000",
+    run: () => $`bun test test/cli/research-command.test.ts --timeout 30000`.env(releaseEnv),
+  },
+  {
+    name: "doctor command tests",
+    command: "bun test test/cli/doctor.test.ts",
+    run: () => $`bun test test/cli/doctor.test.ts`.env(releaseEnv),
+  },
+  {
+    name: "research Cockpit tests",
+    command: "bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx",
+    run: () =>
+      $`bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx`.env(
+        releaseEnv,
+      ),
+  },
+  {
     name: "research service tests",
     command: "bun test test/research/service.test.ts --timeout 30000",
     run: () => $`bun test test/research/service.test.ts --timeout 30000`.env(releaseEnv),

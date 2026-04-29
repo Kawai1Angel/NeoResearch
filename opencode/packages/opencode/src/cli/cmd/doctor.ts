@@ -17,10 +17,15 @@ function existingDirectory(candidate: string | undefined) {
   return existsSync(resolved) ? resolved : undefined
 }
 
-function discoverNeoCastRoot() {
+export function discoverNeoCastRoot() {
   return (
     existingDirectory(process.env.NEO_RESEARCH_NEO_CAST_ROOT) ??
     existingDirectory(process.env.NEO_CAST_ROOT) ??
+    existingDirectory(
+      process.env.NEO_RESEARCH_PACKAGE_ROOT === undefined
+        ? undefined
+        : path.join(process.env.NEO_RESEARCH_PACKAGE_ROOT, "runners", "neo_cast"),
+    ) ??
     existingDirectory(path.resolve(import.meta.dirname, "../../../../../../neo_cast"))
   )
 }
@@ -87,7 +92,8 @@ function checkNeoCastRoot(root: string | undefined): Check {
     return {
       name: "NEO_CAST_ROOT",
       status: "warn",
-      detail: "not found; set NEO_CAST_ROOT or NEO_RESEARCH_NEO_CAST_ROOT to a local neo_cast checkout",
+      detail:
+        "not found; set NEO_CAST_ROOT or NEO_RESEARCH_NEO_CAST_ROOT to a local neo_cast checkout, or install a package with runners/neo_cast",
     }
   }
 
