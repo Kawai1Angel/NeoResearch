@@ -141,6 +141,7 @@ export function ResearchCockpit() {
     [],
   )
   let routedGoalHandled: string | undefined
+  let actionQueue = Promise.resolve()
 
   onMount(() => {
     focusTimer = setTimeout(() => promptInput?.focus(), 0)
@@ -245,6 +246,20 @@ export function ResearchCockpit() {
   const taskRuns = createMemo(() => runs() ?? [])
   const taskArtifacts = createMemo(() => artifacts() ?? [])
   const taskApprovals = createMemo(() => approvals() ?? [])
+  const validChampion = createMemo(() => {
+    const item = champion()
+    if (
+      !item ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      typeof item.candidateID !== "string" ||
+      typeof item.primaryMetric !== "number" ||
+      typeof item.utility !== "number"
+    ) {
+      return undefined
+    }
+    return item
+  })
   const commandCandidate = () => taskCandidates()[0]
   const workflowItems = createMemo(() =>
     buildResearchCockpitWorkflow({
@@ -253,7 +268,7 @@ export function ResearchCockpit() {
       runs: taskRuns(),
       artifacts: taskArtifacts(),
       approvals: taskApprovals(),
-      champion: champion() ?? null,
+      champion: validChampion() ?? null,
       fingerprint: taskFingerprint() ?? {},
       runnerReady: runnerReady(),
     }),
@@ -265,7 +280,7 @@ export function ResearchCockpit() {
       runs: taskRuns(),
       artifacts: taskArtifacts(),
       approvals: taskApprovals(),
-      champion: champion() ?? null,
+      champion: validChampion() ?? null,
       fingerprint: taskFingerprint() ?? {},
       runnerReady: runnerReady(),
     }),
@@ -280,20 +295,27 @@ export function ResearchCockpit() {
   }
 
   async function runAction(name: string, fn: () => Promise<string>) {
-    if (busy()) return
-    setBusy(name)
-    setError(undefined)
-    try {
-      const message = await fn()
-      toast.show({ variant: "info", message })
-      setRefresh((value) => value + 1)
-    } catch (err) {
-      const message = formatError(err)
-      setError(message)
-      toast.show({ variant: "error", message })
-    } finally {
-      setBusy(undefined)
+    const run = async () => {
+      setBusy(name)
+      setError(undefined)
+      try {
+        const message = await fn()
+        toast.show({ variant: "info", message })
+        setRefresh((value) => value + 1)
+      } catch (err) {
+        const message = formatError(err)
+        setError(message)
+        toast.show({ variant: "error", message })
+      } finally {
+        setBusy(undefined)
+      }
     }
+    const queued = actionQueue.then(run, run)
+    actionQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    )
+    await queued
   }
 
   async function createTask(mode: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
@@ -726,6 +748,12 @@ export function ResearchCockpit() {
 
   command.register(() => [
     {
+      title: "Back to NeoResearch home",
+      value: "research.home",
+      category: "Research",
+      onSelect: () => route.navigate({ type: "home" }),
+    },
+    {
       title: "Create TSF review task",
       value: "research.create.review",
       category: "Research",
@@ -954,8 +982,8 @@ export function ResearchCockpit() {
     return formatResearchCockpitMemory(item)
   })
   const championSummary = createMemo(() => {
-    const item = champion()
-    if (!item || typeof item.primaryMetric !== "number" || typeof item.utility !== "number") return "No champion yet"
+    const item = validChampion()
+    if (!item) return "No champion yet"
     return `candidate=${shortID(item.candidateID)} / metric=${item.primaryMetric.toPrecision(4)} / utility=${item.utility.toPrecision(4)}`
   })
   const promptPlaceholder = createMemo(() =>
@@ -993,7 +1021,7 @@ export function ResearchCockpit() {
               fg={busy() ? cockpitColors.textMuted : cockpitColors.primary}
               onMouseUp={() => {
                 if (busy()) return
-                void createCsvTask("review")
+                void createCsvTask("autonomous")
               }}
             >
               New CSV Task
@@ -1339,9 +1367,7 @@ export function ResearchCockpit() {
             ref={(value: TextareaRenderable) => {
               promptInput = value
               value.traits = { status: "FORECAST" }
-              queueMicrotask(() => value.focus())
             }}
-            focused
             minHeight={1}
             maxHeight={2}
             keyBindings={textareaKeybindings()}
@@ -1426,6 +1452,24 @@ export function ResearchCockpit() {
           <text fg={cockpitColors.textMuted}>Artifacts {stats().artifactCount}</text>
           <text fg={cockpitColors.textMuted}>Memory {stats().memoryCount}</text>
           <text fg={cockpitColors.textMuted}>Approvals {stats().pendingApprovals}</text>
+        </box>
+
+        <box gap={0} paddingTop={1}>
+          <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+            Champion
+          </text>
+          <Show
+            when={validChampion()}
+            fallback={<text fg={cockpitColors.textMuted}>No champion selected</text>}
+          >
+            {(item) => (
+              <>
+                <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
+                <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
+                <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
+              </>
+            )}
+          </Show>
         </box>
 
         <box flexGrow={1} justifyContent="flex-end" paddingBottom={1}>
