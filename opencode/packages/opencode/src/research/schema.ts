@@ -79,10 +79,16 @@ export const ResearchMode = Schema.Literals(["review", "autonomous"])
 export type ResearchMode = Schema.Schema.Type<typeof ResearchMode>
 
 export const ResearchTaskStatus = Schema.Literals([
+  "idle",
   "created",
+  "intent_gathering",
   "profiling",
+  "analyzing",
+  "data_analysis",
   "baselining",
+  "searching",
   "researching",
+  "publishing",
   "paused",
   "completed",
   "failed",
@@ -333,7 +339,12 @@ export class CreateArtifactInput extends Schema.Class<CreateArtifactInput>("Rese
   static readonly zod = zod(this)
 }
 
-export const ExportArtifactKind = Schema.Literals(["research_report_markdown"])
+export const ExportArtifactKind = Schema.Literals([
+  "research_report_markdown",
+  "dataset_analysis_report",
+  "research_final_bundle",
+  "model_export_package",
+])
   .annotate({ identifier: "ResearchExportArtifactKind" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type ExportArtifactKind = Schema.Schema.Type<typeof ExportArtifactKind>
@@ -367,6 +378,23 @@ export class ProfileTaskResult extends Schema.Class<ProfileTaskResult>("Research
   run: ResearchRun,
   artifact: ResearchArtifact,
   path: Schema.String,
+}) {
+  static readonly zod = zod(this)
+}
+
+export class PrepareTaskDatasetInput extends Schema.Class<PrepareTaskDatasetInput>("ResearchPrepareTaskDatasetInput")({
+  taskID: ResearchTaskID,
+  force: Schema.optional(Schema.Boolean),
+  outputDir: Schema.optional(Schema.String),
+}) {
+  static readonly zod = zod(this)
+}
+
+export class PrepareTaskDatasetResult extends Schema.Class<PrepareTaskDatasetResult>("ResearchPrepareTaskDatasetResult")({
+  artifact: ResearchArtifact,
+  path: Schema.String,
+  datasetSpec: JsonRecord,
+  command: JsonRecord,
 }) {
   static readonly zod = zod(this)
 }
@@ -468,6 +496,27 @@ export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("Rese
   stage: Schema.optional(ExecutableRunStage),
   description: Schema.optional(Schema.String),
   maxIterations: Schema.optional(Schema.Number),
+  targetMetricValue: Schema.optional(Schema.Number),
+  minRelativeImprovement: Schema.optional(Schema.Number),
+  maxNoImprove: Schema.optional(Schema.Number),
+  timeBudgetSeconds: Schema.optional(Schema.Number),
+  maxCrashStreak: Schema.optional(Schema.Number),
+}) {
+  static readonly zod = zod(this)
+}
+
+export class RunFullPipelineInput extends Schema.Class<RunFullPipelineInput>("ResearchRunFullPipelineInput")({
+  taskID: ResearchTaskID,
+  stage: Schema.optional(ExecutableRunStage),
+  description: Schema.optional(Schema.String),
+  maxIterations: Schema.optional(Schema.Number),
+  targetMetricValue: Schema.optional(Schema.Number),
+  minRelativeImprovement: Schema.optional(Schema.Number),
+  maxNoImprove: Schema.optional(Schema.Number),
+  timeBudgetSeconds: Schema.optional(Schema.Number),
+  maxCrashStreak: Schema.optional(Schema.Number),
+  outputDir: Schema.optional(Schema.String),
+  forceDatasetPreparation: Schema.optional(Schema.Boolean),
 }) {
   static readonly zod = zod(this)
 }

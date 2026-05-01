@@ -310,6 +310,35 @@ export const ResearchRoutes = lazy(() =>
           })
         }),
     )
+    .post(
+      "/tasks/:taskID/prepare-dataset",
+      describeRoute({
+        summary: "Prepare research task dataset",
+        description: "Materialize the task dataset into the configured Neo-Cast dataset contract.",
+        operationId: "research.tasks.prepareDataset",
+        responses: {
+          200: {
+            description: "Prepared dataset contract artifact",
+            content: {
+              "application/json": {
+                schema: resolver(Research.PrepareTaskDatasetResult.zod),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator("json", z.object({ force: z.boolean().optional(), outputDir: z.string().optional() }).default({})),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.prepareDataset", c, function* () {
+          const svc = yield* Research.Service
+          return yield* svc.prepareTaskDataset({
+            taskID: c.req.valid("param").taskID,
+            ...c.req.valid("json"),
+          })
+        }),
+    )
     .patch(
       "/tasks/:taskID/spec",
       describeRoute({
@@ -434,6 +463,57 @@ export const ResearchRoutes = lazy(() =>
         }),
     )
     .post(
+      "/tasks/:taskID/pipeline",
+      describeRoute({
+        summary: "Run multi-agent research pipeline",
+        description: "Run intent, data analysis, NAS, and publish agents for an autonomous research task.",
+        operationId: "research.tasks.pipeline",
+        responses: {
+          200: {
+            description: "Multi-agent pipeline result",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    task: Research.ResearchTask.zod,
+                    intent: z.object({ taskID: Research.ResearchTaskID.zod }).passthrough(),
+                    dataAnalysis: z.object({ artifact: Research.ResearchArtifact.zod }).passthrough(),
+                    nas: z.object({ loop: z.object({ artifact: Research.ResearchArtifact.zod }).passthrough() }).passthrough(),
+                    publish: z.object({ artifact: Research.ResearchArtifact.zod, path: z.string() }).passthrough(),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator(
+        "json",
+        z.object({
+          stage: Research.ExecutableRunStage.zod.optional(),
+          description: z.string().optional(),
+          maxIterations: z.number().int().min(1).max(50).optional(),
+          targetMetricValue: z.number().optional(),
+          minRelativeImprovement: z.number().min(0).optional(),
+          maxNoImprove: z.number().int().min(0).optional(),
+          timeBudgetSeconds: z.number().positive().optional(),
+          maxCrashStreak: z.number().int().min(0).optional(),
+          outputDir: z.string().optional(),
+          forceDatasetPreparation: z.boolean().optional(),
+        }),
+      ),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.pipeline", c, function* () {
+          const svc = yield* Research.Service
+          return yield* svc.runFullPipeline({
+            taskID: c.req.valid("param").taskID,
+            ...c.req.valid("json"),
+          })
+        }),
+    )
+    .post(
       "/tasks/:taskID/autonomous/iterate",
       describeRoute({
         summary: "Run autonomous iteration",
@@ -504,7 +584,16 @@ export const ResearchRoutes = lazy(() =>
                         selectionArtifact: Research.ResearchArtifact.zod,
                       })
                       .array(),
-                    stoppedReason: z.enum(["max_iterations", "budget_exhausted", "approval_required"]),
+                    stoppedReason: z.enum([
+                      "max_iterations",
+                      "budget_exhausted",
+                      "approval_required",
+                      "seed_failed",
+                      "target_reached",
+                      "plateau",
+                      "time_budget_exhausted",
+                      "crash_streak_exceeded",
+                    ]),
                     artifact: Research.ResearchArtifact.zod,
                   }),
                 ),
@@ -521,6 +610,11 @@ export const ResearchRoutes = lazy(() =>
           stage: Research.ExecutableRunStage.zod.optional(),
           description: z.string().optional(),
           maxIterations: z.number().int().min(1).max(50).optional(),
+          targetMetricValue: z.number().optional(),
+          minRelativeImprovement: z.number().min(0).optional(),
+          maxNoImprove: z.number().int().min(0).optional(),
+          timeBudgetSeconds: z.number().positive().optional(),
+          maxCrashStreak: z.number().int().min(0).optional(),
         }),
       ),
       async (c) =>

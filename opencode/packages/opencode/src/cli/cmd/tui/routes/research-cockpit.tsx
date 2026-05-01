@@ -1,9 +1,11 @@
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
-import { useTerminalDimensions } from "@opentui/solid"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { useTextareaKeybindings } from "@tui/component/textarea-keybindings"
 import { useEvent } from "@tui/context/event"
+import { useLocal } from "@tui/context/local"
 import { useRoute } from "@tui/context/route"
 import { useSDK } from "@tui/context/sdk"
 import { useTheme } from "@tui/context/theme"
@@ -12,14 +14,13 @@ import { DialogPrompt } from "@tui/ui/dialog-prompt"
 import { useToast } from "@tui/ui/toast"
 import {
   buildDefaultTsfResearchTask,
+  buildDefaultTsfResearchTaskFromGoal,
+  buildSocraticClarificationState,
   buildResearchCockpitRecommendation,
-  buildResearchCockpitStats,
-  buildResearchCockpitWorkflow,
   canExecuteResearchCockpitTask,
   canRunResearchCockpitCandidate,
-  formatResearchCockpitArtifactMetadata,
+  findBestResearchCockpitMetric,
   formatResearchCockpitExport,
-  formatResearchCockpitMemory,
   formatResearchCockpitProfile,
   formatResearchCockpitIteration,
   formatResearchCockpitLoop,
@@ -28,12 +29,14 @@ import {
   getResearchCockpitRunnerStatus,
   hasApprovedResearchCockpitBlindTestGate,
   hasApprovedResearchCockpitRefTestGate,
+  interactionModeForTask,
   parseTsfCsvTaskInput,
-  researchCockpitArtifactTarget,
-  researchCockpitCandidatePipeline,
+  validateTsfCsvTaskInput,
+  researchInteractionModeLabel,
   researchCockpitCandidateTitle,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
+  taskModeForInteractionMode,
   updateResearchCockpitTaskRunnerRoot,
   type CreateResearchTaskInput,
   type JsonRecord,
@@ -44,12 +47,12 @@ import {
   type ResearchCockpitExportResult,
   type ResearchCockpitIterationResult,
   type ResearchCockpitLoopResult,
-  type ResearchCockpitMemory,
+  type ResearchInteractionMode,
   type ResearchCockpitProfileResult,
   type ResearchCockpitRun,
+  type ResearchCockpitRunnerStatus,
   type ResearchCockpitSeedSweepResult,
   type ResearchCockpitTask,
-  type ResearchCockpitWorkflowStatus,
   type TsfResearchTaskDefaults,
 } from "./research-cockpit-data"
 import {
@@ -60,10 +63,16 @@ import {
   slashMenuHasOptions,
   type SlashOption,
 } from "./research-slash-menu"
+import packageJson from "../../../../../package.json"
 
 type CandidateRunStage = Extract<NonNullable<ResearchCockpitRun["stage"]>, "smoke" | "ref_test" | "blind_test">
 
-async function researchRequest<T>(sdk: ReturnType<typeof useSDK>, path: string, init: RequestInit = {}): Promise<T> {
+async function researchRequest<T>(
+  sdk: ReturnType<typeof useSDK>,
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = 90_000,
+): Promise<T> {
   const url = new URL(path, sdk.url)
   if (sdk.directory) url.searchParams.set("directory", sdk.directory)
 
@@ -72,10 +81,24 @@ async function researchRequest<T>(sdk: ReturnType<typeof useSDK>, path: string, 
     headers.set("content-type", "application/json")
   }
 
-  const response = await sdk.fetch(url, {
-    ...init,
-    headers,
-  })
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const signal =
+    init.signal && !init.signal.aborted
+      ? (AbortSignal as unknown as { any: (signals: AbortSignal[]) => AbortSignal }).any?.([
+          init.signal,
+          timeoutSignal,
+        ]) ?? timeoutSignal
+      : timeoutSignal
+
+  let response: Response
+  try {
+    response = await sdk.fetch(url, { ...init, headers, signal })
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s (${path})`)
+    }
+    throw err
+  }
   if (!response.ok) {
     const text = await response.text()
     throw new Error(text || `${response.status} ${response.statusText}`)
@@ -131,12 +154,6 @@ function assistantTextFromResponse(result: unknown) {
   return text || "Research Agent completed without a text response."
 }
 
-function workflowMark(status: ResearchCockpitWorkflowStatus) {
-  if (status === "done") return "[x]"
-  if (status === "active") return "[o]"
-  return "[ ]"
-}
-
 const cockpitColors = {
   background: "#11111b",
   panel: "#1e1e2e",
@@ -152,6 +169,26 @@ const cockpitColors = {
 
 const promptEventHistoryLimit = 20
 const errorEventHistoryLimit = 10
+const neoResearchVersion = InstallationVersion === "local" ? packageJson.version : InstallationVersion
+const interactionModeOptions: Array<{
+  key: string
+  title: string
+  value: ResearchInteractionMode
+  description: string
+}> = [
+  {
+    key: "1",
+    title: "Companion",
+    value: "companion",
+    description: "Key checkpoints ask for human confirmation and choice.",
+  },
+  {
+    key: "2",
+    title: "Socratic",
+    value: "socratic",
+    description: "Clarify goals first, then run with minimal interruption.",
+  },
+]
 
 type StreamLine = {
   id: string
@@ -162,7 +199,8 @@ type StreamLine = {
 type ChatProviderList = {
   providers: Array<{
     id: string
-    models?: Record<string, { id?: string }>
+    name?: string
+    models?: Record<string, { id?: string; name?: string }>
   }>
   default: Record<string, string>
 }
@@ -173,10 +211,62 @@ type ChatAgent = {
   hidden?: boolean
 }
 
-function workflowColor(status: ResearchCockpitWorkflowStatus) {
-  if (status === "done") return cockpitColors.text
-  if (status === "active") return cockpitColors.primary
-  return cockpitColors.textMuted
+type ChatModelSelection = {
+  providerID: string
+  modelID: string
+}
+
+function useOptionalLocal() {
+  try {
+    return useLocal()
+  } catch {
+    return undefined
+  }
+}
+
+export function resolveResearchCockpitChatDefaults(input: {
+  providersResult: ChatProviderList
+  agentsResult: ChatAgent[]
+  selectedModel?: ChatModelSelection
+  selectedAgentName?: string
+}) {
+  const { providersResult, agentsResult, selectedModel, selectedAgentName } = input
+  if (!Array.isArray(providersResult.providers)) {
+    throw new Error("AI provider list is unavailable.")
+  }
+  if (!Array.isArray(agentsResult)) {
+    throw new Error("AI agent list is unavailable.")
+  }
+
+  const agent =
+    (selectedAgentName ? agentsResult.find((item) => item.name === selectedAgentName) : undefined) ??
+    agentsResult.find((item) => item.mode !== "subagent" && !item.hidden) ??
+    agentsResult[0]
+  if (!agent) throw new Error("No primary agent is available for chat.")
+
+  if (selectedModel?.providerID && selectedModel.modelID) {
+    return {
+      agent: agent.name,
+      model: {
+        providerID: selectedModel.providerID,
+        modelID: selectedModel.modelID,
+      },
+    }
+  }
+
+  const provider = providersResult.providers.find((item) => Object.keys(item.models ?? {}).length > 0)
+  if (!provider) {
+    throw new Error("No AI provider is configured. Run neo-research init or set an API key, then reopen the TUI.")
+  }
+  const modelID = providersResult.default[provider.id] ?? Object.keys(provider.models ?? {})[0]
+  if (!modelID) throw new Error(`No model is available for provider ${provider.id}.`)
+  return {
+    agent: agent.name,
+    model: {
+      providerID: provider.id,
+      modelID,
+    },
+  }
 }
 
 function streamLineColor(tone: StreamLine["tone"]) {
@@ -188,14 +278,200 @@ function streamLineColor(tone: StreamLine["tone"]) {
   return cockpitColors.textMuted
 }
 
+function hasMeaningfulFingerprint(value: unknown) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length > 0
+}
+
+function isFinalResearchArtifact(artifact: ResearchCockpitArtifact) {
+  const kind = artifact.kind.toLowerCase()
+  return kind.includes("final") || kind.includes("bundle") || kind.includes("report")
+}
+
+function compactStreamTextParts(value: string) {
+  const text = value.trim() || "completed"
+  return text
+    .split(/\r?\n/)
+    .map((part) => part.trimEnd())
+    .filter((part) => part.trim().length > 0)
+}
+
 function promptTaskTitle(value: string) {
   return value.length > 72 ? `${value.slice(0, 69)}...` : value
+}
+
+function recordValue(value: unknown): JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonRecord) : {}
+}
+
+function stringListValue(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : []
+}
+
+function numberListValue(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is number => typeof item === "number" && Number.isFinite(item)) : []
+}
+
+function compactPathName(value: string) {
+  return value.split(/[\\/]/).filter(Boolean).pop() ?? value
+}
+
+function compactTailPath(value: string) {
+  const normalized = value.replace(/\\/g, "/")
+  if (normalized.length <= 30) return value
+  const tail = normalized.split("/").filter(Boolean).pop()
+  return tail ? `.../${tail}` : value
+}
+
+function splitSlashSummary(prefix: string, summary: string) {
+  const parts = summary
+    .split(" / ")
+    .map((part) => part.trim())
+    .filter(Boolean)
+  if (parts.length === 0) return []
+  const lines: string[] = []
+  for (let index = 0; index < parts.length; index += 2) {
+    const text = parts.slice(index, index + 2).join(" / ")
+    lines.push(index === 0 ? `${prefix} ${text}` : text)
+  }
+  return lines
+}
+
+function runnerIssueDetailLines(status: ResearchCockpitRunnerStatus) {
+  if (status.ready) return []
+  if (status.reason === "missing_runner_script") return ["Missing py/validate.py"]
+  if (status.reason === "missing_root" || status.reason === "missing_runtime") return ["Set runner root in taskSpec.runtime."]
+  if (status.reason === "missing_root_path") return [`Root not found: ${compactTailPath(status.root ?? "")}`]
+  if (status.reason === "missing_python") return ["Initialize Neo-Cast runtime Python."]
+  if (status.reason === "python_unavailable") return [`Python unavailable: ${compactTailPath(status.pythonExecutable ?? "")}`]
+  if (status.reason === "unsupported_python") return ["Python must be >= 3.10."]
+  if (status.reason === "dataset_spec_mismatch") return ["Prepared dataset does not match task."]
+  if (status.reason === "missing_dataset_spec") return ["Prepare Neo-Cast dataset_spec.json."]
+  if (status.reason === "missing_task") return ["No task selected."]
+  return [status.detail]
+}
+
+function formatTaskRequirementSummaryLines(task?: ResearchCockpitTask) {
+  if (!task) return []
+
+  const taskSpec = recordValue(task.taskSpec)
+  const dataset = recordValue(taskSpec.dataset)
+  const metadata = recordValue(taskSpec.metadata)
+  const objective = recordValue(task.objective)
+  const budget = recordValue(task.budget)
+  const prompt = typeof metadata.userPrompt === "string" ? metadata.userPrompt.trim() : ""
+  const datasetName =
+    typeof dataset.path === "string" && dataset.path.length > 0
+      ? compactPathName(dataset.path)
+      : typeof dataset.loaderID === "string" && dataset.loaderID.length > 0
+        ? dataset.loaderID
+        : undefined
+  const targets = stringListValue(dataset.targetCols)
+  const horizons = numberListValue(taskSpec.predictionLengths)
+  const contextLength = typeof taskSpec.contextLength === "number" && Number.isFinite(taskSpec.contextLength) ? taskSpec.contextLength : undefined
+  const metric = typeof objective.primaryMetric === "string" && objective.primaryMetric.length > 0 ? objective.primaryMetric : undefined
+  const maxRuns = typeof budget.maxRuns === "number" && Number.isFinite(budget.maxRuns) ? budget.maxRuns : undefined
+  const primaryParts = [
+    metric ? `指标=${metric}` : undefined,
+    prompt ? `需求=${promptTaskTitle(prompt)}` : undefined,
+  ].filter((part): part is string => Boolean(part))
+  const detailParts = [
+    datasetName ? `数据=${datasetName}` : undefined,
+    targets.length > 0 ? `目标=${targets.join(",")}` : undefined,
+    horizons.length > 0 ? `预测=${horizons.join(",")}` : undefined,
+    contextLength ? `上下文=${contextLength}` : undefined,
+    maxRuns ? `预算=${maxRuns} runs` : undefined,
+  ].filter((part): part is string => Boolean(part))
+
+  if (primaryParts.length === 0 && detailParts.length === 0) return [`需求摘要 ${promptTaskTitle(task.title)}`]
+  return [`需求摘要 ${primaryParts.join(" / ") || promptTaskTitle(task.title)}`, ...(detailParts.length > 0 ? [detailParts.join(" / ")] : [])]
+}
+
+function InteractionModeDialog(props: {
+  onConfirm: (mode: ResearchInteractionMode) => void
+}) {
+  const { theme } = useTheme()
+  const [selected, setSelected] = createSignal<ResearchInteractionMode>("socratic")
+
+  function move(direction: number) {
+    const index = interactionModeOptions.findIndex((option) => option.value === selected())
+    const next = (index + direction + interactionModeOptions.length) % interactionModeOptions.length
+    setSelected(interactionModeOptions[next]!.value)
+  }
+
+  useKeyboard((evt) => {
+    if (evt.name === "1") {
+      setSelected("companion")
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+    if (evt.name === "2") {
+      setSelected("socratic")
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+    if (evt.name === "up" || (evt.ctrl && evt.name === "p")) {
+      move(-1)
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+    if (evt.name === "down" || (evt.ctrl && evt.name === "n")) {
+      move(1)
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+    if (evt.name === "return") {
+      props.onConfirm(selected())
+      evt.preventDefault()
+      evt.stopPropagation()
+    }
+  })
+
+  return (
+    <box paddingLeft={2} paddingRight={2} gap={1}>
+      <box flexDirection="row" justifyContent="space-between">
+        <text attributes={TextAttributes.BOLD} fg={theme.text}>
+          Interaction mode
+        </text>
+        <text fg={theme.textMuted}>esc</text>
+      </box>
+      <box gap={1}>
+        <For each={interactionModeOptions}>
+          {(option) => {
+            const active = createMemo(() => selected() === option.value)
+            return (
+              <box gap={1}>
+                <box flexDirection="row" gap={1}>
+                  <text fg={active() ? theme.primary : theme.textMuted}>{active() ? ">" : " "}</text>
+                  <text attributes={TextAttributes.BOLD} fg={active() ? theme.primary : theme.text}>
+                    {option.key} {option.title}
+                  </text>
+                </box>
+                <box paddingLeft={4}>
+                  <text fg={theme.textMuted}>{option.description}</text>
+                </box>
+              </box>
+            )
+          }}
+        </For>
+      </box>
+      <box paddingBottom={1} gap={2} flexDirection="row">
+        <text fg={theme.text}>
+          enter <span style={{ fg: theme.textMuted }}>submit</span>
+        </text>
+        <text fg={theme.textMuted}>1/2 choose</text>
+        <text fg={theme.textMuted}>up/down move</text>
+      </box>
+    </box>
+  )
 }
 
 export function ResearchCockpit() {
   let promptInput: TextareaRenderable | undefined
   let focusTimer: ReturnType<typeof setTimeout> | undefined
-  let promptEventID = 0
   const sdk = useSDK()
   const event = useEvent()
   const route = useRoute()
@@ -204,8 +480,10 @@ export function ResearchCockpit() {
   const dialog = useDialog()
   const toast = useToast()
   const { theme } = useTheme()
+  const local = useOptionalLocal()
   const textareaKeybindings = useTextareaKeybindings()
   const slashSelection = createResearchSlashSelection()
+  let streamEventID = 0
   const [refresh, setRefresh] = createSignal(0)
   const [selectedIndex, setSelectedIndex] = createSignal(0)
   const [selectedCandidateIndex, setSelectedCandidateIndex] = createSignal(0)
@@ -214,12 +492,11 @@ export function ResearchCockpit() {
   const [errorEvents, setErrorEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
   const [actionEvents, setActionEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
   const [promptValue, setPromptValue] = createSignal("")
+  const [csvInputErrors, setCsvInputErrors] = createSignal<string[]>([])
   const [promptEvents, setPromptEvents] = createSignal<Array<{ id: number; text: string; taskID?: string; detail?: string }>>(
     [],
   )
   const [chatSessionID, setChatSessionID] = createSignal<string>()
-  let errorEventID = 0
-  let actionEventID = 0
   const routedGoalsHandled = new Set<string>()
   let routedCsvTaskHandled = false
   let actionQueue = Promise.resolve()
@@ -275,7 +552,7 @@ export function ResearchCockpit() {
     if (!shouldOpenCsvTask || routedCsvTaskHandled) return
     routedCsvTaskHandled = true
     setTimeout(() => {
-      void createCsvTask("autonomous")
+      void createCsvTask()
     }, 0)
   })
 
@@ -297,10 +574,6 @@ export function ResearchCockpit() {
     )
   })
 
-  const [memory] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitMemory[]>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/memory`)
-  })
-
   const [taskFingerprint] = createResource(selectedTaskSource, async (source) => {
     return researchRequest<JsonRecord>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/fingerprint`)
   })
@@ -319,17 +592,6 @@ export function ResearchCockpit() {
     )
   })
 
-  const stats = createMemo(() =>
-    buildResearchCockpitStats({
-      tasks: tasks() ?? [],
-      candidates: candidates() ?? [],
-      artifacts: artifacts() ?? [],
-      memory: memory() ?? [],
-      runs: runs() ?? [],
-      approvals: approvals() ?? [],
-    }),
-  )
-
   const pendingApproval = createMemo(() => approvals()?.find((approval) => approval.status === "pending"))
   const runnerStatus = createMemo(() => getResearchCockpitRunnerStatus(selectedTask(), { validateRuntime: true }))
   const runnerReady = createMemo(() => runnerStatus().ready)
@@ -337,6 +599,8 @@ export function ResearchCockpit() {
   const taskRuns = createMemo(() => runs() ?? [])
   const taskArtifacts = createMemo(() => artifacts() ?? [])
   const taskApprovals = createMemo(() => approvals() ?? [])
+  const taskInteractionMode = createMemo(() => interactionModeForTask(selectedTask()))
+  const socraticClarification = createMemo(() => buildSocraticClarificationState(selectedTask(), taskApprovals()))
   const validChampion = createMemo(() => {
     const item = champion()
     if (
@@ -353,11 +617,6 @@ export function ResearchCockpit() {
   })
   const selectedCandidate = createMemo(() => taskCandidates()[selectedCandidateIndex()])
   const commandCandidate = () => selectedCandidate()
-  const candidatePosition = createMemo(() => {
-    const count = taskCandidates().length
-    if (count === 0) return "Candidate 0/0"
-    return `Candidate ${selectedCandidateIndex() + 1}/${count}`
-  })
   createEffect(() => {
     const count = taskCandidates().length
     if (count === 0 && selectedCandidateIndex() !== 0) {
@@ -368,18 +627,6 @@ export function ResearchCockpit() {
       setSelectedCandidateIndex(count - 1)
     }
   })
-  const workflowItems = createMemo(() =>
-    buildResearchCockpitWorkflow({
-      task: selectedTask(),
-      candidates: taskCandidates(),
-      runs: taskRuns(),
-      artifacts: taskArtifacts(),
-      approvals: taskApprovals(),
-      champion: validChampion() ?? null,
-      fingerprint: taskFingerprint() ?? {},
-      runnerReady: runnerReady(),
-    }),
-  )
   const recommendation = createMemo(() =>
     buildResearchCockpitRecommendation({
       task: selectedTask(),
@@ -392,15 +639,6 @@ export function ResearchCockpit() {
       runnerReady: runnerReady(),
     }),
   )
-  const statusColor = (status: string) => {
-    if (["completed", "succeeded", "approved", "auto_approved", "accepted", "ready"].includes(status))
-      return cockpitColors.success
-    if (["failed", "rejected"].includes(status)) return cockpitColors.error
-    if (["researching", "running", "queued", "baselining", "profiling", "pending"].includes(status))
-      return cockpitColors.warning
-    return cockpitColors.textMuted
-  }
-
   async function runAction(name: string, fn: () => Promise<string>) {
     const run = async () => {
       setBusy(name)
@@ -409,7 +647,7 @@ export function ResearchCockpit() {
         setError(undefined)
         setActionEvents((events) => [
           ...events.slice(-(promptEventHistoryLimit - 1)),
-          { id: ++actionEventID, action: name, text: message },
+          { id: ++streamEventID, action: name, text: message },
         ])
         toast.show({ variant: "info", message })
         setRefresh((value) => value + 1)
@@ -418,7 +656,7 @@ export function ResearchCockpit() {
         setError(message)
         setErrorEvents((events) => [
           ...events.slice(-(errorEventHistoryLimit - 1)),
-          { id: ++errorEventID, action: name, text: message },
+          { id: ++streamEventID, action: name, text: message },
         ])
         toast.show({ variant: "error", message })
       } finally {
@@ -433,9 +671,33 @@ export function ResearchCockpit() {
     await queued
   }
 
-  async function createTask(mode: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
-    await runAction(`create-${mode}`, async () => {
-      const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask(mode, sdk.directory ?? process.cwd(), defaults)
+  async function chooseInteractionMode() {
+    return new Promise<ResearchInteractionMode | undefined>((resolve) => {
+      let settled = false
+      const finish = (value: ResearchInteractionMode | undefined) => {
+        if (settled) return
+        settled = true
+        resolve(value)
+        dialog.clear()
+      }
+      dialog.replace(
+        () => (
+          <InteractionModeDialog onConfirm={(mode) => finish(mode)} />
+        ),
+        () => finish(undefined),
+      )
+    })
+  }
+
+  async function createTask(mode?: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
+    const interactionMode = defaults.interactionMode ?? (mode === undefined ? await chooseInteractionMode() : undefined)
+    const resolvedMode = mode ?? (interactionMode === undefined ? undefined : taskModeForInteractionMode(interactionMode))
+    if (!resolvedMode) return
+    await runAction(`create-${resolvedMode}`, async () => {
+      const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask(resolvedMode, sdk.directory ?? process.cwd(), {
+        ...defaults,
+        ...(interactionMode === undefined ? {} : { interactionMode }),
+      })
       const task = await researchRequest<ResearchCockpitTask>(sdk, "/research/tasks", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -445,18 +707,47 @@ export function ResearchCockpit() {
     })
   }
 
-  async function createCsvTask(mode: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
-    const value = await DialogPrompt.show(dialog, "CSV dataset path", {
-      placeholder: "/path/to/ETTh1.csv target=OT horizon=24 context=96 full",
-      description: () => <text fg={theme.textMuted}>Options: target=OT,HUFL horizon=24,48 context=96 preset=etth1 full|bridge.</text>,
-    })
-    const parsed = value ? parseTsfCsvTaskInput(value) : undefined
-    if (!parsed?.datasetPath) return
-    await createTask(mode, {
+  async function createCsvTask(mode?: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
+    const interactionMode = defaults.interactionMode ?? (mode === undefined ? await chooseInteractionMode() : undefined)
+    const resolvedMode = mode ?? (interactionMode === undefined ? undefined : taskModeForInteractionMode(interactionMode))
+    if (!resolvedMode) return
+    let parsed: TsfResearchTaskDefaults | undefined
+    let inputValue: string | undefined
+    while (!parsed?.datasetPath) {
+      const value = await DialogPrompt.show(dialog, "CSV dataset path", {
+        value: inputValue,
+        placeholder: "/path/to/ETTh1.csv target=OT horizon=24 context=96 full",
+        description: () => (
+          <box gap={1}>
+            <text fg={theme.textMuted}>Options: target=OT,HUFL horizon=24,48 context=96 preset=etth1 full|bridge.</text>
+            <For each={csvInputErrors()}>
+              {(error) => <text fg={cockpitColors.error}>{error}</text>}
+            </For>
+          </box>
+        ),
+      })
+      inputValue = value ?? undefined
+      if (!value) {
+        setCsvInputErrors([])
+        return
+      }
+      const errors = validateTsfCsvTaskInput(value)
+      if (errors.length > 0) {
+        setCsvInputErrors(errors)
+        continue
+      }
+      parsed = parseTsfCsvTaskInput(value)
+      if (!parsed?.datasetPath) {
+        setCsvInputErrors(["Enter a CSV dataset path."])
+      }
+    }
+    setCsvInputErrors([])
+    await createTask(resolvedMode, {
       datasetPreset: "etth1_tslib_v1",
       targetCols: ["OT"],
       ...defaults,
       ...parsed,
+      ...(interactionMode === undefined ? {} : { interactionMode }),
     })
     dialog.clear()
   }
@@ -511,27 +802,12 @@ export function ResearchCockpit() {
       researchRequest<ChatProviderList>(sdk, "/config/providers"),
       researchRequest<ChatAgent[]>(sdk, "/agent"),
     ])
-    if (!Array.isArray(providersResult.providers)) {
-      throw new Error("AI provider list is unavailable.")
-    }
-    if (!Array.isArray(agentsResult)) {
-      throw new Error("AI agent list is unavailable.")
-    }
-    const provider = providersResult.providers.find((item) => Object.keys(item.models ?? {}).length > 0)
-    if (!provider) {
-      throw new Error("No AI provider is configured. Run neo-research init or set an API key, then reopen the TUI.")
-    }
-    const modelID = providersResult.default[provider.id] ?? Object.keys(provider.models ?? {})[0]
-    if (!modelID) throw new Error(`No model is available for provider ${provider.id}.`)
-    const agent = agentsResult.find((item) => item.mode !== "subagent" && !item.hidden) ?? agentsResult[0]
-    if (!agent) throw new Error("No primary agent is available for chat.")
-    return {
-      agent: agent.name,
-      model: {
-        providerID: provider.id,
-        modelID,
-      },
-    }
+    return resolveResearchCockpitChatDefaults({
+      providersResult,
+      agentsResult,
+      selectedModel: local?.model.current(),
+      selectedAgentName: local?.agent.current()?.name,
+    })
   }
 
   async function ensureChatSession() {
@@ -697,12 +973,12 @@ export function ResearchCockpit() {
     await runAction("export-artifact", async () => {
       const result = await researchRequest<ResearchCockpitExportResult>(
         sdk,
-        `/research/tasks/${encodeURIComponent(task.id)}/export`,
-        {
-          method: "POST",
-          body: JSON.stringify({}),
-        },
-      )
+          `/research/tasks/${encodeURIComponent(task.id)}/export`,
+          {
+            method: "POST",
+            body: JSON.stringify({ kind: "research_final_bundle", outputDir: ".neo-research/final" }),
+          },
+        )
       return formatResearchCockpitExport(result)
     })
   }
@@ -860,11 +1136,11 @@ export function ResearchCockpit() {
       return
     }
     if (name === "csv" || name === "dataset") {
-      await createCsvTask("autonomous")
+      await createCsvTask()
       return
     }
     if (name === "csv-full" || name === "dataset-full") {
-      await createCsvTask("autonomous", { bridgeOnly: false })
+      await createCsvTask(undefined, { bridgeOnly: false })
       return
     }
     if (name === "seed" || name === "seed-baselines" || name === "baselines") {
@@ -950,13 +1226,18 @@ export function ResearchCockpit() {
   }
 
   async function createTaskFromPrompt(value: string, source: "prompt" | "home" = "prompt") {
+    const interactionMode = source === "home" ? "socratic" : await chooseInteractionMode()
+    if (!interactionMode) return
+    const mode = taskModeForInteractionMode(interactionMode)
     await runAction(source === "home" ? "create-from-home-goal" : "create-from-prompt", async () => {
-      const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask("autonomous", sdk.directory ?? process.cwd(), {
-        bridgeOnly: false,
-      })
+      const payload: CreateResearchTaskInput = buildDefaultTsfResearchTaskFromGoal(
+        value,
+        mode,
+        sdk.directory ?? process.cwd(),
+        { interactionMode },
+      )
       const metadata = payload.taskSpec.metadata
       const eventDetail = source === "home" ? "created from home goal" : "created from prompt"
-      payload.title = promptTaskTitle(value)
       payload.taskSpec = {
         ...payload.taskSpec,
         metadata: {
@@ -974,22 +1255,25 @@ export function ResearchCockpit() {
       let detail = eventDetail
       let actionMessage = `${task.title} ${detail}`
       if (executableTask.mode === "autonomous" && canExecuteResearchCockpitTask(executableTask, runnerOptions)) {
-        const result = await researchRequest<ResearchCockpitIterationResult>(
+        const result = await researchRequest<{
+          nas: { loop: ResearchCockpitLoopResult }
+          publish: ResearchCockpitExportResult
+        }>(
           sdk,
-          `/research/tasks/${encodeURIComponent(executableTask.id)}/autonomous/iterate`,
+          `/research/tasks/${encodeURIComponent(executableTask.id)}/pipeline`,
           {
             method: "POST",
-            body: JSON.stringify({ stage: "smoke", description: value }),
+            body: JSON.stringify({ stage: "smoke", description: value, maxIterations: 3 }),
           },
         )
-        detail = `${eventDetail}; submitted to research agent`
-        actionMessage = formatResearchCockpitIteration(result)
+        detail = `${eventDetail}; completed multi-agent pipeline`
+        actionMessage = `${formatResearchCockpitLoop(result.nas.loop)}; ${formatResearchCockpitExport(result.publish)}`
       }
       setSelectedIndex(0)
       setPromptEvents((events) => [
         ...events.slice(-(promptEventHistoryLimit - 1)),
         {
-          id: ++promptEventID,
+          id: ++streamEventID,
           text: value,
           taskID: task.id,
           detail,
@@ -1014,7 +1298,7 @@ export function ResearchCockpit() {
       setPromptEvents((events) => [
         ...events.slice(-(promptEventHistoryLimit - 1)),
         {
-          id: ++promptEventID,
+          id: ++streamEventID,
           text: value,
         },
       ])
@@ -1025,7 +1309,7 @@ export function ResearchCockpit() {
     setPromptEvents((events) => [
       ...events.slice(-(promptEventHistoryLimit - 1)),
       {
-        id: ++promptEventID,
+        id: ++streamEventID,
         text: value,
         taskID: task?.id,
       },
@@ -1147,19 +1431,19 @@ export function ResearchCockpit() {
       onSelect: () => void createTask("autonomous", { bridgeOnly: false }),
     },
     {
-      title: "Create TSF autonomous task from CSV",
+      title: "Create TSF task from CSV",
       value: "research.create.autonomous.csv",
       category: "Research",
       keybind: "ctrl+n",
       slash: { name: "csv", aliases: ["dataset"] },
-      onSelect: () => void createCsvTask("autonomous"),
+      onSelect: () => void createCsvTask(),
     },
     {
-      title: "Create TSF full-recipe autonomous task from CSV",
+      title: "Create TSF full-recipe task from CSV",
       value: "research.create.autonomous.csv.full",
       category: "Research",
       slash: { name: "csv-full", aliases: ["dataset-full"] },
-      onSelect: () => void createCsvTask("autonomous", { bridgeOnly: false }),
+      onSelect: () => void createCsvTask(undefined, { bridgeOnly: false }),
     },
     {
       title: "Seed TSF baselines",
@@ -1324,61 +1608,20 @@ export function ResearchCockpit() {
       },
     },
     {
-      title: "Export research report",
+      title: "Export final bundle",
       value: "research.export.report",
       category: "Research",
       enabled: !!selectedTask(),
       keybind: "ctrl+e",
-      slash: { name: "export", aliases: ["report"] },
+      slash: { name: "export", aliases: ["bundle", "report"] },
       onSelect: () => void exportTaskArtifact(),
     },
   ])
 
-  const maxRuns = createMemo(() => Number(selectedTask()?.budget.maxRuns ?? 0))
-  const selectedTaskPosition = createMemo(() => {
-    const count = sortedTasks().length
-    if (count === 0) return "Task 0/0"
-    return `Task ${selectedIndex() + 1}/${count}`
-  })
   const succeededRuns = createMemo(
     () => taskRuns().filter((run) => run.status === "succeeded" && run.stage !== "profile").length,
   )
-  const remainingRuns = createMemo(() => Math.max(0, maxRuns() - succeededRuns()))
-  const taskLabel = createMemo(() => selectedTask()?.title ?? "No research task selected")
-  const taskStatus = createMemo(() => selectedTask()?.status ?? "created")
-  const taskPath = createMemo(() => sdk.directory ?? process.cwd())
   const latestRun = createMemo(() => (runs() ?? [])[0])
-  const forecasterStatus = createMemo<ResearchCockpitWorkflowStatus>(() => {
-    if (maxRuns() > 0 && succeededRuns() >= maxRuns()) return "done"
-    if (succeededRuns() > 0) return "active"
-    const items = workflowItems()
-    if (items[5]?.status === "done") return "done"
-    if (items[2]?.status !== "todo" || items[3]?.status !== "todo") return "active"
-    return "todo"
-  })
-  const latestFailedRun = createMemo(() => taskRuns().find((run) => run.status === "failed" && runFailureText(run)))
-  const visibleCandidates = createMemo(() => {
-    const items = taskCandidates()
-    if (items.length <= 4) return items
-    const index = selectedCandidateIndex()
-    const start = Math.max(0, Math.min(index - 1, items.length - 4))
-    return items.slice(start, start + 4)
-  })
-  const profileSummary = createMemo(() => formatResearchCockpitProfile(taskFingerprint() ?? {}))
-  const candidateRunCount = (candidate: ResearchCockpitCandidate) =>
-    taskRuns().filter((run) => run.candidateID === candidate.id).length
-  const candidateStageRun = (candidate: ResearchCockpitCandidate, stage: CandidateRunStage) =>
-    taskRuns().find((run) => run.candidateID === candidate.id && run.stage === stage)
-  const candidateStageSummary = (candidate: ResearchCockpitCandidate, stage: CandidateRunStage) => {
-    const run = candidateStageRun(candidate, stage)
-    if (!run) return "-"
-    return `${run.status} ${metricText(run.metrics)}`
-  }
-  const actionColor = (enabled: boolean) => (enabled && !busy() ? cockpitColors.primary : cockpitColors.textMuted)
-  const approvedGateColor = (enabled: boolean, approved: boolean) => {
-    if (approved) return cockpitColors.success
-    return actionColor(enabled)
-  }
   const streamLines = createMemo<StreamLine[]>(() => {
     const lines: StreamLine[] = []
     const hasConversation = promptEvents().length > 0 || actionEvents().length > 0 || errorEvents().length > 0 || !!busy()
@@ -1399,45 +1642,205 @@ export function ResearchCockpit() {
         })
       }
     }
-    for (const event of promptEvents()) {
-      lines.push({ id: `prompt-${event.id}`, text: `You: ${event.text}`, tone: "text" })
-      if (event.detail) lines.push({ id: `prompt-detail-${event.id}`, text: event.detail, tone: "muted" })
-    }
-    for (const event of actionEvents()) {
-      const text = event.text.trim() || "completed"
-      const parts = text.split(/\r?\n/)
-      parts.forEach((part, index) => {
-        lines.push({
-          id: `action-${event.id}-${index}`,
-          text: index === 0 ? `Research Agent: ${part}` : `  ${part}`,
-          tone: "primary",
+    const timeline = [
+      ...promptEvents().map((event) => ({ id: event.id, kind: "prompt" as const, event })),
+      ...actionEvents().map((event) => ({ id: event.id, kind: "action" as const, event })),
+      ...errorEvents()
+        .slice(-errorEventHistoryLimit)
+        .map((event) => ({ id: event.id, kind: "error" as const, event })),
+    ].sort((a, b) => a.id - b.id)
+    for (const item of timeline) {
+      if (item.kind === "prompt") {
+        lines.push({ id: `prompt-${item.event.id}`, text: `You: ${item.event.text}`, tone: "text" })
+        if (item.event.detail) lines.push({ id: `prompt-detail-${item.event.id}`, text: item.event.detail, tone: "muted" })
+        continue
+      }
+      if (item.kind === "action") {
+        const parts = compactStreamTextParts(item.event.text)
+        parts.forEach((part, index) => {
+          lines.push({
+            id: `action-${item.event.id}-${index}`,
+            text: index === 0 ? `Research Agent: ${part}` : `  ${part}`,
+            tone: "primary",
+          })
         })
-      })
-    }
-    for (const item of errorEvents().slice(-errorEventHistoryLimit)) {
-      lines.push({ id: `error-${item.id}`, text: `${item.action}: ${item.text}`, tone: "error" })
+        continue
+      }
+      lines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
     const active = busy()
     if (active) lines.push({ id: "busy", text: `Running ${active}...`, tone: "warning" })
     if (lines.length > 0) return lines
-    if (selectedTask()) {
+    const clarification = socraticClarification()
+    if (clarification.active) {
+      return [
+        {
+          id: "socratic-clarification",
+          text: `Socratic clarification: slots: ${clarification.missingSlots.join(", ") || "unknown"}`,
+          tone: "warning",
+        },
+        {
+          id: "socratic-next-question",
+          text: `Next question: ${clarification.nextQuestion ?? "Confirm the missing research intent."}`,
+          tone: "primary",
+        },
+      ]
+    }
+    const approval = pendingApproval()
+    if (approval) {
+      return [
+        {
+          id: "approval-requested",
+          text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue.`,
+          tone: "warning",
+        },
+        {
+          id: "approval-reason",
+          text: approval.reason,
+          tone: "muted",
+        },
+      ]
+    }
+    const task = selectedTask()
+    if (task) {
+      const mode = taskInteractionMode()
+      if (mode === "socratic") {
+        return [
+          {
+            id: "idle-task-socratic",
+            text: "Socratic onboarding: confirm dataset, target columns, horizon, and metric before the first autonomous loop.",
+            tone: "primary",
+          },
+        ]
+      }
+      if (mode === "companion") {
+        return [
+          {
+            id: "idle-task-companion",
+            text: "Companion checkpoint: review the proposed next step, approve gates, or ask for a recommendation.",
+            tone: "primary",
+          },
+        ]
+      }
       return [{ id: "idle-task", text: "Research output will appear here as the agent runs.", tone: "muted" }]
     }
     return [{ id: "idle-empty", text: "Describe a forecasting goal or create a CSV task to begin.", tone: "muted" }]
   })
-  const promptPlaceholder = createMemo(() =>
-    selectedTask()
-      ? "Ask for the next experiment, approve a gate, or export the report..."
-      : "Ask Research Agent, or use New CSV Task to create a dataset-backed task...",
+  const promptPlaceholder = createMemo(() => {
+    if (!selectedTask()) return "Ask Research Agent, or use New CSV Task to create a dataset-backed task..."
+    if (socraticClarification().active) return "Answer the current Socratic question..."
+    if (taskInteractionMode() === "companion") return "Ask for a recommendation, approve a checkpoint, or export the bundle..."
+    if (taskInteractionMode() === "socratic") return "Answer the next clarifying question, request an experiment, or export..."
+    return "Ask for the next experiment, approve a gate, or export the report..."
+  })
+  const [chatMetadata] = createResource(async () => {
+    try {
+      const [providersResult, agentsResult] = await Promise.all([
+        researchRequest<ChatProviderList>(sdk, "/config/providers"),
+        researchRequest<ChatAgent[]>(sdk, "/agent"),
+      ])
+      const defaults = resolveResearchCockpitChatDefaults({
+        providersResult,
+        agentsResult,
+        selectedModel: local?.model.current(),
+        selectedAgentName: local?.agent.current()?.name,
+      })
+      const provider = providersResult.providers.find((item) => item.id === defaults.model.providerID)
+      const model = provider?.models?.[defaults.model.modelID]
+      const modelID = defaults.model.modelID
+      const modelName = model?.name ?? model?.id ?? modelID
+      return {
+        agent: defaults.agent,
+        model: modelName,
+        provider: provider?.name ?? provider?.id,
+      }
+    } catch {
+      return undefined
+    }
+  })
+  const promptMetadataText = createMemo(() => {
+    const selectedModel = local?.model.current()
+    if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
+    const metadata = chatMetadata()
+    if (metadata?.model) return metadata.model
+    return metadata?.agent ?? "Research Agent"
+  })
+  const hasResultArtifact = createMemo(() => taskArtifacts().some(isFinalResearchArtifact))
+  const taskRequirementSummary = createMemo(() => formatTaskRequirementSummaryLines(selectedTask()))
+  const profileSummary = createMemo(() => formatResearchCockpitProfile(taskFingerprint() ?? {}))
+  const profileSummaryLines = createMemo(() => splitSlashSummary("Profile", profileSummary()))
+  const bestMetricSummary = createMemo(() =>
+    findBestResearchCockpitMetric(selectedTask()?.objective ?? {}, taskRuns(), validChampion() ?? null),
   )
-  const sidebarVisible = createMemo(() => dimensions().width >= 92)
+  const hasExplorationProgress = createMemo(() => taskCandidates().length > 0 || succeededRuns() > 0)
+  const hasProfileProgress = createMemo(() =>
+    taskRuns().some((run) => run.stage === "profile" && run.status === "succeeded") ||
+    taskArtifacts().some((artifact) => artifact.kind === "task_profile_json" || artifact.kind === "dataset_analysis_report"),
+  )
+  const hasInputProgress = createMemo(() => hasProfileProgress() || hasExplorationProgress() || hasResultArtifact())
+  const promptAgentLabel = createMemo(() => {
+    if (validChampion() || hasResultArtifact()) return "Publish Agent"
+    if (hasExplorationProgress()) return "NAS Agent"
+    if (hasProfileProgress()) return "Data Analysis Agent"
+    return "Intent Agent"
+  })
+  const sidebarRecommendation = createMemo(() => {
+    if (validChampion() && !hasResultArtifact()) {
+      return {
+        title: "Export final bundle",
+        detail: "Package the champion, evidence, and report for review.",
+      }
+    }
+    if (hasResultArtifact()) {
+      return {
+        title: "Review final bundle",
+        detail: "Inspect the exported evidence or continue exploration.",
+      }
+    }
+    return recommendation()
+  })
+  const sidebarVisible = createMemo(() => dimensions().width >= 100)
   const sidebarWidth = createMemo(() => {
     const width = dimensions().width
-    if (width >= 140) return 42
-    if (width >= 110) return 36
-    return 32
+    if (width >= 170) return 44
+    if (width >= 140) return 40
+    return 34
   })
-
+  const maxRuns = createMemo(() => Number(selectedTask()?.budget.maxRuns ?? 0))
+  const remainingRuns = createMemo(() => Math.max(0, maxRuns() - succeededRuns()))
+  const taskLabel = createMemo(() => selectedTask()?.title ?? "No research task selected")
+  const selectedTaskPosition = createMemo(() => {
+    const count = sortedTasks().length
+    if (count === 0) return "Task 0/0"
+    return `Task ${selectedIndex() + 1}/${count}`
+  })
+  const candidatePosition = createMemo(() => {
+    const count = taskCandidates().length
+    if (count === 0) return "Candidate 0/0"
+    return `Candidate ${selectedCandidateIndex() + 1}/${count}`
+  })
+  const taskSummary = createMemo(() => `${selectedTaskPosition()} · ${candidatePosition()}`)
+  const hasResultsProgress = createMemo(() => Boolean(validChampion()) || hasResultArtifact())
+  const progressState = (done: boolean, active: boolean) => (done ? "done" : active ? "active" : "todo")
+  const taskPath = createMemo(() => sdk.directory ?? process.cwd())
+  const compactTaskPath = createMemo(() => compactTailPath(taskPath()))
+  const runnerIssueTitle = createMemo(() => {
+    const status = runnerStatus()
+    if (status.reason === "missing_root" || status.reason === "missing_root_path") return "Runner root missing"
+    if (status.reason === "missing_runner_script") return "Runner script missing"
+    if (status.reason === "missing_python" || status.reason === "python_unavailable") return "Runner Python missing"
+    if (status.reason === "unsupported_python") return "Runner Python unsupported"
+    if (status.reason === "missing_runtime") return "Runner runtime missing"
+    if (status.reason === "dataset_spec_mismatch") return "Runner dataset mismatch"
+    return "Runner not ready"
+  })
+  const runnerIssueDetails = createMemo(() => runnerIssueDetailLines(runnerStatus()))
+  const sidebarRecommendationDetail = createMemo(() => {
+    const item = sidebarRecommendation()
+    if ("action" in item && item.action === "configure_runner") return "Set runner root before runs."
+    return item.detail
+  })
+  const statusMark = (status: "done" | "active" | "todo") => (status === "done" ? "✓" : status === "active" ? "→" : "•")
   return (
     <box flexGrow={1} height="100%" flexDirection="row" backgroundColor={cockpitColors.background}>
       <box
@@ -1455,22 +1858,22 @@ export function ResearchCockpit() {
           </text>
           <box flexDirection="row" gap={2}>
             <text fg={cockpitColors.primary} onMouseUp={() => route.navigate({ type: "home" })}>
-              Home alt+h
+              Home
             </text>
             <text fg={sortedTasks().length < 2 ? cockpitColors.textMuted : cockpitColors.primary} onMouseUp={() => selectTaskOffset(-1)}>
-              Previous Task ^K
+              Previous Task
             </text>
             <text fg={sortedTasks().length < 2 ? cockpitColors.textMuted : cockpitColors.primary} onMouseUp={() => selectTaskOffset(1)}>
-              Next Task ^J
+              Next Task
             </text>
             <text
               fg={busy() ? cockpitColors.textMuted : cockpitColors.primary}
               onMouseUp={() => {
                 if (busy()) return
-                void createCsvTask("autonomous")
+                void createCsvTask()
               }}
             >
-              New CSV Task ^N
+              New CSV Task
             </text>
             <text
               fg={!selectedTask() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
@@ -1479,7 +1882,7 @@ export function ResearchCockpit() {
                 void seedBaselines()
               }}
             >
-              Seed Baselines ^B
+              Seed Baselines
             </text>
             <text
               fg={
@@ -1492,7 +1895,7 @@ export function ResearchCockpit() {
                 void runAutonomousLoop()
               }}
             >
-              Agent Loop ^L
+              Agent Loop
             </text>
             <text
               fg={!selectedTask() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
@@ -1501,290 +1904,78 @@ export function ResearchCockpit() {
                 void exportTaskArtifact()
               }}
             >
-              Export Report ^E
+              Export Bundle
             </text>
           </box>
         </box>
 
-        <box flexGrow={1} minHeight={0} gap={1} paddingTop={1}>
-          <Show when={busy()}>
-            <box backgroundColor={cockpitColors.panel} border={["left"]} borderColor={cockpitColors.warning} paddingLeft={1}>
-              <text fg={cockpitColors.warning} attributes={TextAttributes.BOLD}>
-                Active Action
-              </text>
-              <text fg={cockpitColors.warning}>Running {busy()}...</text>
-            </box>
-          </Show>
-
-          <Show when={latestFailedRun()}>
-            {(run) => (
-              <box backgroundColor={cockpitColors.panel} border={["left"]} borderColor={cockpitColors.error} paddingLeft={1}>
-                <text fg={cockpitColors.error} attributes={TextAttributes.BOLD}>
-                  Latest Failure
-                </text>
-                <text fg={cockpitColors.error} width="100%" overflow="hidden" wrapMode="none">
-                  {run().id} {run().stage ?? "run"} {run().status}
-                </text>
-                <text fg={cockpitColors.error} width="100%" overflow="hidden" wrapMode="none">
-                  {runFailureText(run())}
-                </text>
-              </box>
-            )}
-          </Show>
-
-          <Show when={selectedTask()}>
-            <box gap={0}>
-              <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                Candidate Table
-              </text>
-              <Show
-                when={taskCandidates().length > 0}
-                fallback={<text fg={cockpitColors.textMuted}>No candidates yet</text>}
-              >
-                <For each={visibleCandidates()}>
-                  {(candidate) => (
-                    <box gap={0}>
-                      <text
-                        fg={candidate.id === selectedCandidate()?.id ? cockpitColors.primary : cockpitColors.text}
-                        width="100%"
-                        overflow="hidden"
-                        wrapMode="none"
-                      >
-                        {candidate.id === selectedCandidate()?.id ? "> " : "  "}
-                        {researchCockpitCandidateTitle(candidate)} / {shortID(candidate.id)} / {candidate.approvalStatus} / smoke{" "}
-                        {candidateStageSummary(candidate, "smoke")} / runs {candidateRunCount(candidate)}
-                      </text>
-                      <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                        {"  "}
-                        {researchCockpitCandidatePipeline(candidate) || candidate.rationale || candidate.id}
-                      </text>
-                      <Show when={candidate.id === selectedCandidate()?.id}>
-                        <box flexDirection="row" gap={2}>
-                          <text
-                            fg={actionColor(canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void prepareCandidate(candidate)
-                            }}
-                          >
-                            Smoke Prep
-                          </text>
-                          <text
-                            fg={actionColor(runnerReady() && canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!runnerReady() || !canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void executeCandidate(candidate)
-                            }}
-                          >
-                            Smoke Exec
-                          </text>
-                          <text
-                            fg={actionColor(runnerReady() && canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!runnerReady() || !canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void executeCandidateSeedSweep(candidate)
-                            }}
-                          >
-                            Seed Sweep
-                          </text>
-                        </box>
-                        <box flexDirection="row" gap={2}>
-                          <text
-                            fg={approvedGateColor(
-                              canRunResearchCockpitCandidate(candidate),
-                              hasApprovedResearchCockpitRefTestGate(taskApprovals(), candidate.id),
-                            )}
-                            onMouseUp={() => {
-                              if (!canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void requestRefTestGate(candidate)
-                            }}
-                          >
-                            Ref Gate
-                          </text>
-                          <text
-                            fg={actionColor(canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void prepareCandidate(candidate, "ref_test")
-                            }}
-                          >
-                            Ref Prep
-                          </text>
-                          <text
-                            fg={actionColor(runnerReady() && canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!runnerReady() || !canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void executeCandidate(candidate, "ref_test")
-                            }}
-                          >
-                            Ref Exec
-                          </text>
-                        </box>
-                        <box flexDirection="row" gap={2}>
-                          <text
-                            fg={approvedGateColor(
-                              canRunResearchCockpitCandidate(candidate),
-                              hasApprovedResearchCockpitBlindTestGate(taskApprovals(), candidate.id),
-                            )}
-                            onMouseUp={() => {
-                              if (!canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void requestBlindTestGate(candidate)
-                            }}
-                          >
-                            Blind Gate
-                          </text>
-                          <text
-                            fg={actionColor(canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void prepareCandidate(candidate, "blind_test")
-                            }}
-                          >
-                            Blind Prep
-                          </text>
-                          <text
-                            fg={actionColor(runnerReady() && canRunResearchCockpitCandidate(candidate))}
-                            onMouseUp={() => {
-                              if (!runnerReady() || !canRunResearchCockpitCandidate(candidate) || busy()) return
-                              void executeCandidate(candidate, "blind_test")
-                            }}
-                          >
-                            Blind Exec
-                          </text>
-                        </box>
-                      </Show>
-                    </box>
-                  )}
-                </For>
-              </Show>
-            </box>
-
-            <box gap={0}>
-              <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                Run History
-              </text>
-              <Show when={taskRuns().length > 0} fallback={<text fg={cockpitColors.textMuted}>No runs yet</text>}>
-                <For each={taskRuns().slice(0, 5)}>
-                  {(run) => (
-                    <>
-                      <text fg={statusColor(run.status)} width="100%" overflow="hidden" wrapMode="none">
-                        {runSummaryText(run)}
-                      </text>
-                      <Show when={runFailureText(run)}>
-                        {(failure) => (
-                          <text fg={cockpitColors.error} width="100%" overflow="hidden" wrapMode="none">
-                            {"  "}
-                            {failure()}
-                          </text>
-                        )}
-                      </Show>
-                    </>
-                  )}
-                </For>
-              </Show>
-            </box>
-
-            <box gap={0}>
-              <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                Dataset Profile
-              </text>
-              <text
-                fg={profileSummary() === "-" ? cockpitColors.textMuted : cockpitColors.text}
-                width="100%"
-                overflow="hidden"
-                wrapMode="none"
-              >
-                {profileSummary()}
-              </text>
-            </box>
-
-            <Show when={taskArtifacts().length > 0}>
-              <box gap={0}>
-                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                  Artifacts
-                </text>
-                <For each={taskArtifacts().slice(0, 3)}>
-                  {(artifact) => (
-                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                      {artifact.kind} / {formatResearchCockpitArtifactMetadata(artifact) ?? researchCockpitArtifactTarget(artifact)}
-                    </text>
-                  )}
-                </For>
-              </box>
-            </Show>
-
-            <Show when={memory()?.length}>
-              <box gap={0}>
-                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                  Memory
-                </text>
-                <For each={(memory() ?? []).slice(0, 3)}>
-                  {(item) => (
-                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                      {formatResearchCockpitMemory(item)}
-                    </text>
-                  )}
-                </For>
-              </box>
-            </Show>
-          </Show>
-
-          <Show when={errorEvents().length > 0}>
-            <box gap={0}>
-              <text fg={cockpitColors.error} attributes={TextAttributes.BOLD}>
-                Error Log
-              </text>
-              <For each={errorEvents().slice(-errorEventHistoryLimit)}>
-                {(item) => (
-                  <text fg={cockpitColors.error} width="100%" overflow="hidden" wrapMode="none">
-                    {item.action}: {item.text}
-                  </text>
-                )}
-              </For>
-            </box>
-          </Show>
-
-          <box gap={0}>
-            <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-              Research Stream
-            </text>
+        <scrollbox
+          flexGrow={1}
+          stickyScroll={true}
+          stickyStart="bottom"
+          viewportOptions={{ paddingRight: 1 }}
+          verticalScrollbarOptions={{
+            paddingLeft: 1,
+            visible: true,
+            trackOptions: {
+              backgroundColor: cockpitColors.background,
+              foregroundColor: cockpitColors.border,
+            },
+          }}
+        >
+          <box paddingTop={1} paddingRight={1} paddingBottom={2}>
             <For each={streamLines()}>
-              {(line) => (
-                <text fg={streamLineColor(line.tone)} width="100%" overflow="hidden" wrapMode="none">
-                  {line.text}
-                </text>
-              )}
+              {(line) =>
+                line.text.startsWith("You: ") ? (
+                  <box
+                    backgroundColor={cockpitColors.panel}
+                    border={["left"]}
+                    borderColor={cockpitColors.primary}
+                    paddingLeft={2}
+                    paddingRight={2}
+                    paddingTop={1}
+                    paddingBottom={1}
+                  >
+                    <text fg={cockpitColors.text}>{line.text.slice(5)}</text>
+                  </box>
+                ) : (
+                  <text fg={streamLineColor(line.tone)}>{line.text}</text>
+                )
+              }
             </For>
           </box>
-        </box>
+        </scrollbox>
 
         <box
           flexShrink={0}
-          height={3}
+          height={4}
           backgroundColor={cockpitColors.panel}
           border={["left"]}
           borderColor={cockpitColors.primary}
-          paddingLeft={1}
-          paddingRight={1}
+          paddingLeft={2}
+          paddingRight={2}
+          paddingTop={1}
         >
-          <textarea
-            ref={(value: TextareaRenderable) => {
-              promptInput = value
-              value.traits = { status: "FORECAST" }
-              value.focus()
-            }}
-            minHeight={1}
-            maxHeight={1}
-            keyBindings={textareaKeybindings()}
-            onKeyDown={handleSlashKeyDown}
-            onContentChange={() => setPromptValue(promptInput?.plainText ?? "")}
-            onSubmit={() => void submitPrompt()}
-            placeholder={promptPlaceholder()}
-            placeholderColor={cockpitColors.textMuted}
-            textColor={cockpitColors.text}
-            focusedTextColor={cockpitColors.text}
-            cursorColor={cockpitColors.primary}
-          />
+          <box flexGrow={1} minHeight={0}>
+            <textarea
+              ref={(value: TextareaRenderable) => {
+                promptInput = value
+                value.traits = { status: "FORECAST" }
+                value.focus()
+              }}
+              minHeight={1}
+              maxHeight={3}
+              keyBindings={textareaKeybindings()}
+              onKeyDown={handleSlashKeyDown}
+              onContentChange={() => setPromptValue(promptInput?.plainText ?? "")}
+              onSubmit={() => void submitPrompt()}
+              placeholder={promptPlaceholder()}
+              placeholderColor={cockpitColors.textMuted}
+              textColor={cockpitColors.text}
+              focusedTextColor={cockpitColors.text}
+              cursorColor={cockpitColors.primary}
+            />
+          </box>
           <ResearchSlashMenu
             value={promptValue()}
             options={() => command.slashes()}
@@ -1800,15 +1991,20 @@ export function ResearchCockpit() {
             onSelect={selectSlashOption}
             selection={slashSelection}
           />
-          <box flexDirection="row" gap={2}>
-            <text fg={cockpitColors.primary}>Planner</text>
-            <text fg={cockpitColors.text}>Research Agent</text>
+          <box flexShrink={0} flexDirection="row" gap={1} paddingTop={1}>
+            <Show when={taskInteractionMode()}>
+              {(mode) => <text fg={cockpitColors.primary}>{researchInteractionModeLabel(mode())}</text>}
+            </Show>
+            <text fg={cockpitColors.primary}>{promptAgentLabel()}</text>
+            <text fg={cockpitColors.text} flexShrink={1} overflow="hidden" wrapMode="none">
+              {promptMetadataText()}
+            </text>
           </box>
         </box>
 
-        <box flexShrink={0} flexDirection="row" justifyContent="space-between">
-          <text fg={cockpitColors.textMuted}>enter submit</text>
+        <box flexShrink={0} flexDirection="row" justifyContent="flex-end">
           <box flexDirection="row" gap={2}>
+            <text fg={cockpitColors.textMuted}>tab agents</text>
             <text fg={cockpitColors.textMuted}>ctrl+p commands</text>
           </box>
         </box>
@@ -1825,123 +2021,156 @@ export function ResearchCockpit() {
           paddingLeft={2}
           paddingRight={1}
           paddingTop={1}
-          gap={1}
+          paddingBottom={1}
         >
-        <text fg={cockpitColors.text} attributes={TextAttributes.BOLD} width="100%" overflow="hidden" wrapMode="none">
-          {taskLabel()}
-        </text>
-        <text fg={cockpitColors.textMuted}>{selectedTaskPosition()}</text>
-        <text fg={cockpitColors.textMuted}>{candidatePosition()}</text>
-        <text fg={statusColor(taskStatus())}>{taskStatus()}</text>
-        <Show when={selectedTask() && !runnerReady()}>
-          <text fg={cockpitColors.textMuted}>
-            {runnerStatus().reason === "missing_python" || runnerStatus().reason === "unsupported_python"
-              ? "Runner runtime not ready"
-              : "Runner not ready"}
-          </text>
-          <text
-            fg={busy() ? cockpitColors.textMuted : cockpitColors.primary}
-            onMouseUp={() => {
-              if (busy()) return
-              void useProjectRunnerRoot()
+          <scrollbox
+            flexGrow={1}
+            stickyScroll={true}
+            stickyStart="top"
+            viewportOptions={{ paddingRight: 3 }}
+            verticalScrollbarOptions={{
+              paddingLeft: 1,
+              visible: true,
+              trackOptions: {
+                backgroundColor: cockpitColors.sidebar,
+                foregroundColor: cockpitColors.border,
+              },
             }}
           >
-            Use Project Runner
-          </text>
-        </Show>
-
-        <box gap={0} paddingTop={1}>
-          <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-            Progress
-          </text>
-          <text fg={workflowItems()[0]?.status === "done" ? cockpitColors.success : cockpitColors.primary}>
-            Planner
-          </text>
-          <For each={workflowItems().slice(0, 2)}>
-            {(item) => (
-              <text fg={workflowColor(item.status)}>
-                {workflowMark(item.status)} {item.label}
+            <box gap={1}>
+              <text fg={cockpitColors.text} attributes={TextAttributes.BOLD} width="100%" overflow="hidden" wrapMode="none">
+                {taskLabel()}
               </text>
-            )}
-          </For>
-          <text fg={workflowColor(forecasterStatus())}>
-            {workflowMark(forecasterStatus())} Forecaster {succeededRuns()}/{maxRuns()} experiments
-          </text>
-          <text fg={cockpitColors.textMuted}>  {remainingRuns()} remaining</text>
-          <For each={workflowItems().slice(2, 4)}>
-            {(item) => (
-              <text fg={workflowColor(item.status)}>
-                {workflowMark(item.status)} {item.label}
-              </text>
-            )}
-          </For>
-          <text fg={pendingApproval() ? cockpitColors.warning : cockpitColors.textMuted}>Critic</text>
-          <For each={workflowItems().slice(4)}>
-            {(item) => (
-              <text fg={workflowColor(item.status)}>
-                {workflowMark(item.status)} {item.label}
-              </text>
-            )}
-          </For>
-        </box>
 
-        <box gap={0} paddingTop={1}>
-          <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-            Context
-          </text>
-          <text fg={cockpitColors.textMuted}>Tasks {stats().taskTotal}</text>
-          <text fg={cockpitColors.textMuted}>Candidates {stats().candidateCount}</text>
-          <text fg={cockpitColors.textMuted}>Artifacts {stats().artifactCount}</text>
-          <text fg={cockpitColors.textMuted}>Memory {stats().memoryCount}</text>
-          <text fg={cockpitColors.textMuted}>Approvals {stats().pendingApprovals}</text>
-        </box>
+              <box gap={0} paddingTop={1}>
+                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                  任务
+                </text>
+                <text fg={cockpitColors.textMuted}>{taskSummary()}</text>
+              </box>
 
-        <Show when={errorEvents().length > 0}>
-          <box gap={0} paddingTop={1}>
-            <text fg={cockpitColors.error} attributes={TextAttributes.BOLD}>
-              Recent Errors
+              <box gap={0} paddingTop={1}>
+                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                  ▾ AutoResearch进展
+                </text>
+                <text fg={hasInputProgress() ? cockpitColors.success : selectedTask() ? cockpitColors.primary : cockpitColors.textMuted}>
+                  {statusMark(progressState(hasInputProgress(), Boolean(selectedTask())))} Intent Agent
+                </text>
+                <For each={taskRequirementSummary()}>
+                  {(summary) => (
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      {summary}
+                    </text>
+                  )}
+                </For>
+                <text fg={hasExplorationProgress() || hasResultArtifact() ? cockpitColors.success : hasProfileProgress() ? cockpitColors.primary : cockpitColors.textMuted}>
+                  {statusMark(progressState(hasExplorationProgress() || hasResultArtifact(), hasProfileProgress()))} Data Analysis Agent
+                </text>
+                <For each={profileSummary() === "-" ? [] : profileSummaryLines()}>
+                  {(summary) => (
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      {summary}
+                    </text>
+                  )}
+                </For>
+                <text fg={hasExplorationProgress() ? cockpitColors.success : cockpitColors.textMuted}>
+                  {statusMark(progressState(hasExplorationProgress(), hasProfileProgress() && runnerReady()))} NAS Agent {succeededRuns()}/{maxRuns()} runs
+                </text>
+                <Show when={bestMetricSummary()}>
+                  {(summary) => (
+                    <text fg={cockpitColors.success} width="100%" overflow="hidden" wrapMode="none">
+                      {summary()}
+                    </text>
+                  )}
+                </Show>
+                <text fg={hasResultsProgress() ? cockpitColors.success : cockpitColors.textMuted}>
+                  {statusMark(progressState(hasResultsProgress(), hasExplorationProgress()))} Publish Agent
+                </text>
+              </box>
+
+              <Show when={pendingApproval()}>
+                {(approval) => (
+                  <box gap={0} paddingTop={1}>
+                    <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                      {taskInteractionMode() === "companion" ? "Companion checkpoint" : "Approval gate"}
+                    </text>
+                    <text fg={cockpitColors.warning}>{approval().kind} pending</text>
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      /approve to continue
+                    </text>
+                  </box>
+                )}
+              </Show>
+
+              <box gap={0} paddingTop={1}>
+                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                  下一步
+                </text>
+                <text fg={cockpitColors.primary} width="100%" overflow="hidden" wrapMode="none">
+                  {sidebarRecommendation().title}
+                </text>
+                <text fg={cockpitColors.textMuted} width="100%" wrapMode="word">
+                  {sidebarRecommendationDetail()}
+                </text>
+              </box>
+
+              <box gap={0} paddingTop={1}>
+                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                  Runner
+                </text>
+                <text fg={runnerReady() ? cockpitColors.success : cockpitColors.warning}>
+                  {runnerReady() ? "ready" : runnerIssueTitle()}
+                </text>
+                <Show when={!runnerReady()}>
+                  <For each={runnerIssueDetails()}>
+                    {(detail) => (
+                      <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                        {detail}
+                      </text>
+                    )}
+                  </For>
+                </Show>
+                <Show when={!runnerReady() && selectedTask()}>
+                  <text
+                    fg={busy() ? cockpitColors.textMuted : cockpitColors.primary}
+                    onMouseUp={() => {
+                      if (busy()) return
+                      void useProjectRunnerRoot()
+                    }}
+                  >
+                    Use Project Runner
+                  </text>
+                </Show>
+              </box>
+
+              <Show when={validChampion()}>
+                {(item) => (
+                  <box gap={0} paddingTop={1}>
+                    <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                      Champion
+                    </text>
+                    <>
+                      <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
+                      <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
+                      <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
+                    </>
+                  </box>
+                )}
+              </Show>
+            </box>
+          </scrollbox>
+
+          <box flexShrink={0} paddingTop={1}>
+            <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+              {compactTaskPath()}
             </text>
-            <For each={errorEvents().slice(-2)}>
-              {(item) => (
-                <>
-                  <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                    {item.action}
-                  </text>
-                  <text fg={cockpitColors.error} width="100%" overflow="hidden" wrapMode="none">
-                    {item.text}
-                  </text>
-                </>
-              )}
-            </For>
+            <text fg={runnerReady() ? cockpitColors.success : cockpitColors.textMuted}>
+              NeoResearch v{neoResearchVersion}
+            </text>
           </box>
-        </Show>
-
-        <box gap={0} paddingTop={1}>
-          <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-            Champion
-          </text>
-          <Show
-            when={validChampion()}
-            fallback={<text fg={cockpitColors.textMuted}>No champion selected</text>}
-          >
-            {(item) => (
-              <>
-                <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
-                <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
-                <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
-              </>
-            )}
-          </Show>
-        </box>
-
-        <box flexGrow={1} justifyContent="flex-end" paddingBottom={1}>
-          <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-            {taskPath()}
-          </text>
-          <text fg={runnerReady() ? cockpitColors.success : cockpitColors.textMuted}>NeoResearch alpha</text>
-        </box>
         </box>
       </Show>
+
     </box>
   )
 }

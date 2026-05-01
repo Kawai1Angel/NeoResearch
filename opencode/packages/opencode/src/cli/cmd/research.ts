@@ -16,6 +16,7 @@ import {
 import { cmd } from "./cmd"
 import {
   buildDefaultTsfResearchTaskInput,
+  buildDefaultTsfResearchTaskInputFromGoal,
   formatResearchApprovalsTable,
   formatResearchArtifactsTable,
   formatResearchAutonomousIteration,
@@ -29,7 +30,9 @@ import {
   formatResearchTasksTable,
   formatResearchWorkerLoop,
   formatResearchWorkerOnce,
+  researchModeForInteractionMode,
   type ResearchOutputFormat,
+  type ResearchInteractionMode,
 } from "./research-data"
 
 type FormatArg = {
@@ -299,6 +302,9 @@ export const ResearchCommand = cmd({
       .command(ResearchWorkerLoopCommand)
       .command(ResearchIterateCommand)
       .command(ResearchLoopCommand)
+      .command(ResearchPipelineCommand)
+      .command(ResearchVibeCommand)
+      .command(ResearchPrepareDatasetCommand)
       .command(ResearchProfileCommand)
       .command(ResearchExportCommand)
       .command(ResearchArtifactsCommand)
@@ -332,7 +338,21 @@ export const ResearchListCommand = cmd({
       .option("status", {
         describe: "filter by task status",
         type: "string",
-        choices: ["created", "profiling", "baselining", "researching", "paused", "completed", "failed"] as const,
+        choices: [
+          "idle",
+          "created",
+          "intent_gathering",
+          "profiling",
+          "analyzing",
+          "data_analysis",
+          "baselining",
+          "searching",
+          "researching",
+          "publishing",
+          "paused",
+          "completed",
+          "failed",
+        ] as const,
       }),
   handler: async (args: FormatArg & { limit?: number; domain?: string; status?: Research.ResearchTaskStatus }) => {
     const tasks = await runResearch((svc) =>
@@ -356,6 +376,11 @@ export const ResearchCreateCommand = cmd({
         type: "string",
         choices: ["review", "autonomous"] as const,
         default: "review" as const,
+      })
+      .option("interaction-mode", {
+        describe: "user-facing interaction mode",
+        type: "string",
+        choices: ["companion", "socratic"] as const,
       })
       .option("title", {
         describe: "task title",
@@ -397,6 +422,7 @@ export const ResearchCreateCommand = cmd({
   handler: async (
     args: FormatArg & {
       mode: Research.ResearchMode
+      interactionMode?: ResearchInteractionMode
       title?: string
       neoCastRoot?: string
       datasetPath?: string
@@ -408,7 +434,8 @@ export const ResearchCreateCommand = cmd({
     },
   ) => {
     const input = buildDefaultTsfResearchTaskInput({
-      mode: args.mode,
+      mode: args.interactionMode ? researchModeForInteractionMode(args.interactionMode) : args.mode,
+      interactionMode: args.interactionMode,
       title: args.title,
       neoCastProjectRoot: args.neoCastRoot,
       datasetPath: args.datasetPath,
@@ -782,9 +809,161 @@ export const ResearchLoopCommand = cmd({
   },
 })
 
+export const ResearchPrepareDatasetCommand = cmd({
+  command: "prepare-dataset <taskID>",
+  describe: "prepare a task dataset in the configured Neo-Cast runner",
+  builder: (yargs: Argv) =>
+    outputFormat(
+      yargs
+        .positional("taskID", {
+          describe: "research task ID",
+          type: "string",
+          demandOption: true,
+        })
+        .option("output-dir", {
+          describe: "directory for dataset preparation artifacts",
+          type: "string",
+        })
+        .option("force", {
+          describe: "overwrite prepared Neo-Cast dataset files",
+          type: "boolean",
+          default: true,
+        }),
+    ),
+  handler: async (args: FormatArg & { taskID?: string; outputDir?: string; force?: boolean }) => {
+    if (!args.taskID) return
+    const taskID = Research.ResearchTaskID.make(args.taskID)
+    const prepared = await runResearch((svc) =>
+      svc.prepareTaskDataset({
+        taskID,
+        outputDir: args.outputDir,
+        force: args.force,
+      }),
+    )
+    print(prepared, args.format, () => formatResearchExport(prepared))
+  },
+})
+
+export const ResearchPipelineCommand = cmd({
+  command: "pipeline <taskID>",
+  describe: "run the multi-agent NeoResearch pipeline for a task",
+  builder: (yargs: Argv) =>
+    outputFormat(
+      yargs
+        .positional("taskID", {
+          describe: "research task ID",
+          type: "string",
+          demandOption: true,
+        })
+        .option("max-iterations", {
+          describe: "maximum autonomous iterations to run",
+          type: "number",
+          default: 3,
+        })
+        .option("stage", {
+          describe: "execution stage for model search",
+          choices: ["baseline", "smoke", "low_fidelity", "full", "ref_test", "blind_test"] as const,
+          default: "smoke" as const,
+        })
+        .option("description", {
+          describe: "pipeline run description",
+          type: "string",
+        })
+        .option("output-dir", {
+          describe: "directory for pipeline artifacts",
+          type: "string",
+          default: ".neo-research/pipeline",
+        }),
+    ),
+  handler: async (
+    args: FormatArg & {
+      taskID?: string
+      maxIterations?: number
+      stage?: Research.ExecutableRunStage
+      description?: string
+      outputDir?: string
+    },
+  ) => {
+    if (!args.taskID) return
+    const taskID = Research.ResearchTaskID.make(args.taskID)
+    const result = await runResearch((svc) =>
+      svc.runFullPipeline({
+        taskID,
+        stage: args.stage,
+        description: args.description,
+        maxIterations: args.maxIterations,
+        outputDir: args.outputDir,
+      }),
+    )
+    print(result, args.format, () => formatResearchExport(result.publish))
+  },
+})
+
+export const ResearchVibeCommand = cmd({
+  command: "vibe <goal..>",
+  describe: "run the Vibe Data Science TSF pipeline from a research goal",
+  builder: (yargs: Argv) =>
+    outputFormat(
+      yargs
+        .positional("goal", {
+          describe: "forecasting goal, optionally including /path/to/data.csv and target/horizon/context options",
+          type: "string",
+          array: true,
+          demandOption: true,
+        })
+        .option("max-iterations", {
+          describe: "maximum autonomous iterations to run",
+          type: "number",
+          default: 3,
+        })
+        .option("runner-root", {
+          describe: "Neo-Cast runner root",
+          type: "string",
+        })
+        .option("interaction-mode", {
+          describe: "user-facing interaction mode",
+          type: "string",
+          choices: ["companion", "socratic"] as const,
+          default: "socratic" as const,
+        }),
+    ),
+  handler: async (
+    args: FormatArg & {
+      goal?: string[]
+      maxIterations?: number
+      runnerRoot?: string
+      interactionMode?: ResearchInteractionMode
+    },
+  ) => {
+    const goal = args.goal?.join(" ").trim()
+    if (!goal) return
+    const output = await runResearch((svc) =>
+      Effect.gen(function* () {
+        const task = yield* svc.createTask(
+          buildDefaultTsfResearchTaskInputFromGoal({
+            goal,
+            mode: researchModeForInteractionMode(args.interactionMode ?? "socratic"),
+            interactionMode: args.interactionMode ?? "socratic",
+            neoCastProjectRoot: args.runnerRoot ?? process.cwd(),
+          }),
+        )
+        const pipeline = yield* svc.runFullPipeline({
+          taskID: task.id,
+          stage: "smoke",
+          description: goal,
+          maxIterations: args.maxIterations,
+          outputDir: ".neo-research/final",
+        })
+        return pipeline.publish
+      }),
+    )
+    print(output, args.format, () => formatResearchExport(output))
+  },
+})
+
 export const ResearchExportCommand = cmd({
   command: "export <taskID>",
-  describe: "export a research task report artifact",
+  describe: "export a research task artifact",
   builder: (yargs: Argv) =>
     outputFormat(
       yargs
@@ -796,15 +975,32 @@ export const ResearchExportCommand = cmd({
         .option("output-dir", {
           describe: "directory for exported research artifacts",
           type: "string",
+        })
+        .option("kind", {
+          describe: "artifact kind to export",
+          choices: [
+            "research_report_markdown",
+            "dataset_analysis_report",
+            "research_final_bundle",
+            "model_export_package",
+          ] as const,
+          default: "research_report_markdown",
         }),
     ),
-  handler: async (args: FormatArg & { taskID?: string; outputDir?: string }) => {
+  handler: async (
+    args: FormatArg & {
+      taskID?: string
+      outputDir?: string
+      kind?: Research.ExportArtifactKind
+    },
+  ) => {
     if (!args.taskID) return
     const taskID = Research.ResearchTaskID.make(args.taskID)
     const exported = await runResearch((svc) =>
       svc.exportTaskArtifact({
         taskID,
         outputDir: args.outputDir,
+        kind: args.kind,
       }),
     )
     print(exported, args.format, () => formatResearchExport(exported))

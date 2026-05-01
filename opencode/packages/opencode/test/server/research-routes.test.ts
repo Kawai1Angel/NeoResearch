@@ -63,6 +63,14 @@ async function writeFakeNeoCastRunner(root: string) {
     `#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p .neo-cast/artifacts/run_fake
+cat > .neo-cast/artifacts/run_fake/model_impl.py <<'PY'
+class Model:
+    pass
+PY
+cat > .neo-cast/artifacts/run_fake/inference.py <<'PY'
+def predict(rows):
+    return rows
+PY
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"smoke_eval_done","val_avg_mse":0.123,"val_avg_mae":0.456}\\n'
 printf '{"event":"artifact_ready","run_id":"fake","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_fake"
@@ -794,6 +802,130 @@ describe("research routes", () => {
         expect(loopRecord.iterations.map((iteration: { runID: string }) => iteration.runID)).toEqual(
           loop.iterations.map((iteration) => iteration.run.id),
         )
+      },
+    })
+  })
+
+  test("runs the multi-agent research pipeline through the API", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await json<Research.ResearchTask>(
+          await app().request(ResearchPaths.tasks, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              title: "TSF pipeline route",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec(),
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["a", "b", "c"],
+                },
+                runtime: {
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                  pythonExecutable: "bash",
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+            }),
+          }),
+        )
+
+        const response = await app().request(pathFor(ResearchPaths.taskPipeline, { taskID: task.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            stage: "smoke",
+            maxIterations: 1,
+            description: "api pipeline smoke",
+            outputDir: ".neo-research/api-pipeline",
+          }),
+        })
+        expect(response.status).toBe(200)
+        const pipeline = (await response.json()) as Research.RunFullPipelineResult
+
+        expect(pipeline.intent.taskID).toBe(task.id)
+        expect(pipeline.dataAnalysis.artifact.kind).toBe("dataset_analysis_report")
+        expect(pipeline.nas.loop.stoppedReason).toBe("max_iterations")
+        expect(pipeline.publish.artifact.kind).toBe("model_export_package")
+        expect(pipeline.task.status).toBe("completed")
+      },
+    })
+  })
+
+  test("pipeline API rejects review companion tasks without starting NAS", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await json<Research.ResearchTask>(
+          await app().request(ResearchPaths.tasks, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              title: "TSF review pipeline route",
+              domainID: "tsf",
+              mode: "review",
+              taskSpec: {
+                ...validTsfTaskSpec(),
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["a", "b", "c"],
+                },
+                runtime: {
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                  pythonExecutable: "bash",
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+            }),
+          }),
+        )
+
+        const response = await app().request(pathFor(ResearchPaths.taskPipeline, { taskID: task.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            stage: "smoke",
+            maxIterations: 1,
+          }),
+        })
+        expect(response.status).toBe(500)
+        const body = await response.json()
+        expect(body).toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "pipeline_requires_autonomous",
+          },
+        })
+
+        const runs = await json<Research.ResearchRun[]>(
+          await app().request(pathFor(ResearchPaths.taskRuns, { taskID: task.id }), { headers }),
+        )
+        expect(runs).toHaveLength(0)
       },
     })
   })

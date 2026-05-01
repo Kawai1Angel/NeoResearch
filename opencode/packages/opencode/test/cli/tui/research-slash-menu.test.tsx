@@ -8,6 +8,7 @@ import {
   moveSlashSelection,
   resetResearchSlashMenuSelectionForTest,
   resolveSlashOption,
+  slashOptionMatches,
   type SlashOption,
 } from "../../../src/cli/cmd/tui/routes/research-slash-menu"
 
@@ -100,4 +101,21 @@ test("slash selection state can be isolated between menu controllers", () => {
 
   expect(resolveSlashOption("/", options, first)?.display).toBe("/bravo")
   expect(resolveSlashOption("/", options, second)?.display).toBe("/alpha")
+})
+
+test("slash popup ranks prefix matches before substring priority matches", () => {
+  const options = [
+    { display: "/next", description: "Run recommended research action" },
+    { display: "/export", description: "Export final bundle" },
+    { display: "/exit", description: "Exit the app" },
+    { display: "/task-next", description: "Select next research task" },
+  ]
+
+  expect(slashOptionMatches("/ex", options).map((option) => option.display)).toEqual([
+    "/export",
+    "/exit",
+    "/next",
+    "/task-next",
+  ])
+  expect(resolveSlashOption("/ex", options)?.display).toBe("/export")
 })

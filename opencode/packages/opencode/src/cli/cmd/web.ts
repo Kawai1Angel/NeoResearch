@@ -79,7 +79,7 @@ async function startWebInterface(args: NetworkOptions) {
 export const WebCommand = cmd({
   command: "web",
   builder: (yargs) => withNetworkOptions(yargs),
-  describe: "start neo-research server and open web interface",
+  describe: "start NeoResearch server and open web interface",
   handler: async (args) => startWebInterface(args as NetworkOptions),
 })
 

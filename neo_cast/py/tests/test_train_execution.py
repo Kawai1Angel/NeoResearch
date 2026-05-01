@@ -164,6 +164,89 @@ class TrainExecutionTest(unittest.TestCase):
         self.assertEqual(summary["training_prediction"], "point_forecast")
         self.assertEqual(summary["loss"], "mae")
 
+    def test_smoke_rejects_models_over_declared_param_budget(self) -> None:
+        candidate = phase2_quantile_candidate()
+        candidate["constraints"]["param_budget_m"] = 0.000001
+        events: list[dict[str, Any]] = []
+
+        def fake_loader(split: str, horizon: int, batch_size: int, shuffle: bool) -> DataLoader:
+            del split, shuffle
+            x = torch.randn(2, 16, 3)
+            y = torch.randn(2, horizon, 3)
+            return DataLoader(TensorDataset(x, y), batch_size=batch_size)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(
+                    train_module.FAMILY_REGISTRY[candidate["model_family"]],
+                    "build_model",
+                    lambda _config, _input_len, _horizon: torch.nn.Linear(1, 1),
+                ),
+                patch.object(train_module, "make_dataloader", fake_loader),
+                patch.object(train_module, "run_epoch", lambda *args, **kwargs: None),
+                patch.object(train_module, "compute_val_loss", lambda *args, **kwargs: 1.0),
+                patch.object(
+                    train_module,
+                    "evaluate_val_tsf",
+                    lambda models, *, device, horizons: {"val_avg_mse": 0.123, "val_avg_mae": 0.456},
+                ),
+                patch.object(train_module, "save_run_artifacts", lambda **kwargs: None),
+                patch.object(train_module, "emit", lambda event, **payload: events.append({"event": event, **payload})),
+            ):
+                exit_code = train_module.train_models(
+                    candidate=candidate,
+                    smoke=True,
+                    artifact_root=Path(tmp),
+                )
+
+        self.assertEqual(exit_code, 3)
+        self.assertIn(
+            {
+                "event": "error",
+                "kind": "param_budget_exceeded",
+                "candidate_id": candidate["candidate_id"],
+                "num_params_m": 0.000002,
+                "allowed_m": 0.000001,
+            },
+            events,
+        )
+        self.assertIn({"event": "done", "status": "smoke_fail"}, events)
+
+    def test_timeout_horizon_done_reason_is_timeout(self) -> None:
+        candidate = phase2_quantile_candidate()
+        candidate["smoke_config"]["timeout_s"] = 0
+        events: list[dict[str, Any]] = []
+
+        def fake_loader(split: str, horizon: int, batch_size: int, shuffle: bool) -> DataLoader:
+            del split, shuffle
+            x = torch.randn(2, 16, 3)
+            y = torch.randn(2, horizon, 3)
+            return DataLoader(TensorDataset(x, y), batch_size=batch_size)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(train_module, "make_dataloader", fake_loader),
+                patch.object(train_module, "run_epoch", lambda *args, **kwargs: None),
+                patch.object(train_module, "compute_val_loss", lambda *args, **kwargs: 1.0),
+                patch.object(
+                    train_module,
+                    "evaluate_val_tsf",
+                    lambda models, *, device, horizons: {"val_avg_mse": 0.123, "val_avg_mae": 0.456},
+                ),
+                patch.object(train_module, "save_run_artifacts", lambda **kwargs: None),
+                patch.object(train_module, "emit", lambda event, **payload: events.append({"event": event, **payload})),
+            ):
+                exit_code = train_module.train_models(
+                    candidate=candidate,
+                    smoke=True,
+                    artifact_root=Path(tmp),
+                )
+
+        self.assertEqual(exit_code, 0)
+        horizon_done = [event for event in events if event["event"] == "horizon_done"]
+        self.assertEqual(len(horizon_done), 1)
+        self.assertEqual(horizon_done[0]["reason"], "timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

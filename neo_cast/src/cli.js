@@ -311,6 +311,7 @@ function handlePrepareData(rawFlags) {
   const args = [prepareScriptPath, "--materialize-visible", "--source-csv", source];
   const passthroughFlags = [
     ["task-id", "--task-id"],
+    ["dataset-preset", "--dataset-preset"],
     ["timestamp-col", "--timestamp-col"],
     ["feature-cols", "--feature-cols"],
     ["input-len", "--input-len"],

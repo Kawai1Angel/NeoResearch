@@ -6,6 +6,7 @@ const {
   _buildHeuristicCandidate,
   _ensureCandidateDefaults,
   _extractJsonObject,
+  _withLlmTimeout,
 } = require("./llm");
 
 function numberOrNull(value) {
@@ -173,13 +174,17 @@ async function callAnthropic(systemPrompt, userMessage, resolvedConfig) {
   const clientOptions = { apiKey: process.env.ANTHROPIC_API_KEY };
   if (llm.base_url) clientOptions.baseURL = llm.base_url;
   const client = new Anthropic.default(clientOptions);
-  const message = await client.messages.create({
-    model: llm.model || "claude-sonnet-4-6",
-    max_tokens: llm.max_tokens || 1200,
-    temperature: llm.temperature ?? 0.2,
-    system: systemPrompt,
-    messages: [{ role: "user", content: userMessage }],
-  });
+  const message = await _withLlmTimeout(
+    llm,
+    (signal) => client.messages.create({
+      model: llm.model || "claude-sonnet-4-6",
+      max_tokens: llm.max_tokens || 1200,
+      temperature: llm.temperature ?? 0.2,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userMessage }],
+    }, signal ? { signal } : undefined),
+    "Anthropic reflection LLM request",
+  );
   const text = message.content
     .filter((block) => block.type === "text")
     .map((block) => block.text)
@@ -196,26 +201,35 @@ async function callOpenAICompatible(systemPrompt, userMessage, resolvedConfig) {
   }
   if (!llm.base_url) throw new Error("OPENAI-compatible provider requires llm.base_url.");
 
-  const response = await fetch(`${String(llm.base_url).replace(/\/+$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`,
+  const baseUrl = String(llm.base_url).replace(/\/+$/, "");
+  const { ok, status, payload } = await _withLlmTimeout(
+    llm,
+    async (signal) => {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        },
+        signal,
+        body: JSON.stringify({
+          model: llm.model,
+          max_tokens: llm.max_tokens || 1200,
+          temperature: llm.temperature ?? 0.2,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userMessage },
+          ],
+        }),
+      });
+      const payload = await response.json().catch(async () => ({ error: { message: await response.text() } }));
+      return { ok: response.ok, status: response.status, payload };
     },
-    body: JSON.stringify({
-      model: llm.model,
-      max_tokens: llm.max_tokens || 1200,
-      temperature: llm.temperature ?? 0.2,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
-    }),
-  });
-  const payload = await response.json().catch(async () => ({ error: { message: await response.text() } }));
-  if (!response.ok) {
+    "OpenAI-compatible reflection LLM request",
+  );
+  if (!ok) {
     const message = payload?.error?.message || payload?.message || JSON.stringify(payload).slice(0, 500);
-    throw new Error(`${response.status} ${message}`);
+    throw new Error(`${status} ${message}`);
   }
   const text = payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || "";
   if (!text) throw new Error(`OPENAI-compatible API returned empty content: ${JSON.stringify(payload).slice(0, 500)}`);

@@ -534,15 +534,15 @@ def train_models(
     num_params_m = num_params / 1e6
     param_budget_m = float(constraints["param_budget_m"])
 
-    if smoke and num_params_m > 2.0 * param_budget_m:
+    if num_params_m > param_budget_m:
         emit(
             "error",
             kind="param_budget_exceeded",
             candidate_id=candidate["candidate_id"],
             num_params_m=round(num_params_m, 6),
-            allowed_m=round(2.0 * param_budget_m, 6),
+            allowed_m=round(param_budget_m, 6),
         )
-        emit("done", status="smoke_fail")
+        emit("done", status="smoke_fail" if smoke else "full_fail")
         return 3
 
     loss_fn = _build_train_loss(candidate)
@@ -563,10 +563,18 @@ def train_models(
     best_val_losses = {h: float("inf") for h in horizons}
     patience_counters = {h: 0 for h in horizons}
     stopped = {h: False for h in horizons}
+    timed_out = False
+
+    def mark_timeout() -> None:
+        nonlocal timed_out
+        if timed_out:
+            return
+        timed_out = True
+        emit("timeout", elapsed_s=round(time.time() - t_start, 3), budget_s=time_budget_s)
 
     for epoch in range(1, max_epochs + 1):
         if time.time() - t_start >= time_budget_s:
-            emit("timeout", elapsed_s=round(time.time() - t_start, 3), budget_s=time_budget_s)
+            mark_timeout()
             break
 
         active_horizons = [h for h in horizons if not stopped[h]]
@@ -575,6 +583,7 @@ def train_models(
 
         for horizon in active_horizons:
             if time.time() - t_start >= time_budget_s:
+                mark_timeout()
                 break
 
             run_epoch(
@@ -605,12 +614,19 @@ def train_models(
                         best_val_loss=round(best_val_losses[horizon], 6),
                         reason="early_stopping",
                     )
+        if timed_out:
+            break
 
     for horizon in horizons:
         models[horizon].load_state_dict(best_states[horizon])
         models[horizon].eval()
         if not stopped[horizon]:
-            emit("horizon_done", horizon=horizon, best_val_loss=round(best_val_losses[horizon], 6), reason="finished")
+            emit(
+                "horizon_done",
+                horizon=horizon,
+                best_val_loss=round(best_val_losses[horizon], 6),
+                reason="timeout" if timed_out else "finished",
+            )
 
     t_train_end = time.time()
     val_results = evaluate_val_tsf(models, device=device, horizons=horizons)

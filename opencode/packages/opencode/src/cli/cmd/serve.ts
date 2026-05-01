@@ -6,14 +6,14 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 export const ServeCommand = cmd({
   command: "serve",
   builder: (yargs) => withNetworkOptions(yargs),
-  describe: "starts a headless opencode server",
+  describe: "start a headless NeoResearch server",
   handler: async (args) => {
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
       console.log("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }
     const opts = await resolveNetworkOptions(args)
     const server = await Server.listen(opts)
-    console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
+    console.log(`NeoResearch server listening on http://${server.hostname}:${server.port}`)
 
     await new Promise(() => {})
     await server.stop()

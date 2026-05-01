@@ -485,6 +485,19 @@ type DatasetProfile = {
   seasonalityStrength: number
   crossVarCorrelation: number
   distributionShift: number
+  outlierRate?: number
+  acfMainPeriod?: number
+  acfMainPeriodStrength?: number
+  adfStatistic?: number
+  adfStationary?: boolean
+  correlationMatrix?: {
+    columns: string[]
+    values: number[][]
+  }
+  timestampColumn?: string
+  duplicateTimestampRate?: number
+  monotonicTimestamp?: boolean
+  irregularIntervalRatio?: number
 }
 type DatasetProfileWarning = {
   source: "dataset.path"
@@ -999,26 +1012,136 @@ function column(matrix: number[][], index: number) {
   return matrix.map((row) => row[index] ?? Number.NaN)
 }
 
-function profileTrend(matrix: number[][]) {
+function profileTimeAxis(header: string[], rows: string[][]) {
+  const timestampIndex = header.findIndex((item) => ["date", "time", "timestamp", "datetime"].includes(item.toLowerCase()))
+  const index = timestampIndex >= 0 ? timestampIndex : 0
+  const values = rows.map((row) => Date.parse(row[index] ?? ""))
+  const finiteValues = values.filter(Number.isFinite)
+  if (finiteValues.length < 3 || finiteValues.length / Math.max(rows.length, 1) < 0.8) return undefined
+
+  let previous = Number.NEGATIVE_INFINITY
+  for (const value of values) {
+    if (!Number.isFinite(value)) continue
+    if (value <= previous) return undefined
+    previous = value
+  }
+  return values
+}
+
+function trendStrength(values: number[], timeAxis?: number[]) {
+  const xs: number[] = []
+  const ys: number[] = []
+  for (let index = 0; index < values.length; index++) {
+    const value = values[index]
+    if (!Number.isFinite(value)) continue
+    const time = timeAxis?.[index]
+    if (timeAxis && !Number.isFinite(time)) continue
+    xs.push(timeAxis ? time! : xs.length)
+    ys.push(value)
+  }
+  return Math.abs(pearson(xs, ys))
+}
+
+function profileTrend(matrix: number[][], timeAxis?: number[]) {
   if (matrix.length < 3) return 0
-  const time = matrix.map((_, index) => index)
-  const strengths = matrix[0]!.map((_, index) => Math.abs(pearson(time, column(matrix, index))))
+  const strengths = matrix[0]!.map((_, index) => trendStrength(column(matrix, index), timeAxis))
   return meanFinite(strengths)
+}
+
+function firstDifference(values: number[]) {
+  const result: number[] = []
+  for (let index = 1; index < values.length; index++) {
+    const current = values[index]
+    const previous = values[index - 1]
+    result.push(Number.isFinite(current) && Number.isFinite(previous) ? current! - previous! : Number.NaN)
+  }
+  return result
 }
 
 function profileSeasonality(matrix: number[][]) {
   if (matrix.length < 8) return 0
-  const candidateLags = [24, 48, 96, 12, 7].filter((lag) => lag < matrix.length / 2)
+  const candidateLags = [24, 48, 96, 12, 7].filter((lag) => lag < (matrix.length - 1) / 2)
   if (candidateLags.length === 0) return 0
   const strengths: number[] = []
   for (let col = 0; col < matrix[0]!.length; col++) {
-    const values = column(matrix, col)
+    const values = firstDifference(column(matrix, col))
     const best = Math.max(
       ...candidateLags.map((lag) => Math.abs(pearson(values.slice(lag), values.slice(0, values.length - lag)))),
     )
     strengths.push(best)
   }
   return meanFinite(strengths)
+}
+
+function profileACFMainPeriod(matrix: number[][]) {
+  if (matrix.length < 8) return undefined
+  const candidateLags = [24, 48, 96, 12, 7].filter((lag) => lag < (matrix.length - 1) / 2)
+  if (candidateLags.length === 0) return undefined
+  let bestLag = candidateLags[0]!
+  let bestStrength = 0
+  for (const lag of candidateLags) {
+    const strengths: number[] = []
+    for (let col = 0; col < matrix[0]!.length; col++) {
+      const values = column(matrix, col)
+      strengths.push(Math.abs(pearson(values.slice(lag), values.slice(0, values.length - lag))))
+    }
+    const strength = meanFinite(strengths)
+    if (strength > bestStrength) {
+      bestLag = lag
+      bestStrength = strength
+    }
+  }
+  return {
+    lag: bestLag,
+    strength: roundProfileValue(bestStrength),
+  }
+}
+
+function adfStatistic(values: number[]) {
+  const xs: number[] = []
+  const ys: number[] = []
+  for (let index = 1; index < values.length; index++) {
+    const previous = values[index - 1]
+    const current = values[index]
+    if (!Number.isFinite(previous) || !Number.isFinite(current)) continue
+    xs.push(previous!)
+    ys.push(current! - previous!)
+  }
+  if (xs.length < 4) return undefined
+  const xMean = meanFinite(xs)
+  const yMean = meanFinite(ys)
+  let xx = 0
+  let xy = 0
+  for (let index = 0; index < xs.length; index++) {
+    const dx = xs[index]! - xMean
+    xx += dx * dx
+    xy += dx * (ys[index]! - yMean)
+  }
+  if (xx === 0) return undefined
+  const beta = xy / xx
+  const alpha = yMean - beta * xMean
+  const rss = xs.reduce((sum, x, index) => {
+    const residual = ys[index]! - (alpha + beta * x)
+    return sum + residual * residual
+  }, 0)
+  const variance = rss / Math.max(xs.length - 2, 1)
+  const standardError = Math.sqrt(variance / xx)
+  if (standardError === 0) return undefined
+  return beta / standardError
+}
+
+function profileADF(matrix: number[][]) {
+  const statistics: number[] = []
+  for (let col = 0; col < (matrix[0]?.length ?? 0); col++) {
+    const statistic = adfStatistic(column(matrix, col))
+    if (statistic !== undefined) statistics.push(statistic)
+  }
+  if (statistics.length === 0) return undefined
+  const statistic = roundProfileValue(meanFinite(statistics))
+  return {
+    statistic,
+    stationary: statistic <= -3,
+  }
 }
 
 function profileCrossCorrelation(matrix: number[][]) {
@@ -1033,6 +1156,23 @@ function profileCrossCorrelation(matrix: number[][]) {
   return meanFinite(correlations)
 }
 
+function profileCorrelationMatrix(matrix: number[][], columns: string[]) {
+  const width = matrix[0]?.length ?? 0
+  if (width === 0) return undefined
+  const values: number[][] = []
+  for (let left = 0; left < width; left++) {
+    const row: number[] = []
+    for (let right = 0; right < width; right++) {
+      row.push(left === right ? 1 : roundProfileValue(pearson(column(matrix, left), column(matrix, right))))
+    }
+    values.push(row)
+  }
+  return {
+    columns,
+    values,
+  }
+}
+
 function profileDistributionShift(matrix: number[][]) {
   if (matrix.length < 4) return 0
   const midpoint = Math.floor(matrix.length / 2)
@@ -1043,12 +1183,57 @@ function profileDistributionShift(matrix: number[][]) {
     const firstValues = column(first, col)
     const secondValues = column(second, col)
     const allValues = column(matrix, col)
-    const scale = stdFinite(allValues) || 1
+    const scale = stdFinite(allValues)
+    const nearConstantThreshold = Math.max(1e-9, Math.abs(meanFinite(allValues)) * 1e-6)
+    if (scale <= nearConstantThreshold) {
+      shifts.push(0)
+      continue
+    }
     const meanShift = Math.abs(meanFinite(secondValues) - meanFinite(firstValues)) / scale
     const stdShift = Math.abs(stdFinite(secondValues) - stdFinite(firstValues)) / scale
     shifts.push(meanShift + 0.5 * stdShift)
   }
   return meanFinite(shifts)
+}
+
+function profileTimestampQuality(header: string[], rows: string[][]) {
+  const timestampIndex = header.findIndex((item) => ["date", "time", "timestamp", "datetime"].includes(item.toLowerCase()))
+  const index = timestampIndex >= 0 ? timestampIndex : 0
+  const values = rows.map((row) => Date.parse(row[index] ?? "")).filter((value) => Number.isFinite(value))
+  if (values.length < 2) return {}
+  const duplicates = values.length - new Set(values).size
+  let monotonicBreaks = 0
+  const deltas: number[] = []
+  for (let idx = 1; idx < values.length; idx++) {
+    const delta = values[idx]! - values[idx - 1]!
+    if (delta <= 0) monotonicBreaks += 1
+    else deltas.push(delta)
+  }
+  const sortedDeltas = [...deltas].sort((left, right) => left - right)
+  const medianDelta = sortedDeltas[Math.floor(sortedDeltas.length / 2)]
+  const irregular =
+    medianDelta === undefined || medianDelta <= 0
+      ? 0
+      : deltas.filter((delta) => Math.abs(delta - medianDelta) / medianDelta > 0.05).length / Math.max(deltas.length, 1)
+  return {
+    timestampColumn: header[index],
+    duplicateTimestampRate: roundProfileValue(duplicates / values.length),
+    monotonicTimestamp: monotonicBreaks === 0,
+    irregularIntervalRatio: roundProfileValue(irregular),
+  }
+}
+
+function profileOutlierRate(matrix: number[][]) {
+  const values = matrix.flat().filter(Number.isFinite)
+  if (values.length < 8) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  const q1 = sorted[Math.floor(sorted.length * 0.25)]!
+  const q3 = sorted[Math.floor(sorted.length * 0.75)]!
+  const iqr = q3 - q1
+  if (iqr <= 0) return 0
+  const low = q1 - 3 * iqr
+  const high = q3 + 3 * iqr
+  return values.filter((value) => value < low || value > high).length / values.length
 }
 
 function datasetProfileWarning(
@@ -1106,29 +1291,49 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
   }
 
   let missing = 0
-  const matrix = dataRows.map((row) =>
-    numericIndexes.map((index) => {
-      const value = parseNumberCell(row[index] ?? "")
-      if (!Number.isFinite(value)) missing += 1
-      return value
-    }),
-  )
-  const totalCells = Math.max(dataRows.length * numericIndexes.length, 1)
-  return {
-    profile: {
-      source: "dataset.path",
+	  const matrix = dataRows.map((row) =>
+	    numericIndexes.map((index) => {
+	      const value = parseNumberCell(row[index] ?? "")
+	      if (!Number.isFinite(value)) missing += 1
+	      return value
+	    }),
+	  )
+	  const timeAxis = profileTimeAxis(header, dataRows)
+	  const numericColumns = numericIndexes.map((index) => header[index] ?? `col_${index}`)
+	  const acf = profileACFMainPeriod(matrix)
+	  const adf = profileADF(matrix)
+	  const correlationMatrix = profileCorrelationMatrix(matrix, numericColumns)
+	  const totalCells = Math.max(dataRows.length * numericIndexes.length, 1)
+	  return {
+	    profile: {
+	      source: "dataset.path",
       path: datasetPath,
       rowCount: dataRows.length,
       targetCount: numericIndexes.length,
       numericColumnCount: numericIndexes.length,
       missingRate: roundProfileValue(missing / totalCells),
-      trendStrength: roundProfileValue(profileTrend(matrix)),
+      trendStrength: roundProfileValue(profileTrend(matrix, timeAxis)),
       seasonalityStrength: roundProfileValue(profileSeasonality(matrix)),
-      crossVarCorrelation: roundProfileValue(profileCrossCorrelation(matrix)),
-      distributionShift: roundProfileValue(profileDistributionShift(matrix)),
-    },
-  }
-}
+	      crossVarCorrelation: roundProfileValue(profileCrossCorrelation(matrix)),
+	      distributionShift: roundProfileValue(profileDistributionShift(matrix)),
+	      outlierRate: roundProfileValue(profileOutlierRate(matrix)),
+	      ...(acf === undefined
+	        ? {}
+	        : {
+	            acfMainPeriod: acf.lag,
+	            acfMainPeriodStrength: acf.strength,
+	          }),
+	      ...(adf === undefined
+	        ? {}
+	        : {
+	            adfStatistic: adf.statistic,
+	            adfStationary: adf.stationary,
+	          }),
+	      ...(correlationMatrix === undefined ? {} : { correlationMatrix }),
+	      ...profileTimestampQuality(header, dataRows),
+	    },
+	  }
+	}
 
 function datasetProfileBiases(profile: DatasetProfile | undefined) {
   if (!profile) return []
@@ -1252,6 +1457,44 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
     }),
   ]
 
+  const datasetProfile = profileTSFDataset(task).profile
+  if (datasetProfile !== undefined && !task.runtime.bridgeOnly) {
+    if (datasetProfile.crossVarCorrelation >= 0.5) {
+      candidates.push(
+        recipe(task, {
+          recipeID: "tsf_profile_feature_fusion_baseline",
+          hypothesis:
+            "Dataset profile shows correlated targets, so feature fusion should test cross-variate signal sharing.",
+          preprocessing: { actions: [{ type: "none" }] },
+          embedding: { type: "invert", dModel },
+          backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
+          fusion: { type: "feature", variateToken: true, crossAttention: datasetProfile.crossVarCorrelation >= 0.7 },
+          predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+        }),
+      )
+    }
+    if (datasetProfile.distributionShift >= 0.5 || datasetProfile.missingRate > 0) {
+      const robust = recipe(task, {
+        recipeID: "tsf_profile_shift_robust_baseline",
+        hypothesis:
+          "Dataset profile shows shift or missingness, so instance normalization and robust loss should be tested.",
+        preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
+        embedding: { type: "patch", patchLen, stride, dModel },
+        backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 2, dropout: 0.15, ffnMult: 4 },
+        fusion: { type: "temporal", channelMode: "independent" },
+        predictionHead: { type: "linear", outputDistribution: "point" },
+      })
+      candidates.push({
+        ...robust,
+        trainingStrategy: {
+          ...robust.trainingStrategy,
+          loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
+          optimizer: { type: "adamw", lr: 0.0007, weightDecay: 0.01 },
+        },
+      })
+    }
+  }
+
   return candidates.map((candidate) => ({
     candidateSpec: candidate as unknown as DomainCandidateProposal["candidateSpec"],
     rationale: candidate.hypothesis,
@@ -1348,11 +1591,18 @@ function datasetProfileFromFingerprint(taskFingerprint: Record<string, unknown>)
     numericColumnCount: numberFromRecord(record, "numericColumnCount"),
     missingRate: numberFromRecord(record, "missingRate"),
     trendStrength: numberFromRecord(record, "trendStrength"),
-    seasonalityStrength: numberFromRecord(record, "seasonalityStrength"),
-    crossVarCorrelation: numberFromRecord(record, "crossVarCorrelation"),
-    distributionShift: numberFromRecord(record, "distributionShift"),
-  }
-}
+	    seasonalityStrength: numberFromRecord(record, "seasonalityStrength"),
+	    crossVarCorrelation: numberFromRecord(record, "crossVarCorrelation"),
+	    distributionShift: numberFromRecord(record, "distributionShift"),
+	    ...(typeof record.outlierRate === "number" ? { outlierRate: numberFromRecord(record, "outlierRate") } : {}),
+	    ...(typeof record.acfMainPeriod === "number" ? { acfMainPeriod: numberFromRecord(record, "acfMainPeriod") } : {}),
+	    ...(typeof record.acfMainPeriodStrength === "number"
+	      ? { acfMainPeriodStrength: numberFromRecord(record, "acfMainPeriodStrength") }
+	      : {}),
+	    ...(typeof record.adfStatistic === "number" ? { adfStatistic: numberFromRecord(record, "adfStatistic") } : {}),
+	    ...(typeof record.adfStationary === "boolean" ? { adfStationary: record.adfStationary } : {}),
+	  }
+	}
 
 function searchBiasSet(taskFingerprint: JsonRecord) {
   const biases = taskFingerprint.searchBiases
@@ -2282,9 +2532,31 @@ function candidatePipeline(candidateSpec: JsonRecord) {
     .join(" / ")
 }
 
+function isDataAnalysisArtifact(kind: string) {
+  return (
+    kind === "dataset_analysis_report" ||
+    kind === "dataset_quantitative_analysis_markdown" ||
+    kind === "dataset_qualitative_analysis_markdown" ||
+    kind === "dataset_main_analysis_markdown"
+  )
+}
+
+function readFileURI(uri: string) {
+  if (!uri.startsWith("file://")) return undefined
+  try {
+    return readFileSync(uri.replace(/^file:\/\//, ""), "utf8")
+  } catch {
+    return undefined
+  }
+}
+
 function renderTSFArtifact(input: DomainArtifactContext): DomainArtifactRender | undefined {
   if (input.kind !== "research_report_markdown") return undefined
   const recipeCount = input.candidates.filter((candidate) => candidateRecipeID(candidate.candidateSpec)).length
+  const dataAnalysisArtifacts = input.artifacts.filter((artifact) => isDataAnalysisArtifact(artifact.kind))
+  const datasetAnalysisReport = dataAnalysisArtifacts.find((artifact) => artifact.kind === "dataset_analysis_report")
+  const datasetAnalysisContent =
+    datasetAnalysisReport === undefined ? undefined : readFileURI(datasetAnalysisReport.uri)?.trim()
   const lines = [
     `# ${input.task.title}`,
     "",
@@ -2354,7 +2626,20 @@ function renderTSFArtifact(input: DomainArtifactContext): DomainArtifactRender |
     }
   }
 
-  lines.push("## Runs", "")
+  lines.push("", "## Data Analysis Agents", "")
+  if (dataAnalysisArtifacts.length === 0) {
+    lines.push("- None")
+  } else {
+    if (datasetAnalysisContent !== undefined && datasetAnalysisContent.length > 0) {
+      lines.push(datasetAnalysisContent, "")
+    }
+    for (const artifact of dataAnalysisArtifacts) {
+      const role = typeof artifact.metadata.role === "string" ? artifact.metadata.role : "data-analysis-agent"
+      lines.push(`- ${artifact.kind}: ${role} (${artifact.uri})`)
+    }
+  }
+
+  lines.push("", "## Runs", "")
   if (input.runs.length === 0) {
     lines.push("- None")
   } else {

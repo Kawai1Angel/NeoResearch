@@ -47,6 +47,7 @@ from dataset_contract import (
     parse_column_list,
     parse_int_list,
     parse_row_range,
+    project_dataset_spec_path,
     ref_test_data_path,
     resolve_data_root,
     visible_data_path,
@@ -481,6 +482,10 @@ def materialize_visible_splits(
 
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     write_dataset_spec(spec, DATA_ROOT)
+    for spec_path in (dataset_spec_path(DATA_ROOT), project_dataset_spec_path(PROJECT_ROOT)):
+        payload = json.loads(spec_path.read_text(encoding="utf-8"))
+        payload["source_csv"] = str(source_path.expanduser().resolve())
+        spec_path.write_text(f"{json.dumps(payload, indent=2, sort_keys=True)}\n", encoding="utf-8")
     profile_path = DATA_ROOT / f"{DATASET}_profile.json"
     profile_path.write_text(f"{json.dumps(prepared_profile, indent=2, sort_keys=True)}\n", encoding="utf-8")
 

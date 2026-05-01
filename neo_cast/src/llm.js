@@ -350,6 +350,43 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
   return candidate;
 }
 
+function _resolveLlmTimeoutMs(llm = {}, fallbackSeconds = 120) {
+  const seconds = Number(llm.timeout_seconds ?? fallbackSeconds);
+  const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : fallbackSeconds;
+  return Math.ceil(safeSeconds * 1000);
+}
+
+async function _withLlmTimeout(llm, operation, label = "LLM request") {
+  const timeoutMs = _resolveLlmTimeoutMs(llm);
+  const timeoutSeconds = Number((timeoutMs / 1000).toFixed(3));
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let didTimeout = false;
+  let timeout = null;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      didTimeout = true;
+      if (controller) controller.abort();
+      reject(new Error(`${label} timed out after ${timeoutSeconds}s`));
+    }, timeoutMs);
+    if (typeof timeout.unref === "function") timeout.unref();
+  });
+
+  try {
+    return await Promise.race([
+      operation(controller?.signal),
+      timeoutPromise,
+    ]);
+  } catch (error) {
+    if (didTimeout) {
+      throw new Error(`${label} timed out after ${timeoutSeconds}s`);
+    }
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic API call via SDK
 // ---------------------------------------------------------------------------
@@ -363,13 +400,17 @@ async function _generateWithAnthropic(requirement, history, resolvedConfig, atte
 
   const client = new Anthropic.default(clientOptions);
 
-  const message = await client.messages.create({
-    model: llm.model || "claude-sonnet-4-6",
-    max_tokens: llm.max_tokens || 1024,
-    temperature: llm.temperature ?? 0.3,
-    system: _buildSystemPrompt(taskContext),
-    messages: [{ role: "user", content: _buildUserMessage(requirement, history, attempt, taskContext) }],
-  });
+  const message = await _withLlmTimeout(
+    llm,
+    (signal) => client.messages.create({
+      model: llm.model || "claude-sonnet-4-6",
+      max_tokens: llm.max_tokens || 1024,
+      temperature: llm.temperature ?? 0.3,
+      system: _buildSystemPrompt(taskContext),
+      messages: [{ role: "user", content: _buildUserMessage(requirement, history, attempt, taskContext) }],
+    }, signal ? { signal } : undefined),
+    "Anthropic LLM request",
+  );
 
   const text = message.content
     .filter((block) => block.type === "text")
@@ -394,29 +435,36 @@ async function _generateWithOpenAICompatible(requirement, history, resolvedConfi
   }
 
   const baseUrl = String(llm.base_url).replace(/\/+$/, "");
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`,
+  const { ok, status, payload } = await _withLlmTimeout(
+    llm,
+    async (signal) => {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        },
+        signal,
+        body: JSON.stringify({
+          model: llm.model,
+          max_tokens: llm.max_tokens || 1024,
+          temperature: llm.temperature ?? 0.3,
+          messages: [
+            { role: "system", content: _buildSystemPrompt(taskContext) },
+            { role: "user", content: _buildUserMessage(requirement, history, attempt, taskContext) },
+          ],
+        }),
+      });
+      const payload = await response.json().catch(async () => ({
+        error: { message: await response.text() },
+      }));
+      return { ok: response.ok, status: response.status, payload };
     },
-    body: JSON.stringify({
-      model: llm.model,
-      max_tokens: llm.max_tokens || 1024,
-      temperature: llm.temperature ?? 0.3,
-      messages: [
-        { role: "system", content: _buildSystemPrompt(taskContext) },
-        { role: "user", content: _buildUserMessage(requirement, history, attempt, taskContext) },
-      ],
-    }),
-  });
-
-  const payload = await response.json().catch(async () => ({
-    error: { message: await response.text() },
-  }));
-  if (!response.ok) {
+    "OpenAI-compatible LLM request",
+  );
+  if (!ok) {
     const message = payload?.error?.message || payload?.message || JSON.stringify(payload).slice(0, 500);
-    throw new Error(`${response.status} ${message}`);
+    throw new Error(`${status} ${message}`);
   }
 
   const text = payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || "";
@@ -474,4 +522,6 @@ module.exports = {
   _buildUserMessage,
   _ensureCandidateDefaults,
   _extractJsonObject,
+  _resolveLlmTimeoutMs,
+  _withLlmTimeout,
 };

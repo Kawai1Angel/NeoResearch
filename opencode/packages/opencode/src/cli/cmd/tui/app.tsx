@@ -66,6 +66,13 @@ import { FormatError, FormatUnknownError } from "@/cli/error"
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
 
+export const resizeClearSequence = "\x1b[2J\x1b[H"
+
+export function clearTerminalResizeArtifacts(stdout: Pick<NodeJS.WriteStream, "isTTY" | "write"> = process.stdout) {
+  if (!stdout.isTTY) return
+  stdout.write(resizeClearSequence)
+}
+
 export function rendererConfig(_config: TuiConfig.Info): CliRendererConfig {
   const mouseEnabled = !Flag.OPENCODE_DISABLE_MOUSE && (_config.mouse ?? true)
 
@@ -251,7 +258,9 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     on(
       dimensions,
       () => {
+        clearTerminalResizeArtifacts()
         renderer.currentRenderBuffer.clear()
+        renderer.nextRenderBuffer.clear()
         renderer.requestRender()
       },
       { defer: true },

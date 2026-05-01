@@ -166,3 +166,47 @@ test("reflectAndPropose real LLM path tags candidates as llm_reflection", async 
     else process.env.NEO_CAST_LLM_API_KEY = originalKey;
   }
 });
+
+test("reflectAndPropose honors llm timeout for OpenAI-compatible requests", async () => {
+  const projectRoot = tempProject("neo-cast-reflect-timeout-");
+  writeCurrentCandidate(projectRoot, {
+    recipe_version: "recipe_schema_v1",
+    recipe_id: "previous_linear",
+    embedding: { type: "none" },
+    backbone: { type: "linear" },
+  });
+
+  const originalFetch = global.fetch;
+  const originalKey = process.env.NEO_CAST_LLM_API_KEY;
+  process.env.NEO_CAST_LLM_API_KEY = "test-key";
+
+  let sawAbort = false;
+  global.fetch = async (_url, options = {}) => new Promise((_resolve, reject) => {
+    options.signal?.addEventListener("abort", () => {
+      sawAbort = true;
+      const error = new Error("aborted by timeout");
+      error.name = "AbortError";
+      reject(error);
+    });
+  });
+
+  try {
+    const result = await Promise.race([
+      reflectAndPropose(
+        "improve long horizon",
+        [],
+        { run_id: "missing", val_avg_mse: "1.0" },
+        { llm: { provider: "openai-compatible", base_url: "https://example.invalid/v1", model: "test", timeout_seconds: 0.01 } },
+        { projectRoot, attempt: 2 },
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("timed_out"), 75)),
+    ]);
+
+    assert.equal(result, null);
+    assert.equal(sawAbort, true);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.NEO_CAST_LLM_API_KEY;
+    else process.env.NEO_CAST_LLM_API_KEY = originalKey;
+  }
+});

@@ -3,12 +3,15 @@ import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
+  buildDefaultTsfResearchTaskFromGoal,
   buildDefaultTsfResearchTask,
+  buildSocraticClarificationState,
   buildResearchCockpitRecommendation,
   buildResearchCockpitStats,
   buildResearchCockpitWorkflow,
   canExecuteResearchCockpitTask,
   canRunResearchCockpitCandidate,
+  findBestResearchCockpitMetric,
   formatResearchCockpitArtifactMetadata,
   formatResearchCockpitExport,
   formatResearchCockpitFingerprint,
@@ -21,7 +24,10 @@ import {
   formatResearchCockpitSeedSweep,
   hasApprovedResearchCockpitBlindTestGate,
   hasApprovedResearchCockpitRefTestGate,
+  interactionModeForTask,
   parseTsfCsvTaskInput,
+  validateTsfCsvTaskInput,
+  researchInteractionModeLabel,
   researchCockpitArtifactTarget,
   researchCockpitCandidatePipeline,
   researchCockpitCandidateTitle,
@@ -44,6 +50,13 @@ async function createNeoCastRunnerRoot(version = "Python 3.12.0") {
   const pythonPath = path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
   await writeFile(pythonPath, `#!/bin/sh\necho '${version}'\n`, "utf8")
   await chmod(pythonPath, 0o755)
+  return root
+}
+
+async function createPreparedNeoCastRunnerRoot(spec: Record<string, unknown>, version = "Python 3.12.0") {
+  const root = await createNeoCastRunnerRoot(version)
+  await mkdir(path.join(root, ".neo-cast"), { recursive: true })
+  await writeFile(path.join(root, ".neo-cast", "dataset_spec.json"), `${JSON.stringify(spec, null, 2)}\n`, "utf8")
   return root
 }
 
@@ -137,6 +150,24 @@ describe("research cockpit data helpers", () => {
     })
   })
 
+  test("labels research interaction mode from task metadata or task mode", () => {
+    expect(
+      researchInteractionModeLabel(
+        interactionModeForTask(
+          task({
+            id: "review_companion",
+            mode: "review",
+            taskSpec: { metadata: { interactionMode: "companion" } },
+          }),
+        ),
+      ),
+    ).toBe("认知伴随")
+
+    expect(researchInteractionModeLabel(interactionModeForTask(task({ id: "auto_default", mode: "autonomous" })))).toBe(
+      "苏格拉底",
+    )
+  })
+
   test("builds an actionable empty cockpit workflow", () => {
     const workflow = buildResearchCockpitWorkflow({
       candidates: [],
@@ -154,7 +185,7 @@ describe("research cockpit data helpers", () => {
       "todo:Design candidates",
       "todo:Run smoke experiments",
       "todo:Review gates",
-      "todo:Export report",
+      "todo:Export bundle",
     ])
     expect(
       buildResearchCockpitRecommendation({
@@ -211,7 +242,7 @@ describe("research cockpit data helpers", () => {
       "done:Design candidates",
       "done:Run smoke experiments",
       "done:Review gates",
-      "active:Export report",
+      "active:Export bundle",
     ])
     expect(
       buildResearchCockpitRecommendation({
@@ -254,22 +285,49 @@ describe("research cockpit data helpers", () => {
       "done:Design candidates",
       "todo:Run smoke experiments",
       "todo:Review gates",
-      "todo:Export report",
+      "todo:Export bundle",
     ])
   })
 
 
   test("creates default TSF task payloads for review and autonomous modes", () => {
-    expect(buildDefaultTsfResearchTask("review")).toMatchObject({
+    const reviewTask = buildDefaultTsfResearchTask("review")
+    const autonomousTask = buildDefaultTsfResearchTask("autonomous")
+
+    expect(reviewTask).toMatchObject({
       title: "TSF Review Research",
       domainID: "tsf",
       mode: "review",
+      taskSpec: {
+        contextLength: 96,
+        predictionLengths: [24],
+        dataset: {
+          loaderID: "etth1_tslib_v1",
+          targetCols: ["OT"],
+        },
+        runtime: {
+          bridgeOnly: true,
+        },
+        metadata: { interactionMode: "companion" },
+      },
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
     })
-    expect(buildDefaultTsfResearchTask("autonomous")).toMatchObject({
+    expect(autonomousTask).toMatchObject({
       title: "TSF Autonomous Research",
       domainID: "tsf",
       mode: "autonomous",
+      taskSpec: {
+        contextLength: 96,
+        predictionLengths: [24],
+        dataset: {
+          loaderID: "etth1_tslib_v1",
+          targetCols: ["OT"],
+        },
+        runtime: {
+          bridgeOnly: true,
+        },
+        metadata: { interactionMode: "socratic" },
+      },
       budget: { maxRuns: 12, maxParallel: 1 },
     })
   })
@@ -349,6 +407,76 @@ describe("research cockpit data helpers", () => {
     })
   })
 
+  test("creates Cockpit TSF task payloads by extracting structured fields from a research goal", () => {
+    const payload = buildDefaultTsfResearchTaskFromGoal(
+      "Forecast /data/ETTh1.csv target=OT,HUFL horizon=96,192 context=512 preset=etth1 full max-runs=5 time=120",
+      "autonomous",
+      "/tmp/neo-cast",
+    )
+
+    expect(payload.title).toBe("Forecast ETTh1 horizon 96,192")
+    expect(payload.taskSpec).toMatchObject({
+      contextLength: 512,
+      predictionLengths: [96, 192],
+      dataset: {
+        loaderID: "etth1",
+        path: "/data/ETTh1.csv",
+        targetCols: ["OT", "HUFL"],
+      },
+      runtime: {
+        bridgeOnly: false,
+        neoCastProjectRoot: "/tmp/neo-cast",
+      },
+      constraints: {
+        maxTrainingSeconds: 120,
+        maxTrials: 5,
+      },
+      metadata: {
+        interactionMode: "socratic",
+        userPrompt:
+          "Forecast /data/ETTh1.csv target=OT,HUFL horizon=96,192 context=512 preset=etth1 full max-runs=5 time=120",
+      },
+    })
+    expect(payload.budget).toMatchObject({
+      maxRuns: 5,
+      maxParallel: 1,
+      loop: {
+        timeBudgetSeconds: 120,
+      },
+    })
+  })
+
+  test("requires the prepared Neo-Cast dataset spec to match the selected task before execution", async () => {
+    const root = await createPreparedNeoCastRunnerRoot({
+      schema_version: "dataset.v1",
+      source_csv: "/data/other.csv",
+      task_id: "etth1",
+      timestamp_col: "date",
+      feature_columns: ["OT"],
+      input_len: 96,
+      horizons: [48],
+      splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
+      normalization: { type: "standard", fit_split: "train" },
+      missing: { strategy: "forward_fill", limit: null },
+      time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+    })
+
+    const status = canExecuteResearchCockpitTask(
+      task({
+        id: "dataset_mismatch",
+        taskSpec: {
+          contextLength: 96,
+          predictionLengths: [24],
+          dataset: { path: "/data/ETTh1.csv", targetCols: ["OT"] },
+          runtime: { neoCastProjectRoot: root },
+        },
+      }),
+      { validateRuntime: true },
+    )
+
+    expect(status).toBe(false)
+  })
+
   test("parses CSV task dialog input with forecasting options", () => {
     expect(parseTsfCsvTaskInput("/data/ETTh1.csv target=OT,HUFL horizon=24,48 context=192 preset=etth1 full")).toEqual({
       datasetPath: "/data/ETTh1.csv",
@@ -359,6 +487,17 @@ describe("research cockpit data helpers", () => {
       bridgeOnly: false,
     })
     expect(parseTsfCsvTaskInput("   ")).toBeUndefined()
+  })
+
+  test("validates CSV task input before creating tasks", () => {
+    expect(validateTsfCsvTaskInput("")).toEqual(["Enter a CSV dataset path."])
+    expect(validateTsfCsvTaskInput("/tmp/missing.txt")).toContain("Dataset path must point to a .csv file.")
+    expect(validateTsfCsvTaskInput("/tmp/missing.csv horizon=abc context=0 time=bad")).toEqual([
+      "Dataset file does not exist: /tmp/missing.csv",
+      "horizon must be a positive integer list.",
+      "context must be a positive integer.",
+      "time must be a positive duration like 30s, 5m, or 1h.",
+    ])
   })
 
   test("formats exported research artifact messages", () => {
@@ -375,6 +514,23 @@ describe("research cockpit data helpers", () => {
         path: "/tmp/research-report.md",
       }),
     ).toBe("research_report_markdown exported: /tmp/research-report.md")
+    expect(
+      formatResearchCockpitExport({
+        artifact: artifact({
+          id: "artifact_export",
+          kind: "model_export_package",
+          metadata: {
+            championCandidateID: "candidate_best",
+            primaryMetricName: "val_avg_mse",
+            primaryMetricValue: 0.123456,
+            copiedFiles: ["README.md", "requirements.txt", "mcp_server.py"],
+          },
+        }),
+        path: "/tmp/pkg",
+      }),
+    ).toBe(
+      "model_export_package exported: /tmp/pkg / champion=candidate_best / val_avg_mse=0.123456 / files=README.md, requirements.txt, mcp_server.py",
+    )
   })
 
   test("formats autonomous iteration messages", () => {
@@ -424,7 +580,31 @@ describe("research cockpit data helpers", () => {
         ],
         artifact: artifact({ id: "artifact_loop", kind: "research_autonomous_loop_json" }),
       }),
-    ).toBe("loop max_iterations / 2 iterations / 1 succeeded / artifact research_autonomous_loop_json")
+    ).toBe(
+      "loop stopped: reached max iterations / 2 iterations / 1 succeeded / selected candidate_a / val_avg_mse=0.1234 / artifact research_autonomous_loop_json",
+    )
+  })
+
+  test("finds the best displayed metric across champion and succeeded runs", () => {
+    const runs: ResearchCockpitRun[] = [
+      { id: "run_bad", status: "succeeded", metrics: { val_avg_mse: 0.5 }, time: { created: 1, updated: 1 } },
+      { id: "run_best", status: "succeeded", metrics: { val_avg_mse: 0.2 }, time: { created: 1, updated: 1 } },
+    ]
+
+    expect(findBestResearchCockpitMetric({ primaryMetric: "val_avg_mse", direction: "minimize" }, runs)).toBe(
+      "best val_avg_mse=0.2",
+    )
+    expect(
+      findBestResearchCockpitMetric({ primaryMetric: "val_avg_mse", direction: "minimize" }, runs, {
+        taskID: "task_a",
+        candidateID: "candidate_a",
+        runID: "run_champion",
+        primaryMetric: 0.1,
+        utility: 0.9,
+        acceptedAt: 1,
+        time: { created: 1, updated: 1 },
+      }),
+    ).toBe("best val_avg_mse=0.1")
   })
 
   test("summarizes modular candidate recipes for cockpit display", () => {
@@ -742,6 +922,37 @@ describe("research cockpit data helpers", () => {
       }),
     ).toBe("warning=dataset_read_failed")
     expect(formatResearchCockpitProfile({})).toBe("-")
+  })
+
+  test("builds Socratic clarification state from pending protocol approvals", () => {
+    expect(
+      buildSocraticClarificationState(
+        task({
+          id: "task_socratic",
+          mode: "autonomous",
+          status: "paused",
+          taskSpec: { metadata: { interactionMode: "socratic" } },
+        }),
+        [
+          {
+            id: "approval_protocol",
+            kind: "protocol",
+            status: "pending",
+            reason: [
+              "Intent clarification required before running the autonomous pipeline.",
+              "- Which CSV dataset path should NeoResearch use for profiling and execution?",
+              "- Which target columns should be forecast?",
+            ].join("\n"),
+            time: { created: 1, updated: 1 },
+          },
+        ],
+      ),
+    ).toEqual({
+      active: true,
+      missingSlots: ["dataset.path", "dataset.targetCols"],
+      nextQuestion: "Which CSV dataset path should NeoResearch use for profiling and execution?",
+      questionCount: 2,
+    })
   })
 
   test("detects research events that should refresh cockpit data", () => {

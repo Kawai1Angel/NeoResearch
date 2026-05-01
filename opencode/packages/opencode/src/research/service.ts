@@ -1,6 +1,7 @@
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
-import { mkdir, readFile, writeFile } from "fs/promises"
+import { cp, mkdir, readFile, writeFile } from "fs/promises"
+import { existsSync } from "fs"
 import path from "path"
 import z from "zod"
 import { and, desc, eq, inArray, isNull, ne, Database, NotFoundError } from "@/storage"
@@ -32,6 +33,8 @@ import {
   ListApprovalInput,
   ListTaskInput,
   PrepareRunInput,
+  PrepareTaskDatasetInput,
+  PrepareTaskDatasetResult,
   ProfileTaskInput,
   ProfileTaskResult,
   ReplyApprovalInput,
@@ -46,6 +49,7 @@ import {
   ResearchMemoryID,
   ResearchRun,
   ResearchRunID,
+  RunFullPipelineInput,
   SeedBaselinesInput,
   ResearchTask,
   ResearchTaskID,
@@ -68,6 +72,15 @@ import {
 import { DomainRegistry } from "./domain-registry"
 import { proposeLLMCandidate } from "./llm-proposal"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
+import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
+import {
+  buildDatasetAnalysisReportMarkdown,
+  type DatasetAnalysisSourceReport,
+  summarizeDataAnalysisAgent,
+  type DataAnalysisAgentResult,
+} from "./agents/data-analysis-agent"
+import { summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
+import { summarizePublishAgent, type PublishAgentResult } from "./agents/publish-agent"
 
 type DbClient = Parameters<typeof Database.use>[0] extends (trx: infer D) => unknown ? D : never
 type ResearchTaskRow = typeof ResearchTaskTable.$inferSelect
@@ -112,12 +125,28 @@ export interface ResearchManagerStep {
 
 export type ResearchManagerTraceStep = ResearchManagerStep
 
-export type AutonomousLoopStoppedReason = "max_iterations" | "budget_exhausted" | "approval_required"
+export type AutonomousLoopStoppedReason =
+  | "max_iterations"
+  | "budget_exhausted"
+  | "approval_required"
+  | "seed_failed"
+  | "target_reached"
+  | "plateau"
+  | "time_budget_exhausted"
+  | "crash_streak_exceeded"
 
 export interface AutonomousLoopResult {
   readonly iterations: AutonomousIterationResult[]
   readonly stoppedReason: AutonomousLoopStoppedReason
   readonly artifact: ResearchArtifact
+}
+
+export interface RunFullPipelineResult {
+  readonly task: ResearchTask
+  readonly intent: IntentAgentResult
+  readonly dataAnalysis: DataAnalysisAgentResult
+  readonly nas: NASAgentResult
+  readonly publish: PublishAgentResult
 }
 
 const ResearchValidationIssueSchema = z
@@ -160,6 +189,24 @@ export const ApprovalRequiredError = NamedError.create(
     taskID: z.string(),
     candidateID: z.string(),
     kind: z.string(),
+  }),
+)
+
+export const PipelineBlockedError = NamedError.create(
+  "ResearchPipelineBlockedError",
+  z.object({
+    taskID: z.string(),
+    reason: z.enum(["pipeline_requires_autonomous", "intent_clarification_required"]),
+    missingFields: z.array(z.string()).optional(),
+    clarifyingQuestions: z.array(z.string()).optional(),
+  }),
+)
+
+export const SeedBaselinesError = NamedError.create(
+  "ResearchSeedBaselinesError",
+  z.object({
+    taskID: z.string(),
+    message: z.string(),
   }),
 )
 
@@ -269,6 +316,40 @@ function maxParallelLimit(budget: ResearchTask["budget"]) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
 }
 
+function budgetLoopPolicy(task: ResearchTask) {
+  const budget = recordValue(task.budget)
+  return recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
+}
+
+function numericPolicyValue(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function integerPolicyValue(value: unknown) {
+  const parsed = numericPolicyValue(value)
+  return parsed === undefined || parsed < 0 ? undefined : Math.floor(parsed)
+}
+
+function maxFailedCandidateRetries(task: ResearchTask) {
+  const policy = budgetLoopPolicy(task)
+  return integerPolicyValue(policy.maxFailedCandidateRetries ?? policy.maxRetriesPerCandidate) ?? 1
+}
+
+function loopPolicyValue(inputValue: unknown, task: ResearchTask, ...keys: string[]) {
+  if (inputValue !== undefined) return numericPolicyValue(inputValue)
+  const policy = budgetLoopPolicy(task)
+  for (const key of keys) {
+    const value = numericPolicyValue(policy[key])
+    if (value !== undefined) return value
+  }
+  return undefined
+}
+
+function loopPolicyInteger(inputValue: unknown, task: ResearchTask, ...keys: string[]) {
+  const value = loopPolicyValue(inputValue, task, ...keys)
+  return value === undefined || value < 0 ? undefined : Math.floor(value)
+}
+
 function candidateRecipeID(candidateSpec: ResearchCandidate["candidateSpec"]) {
   const value = (candidateSpec as Record<string, unknown>).recipeID
   return typeof value === "string" && value.length > 0 ? value : undefined
@@ -339,6 +420,13 @@ function managerStep(
 function recordValue(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
+}
+
+function errorMetadata(error: unknown): JsonRecord {
+  return {
+    error: error instanceof Error ? error.message : String(error),
+    errorName: error instanceof Error ? error.name : "Error",
+  } as JsonRecord
 }
 
 function cloneJsonRecord(value: JsonRecord): Record<string, unknown> {
@@ -488,6 +576,79 @@ function assertCandidateApproved(taskID: ResearchTaskID, candidate: ResearchCand
 
 function isBetterMetric(direction: "minimize" | "maximize", next: number, current: number) {
   return direction === "minimize" ? next < current : next > current
+}
+
+function isMeaningfulMetricImprovement(
+  direction: "minimize" | "maximize",
+  next: number,
+  current: number,
+  minRelativeImprovement: number,
+) {
+  if (!isBetterMetric(direction, next, current)) return false
+  if (minRelativeImprovement <= 0) return true
+  const delta = Math.abs(next - current)
+  return delta / Math.max(Math.abs(current), 1e-12) >= minRelativeImprovement
+}
+
+function candidateAttemptStateFromRuns(
+  runs: readonly ResearchRun[],
+  maxFailedRetries: number,
+  primaryMetricName?: string,
+) {
+  const retryableCounts = new Map<ResearchCandidateID, number>()
+  const attempted = new Set<ResearchCandidateID>()
+  const inconclusive = new Set<ResearchCandidateID>()
+  for (const run of runs) {
+    if (run.candidateID === undefined) continue
+    if (run.status === "failed") {
+      retryableCounts.set(run.candidateID, (retryableCounts.get(run.candidateID) ?? 0) + 1)
+      continue
+    }
+    if (
+      run.status === "succeeded" &&
+      primaryMetricName !== undefined &&
+      metricValue(run.metrics, primaryMetricName) === undefined
+    ) {
+      inconclusive.add(run.candidateID)
+      retryableCounts.set(run.candidateID, (retryableCounts.get(run.candidateID) ?? 0) + 1)
+      continue
+    }
+    attempted.add(run.candidateID)
+  }
+  for (const [candidateID, count] of retryableCounts) {
+    if (count > maxFailedRetries) attempted.add(candidateID)
+  }
+  return {
+    attemptedCandidateIDs: attempted,
+    inconclusiveCandidateIDs: inconclusive,
+  }
+}
+
+function autonomousLoopMaxIterations(inputValue: unknown, task: ResearchTask) {
+  const requested = integerPolicyValue(inputValue)
+  if (requested !== undefined) return Math.max(1, Math.min(requested, 50))
+  const budgetMaxRuns = maxRunsLimit(task.budget)
+  return Math.max(1, Math.min(Math.max(budgetMaxRuns ?? 10, 10), 50))
+}
+
+function rankExistingReadyCandidates(
+  candidates: readonly ResearchCandidate[],
+  readyCandidateIDs: readonly ResearchCandidateID[],
+): DomainCandidateRanking[] {
+  const ready = new Set(readyCandidateIDs)
+  return candidates
+    .filter((candidate) => ready.has(candidate.id))
+    .map((candidate, index) => ({
+      rank: index + 1,
+      score: readyCandidateIDs.length - index,
+      reasons: ["existing approved frontier candidate"],
+      predictorVersion: "existing_frontier_v1",
+      candidateSpec: candidate.candidateSpec,
+      rationale: candidate.rationale,
+      riskLevel: candidate.riskLevel,
+      approvalStatus: candidate.approvalStatus,
+      generatedBy: candidate.generatedBy,
+    }))
 }
 
 function artifactDirsFromRecords(records: Record<string, unknown>[]) {
@@ -975,6 +1136,10 @@ function renderCandidateLineageMarkdown(candidates: readonly ResearchCandidate[]
   return `${lines.join("\n")}\n`
 }
 
+function filePathFromURI(uri: string) {
+  return uri.startsWith("file://") ? uri.slice("file://".length) : undefined
+}
+
 function renderResearchReportMarkdown(input: {
   readonly task: ResearchTask
   readonly candidates: ResearchCandidate[]
@@ -1101,6 +1266,185 @@ function renderResearchReportMarkdown(input: {
   return `${lines.join("\n")}\n`
 }
 
+type DatasetAnalysisReport = {
+  readonly kind: string
+  readonly filename: string
+  readonly role: string
+  readonly content: string
+  readonly metadata: JsonRecord
+}
+
+function markdownValue(value: unknown) {
+  if (typeof value === "number") return formatMetricValue(value)
+  if (typeof value === "string" && value.length > 0) return value
+  if (typeof value === "boolean") return value ? "true" : "false"
+  return "-"
+}
+
+function numericProfileValue(profile: Record<string, unknown>, key: string) {
+  const value = profile[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function dataAnalysisSignal(value: number | undefined, threshold: number, active: string, inactive: string) {
+  return value !== undefined && value >= threshold ? active : inactive
+}
+
+function renderDatasetQuantitativeAnalysis(task: ResearchTask, fingerprint: JsonRecord) {
+  const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  const rows = [
+    ["Rows", profile.rowCount, "usable observations detected in the CSV profile"],
+    ["Targets", profile.targetCount, "forecast target columns used by the task"],
+    ["Missing rate", profile.missingRate, "fraction of missing numeric target cells"],
+    ["Trend strength", profile.trendStrength, "mean absolute correlation with time index"],
+    ["Seasonality strength", profile.seasonalityStrength, "best lag-correlation over common TSF lags"],
+    ["Cross-variate correlation", profile.crossVarCorrelation, "mean absolute pairwise target correlation"],
+    ["Distribution shift", profile.distributionShift, "normalized first-half vs second-half drift"],
+    ["Outlier rate", profile.outlierRate, "IQR-based extreme-value share"],
+    ["ACF main period", profile.acfMainPeriod, "dominant lag from average target autocorrelation"],
+    ["ACF main period strength", profile.acfMainPeriodStrength, "mean autocorrelation strength at the dominant lag"],
+    ["ADF statistic", profile.adfStatistic, "Augmented Dickey-Fuller style stationarity statistic"],
+    ["ADF stationarity", profile.adfStationary, "whether the profile suggests stationarity at the default threshold"],
+    ["Irregular interval ratio", profile.irregularIntervalRatio, "timestamp cadence instability"],
+    ["Duplicate timestamp rate", profile.duplicateTimestampRate, "duplicate timestamp share"],
+  ]
+  const lines = [
+    "# Quantitative Sub-Agent Data Analysis",
+    "",
+    "- Agent: quantitative-data-analyst",
+    `- Task ID: ${task.id}`,
+    `- Primary metric: ${markdownValue(recordValue(task.objective).primaryMetric)}`,
+    `- Direction: ${markdownValue(recordValue(task.objective).direction)}`,
+    "",
+    "## Dataset Metrics",
+    "",
+    "| Metric | Value | Interpretation |",
+    "| --- | ---: | --- |",
+    ...rows.map(([label, value, meaning]) => `| ${label} | ${markdownValue(value)} | ${meaning} |`),
+    "",
+    "## Constraint Signals",
+    "",
+    `- Context length: ${markdownValue(recordValue(fingerprint).contextLength)}`,
+    `- Max prediction length: ${markdownValue(recordValue(fingerprint).maxPredictionLength)}`,
+    `- Horizon/context ratio: ${markdownValue(recordValue(fingerprint).horizonContextRatio)}`,
+    `- Max params: ${markdownValue(recordValue(fingerprint).maxParams)}`,
+    `- Max training seconds: ${markdownValue(recordValue(fingerprint).maxTrainingSeconds)}`,
+  ]
+  return `${lines.join("\n")}\n`
+}
+
+function renderDatasetQualitativeAnalysis(task: ResearchTask, fingerprint: JsonRecord) {
+  const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  const biases = Array.isArray(recordValue(fingerprint).searchBiases)
+    ? (recordValue(fingerprint).searchBiases as unknown[]).filter((item): item is string => typeof item === "string")
+    : []
+  const seasonality = numericProfileValue(profile, "seasonalityStrength")
+  const trend = numericProfileValue(profile, "trendStrength")
+  const crossVar = numericProfileValue(profile, "crossVarCorrelation")
+  const shift = numericProfileValue(profile, "distributionShift")
+  const missing = numericProfileValue(profile, "missingRate")
+  const lines = [
+    "# Qualitative Sub-Agent Data Analysis",
+    "",
+    "- Agent: qualitative-data-analyst",
+    `- Task ID: ${task.id}`,
+    "",
+    "## Reading",
+    "",
+    `- ${dataAnalysisSignal(seasonality, 0.4, "Seasonal structure is a strong prior for candidate design.", "Seasonality is not dominant from the profile.")}`,
+    `- ${dataAnalysisSignal(trend, 0.2, "Trend is present and should be handled by baseline and residual designs.", "Trend is weak enough for simple baselines to remain useful.")}`,
+    `- ${dataAnalysisSignal(crossVar, 0.5, "Cross-variate dependence is material; feature fusion or graph-style candidates are justified.", "Cross-variate dependence is limited; independent temporal candidates are acceptable.")}`,
+    `- ${dataAnalysisSignal(shift, 0.5, "Distribution shift is visible; robust loss or reweighting should be considered.", "Distribution shift is not the dominant risk.")}`,
+    `- ${missing !== undefined && missing > 0 ? "Missing values are present; candidate recipes should include missing-aware preprocessing." : "Missing values are not a primary concern in the profiled targets."}`,
+    "",
+    "## Search Priors",
+    "",
+    biases.length === 0 ? "- No explicit search bias detected." : `- ${biases.join(", ")}`,
+  ]
+  return `${lines.join("\n")}\n`
+}
+
+function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonRecord) {
+  const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  const crossVar = numericProfileValue(profile, "crossVarCorrelation")
+  const seasonality = numericProfileValue(profile, "seasonalityStrength")
+  const shift = numericProfileValue(profile, "distributionShift")
+  const missing = numericProfileValue(profile, "missingRate")
+  const recommendation = [
+    "Start from the existing linear and patch baselines to establish a low-cost floor.",
+    crossVar !== undefined && crossVar >= 0.5
+      ? "Prioritize at least one cross-variate candidate because the quantitative and qualitative sub-agents both flag cross-variate structure."
+      : "Keep the first pass focused on independent temporal candidates because cross-variate evidence is limited.",
+    seasonality !== undefined && seasonality >= 0.4
+      ? "Include patch or frequency-aware variants to exploit seasonal structure."
+      : "Avoid over-indexing on frequency modules until run evidence supports them.",
+    (shift !== undefined && shift >= 0.5) || (missing !== undefined && missing > 0)
+      ? "Use robust loss or preprocessing in later candidates if the bridge runner supports it."
+      : "Keep preprocessing minimal in the first autonomous pass.",
+  ]
+  const lines = [
+    "# Main Agent Data Analysis Summary",
+    "",
+    "- Agent: main-data-analyst",
+    `- Task ID: ${task.id}`,
+    "",
+    "## Inputs Reviewed",
+    "",
+    "- Quantitative sub-agent: numeric dataset profile, objective, horizon, and resource constraints.",
+    "- Qualitative sub-agent: structural interpretation of trend, seasonality, cross-variate behavior, shift, and missingness.",
+    "",
+    "## Synthesis",
+    "",
+    ...recommendation.map((item) => `- ${item}`),
+    "",
+    "## Handoff To Model Search",
+    "",
+    "- Seed small baselines first.",
+    "- Let autonomous iteration compare candidate utility against accuracy, resource cost, model size, and stability.",
+    "- Stop when the configured target, plateau, crash, time, or run budget condition is reached.",
+  ]
+  return `${lines.join("\n")}\n`
+}
+
+function buildDatasetAnalysisReports(task: ResearchTask, fingerprint: JsonRecord): DatasetAnalysisReport[] {
+  return [
+    {
+      kind: "dataset_quantitative_analysis_markdown",
+      filename: "quantitative-subagent.md",
+      role: "quantitative-data-analyst",
+      content: renderDatasetQuantitativeAnalysis(task, fingerprint),
+      metadata: {
+        format: "markdown",
+        role: "quantitative-data-analyst",
+        phase: "data_analysis",
+      } as JsonRecord,
+    },
+    {
+      kind: "dataset_qualitative_analysis_markdown",
+      filename: "qualitative-subagent.md",
+      role: "qualitative-data-analyst",
+      content: renderDatasetQualitativeAnalysis(task, fingerprint),
+      metadata: {
+        format: "markdown",
+        role: "qualitative-data-analyst",
+        phase: "data_analysis",
+      } as JsonRecord,
+    },
+    {
+      kind: "dataset_main_analysis_markdown",
+      filename: "main-agent-summary.md",
+      role: "main-data-analyst",
+      content: renderDatasetMainAnalysisSummary(task, fingerprint),
+      metadata: {
+        format: "markdown",
+        role: "main-data-analyst",
+        phase: "data_analysis",
+        inputs: ["dataset_quantitative_analysis_markdown", "dataset_qualitative_analysis_markdown"],
+      } as JsonRecord,
+    },
+  ]
+}
+
 async function executeRunnerPlan(plan: DomainRunPlan): Promise<RunnerExecution> {
   const cwd = plan.command.cwd ?? process.cwd()
   for (const item of plan.writes) {
@@ -1122,6 +1466,72 @@ async function executeRunnerPlan(plan: DomainRunPlan): Promise<RunnerExecution> 
     stderr: result.stderr.toString(),
     records: parseRunnerRecords(stdout),
   }
+}
+
+function tsfDatasetPreparationConfig(task: ResearchTask) {
+  if (task.domainID !== "tsf") return undefined
+  const taskSpec = recordValue(task.taskSpec)
+  const dataset = recordValue(taskSpec.dataset)
+  const runtime = recordValue(taskSpec.runtime)
+  const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
+  const source = typeof dataset.path === "string" ? dataset.path.trim() : ""
+  if (!root || !source) return undefined
+  const contextLength = numericPolicyValue(taskSpec.contextLength)
+  const predictionLengths = Array.isArray(taskSpec.predictionLengths)
+    ? taskSpec.predictionLengths.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+    : []
+  const targetCols = Array.isArray(dataset.targetCols)
+    ? dataset.targetCols.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
+  const loaderID = typeof dataset.loaderID === "string" && dataset.loaderID.length > 0 ? dataset.loaderID : "local_csv"
+  return {
+    root: path.resolve(root),
+    source: path.resolve(source),
+    loaderID,
+    contextLength: contextLength === undefined ? undefined : Math.floor(contextLength),
+    predictionLengths: predictionLengths.map((item) => Math.floor(item)),
+    targetCols,
+  }
+}
+
+function datasetPresetFromLoader(loaderID: string) {
+  if (loaderID.endsWith("_tslib_v1")) return loaderID.replace(/_tslib_v1$/, "")
+  if (["etth1", "ettm1", "weather", "traffic"].includes(loaderID)) return loaderID
+  return undefined
+}
+
+function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
+  const config = tsfDatasetPreparationConfig(task)
+  if (!config) {
+    throw new Error("TSF dataset preparation requires taskSpec.dataset.path and taskSpec.runtime.neoCastProjectRoot")
+  }
+  const args = ["./bin/neo-cast.js", "prepare-data", "--source", config.source]
+  const preset = datasetPresetFromLoader(config.loaderID)
+  if (preset) args.push("--dataset-preset", preset)
+  else args.push("--task-id", config.loaderID)
+  if (config.targetCols.length > 0) args.push("--feature-cols", config.targetCols.join(","))
+  if (config.contextLength !== undefined) args.push("--input-len", String(config.contextLength))
+  if (config.predictionLengths.length > 0) args.push("--horizons", config.predictionLengths.join(","))
+  if (force) args.push("--force")
+  return {
+    executable: process.execPath,
+    args,
+    cwd: config.root,
+    source: config.source,
+  }
+}
+
+async function readPreparedDatasetSpec(root: string) {
+  const candidates = [
+    path.join(root, ".neo-cast", "dataset_spec.json"),
+    path.join(root, ".neo-cast", "dataset", "dataset_spec.json"),
+  ]
+  for (const file of candidates) {
+    if (!existsSync(file)) continue
+    const payload = JSON.parse(await readFile(file, "utf8"))
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload as JsonRecord
+  }
+  throw new Error(`Neo-Cast dataset spec was not created under ${root}`)
 }
 
 const decodeTask = Schema.decodeUnknownSync(ResearchTask)
@@ -1265,6 +1675,7 @@ export interface Interface {
   readonly listRuns: (taskID: ResearchTaskID) => Effect.Effect<ResearchRun[]>
   readonly createArtifact: (input: CreateArtifactInput) => Effect.Effect<ResearchArtifact>
   readonly listArtifacts: (taskID: ResearchTaskID) => Effect.Effect<ResearchArtifact[]>
+  readonly prepareTaskDataset: (input: PrepareTaskDatasetInput) => Effect.Effect<PrepareTaskDatasetResult>
   readonly profileTask: (input: ProfileTaskInput) => Effect.Effect<ProfileTaskResult>
   readonly exportTaskArtifact: (input: ExportTaskArtifactInput) => Effect.Effect<ExportTaskArtifactResult>
   readonly createMemory: (input: CreateMemoryInput) => Effect.Effect<ResearchMemory>
@@ -1280,6 +1691,11 @@ export interface Interface {
   readonly executeSeedSweep: (input: ExecuteSeedSweepInput) => Effect.Effect<SeedSweepResult>
   readonly runAutonomousIteration: (input: AutonomousIterationInput) => Effect.Effect<AutonomousIterationResult>
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
+  readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
+  readonly runDataAnalysisAgent: (input: ProfileTaskInput) => Effect.Effect<DataAnalysisAgentResult>
+  readonly runNASAgent: (input: AutonomousLoopInput) => Effect.Effect<NASAgentResult>
+  readonly runPublishAgent: (input: ExportTaskArtifactInput) => Effect.Effect<PublishAgentResult>
+  readonly runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Research") {}
@@ -1342,7 +1758,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             title: input.title,
             domain_id: input.domainID,
             mode: input.mode,
-            status: "created",
+            status: "idle",
             task_spec: taskSpec,
             objective: input.objective,
             budget: input.budget,
@@ -2308,6 +2724,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       readonly rankings: DomainCandidateRanking[]
       readonly readyCandidateIDs: ResearchCandidateID[]
       readonly attemptedCandidateIDs: ResearchCandidateID[]
+      readonly inconclusiveCandidateIDs: ResearchCandidateID[]
     }) {
       const dir = path.join(Instance.directory, ".neo-research", "candidate-selection", input.task.id)
       const file = path.join(dir, `${input.run.id}.json`)
@@ -2327,6 +2744,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         taskFingerprint: input.taskFingerprint,
         readyCandidateIDs: input.readyCandidateIDs,
         attemptedCandidateIDs: input.attemptedCandidateIDs,
+        inconclusiveCandidateIDs: input.inconclusiveCandidateIDs,
         rankPredictor,
         rankings,
       }
@@ -2345,6 +2763,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           stage: input.run.stage,
           selectionSource: input.selectionSource,
           rankingCount: rankings.length,
+          inconclusiveCandidateCount: input.inconclusiveCandidateIDs.length,
           rankPredictorVersion: rankPredictor.version,
           ...(typeof rankPredictor.historyMemoryCount === "number"
             ? { historyMemoryCount: rankPredictor.historyMemoryCount }
@@ -2449,8 +2868,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const artifactPathID = ResearchArtifactID.ascending()
       const dir = path.join(Instance.directory, ".neo-research", "autonomous-loop", input.task.id)
       const file = path.join(dir, `${artifactPathID}.json`)
+      const primaryMetricName = objectiveMetricName(input.task.objective)
       const succeededCount = input.iterations.filter((iteration) => iteration.run.status === "succeeded").length
       const failedCount = input.iterations.filter((iteration) => iteration.run.status === "failed").length
+      const inconclusiveCount = input.iterations.filter(
+        (iteration) =>
+          iteration.run.status === "succeeded" && metricValue(iteration.run.metrics, primaryMetricName) === undefined,
+      ).length
       const payload = {
         taskID: input.task.id,
         domainID: input.task.domainID,
@@ -2458,6 +2882,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         iterationCount: input.iterations.length,
         succeededCount,
         failedCount,
+        inconclusiveCount,
         generatedAt: new Date().toISOString(),
         iterations: input.iterations.map((iteration, index) => ({
           index: index + 1,
@@ -2486,6 +2911,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           iterationCount: input.iterations.length,
           succeededCount,
           failedCount,
+          inconclusiveCount,
           runIDs: input.iterations.map((iteration) => iteration.run.id),
           candidateIDs: input.iterations.map((iteration) => iteration.candidate.id),
         },
@@ -2526,31 +2952,46 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       let seeded: SeedBaselinesResult = { candidates: [], approvals: [] }
       let candidates = yield* listCandidates(task.id)
       if (candidates.length === 0) {
-        seeded = yield* seedBaselines({ taskID: task.id })
+        seeded = yield* seedBaselines({ taskID: task.id }).pipe(
+          Effect.catchCause((cause) => {
+            const error = Cause.squash(cause)
+            return Effect.sync(() => {
+              throw new SeedBaselinesError({
+                taskID: task.id,
+                message: error instanceof Error ? error.message : String(error),
+              })
+            })
+          }),
+        )
         candidates = seeded.candidates
       }
 
       const runs = yield* listRuns(task.id)
-      const attemptedCandidateIDs = new Set(
-        runs.map((run) => run.candidateID).filter((id): id is ResearchCandidateID => id !== undefined),
-      )
+      const primaryMetricName = objectiveMetricName(task.objective)
+      const attemptState = candidateAttemptStateFromRuns(runs, maxFailedCandidateRetries(task), primaryMetricName)
       const readyCandidateIDs = candidates
         .filter(
           (item) =>
             (item.approvalStatus === "approved" || item.approvalStatus === "auto_approved") &&
-            !attemptedCandidateIDs.has(item.id),
+            !attemptState.attemptedCandidateIDs.has(item.id),
         )
         .map((item) => item.id)
       let candidate = candidates.find(
         (item) =>
           (item.approvalStatus === "approved" || item.approvalStatus === "auto_approved") &&
-          !attemptedCandidateIDs.has(item.id),
+          attemptState.inconclusiveCandidateIDs.has(item.id) &&
+          !attemptState.attemptedCandidateIDs.has(item.id),
+      )
+      candidate ??= candidates.find(
+        (item) =>
+          (item.approvalStatus === "approved" || item.approvalStatus === "auto_approved") &&
+          !attemptState.attemptedCandidateIDs.has(item.id),
       )
 
       const proposalApprovals: ResearchApproval[] = []
       let proposalCreated = false
       let selectionSource: "existing_frontier" | "domain_proposal" = "existing_frontier"
-      let rankings: DomainCandidateRanking[] = []
+      let rankings: DomainCandidateRanking[] = rankExistingReadyCandidates(candidates, readyCandidateIDs)
       let llmMetadata: JsonRecord = {}
       if (!candidate) {
         const memory = yield* listRelatedMemory(task)
@@ -2666,7 +3107,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             approvalStatus: candidate.approvalStatus,
             seededCandidateCount: seeded.candidates.length,
             readyCandidateCount: readyCandidateIDs.length,
-            attemptedCandidateCount: attemptedCandidateIDs.size,
+            attemptedCandidateCount: attemptState.attemptedCandidateIDs.size,
+            inconclusiveCandidateCount: attemptState.inconclusiveCandidateIDs.size,
             proposalCreated,
             rankingCount: rankings.length,
             rankPredictorVersion: rankPredictor.version,
@@ -2703,29 +3145,48 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         stage: input.stage,
         description: input.description,
       })
+      const runSucceeded = executed.run.status === "succeeded"
       managerTrace.push(
-        managerStep("runner", "completed", "Prepared and executed the selected candidate run.", {
-          runID: executed.run.id,
-          selectedCandidateID: candidate.id,
-          stage: executed.run.stage,
-          status: executed.run.status,
-          metrics: executed.run.metrics,
-          rankPredictorVersion: rankPredictor.version,
-        }),
+        managerStep(
+          "runner",
+          runSucceeded ? "completed" : "blocked",
+          runSucceeded
+            ? "Prepared and executed the selected candidate run."
+            : "Runner execution failed for the selected candidate.",
+          {
+            runID: executed.run.id,
+            selectedCandidateID: candidate.id,
+            stage: executed.run.stage,
+            status: executed.run.status,
+            metrics: executed.run.metrics,
+            ...(executed.run.error === undefined ? {} : { error: executed.run.error }),
+            rankPredictorVersion: rankPredictor.version,
+          },
+        ),
       )
 
-      const primaryMetricName = objectiveMetricName(task.objective)
       const primaryMetric = metricValue(executed.run.metrics, primaryMetricName)
+      const primaryMetricMissing = executed.run.status === "succeeded" && primaryMetric === undefined
       managerTrace.push(
-        managerStep("analyst", "completed", "Analyzed run metrics against the task objective.", {
-          runID: executed.run.id,
-          selectedCandidateID: candidate.id,
-          selectedRecipeID,
-          primaryMetricName,
-          ...(primaryMetric === undefined ? {} : { primaryMetric }),
-          direction: objectiveDirection(task.objective),
-          rankPredictorVersion: rankPredictor.version,
-        }),
+        managerStep(
+          "analyst",
+          primaryMetricMissing ? "blocked" : primaryMetric === undefined ? "skipped" : "completed",
+          primaryMetricMissing
+            ? "Run succeeded but did not produce the primary metric; marked the candidate inconclusive."
+            : primaryMetric === undefined
+              ? "Skipped metric analysis because the run did not produce the primary metric."
+            : "Analyzed run metrics against the task objective.",
+          {
+            runID: executed.run.id,
+            selectedCandidateID: candidate.id,
+            selectedRecipeID,
+            primaryMetricName,
+            ...(primaryMetric === undefined ? {} : { primaryMetric }),
+            ...(primaryMetricMissing ? { primaryMetricMissing: true } : {}),
+            direction: objectiveDirection(task.objective),
+            rankPredictorVersion: rankPredictor.version,
+          },
+        ),
       )
 
       const memory = yield* listMemory(task.id)
@@ -2757,7 +3218,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         selectionSource,
         rankings,
         readyCandidateIDs,
-        attemptedCandidateIDs: [...attemptedCandidateIDs],
+        attemptedCandidateIDs: [...attemptState.attemptedCandidateIDs],
+        inconclusiveCandidateIDs: [...attemptState.inconclusiveCandidateIDs],
       })
       const selectedRun = yield* attachArtifactRefToRun(executed.run, selectionArtifact.id)
 
@@ -2787,13 +3249,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       if (candidates.length === 0) return undefined
 
       const runs = yield* listRuns(task.id)
-      const attemptedCandidateIDs = new Set(
-        runs.map((run) => run.candidateID).filter((id): id is ResearchCandidateID => id !== undefined),
+      const attemptState = candidateAttemptStateFromRuns(
+        runs,
+        maxFailedCandidateRetries(task),
+        objectiveMetricName(task.objective),
       )
       const hasReadyCandidate = candidates.some(
         (candidate) =>
           (candidate.approvalStatus === "approved" || candidate.approvalStatus === "auto_approved") &&
-          !attemptedCandidateIDs.has(candidate.id),
+          !attemptState.attemptedCandidateIDs.has(candidate.id),
       )
       if (hasReadyCandidate) return undefined
 
@@ -2806,11 +3270,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
     })
 
     const runAutonomousLoop = Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
-      const maxIterations = Math.max(1, Math.min(Math.floor(input.maxIterations ?? 1), 50))
       const iterations: AutonomousIterationResult[] = []
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
+      const maxIterations = autonomousLoopMaxIterations(input.maxIterations, task)
+      const direction = objectiveDirection(task.objective)
+      const primaryMetricName = objectiveMetricName(task.objective)
+      const targetMetricValue = loopPolicyValue(input.targetMetricValue, task, "targetMetricValue", "target")
+      const minRelativeImprovement =
+        loopPolicyValue(input.minRelativeImprovement, task, "minRelativeImprovement", "minImprovement") ?? 0
+      const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds")
+      const timeBudgetSeconds = loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS")
+      const maxCrashStreak = loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak")
+      const startedAt = Date.now()
+      let bestMetric: number | undefined
+      let noImproveStreak = 0
+      let crashStreak = 0
       for (let index = 0; index < maxIterations; index++) {
+        if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
+          return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "time_budget_exhausted" })
+        }
         const budgetExceeded = yield* getRunBudgetExceeded(task, "queued")
         if (budgetExceeded) {
           yield* ensureBudgetApproval(task, undefined, budgetExceeded)
@@ -2834,11 +3313,46 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                 Effect.map((result) => ({ status: "stopped" as const, result })),
               )
             }
+            if (SeedBaselinesError.isInstance(error)) {
+              return finishAutonomousLoop({ task, iterations, stoppedReason: "seed_failed" }).pipe(
+                Effect.map((result) => ({ status: "stopped" as const, result })),
+              )
+            }
             return Effect.failCause(cause)
           }),
         )
         if (iterationResult.status === "stopped") return iterationResult.result
         iterations.push(iterationResult.iteration)
+        if (iterationResult.iteration.run.status === "failed") {
+          crashStreak += 1
+          if (maxCrashStreak !== undefined && crashStreak >= maxCrashStreak) {
+            return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "crash_streak_exceeded" })
+          }
+        } else {
+          crashStreak = 0
+        }
+        const metric = metricValue(iterationResult.iteration.run.metrics, primaryMetricName)
+        if (metric !== undefined) {
+          const improved =
+            bestMetric === undefined ||
+            isMeaningfulMetricImprovement(direction, metric, bestMetric, minRelativeImprovement)
+          if (improved) {
+            bestMetric = metric
+            noImproveStreak = 0
+          } else {
+            noImproveStreak += 1
+          }
+          const targetReached =
+            targetMetricValue !== undefined &&
+            (direction === "minimize" ? metric <= targetMetricValue : metric >= targetMetricValue)
+          if (targetReached) return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "target_reached" })
+          if (maxNoImprove !== undefined && noImproveStreak >= maxNoImprove) {
+            return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "plateau" })
+          }
+        }
+        if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
+          return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "time_budget_exhausted" })
+        }
       }
       return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "max_iterations" })
     })
@@ -2934,14 +3448,136 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       return rows.map(mapArtifact)
     })
 
-    const exportTaskArtifact = Effect.fn("Research.exportTaskArtifact")(function* (input: ExportTaskArtifactInput) {
+    const prepareTaskDataset = Effect.fn("Research.prepareTaskDataset")(function* (input: PrepareTaskDatasetInput) {
       const task = yield* getTask(input.taskID)
-      const candidates = yield* listCandidates(task.id)
-      const runs = yield* listRuns(task.id)
-      const approvals = yield* listApprovals({ taskID: task.id })
-      const artifacts = yield* listArtifacts(task.id)
-      const memory = yield* listMemory(task.id)
-      const champion = yield* getChampion(task.id)
+      const command = buildPrepareDatasetCommand(task, input.force ?? true)
+      const execution = yield* Effect.promise(() =>
+        Process.run([command.executable, ...command.args], {
+          cwd: command.cwd,
+          nothrow: true,
+          timeout: 300_000,
+        }),
+      )
+      if (execution.code !== 0) {
+        const stderr = execution.stderr.toString().trim()
+        throw new Error(stderr || `Neo-Cast prepare-data failed with code ${execution.code}`)
+      }
+      const datasetSpec = yield* Effect.promise(() => readPreparedDatasetSpec(command.cwd))
+      const root = runnerPath(Instance.directory, input.outputDir ?? ".neo-research/datasets")
+      const directory = path.join(root, task.id)
+      const outputPath = path.join(directory, "dataset-preparation.json")
+      const payload = {
+        taskID: task.id,
+        domainID: task.domainID,
+        generatedAt: new Date().toISOString(),
+        command: {
+          executable: command.executable,
+          args: command.args,
+          cwd: command.cwd,
+          exitCode: execution.code,
+        },
+        stdout: execution.stdout.toString(),
+        stderr: execution.stderr.toString(),
+        datasetSpec,
+      }
+      yield* Effect.promise(async () => {
+        await mkdir(directory, { recursive: true })
+        await writeFile(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8")
+      })
+      const artifact = yield* createArtifact({
+        taskID: task.id,
+        kind: "dataset_preparation_json",
+        uri: `file://${outputPath}`,
+        metadata: {
+          format: "json",
+          taskID: task.id,
+          source: command.source,
+          runnerRoot: command.cwd,
+          inputLen: typeof datasetSpec.input_len === "number" ? datasetSpec.input_len : 0,
+          horizons: Array.isArray(datasetSpec.horizons) ? datasetSpec.horizons.join(",") : "",
+          featureColumns: Array.isArray(datasetSpec.feature_columns) ? datasetSpec.feature_columns.join(",") : "",
+        },
+      })
+      return {
+        artifact,
+        path: outputPath,
+        datasetSpec,
+        command: payload.command as JsonRecord,
+      }
+    })
+
+    const readTaskExportSnapshot = Effect.fn("Research.readTaskExportSnapshot")(function* (taskID: ResearchTaskID) {
+      const projectID = Instance.project.id
+      return yield* Effect.try({
+        try: () =>
+          Database.transaction((d) => {
+            const taskRow = d
+              .select()
+              .from(ResearchTaskTable)
+              .where(and(eq(ResearchTaskTable.id, taskID), eq(ResearchTaskTable.project_id, projectID)))
+              .get()
+            if (!taskRow) throw missing("Research task", taskID)
+
+            const candidateRows = d
+              .select()
+              .from(ResearchCandidateTable)
+              .where(eq(ResearchCandidateTable.task_id, taskID))
+              .orderBy(desc(ResearchCandidateTable.time_updated))
+              .all()
+            const runRows = d
+              .select()
+              .from(ResearchRunTable)
+              .where(eq(ResearchRunTable.task_id, taskID))
+              .orderBy(desc(ResearchRunTable.time_updated))
+              .all()
+            const approvalRows = d
+              .select()
+              .from(ResearchApprovalTable)
+              .where(eq(ResearchApprovalTable.task_id, taskID))
+              .orderBy(desc(ResearchApprovalTable.time_updated))
+              .all()
+            const artifactRows = d
+              .select()
+              .from(ResearchArtifactTable)
+              .where(eq(ResearchArtifactTable.task_id, taskID))
+              .orderBy(desc(ResearchArtifactTable.time_updated))
+              .all()
+            const memoryRows = d
+              .select()
+              .from(ResearchMemoryTable)
+              .where(eq(ResearchMemoryTable.task_id, taskID))
+              .orderBy(desc(ResearchMemoryTable.time_updated))
+              .all()
+            const championRow = d
+              .select()
+              .from(ResearchChampionTable)
+              .where(eq(ResearchChampionTable.task_id, taskID))
+              .get()
+
+            return {
+              task: mapTask(taskRow),
+              candidates: candidateRows.map(mapCandidate),
+              runs: runRows.map(mapRun),
+              approvals: approvalRows.map(mapApproval),
+              artifacts: artifactRows.map(mapArtifact),
+              memory: memoryRows.map(mapMemory),
+              champion: championRow ? mapChampion(championRow) : undefined,
+            }
+          }),
+        catch: (error) => error,
+      }).pipe(
+        Effect.catch((error: unknown) =>
+          Effect.sync(() => {
+            throw error
+          }),
+        ),
+      )
+    })
+
+    const exportTaskArtifact = Effect.fn("Research.exportTaskArtifact")(function* (input: ExportTaskArtifactInput) {
+      const { task, candidates, runs, approvals, artifacts, memory, champion } = yield* readTaskExportSnapshot(
+        input.taskID,
+      )
       const kind = input.kind ?? "research_report_markdown"
       const experimentAnalysis = analyzeExperimentResults({ task, candidates, runs, champion })
       const lineage = candidateLineageStats(candidates)
@@ -2971,12 +3607,141 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const lineageContent = renderCandidateLineageMarkdown(candidates)
       const root = runnerPath(Instance.directory, input.outputDir ?? ".neo-research/artifacts")
       const directory = path.join(root, task.id)
+      const sections = [content, lineageContent, experimentAnalysisContent]
+        .map((section) => section.trim())
+        .filter((section) => section.length > 0)
+      if (kind === "research_final_bundle" || kind === "model_export_package") {
+        const reportDirectory = path.join(directory, "report")
+        const resultsDirectory = path.join(directory, "results")
+        const modelDirectory = path.join(directory, "model")
+        const traceDirectory = path.join(directory, "trace")
+        const reportPath = path.join(reportDirectory, "research-report.md")
+        const runsPath = path.join(resultsDirectory, "runs.json")
+        const candidatesPath = path.join(resultsDirectory, "candidates.json")
+        const championPath = path.join(resultsDirectory, "champion.json")
+        const artifactsPath = path.join(resultsDirectory, "artifacts.json")
+        const approvalsPath = path.join(resultsDirectory, "approvals.json")
+        const memoryPath = path.join(resultsDirectory, "memory.json")
+        const manifestPath = path.join(directory, "manifest.json")
+        const championRunnerArtifact =
+          champion === undefined
+            ? undefined
+            : artifacts.find((artifact) => artifact.kind === "runner_artifact" && artifact.runID === champion.runID)
+        const championArtifactDir =
+          championRunnerArtifact === undefined ? undefined : filePathFromURI(championRunnerArtifact.uri)
+        const copiedFiles: Record<string, string> = {
+          report: "report/research-report.md",
+          runs: "results/runs.json",
+          candidates: "results/candidates.json",
+          champion: "results/champion.json",
+          artifacts: "results/artifacts.json",
+          approvals: "results/approvals.json",
+          memory: "results/memory.json",
+          manifest: "manifest.json",
+        }
+	        const modelCopies = [
+	          ["model.pt", "modelWeights"],
+	          ["model_impl.py", "modelImpl"],
+	          ["inference.py", "inference"],
+	          ["metadata.json", "modelMetadata"],
+	          ["model_spec.json", "modelSpec"],
+	          ["patch_bundle.json", "patchBundle"],
+	          ["preprocess.json", "preprocess"],
+	          ["tool_schema.json", "toolSchema"],
+	          ["mcp_server.py", "mcpServer"],
+	          ["requirements.txt", "requirements"],
+	          ["README.md", "readme"],
+	          ["example.py", "example"],
+	          ["eval_report.md", "evalReport"],
+	        ] as const
+
+        yield* Effect.promise(async () => {
+          await mkdir(reportDirectory, { recursive: true })
+          await mkdir(resultsDirectory, { recursive: true })
+          await mkdir(modelDirectory, { recursive: true })
+          await mkdir(traceDirectory, { recursive: true })
+          await writeFile(reportPath, `${sections.join("\n\n")}\n`, "utf8")
+          await writeFile(runsPath, `${JSON.stringify(runs, null, 2)}\n`, "utf8")
+          await writeFile(candidatesPath, `${JSON.stringify(candidates, null, 2)}\n`, "utf8")
+          await writeFile(championPath, `${JSON.stringify(champion ?? null, null, 2)}\n`, "utf8")
+          await writeFile(artifactsPath, `${JSON.stringify(artifacts, null, 2)}\n`, "utf8")
+          await writeFile(approvalsPath, `${JSON.stringify(approvals, null, 2)}\n`, "utf8")
+          await writeFile(memoryPath, `${JSON.stringify(memory, null, 2)}\n`, "utf8")
+          if (championArtifactDir !== undefined) {
+            for (const [filename, manifestKey] of modelCopies) {
+              const source = path.join(championArtifactDir, filename)
+              if (!existsSync(source)) continue
+              const target = path.join(modelDirectory, filename)
+              await cp(source, target, { force: true })
+              copiedFiles[manifestKey] = `model/${filename}`
+            }
+            const modelImplSource = path.join(championArtifactDir, "model_impl.py")
+            if (existsSync(modelImplSource)) {
+              await cp(modelImplSource, path.join(modelDirectory, "model.py"), { force: true })
+              copiedFiles.modelPy = "model/model.py"
+            }
+          }
+          const loopArtifacts = artifacts.filter((artifact) => artifact.kind === "research_autonomous_loop_json")
+          for (const artifact of loopArtifacts) {
+            const source = filePathFromURI(artifact.uri)
+            if (source === undefined || !existsSync(source)) continue
+            await cp(source, path.join(traceDirectory, `${artifact.id}.json`), { force: true })
+          }
+          const manifest = {
+            schemaVersion:
+              kind === "model_export_package"
+                ? "neo_research_model_export_package.v1"
+                : "neo_research_final_bundle.v1",
+            taskID: task.id,
+            domainID: task.domainID,
+            generatedAt: new Date().toISOString(),
+            champion:
+              champion === undefined
+                ? null
+                : {
+                    candidateID: champion.candidateID,
+                    runID: champion.runID,
+                    primaryMetric: champion.primaryMetric,
+                    utility: champion.utility,
+                  },
+            counts: {
+              candidates: candidates.length,
+              runs: runs.length,
+              approvals: approvals.length,
+              artifacts: artifacts.length,
+              memory: memory.length,
+            },
+            files: copiedFiles,
+          }
+          await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
+        })
+
+        const artifact = yield* createArtifact({
+          taskID: task.id,
+          kind,
+          uri: `file://${directory}`,
+          metadata: {
+            format: "directory",
+            taskID: task.id,
+            candidateCount: candidates.length,
+            runCount: runs.length,
+            artifactCount: artifacts.length,
+            primaryMetricName: experimentAnalysis.primaryMetricName,
+            copiedFiles: Object.values(copiedFiles),
+            ...(champion === undefined
+              ? {}
+              : {
+                  championCandidateID: champion.candidateID,
+                  primaryMetricValue: champion.primaryMetric,
+                }),
+          },
+        })
+        return { artifact, path: directory }
+      }
+
       const outputPath = path.join(directory, domainArtifact?.filename ?? "research-report.md")
       yield* Effect.promise(async () => {
         await mkdir(directory, { recursive: true })
-        const sections = [content, lineageContent, experimentAnalysisContent]
-          .map((section) => section.trim())
-          .filter((section) => section.length > 0)
         await writeFile(outputPath, `${sections.join("\n\n")}\n`, "utf8")
       })
 
@@ -3060,6 +3825,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                 ...(typeof profileMetrics.distributionShift === "number"
                   ? { profile_distribution_shift: profileMetrics.distributionShift }
                   : {}),
+                ...(typeof profileMetrics.outlierRate === "number" ? { profile_outlier_rate: profileMetrics.outlierRate } : {}),
+                ...(typeof profileMetrics.irregularIntervalRatio === "number"
+                  ? { profile_irregular_interval_ratio: profileMetrics.irregularIntervalRatio }
+                  : {}),
+                ...(typeof profileMetrics.duplicateTimestampRate === "number"
+                  ? { profile_duplicate_timestamp_rate: profileMetrics.duplicateTimestampRate }
+                  : {}),
               },
               resource_usage: {
                 profiler: "domain_fingerprint",
@@ -3097,13 +3869,78 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           ...(profileWarningMessage === undefined ? {} : { profileWarningMessage }),
         },
       })
+      const analysisDirectory = path.join(directory, "data-analysis")
+      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord)
+      const analysisArtifacts: ResearchArtifact[] = []
+	      for (const item of analysisFiles) {
+	        const reportPath = path.join(analysisDirectory, item.filename)
+        yield* Effect.promise(async () => {
+          await mkdir(analysisDirectory, { recursive: true })
+          await writeFile(reportPath, item.content, "utf8")
+        })
+        analysisArtifacts.push(
+          yield* createArtifact({
+            taskID: task.id,
+            runID: run.id,
+            kind: item.kind,
+            uri: `file://${reportPath}`,
+            metadata: {
+              ...item.metadata,
+              taskID: task.id,
+              domainID: task.domainID,
+              role: item.role,
+              profileArtifactID: artifact.id,
+            },
+	          }),
+	        )
+	      }
+	      const sourceReports: DatasetAnalysisSourceReport[] = analysisArtifacts.map((artifact, index) => {
+	        const source = analysisFiles[index]!
+	        return {
+	          id: artifact.id,
+	          kind: artifact.kind,
+	          role: source.role,
+	          content: source.content,
+	        }
+	      })
+	      const unifiedReportPath = path.join(analysisDirectory, "dataset-analysis-report.md")
+	      yield* Effect.promise(async () => {
+	        await mkdir(analysisDirectory, { recursive: true })
+        await writeFile(
+          unifiedReportPath,
+          buildDatasetAnalysisReportMarkdown({
+	            task,
+	            fingerprint: fingerprint as JsonRecord,
+	            sourceArtifactIDs: analysisArtifacts.map((item) => item.id),
+	            sourceReports,
+	          }),
+	          "utf8",
+	        )
+      })
+      const dataAnalysisArtifact = yield* createArtifact({
+        taskID: task.id,
+        runID: run.id,
+        kind: "dataset_analysis_report",
+        uri: `file://${unifiedReportPath}`,
+        metadata: {
+          format: "markdown",
+          role: "data-analysis-agent",
+          phase: "data_analysis",
+          taskID: task.id,
+          domainID: task.domainID,
+          profileArtifactID: artifact.id,
+          sourceArtifactIDs: analysisArtifacts.map((item) => item.id),
+        },
+      })
+      analysisArtifacts.push(dataAnalysisArtifact)
+      const artifactRefs = [artifact.id, ...analysisArtifacts.map((item) => item.id)]
 
       run = mapRun(
         yield* db((d) =>
           d
             .update(ResearchRunTable)
             .set({
-              artifact_refs: [artifact.id],
+              artifact_refs: artifactRefs,
               time_updated: Date.now(),
             })
             .where(eq(ResearchRunTable.id, run.id))
@@ -3113,6 +3950,275 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       )
       yield* bus.publish(Event.RunUpdated, { run })
       return { fingerprint, run, artifact, path: outputPath }
+    })
+
+	    const runIntentAgent = Effect.fn("Research.runIntentAgent")(function* (taskID: ResearchTaskID) {
+	      yield* updateTaskStatus({ taskID, status: "intent_gathering" })
+	      yield* bus.publish(Event.IntentAgentStarted, {
+	        taskID,
+        agent: "IntentAgent",
+	        stage: "intent_gathering",
+	        status: "started",
+	      })
+	      return yield* Effect.gen(function* () {
+	        const task = yield* getTask(taskID)
+	        const result = analyzeIntentTask({ task })
+	        yield* bus.publish(Event.IntentAgentCompleted, {
+	          taskID,
+	          agent: "IntentAgent",
+	          stage: "intent_gathering",
+	          status: "completed",
+	          metadata: {
+	            confidence: result.confidence,
+	            missingFields: result.missingFields,
+	            clarifyingQuestionCount: result.clarifyingQuestions.length,
+	          },
+	        })
+	        return result
+	      }).pipe(
+	        Effect.catchCause((cause) =>
+	          Effect.gen(function* () {
+	            const error = Cause.squash(cause)
+	            yield* updateTaskStatus({ taskID, status: "failed" })
+	            yield* bus.publish(Event.IntentAgentFailed, {
+	              taskID,
+	              agent: "IntentAgent",
+	              stage: "intent_gathering",
+	              status: "failed",
+	              metadata: errorMetadata(error),
+	            })
+	            return yield* Effect.failCause(cause)
+	          }),
+	        ),
+	      )
+	    })
+
+	    const runDataAnalysisAgent = Effect.fn("Research.runDataAnalysisAgent")(function* (input: ProfileTaskInput) {
+	      yield* updateTaskStatus({ taskID: input.taskID, status: "data_analysis" })
+	      yield* bus.publish(Event.DataAnalysisAgentStarted, {
+	        taskID: input.taskID,
+	        agent: "DataAnalysisAgent",
+	        stage: "data_analysis",
+	        status: "started",
+	      })
+	      return yield* Effect.gen(function* () {
+	        const profile = yield* profileTask(input)
+	        const task = yield* getTask(input.taskID)
+	        const artifacts = yield* listArtifacts(input.taskID)
+	        const artifact = artifacts.find(
+	          (item) => item.runID === profile.run.id && item.kind === "dataset_analysis_report",
+	        )
+	        if (!artifact) throw new Error(`Dataset analysis report was not created for task: ${input.taskID}`)
+	        const sourceArtifactIDs = artifacts
+	          .filter(
+	            (item) =>
+	              item.runID === profile.run.id &&
+	              (item.kind === "dataset_quantitative_analysis_markdown" ||
+	                item.kind === "dataset_qualitative_analysis_markdown" ||
+	                item.kind === "dataset_main_analysis_markdown"),
+	          )
+	          .map((item) => item.id)
+	        const result = summarizeDataAnalysisAgent({
+	          task,
+	          fingerprint: profile.fingerprint,
+	          artifact,
+	          sourceArtifactIDs,
+	        })
+	        yield* bus.publish(Event.DataAnalysisAgentCompleted, {
+	          taskID: input.taskID,
+	          agent: "DataAnalysisAgent",
+	          stage: "data_analysis",
+	          status: "completed",
+	          metadata: {
+	            artifactID: artifact.id,
+	            sourceArtifactCount: sourceArtifactIDs.length,
+	            warningCount: result.warningCount,
+	            searchBiases: [...result.searchBiases],
+	          },
+	        })
+	        return result
+	      }).pipe(
+	        Effect.catchCause((cause) =>
+	          Effect.gen(function* () {
+	            const error = Cause.squash(cause)
+	            yield* updateTaskStatus({ taskID: input.taskID, status: "failed" })
+	            yield* bus.publish(Event.DataAnalysisAgentFailed, {
+	              taskID: input.taskID,
+	              agent: "DataAnalysisAgent",
+	              stage: "data_analysis",
+	              status: "failed",
+	              metadata: errorMetadata(error),
+	            })
+	            return yield* Effect.failCause(cause)
+	          }),
+	        ),
+	      )
+	    })
+
+	    const runNASAgent = Effect.fn("Research.runNASAgent")(function* (input: AutonomousLoopInput) {
+      yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
+      yield* bus.publish(Event.NASAgentStarted, {
+        taskID: input.taskID,
+        agent: "NASAgent",
+	        stage: "searching",
+	        status: "started",
+	      })
+	      return yield* Effect.gen(function* () {
+	        const loop = yield* runAutonomousLoop(input)
+	        const result = summarizeNASAgentLoop({ taskID: input.taskID, loop })
+	        for (let index = 0; index < loop.iterations.length; index++) {
+	          const iteration = loop.iterations[index]!
+	          yield* bus.publish(Event.NASIterationCompleted, {
+	            taskID: input.taskID,
+	            agent: "NASAgent",
+	            stage: "searching",
+	            status: "completed",
+	            metadata: {
+	              iterationIndex: index + 1,
+	              candidateID: iteration.candidate.id,
+	              runID: iteration.run.id,
+	              runStatus: iteration.run.status,
+	              metrics: iteration.run.metrics,
+	            },
+	          })
+	        }
+	        yield* bus.publish(Event.NASAgentCompleted, {
+	          taskID: input.taskID,
+	          agent: "NASAgent",
+	          stage: "searching",
+	          status: "completed",
+	          metadata: {
+	            stoppedReason: loop.stoppedReason,
+	            iterationCount: result.iterationCount,
+	            succeededCount: result.succeededCount,
+	            failedCount: result.failedCount,
+	            artifactID: loop.artifact.id,
+	          },
+	        })
+	        return result
+	      }).pipe(
+	        Effect.catchCause((cause) =>
+	          Effect.gen(function* () {
+	            const error = Cause.squash(cause)
+	            yield* updateTaskStatus({ taskID: input.taskID, status: "failed" })
+	            yield* bus.publish(Event.NASAgentFailed, {
+	              taskID: input.taskID,
+	              agent: "NASAgent",
+	              stage: "searching",
+	              status: "failed",
+	              metadata: errorMetadata(error),
+	            })
+	            return yield* Effect.failCause(cause)
+	          }),
+	        ),
+	      )
+	    })
+
+	    const runPublishAgent = Effect.fn("Research.runPublishAgent")(function* (input: ExportTaskArtifactInput) {
+      yield* updateTaskStatus({ taskID: input.taskID, status: "publishing" })
+      yield* bus.publish(Event.PublishAgentStarted, {
+        taskID: input.taskID,
+        agent: "PublishAgent",
+	        stage: "publishing",
+	        status: "started",
+	      })
+	      return yield* Effect.gen(function* () {
+	        const exportResult = yield* exportTaskArtifact({
+	          ...input,
+	          kind: input.kind ?? "model_export_package",
+	        })
+	        const result = summarizePublishAgent({ taskID: input.taskID, exportResult })
+	        yield* updateTaskStatus({ taskID: input.taskID, status: "completed" })
+	        yield* bus.publish(Event.PublishAgentCompleted, {
+	          taskID: input.taskID,
+	          agent: "PublishAgent",
+	          stage: "publishing",
+	          status: "completed",
+	          metadata: {
+	            artifactID: result.artifact.id,
+	            kind: result.artifact.kind,
+	            path: result.path,
+	          },
+	        })
+	        return result
+	      }).pipe(
+	        Effect.catchCause((cause) =>
+	          Effect.gen(function* () {
+	            const error = Cause.squash(cause)
+	            yield* updateTaskStatus({ taskID: input.taskID, status: "failed" })
+	            yield* bus.publish(Event.PublishAgentFailed, {
+	              taskID: input.taskID,
+	              agent: "PublishAgent",
+	              stage: "publishing",
+	              status: "failed",
+	              metadata: errorMetadata(error),
+	            })
+	            return yield* Effect.failCause(cause)
+	          }),
+	        ),
+	      )
+	    })
+
+	    const runFullPipeline = Effect.fn("Research.runFullPipeline")(function* (input: RunFullPipelineInput) {
+	      const initialTask = yield* getTask(input.taskID)
+	      if (initialTask.mode !== "autonomous") {
+	        throw new PipelineBlockedError({
+	          taskID: input.taskID,
+	          reason: "pipeline_requires_autonomous",
+	        })
+	      }
+	      const intent = yield* runIntentAgent(input.taskID)
+	      if (intent.missingFields.length > 0) {
+	        yield* ensurePendingApproval({
+	          taskID: input.taskID,
+	          kind: "protocol",
+	          reason: [
+	            "Intent clarification required before running the autonomous pipeline.",
+	            ...intent.clarifyingQuestions.map((question) => `- ${question}`),
+	          ].join("\n"),
+	        })
+	        yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+	        throw new PipelineBlockedError({
+	          taskID: input.taskID,
+	          reason: "intent_clarification_required",
+	          missingFields: intent.missingFields,
+	          clarifyingQuestions: intent.clarifyingQuestions,
+	        })
+	      }
+	      const task = yield* getTask(input.taskID)
+      const datasetPreparation = tsfDatasetPreparationConfig(task)
+      if (
+        datasetPreparation !== undefined &&
+        (input.forceDatasetPreparation === true || existsSync(path.join(datasetPreparation.root, "bin", "neo-cast.js")))
+      ) {
+        yield* prepareTaskDataset({
+          taskID: input.taskID,
+          force: input.forceDatasetPreparation ?? true,
+        })
+      }
+      const profileOutputDir = input.outputDir === undefined ? undefined : path.join(input.outputDir, "profile")
+      const dataAnalysis = yield* runDataAnalysisAgent({
+        taskID: input.taskID,
+        outputDir: profileOutputDir,
+      })
+      const nas = yield* runNASAgent({
+        taskID: input.taskID,
+        stage: input.stage,
+        description: input.description,
+        maxIterations: input.maxIterations,
+        targetMetricValue: input.targetMetricValue,
+        minRelativeImprovement: input.minRelativeImprovement,
+        maxNoImprove: input.maxNoImprove,
+        timeBudgetSeconds: input.timeBudgetSeconds,
+        maxCrashStreak: input.maxCrashStreak,
+      })
+      const publish = yield* runPublishAgent({
+        taskID: input.taskID,
+        kind: "model_export_package",
+        outputDir: input.outputDir,
+      })
+      const completed = yield* getTask(input.taskID)
+      return { task: completed, intent, dataAnalysis, nas, publish }
     })
 
     const createMemory = Effect.fn("Research.createMemory")(function* (input: CreateMemoryInput) {
@@ -3241,11 +4347,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       executeSeedSweep,
       runAutonomousIteration,
       runAutonomousLoop,
+      runIntentAgent,
+      runDataAnalysisAgent,
+      runNASAgent,
+      runPublishAgent,
+      runFullPipeline,
       createRun,
       updateRunStatus,
       listRuns,
       createArtifact,
       listArtifacts,
+      prepareTaskDataset,
       profileTask,
       exportTaskArtifact,
       createMemory,

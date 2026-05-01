@@ -10,6 +10,11 @@ export type {
   ResearchManagerRole,
   ResearchManagerStep,
   ResearchManagerTraceStep,
+  RunFullPipelineResult,
   SeedSweepResult,
 } from "./service"
+export type { IntentAgentResult } from "./agents/intent-agent"
+export type { DataAnalysisAgentResult } from "./agents/data-analysis-agent"
+export type { NASAgentResult } from "./agents/nas-agent"
+export type { PublishAgentResult } from "./agents/publish-agent"
 export * as Research from "."

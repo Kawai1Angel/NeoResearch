@@ -2,6 +2,7 @@ import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useCommandDialog } from "@tui/component/dialog-command"
+import { useLocal } from "@tui/context/local"
 import { DialogProvider as ProviderAuthDialog } from "@tui/component/dialog-provider"
 import { useRoute } from "@tui/context/route"
 import { useSync } from "@tui/context/sync"
@@ -32,6 +33,14 @@ export function hasNeoResearchApiKey(env: ApiKeyEnv = process.env) {
 
 type HomeAction = "Configure API Key" | "New CSV Task" | "Open Cockpit" | "Run Doctor"
 
+const neoResearchLogo = [
+  " _   _            ____                                _     ",
+  "| \\ | | ___  ___ |  _ \\ ___  ___  ___  __ _ _ __ ___| |__  ",
+  "|  \\| |/ _ \\/ _ \\| |_) / _ \\/ __|/ _ \\/ _` | '__/ __| '_ \\ ",
+  "| |\\  |  __/ (_) |  _ <  __/\\__ \\  __/ (_| | | | (__| | | |",
+  "|_| \\_|\\___|\\___/|_| \\_\\___||___/\\___|\\__,_|_|  \\___|_| |_|",
+]
+
 function useOptionalSync() {
   try {
     return useSync()
@@ -40,13 +49,13 @@ function useOptionalSync() {
   }
 }
 
-export const NEO_RESEARCH_HOME_BANNER = [
-  "N   N EEEE  OOO  RRR  EEEE  SSS  EEEE  A   RRR   CCC H  H",
-  "NN  N E    O   O R  R E    S     E    A A  R  R C    H  H",
-  "N N N EEE  O   O RRR  EEE   SSS  EEE  AAA  RRR  C    HHHH",
-  "N  NN E    O   O R R  E       S  E    A   A R R  C    H  H",
-  "N   N EEEE  OOO  R  R EEEE SSS   EEEE A   A R  R  CCC H  H",
-] as const
+function useOptionalLocal() {
+  try {
+    return useLocal()
+  } catch {
+    return undefined
+  }
+}
 
 export function Home() {
   let input: TextareaRenderable | undefined
@@ -56,21 +65,25 @@ export function Home() {
   const dialog = useDialog()
   const route = useRoute()
   const sync = useOptionalSync()
+  const local = useOptionalLocal()
   const dimensions = useTerminalDimensions()
   const { theme } = useTheme()
   const toast = useToast()
   const slashSelection = createResearchSlashSelection()
   const [inputValue, setInputValue] = createSignal("")
 
-  const width = createMemo(() => Math.max(62, Math.min(96, dimensions().width - 8)))
+  const width = createMemo(() => Math.max(62, Math.min(132, dimensions().width - 24)))
   const compactHeight = createMemo(() => dimensions().height < 42)
-  const top = createMemo(() => (compactHeight() ? 1 : Math.max(2, Math.floor(dimensions().height * 0.22))))
+  const top = createMemo(() => (compactHeight() ? 1 : Math.max(2, Math.floor(dimensions().height * 0.18))))
   const verticalGap = createMemo(() => (compactHeight() ? 1 : 2))
   const providerConnected = createMemo(() => Boolean(sync?.data.provider_next.connected.length))
   const needsApiKey = createMemo(() => !hasNeoResearchApiKey() && !providerConnected())
-  const actions = createMemo<HomeAction[]>(() =>
-    needsApiKey() ? ["Configure API Key", "New CSV Task", "Open Cockpit", "Run Doctor"] : ["New CSV Task", "Open Cockpit", "Run Doctor"],
-  )
+  const actions: HomeAction[] = ["Configure API Key", "New CSV Task", "Open Cockpit", "Run Doctor"]
+  const promptMetadataText = createMemo(() => {
+    const selectedModel = local?.model.current()
+    if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
+    return "Research Agent"
+  })
 
   const openCockpit = () => route.navigate({ type: "cockpit" })
   const openCsvTask = () => route.navigate({ type: "cockpit", newCsvTask: true })
@@ -114,7 +127,7 @@ export function Home() {
       route.navigate({ type: "cockpit", researchGoal })
       toast.show({
         variant: "info",
-        message: "Research goal captured. Cockpit will create an autonomous task.",
+        message: "Research goal captured. Cockpit will start in Socratic mode.",
         duration: 4000,
       })
       return
@@ -194,7 +207,7 @@ export function Home() {
     promptedForApiKey = true
     setTimeout(() => {
       if (!needsApiKey()) return
-      showApiKeyHelp()
+      if (!openProviderDialog()) showApiKeyHelp()
     }, 0)
   })
 
@@ -277,35 +290,46 @@ export function Home() {
     <box flexGrow={1} alignItems="center" paddingTop={top()}>
       <box width={width()} alignItems="center" gap={verticalGap()}>
         <box alignItems="center" gap={0}>
-          <For each={NEO_RESEARCH_HOME_BANNER}>
+          <For each={neoResearchLogo}>
             {(line) => (
-              <text fg={theme.primary} attributes={TextAttributes.BOLD}>
+              <text fg={theme.textMuted} attributes={TextAttributes.BOLD}>
                 {line}
               </text>
             )}
           </For>
-          <Show when={!compactHeight()}>
-            <box height={1} />
-          </Show>
-          <text fg={theme.textMuted}>Autonomous TSF research workspace</text>
+          <text fg={theme.primary} attributes={TextAttributes.BOLD}>
+            Make Small Model Creation Simple
+          </text>
         </box>
 
-        <box width={width()} backgroundColor={theme.backgroundPanel} paddingLeft={2} paddingRight={2} paddingTop={1}>
-          <textarea
-            height={1}
-            keyBindings={[{ name: "return", action: "submit" }]}
-            onSubmit={submitGoal}
-            onKeyDown={handleSlashKeyDown}
-            onContentChange={() => setInputValue(input?.plainText ?? "")}
-            ref={(value: TextareaRenderable) => {
-              input = value
-            }}
-            placeholder={'Ask research goal... "Forecast ETTh1 horizon=24"'}
-            placeholderColor={theme.textMuted}
-            textColor={theme.text}
-            focusedTextColor={theme.text}
-            cursorColor={theme.primary}
-          />
+        <box
+          width={width()}
+          height={4}
+          backgroundColor={theme.backgroundPanel}
+          border={["left"]}
+          borderColor={theme.primary}
+          paddingLeft={2}
+          paddingRight={2}
+          paddingTop={1}
+        >
+          <box flexGrow={1} minHeight={0}>
+            <textarea
+              minHeight={1}
+              maxHeight={3}
+              keyBindings={[{ name: "return", action: "submit" }]}
+              onSubmit={submitGoal}
+              onKeyDown={handleSlashKeyDown}
+              onContentChange={() => setInputValue(input?.plainText ?? "")}
+              ref={(value: TextareaRenderable) => {
+                input = value
+              }}
+              placeholder={"Ask for a recommendation, approve a checkpoint, or export the bundle..."}
+              placeholderColor={theme.textMuted}
+              textColor={theme.text}
+              focusedTextColor={theme.text}
+              cursorColor={theme.primary}
+            />
+          </box>
           <ResearchSlashMenu
             value={inputValue()}
             options={() => command.slashes()}
@@ -321,23 +345,14 @@ export function Home() {
             onSelect={selectSlashOption}
             selection={slashSelection}
           />
-          <box flexDirection="row" gap={2} paddingTop={1}>
-            <text fg={theme.primary} attributes={TextAttributes.BOLD}>
-              Planner
+          <box flexShrink={0} flexDirection="row" gap={1} paddingTop={1}>
+            <text fg={theme.primary}>认知伴随</text>
+            <text fg={theme.primary}>Intent Agent</text>
+            <text fg={theme.text} flexShrink={1} overflow="hidden" wrapMode="none">
+              {promptMetadataText()}
             </text>
-            <text fg={theme.text}>Research Agent</text>
           </box>
         </box>
-
-        <Show when={compactHeight()}>
-          <box alignItems="center" gap={0}>
-            <box flexDirection="row" gap={2}>
-              <text fg={theme.textMuted}>enter submit</text>
-              <text fg={theme.textMuted}>ctrl+p api-key / cockpit / csv / doctor</text>
-              <text fg={theme.textMuted}>doctor env</text>
-            </box>
-          </box>
-        </Show>
 
         <Show when={needsApiKey()}>
           <box
@@ -366,7 +381,7 @@ export function Home() {
         </Show>
 
         <box flexDirection="row" gap={2} justifyContent="center">
-          <For each={actions()}>
+          <For each={actions}>
             {(action) => (
               <text fg={theme.primary} onMouseUp={() => runAction(action)}>
                 {action}
@@ -374,17 +389,6 @@ export function Home() {
             )}
           </For>
         </box>
-
-        <Show when={!compactHeight()}>
-          <box alignItems="center" gap={1} paddingTop={2}>
-            <text fg={theme.textMuted}>Designed for Research OS</text>
-            <box flexDirection="row" gap={2}>
-              <text fg={theme.textMuted}>enter submit</text>
-              <text fg={theme.textMuted}>ctrl+p api-key / cockpit / csv / doctor</text>
-              <text fg={theme.textMuted}>doctor env</text>
-            </box>
-          </box>
-        </Show>
       </box>
     </box>
   )

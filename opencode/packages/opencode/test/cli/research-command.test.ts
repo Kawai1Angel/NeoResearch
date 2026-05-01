@@ -9,6 +9,7 @@ import { createFileResearchRuntime, researchJobFromRunPlan } from "../../src/res
 import {
   ResearchCommand,
   ResearchCreateCommand,
+  ResearchPipelineCommand,
   ResearchProfileCommand,
   ResearchRequestBlindTestCommand,
   ResearchRequestRefTestCommand,
@@ -75,6 +76,8 @@ describe("research CLI commands", () => {
     expect(ResearchWorkerOnceCommand.describe).toContain("worker")
     expect(ResearchWorkerLoopCommand.command).toBe("worker-loop")
     expect(ResearchWorkerLoopCommand.describe).toContain("worker")
+    expect(ResearchPipelineCommand.command).toBe("pipeline <taskID>")
+    expect(ResearchPipelineCommand.describe).toContain("multi-agent")
 
     const registered: string[] = []
     const yargs = {
@@ -95,6 +98,7 @@ describe("research CLI commands", () => {
     expect(registered).toContain("request-shadow-holdout <taskID> <candidateID>")
     expect(registered).toContain("seed-sweep <taskID> <candidateID>")
     expect(registered).toContain("profile <taskID>")
+    expect(registered).toContain("pipeline <taskID>")
     expect(registered).toContain("worker-once")
     expect(registered).toContain("worker-loop")
   })

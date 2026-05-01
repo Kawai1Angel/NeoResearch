@@ -1,15 +1,29 @@
 import { spawnSync } from "node:child_process"
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 
 export type JsonRecord = Record<string, unknown>
+export type ResearchInteractionMode = "companion" | "socratic"
 
 export type ResearchCockpitTask = {
   id: string
   title: string
   domainID: string
   mode: "review" | "autonomous"
-  status: "created" | "profiling" | "baselining" | "researching" | "paused" | "completed" | "failed"
+  status:
+    | "idle"
+    | "created"
+    | "intent_gathering"
+    | "profiling"
+    | "analyzing"
+    | "data_analysis"
+    | "baselining"
+    | "searching"
+    | "researching"
+    | "publishing"
+    | "paused"
+    | "completed"
+    | "failed"
   taskSpec: JsonRecord
   objective: JsonRecord
   budget: JsonRecord
@@ -230,7 +244,7 @@ export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput
   const hasCandidates = input.candidates.length > 0
   const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
   const hasPendingApproval = input.approvals.some((approval) => approval.status === "pending")
-  const hasReport = input.artifacts.some((artifact) => artifact.kind === "research_report_markdown")
+  const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
 
   return [
     {
@@ -259,9 +273,9 @@ export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput
       detail: hasPendingApproval ? "Approval required before promotion." : "Candidate, ref, and blind gates are clear.",
     },
     {
-      label: "Export report",
-      status: hasReport ? "done" : input.champion || hasSucceededRun ? "active" : "todo",
-      detail: hasReport ? "Report artifact available." : "Summarize winner, tradeoffs, and evidence.",
+      label: "Export bundle",
+      status: hasBundle ? "done" : input.champion || hasSucceededRun ? "active" : "todo",
+      detail: hasBundle ? "Final bundle available." : "Package report, results, model code, and weights.",
     },
   ]
 }
@@ -271,7 +285,7 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
   const hasProfile = hasCockpitDatasetProfile(input)
   const hasCandidates = input.candidates.length > 0
   const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
-  const hasReport = input.artifacts.some((artifact) => artifact.kind === "research_report_markdown")
+  const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
   const runnableCandidate = input.candidates.find(canRunResearchCockpitCandidate)
 
   if (!input.task) {
@@ -323,17 +337,17 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
       detail: `Execute ${runnableCandidate.id} and compare the primary metric.`,
     }
   }
-  if (hasSucceededRun && !hasReport) {
+  if (hasSucceededRun && !hasBundle) {
     return {
       action: "export_report",
-      title: "Export research report",
-      detail: "Package the latest evidence into a markdown report.",
+      title: "Export final bundle",
+      detail: "Package the latest evidence, model files, and report into a final bundle.",
     }
   }
   return {
     action: "review_state",
     title: "Review latest research state",
-    detail: hasReport ? "Inspect the exported report and decide whether to continue." : "No immediate blocking action is pending.",
+    detail: hasBundle ? "Inspect the exported bundle and decide whether to continue." : "No immediate blocking action is pending.",
   }
 }
 
@@ -349,7 +363,16 @@ export function researchCockpitArtifactTarget(artifact: ResearchCockpitArtifact)
 
 export function formatResearchCockpitArtifactMetadata(artifact: ResearchCockpitArtifact) {
   let parts: Array<string | undefined> = []
-  if (artifact.kind === "research_report_markdown") {
+  if (artifact.kind === "research_final_bundle") {
+    const champion = metadataString(artifact.metadata, "championCandidateID")
+    const runs = compactValue(artifact.metadata.runCount)
+    const candidates = compactValue(artifact.metadata.candidateCount)
+    parts = [
+      champion ? `champion=${champion}` : undefined,
+      runs ? `runs=${runs}` : undefined,
+      candidates ? `candidates=${candidates}` : undefined,
+    ]
+  } else if (artifact.kind === "research_report_markdown") {
     const metric = metadataString(artifact.metadata, "primaryMetricName")
     const runs = compactValue(artifact.metadata.evaluatedRunCount)
     const multiSeed = compactValue(artifact.metadata.multiSeedCandidateCount)
@@ -445,6 +468,7 @@ function compactValue(value: unknown) {
 }
 
 function metadataString(metadata: JsonRecord, key: string) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined
   const value = metadata[key]
   return typeof value === "string" && value.length > 0 ? value : undefined
 }
@@ -519,6 +543,26 @@ export function formatResearchCockpitProfile(fingerprint: JsonRecord) {
   return parts.length === 0 ? "-" : parts.join(" / ")
 }
 
+export function findBestResearchCockpitMetric(
+  objective: JsonRecord,
+  runs: ResearchCockpitRun[],
+  champion?: ResearchCockpitChampion | null,
+) {
+  const metricName = typeof objective.primaryMetric === "string" ? objective.primaryMetric : "val_avg_mse"
+  if (champion && typeof champion.primaryMetric === "number") {
+    return `best ${metricName}=${formatMetric(champion.primaryMetric)}`
+  }
+  const direction = objective.direction === "maximize" ? "maximize" : "minimize"
+  let best: number | undefined
+  for (const run of runs) {
+    if (run.status !== "succeeded") continue
+    const value = run.metrics[metricName]
+    if (typeof value !== "number" || !Number.isFinite(value)) continue
+    if (best === undefined || (direction === "maximize" ? value > best : value < best)) best = value
+  }
+  return best === undefined ? undefined : `best ${metricName}=${formatMetric(best)}`
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
@@ -585,6 +629,8 @@ export type ResearchCockpitRunnerStatus = {
     | "missing_python"
     | "python_unavailable"
     | "unsupported_python"
+    | "missing_dataset_spec"
+    | "dataset_spec_mismatch"
     | "ready"
   detail: string
 }
@@ -611,6 +657,61 @@ function isSupportedPythonVersion(raw: string) {
 
 function neoCastRuntimePython(root: string) {
   return path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
+}
+
+function optionalNumberArray(value: unknown) {
+  if (!Array.isArray(value)) return undefined
+  const numbers = value.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+  return numbers.length === value.length ? numbers : undefined
+}
+
+function optionalStringArray(value: unknown) {
+  if (!Array.isArray(value)) return undefined
+  const strings = value.filter((item): item is string => typeof item === "string" && item.length > 0)
+  return strings.length === value.length ? strings : undefined
+}
+
+function arrayEquals<T>(left: T[] | undefined, right: T[] | undefined) {
+  if (!left || !right) return true
+  return left.length === right.length && left.every((item, index) => item === right[index])
+}
+
+function readPreparedDatasetSpec(root: string) {
+  const specPaths = [
+    path.join(root, ".neo-cast", "dataset_spec.json"),
+    path.join(root, ".neo-cast", "dataset", "dataset_spec.json"),
+  ]
+  const specPath = specPaths.find((item) => existsSync(item))
+  if (!specPath) return undefined
+  try {
+    const parsed = JSON.parse(readFileSync(specPath, "utf8"))
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as JsonRecord) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function preparedDatasetSpecMatchesTask(task: ResearchCockpitTask, root: string) {
+  const prepared = readPreparedDatasetSpec(root)
+  const taskSpec = asRecord(task.taskSpec)
+  const dataset = asRecord(taskSpec.dataset)
+  const taskDatasetPath = typeof dataset.path === "string" ? path.resolve(dataset.path) : undefined
+  if (!prepared) return taskDatasetPath === undefined
+  const sourceCsv = typeof prepared.source_csv === "string" ? path.resolve(prepared.source_csv) : undefined
+  if (sourceCsv && taskDatasetPath && sourceCsv !== taskDatasetPath) return false
+
+  const inputLen = typeof prepared.input_len === "number" ? prepared.input_len : undefined
+  const contextLength = typeof taskSpec.contextLength === "number" ? taskSpec.contextLength : undefined
+  if (inputLen !== undefined && contextLength !== undefined && inputLen !== contextLength) return false
+
+  if (!arrayEquals(optionalNumberArray(taskSpec.predictionLengths), optionalNumberArray(prepared.horizons))) return false
+  const targets = optionalStringArray(dataset.targetCols)
+  const features = optionalStringArray(prepared.feature_columns)
+  if (targets && features) {
+    const featureSet = new Set(features)
+    if (targets.some((target) => !featureSet.has(target))) return false
+  }
+  return true
 }
 
 export function getResearchCockpitRunnerStatus(
@@ -718,6 +819,16 @@ export function getResearchCockpitRunnerStatus(
       detail: `Neo-Cast requires Python >= 3.10; detected ${versionText || "unknown"}.`,
     }
   }
+  if (!preparedDatasetSpecMatchesTask(task, resolvedRoot)) {
+    return {
+      configured: true,
+      ready: false,
+      root: resolvedRoot,
+      pythonExecutable,
+      reason: "dataset_spec_mismatch",
+      detail: "Neo-Cast prepared dataset_spec.json does not match the selected task.",
+    }
+  }
   return {
     configured: true,
     ready: true,
@@ -755,7 +866,20 @@ export function hasApprovedResearchCockpitApprovalGate(
 }
 
 export function formatResearchCockpitExport(result: ResearchCockpitExportResult) {
-  return `${result.artifact.kind} exported: ${result.path}`
+  const metadata = asRecord(result.artifact.metadata)
+  const champion = metadataString(metadata, "championCandidateID")
+  const metricName = metadataString(metadata, "primaryMetricName")
+  const metricValue = compactValue(metadata.primaryMetricValue)
+  const copiedFiles = Array.isArray(metadata.copiedFiles)
+    ? metadata.copiedFiles.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
+  const parts = [
+    `${result.artifact.kind} exported: ${result.path}`,
+    champion ? `champion=${champion}` : undefined,
+    metricName && metricValue ? `${metricName}=${metricValue}` : undefined,
+    copiedFiles.length > 0 ? `files=${copiedFiles.join(", ")}` : undefined,
+  ].filter((item): item is string => Boolean(item))
+  return parts.join(" / ")
 }
 
 function formatMetric(value: unknown) {
@@ -787,8 +911,19 @@ export function formatResearchCockpitIteration(result: ResearchCockpitIterationR
 
 export function formatResearchCockpitLoop(result: ResearchCockpitLoopResult) {
   const succeeded = result.iterations.filter((iteration) => iteration.run.status === "succeeded").length
+  const bestIteration = result.iterations.find((iteration) => iteration.run.status === "succeeded")
+  const selected = bestIteration ? ` / selected ${bestIteration.candidate.id} / ${primaryMetricText(bestIteration.run.metrics)}` : ""
   const artifact = result.artifact ? ` / artifact ${result.artifact.kind}` : ""
-  return `loop ${result.stoppedReason} / ${result.iterations.length} iterations / ${succeeded} succeeded${artifact}`
+  const iterationLabel = result.iterations.length === 1 ? "iteration" : "iterations"
+  return `loop stopped: ${formatLoopStopReason(result.stoppedReason)} / ${result.iterations.length} ${iterationLabel} / ${succeeded} succeeded${selected}${artifact}`
+}
+
+function formatLoopStopReason(reason: string) {
+  if (reason === "max_iterations") return "reached max iterations"
+  if (reason === "budget_exhausted") return "budget exhausted"
+  if (reason === "no_candidate") return "no runnable candidate"
+  if (reason === "completed") return "completed"
+  return reason.replace(/_/g, " ")
 }
 
 export function formatResearchCockpitSeedSweep(result: ResearchCockpitSeedSweepResult) {
@@ -807,6 +942,10 @@ export type TsfResearchTaskDefaults = {
   contextLength?: number
   predictionLengths?: number[]
   bridgeOnly?: boolean
+  maxRuns?: number
+  maxTrainingSeconds?: number
+  interactionMode?: ResearchInteractionMode
+  metadata?: JsonRecord
 }
 
 export function parseTsfCsvTaskInput(value: string): TsfResearchTaskDefaults | undefined {
@@ -846,9 +985,101 @@ export function parseTsfCsvTaskInput(value: string): TsfResearchTaskDefaults | u
     }
     if (key === "preset" || key === "loader") {
       result.datasetPreset = raw
+      continue
+    }
+    if (key === "max-runs" || key === "runs" || key === "trials" || key === "max-trials") {
+      const maxRuns = Number(raw)
+      if (Number.isFinite(maxRuns) && maxRuns > 0) result.maxRuns = Math.floor(maxRuns)
+      continue
+    }
+    if (key === "time" || key === "time-budget" || key === "seconds" || key === "max-training-seconds") {
+      const seconds = parseDurationSeconds(raw)
+      if (seconds !== undefined) result.maxTrainingSeconds = seconds
     }
   }
   return result
+}
+
+export function validateTsfCsvTaskInput(value: string) {
+  const parts = value.trim().split(/\s+/).filter(Boolean)
+  const datasetPath = parts[0]
+  const errors: string[] = []
+  if (!datasetPath) return ["Enter a CSV dataset path."]
+  if (!/\.csv$/i.test(datasetPath)) {
+    errors.push("Dataset path must point to a .csv file.")
+  } else if (!existsSync(path.resolve(datasetPath))) {
+    errors.push(`Dataset file does not exist: ${path.resolve(datasetPath)}`)
+  }
+  for (const part of parts.slice(1)) {
+    const index = part.indexOf("=")
+    if (index === -1) continue
+    const key = part.slice(0, index).toLowerCase()
+    const raw = part.slice(index + 1)
+    if (key === "horizon" || key === "horizons" || key === "prediction" || key === "predictions") {
+      if (splitNumberOption(raw).length === 0) errors.push("horizon must be a positive integer list.")
+      continue
+    }
+    if (key === "context" || key === "ctx") {
+      const contextLength = Number(raw)
+      if (!Number.isFinite(contextLength) || contextLength <= 0) errors.push("context must be a positive integer.")
+      continue
+    }
+    if (key === "target" || key === "targets") {
+      if (splitCsvOption(raw).length === 0) errors.push("target must include at least one column.")
+      continue
+    }
+    if (key === "max-runs" || key === "runs" || key === "trials" || key === "max-trials") {
+      const maxRuns = Number(raw)
+      if (!Number.isFinite(maxRuns) || maxRuns <= 0) errors.push("runs must be a positive integer.")
+      continue
+    }
+    if (key === "time" || key === "time-budget" || key === "seconds" || key === "max-training-seconds") {
+      if (parseDurationSeconds(raw) === undefined) errors.push("time must be a positive duration like 30s, 5m, or 1h.")
+    }
+  }
+  return errors
+}
+
+function parseDurationSeconds(value: string) {
+  const match = /^(\d+(?:\.\d+)?)(s|sec|m|min|h)?$/i.exec(value.trim())
+  if (!match) return undefined
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount) || amount <= 0) return undefined
+  const unit = (match[2] ?? "s").toLowerCase()
+  const seconds = unit === "h" ? amount * 3600 : unit === "m" || unit === "min" ? amount * 60 : amount
+  return Math.floor(seconds)
+}
+
+function cleanGoalToken(value: string) {
+  return value.replace(/^["'`]+|["'`,.;:]+$/g, "")
+}
+
+function datasetPathFromGoal(value: string) {
+  return value
+    .split(/\s+/)
+    .map(cleanGoalToken)
+    .find((part) => /\.csv$/i.test(part) || /[/\\][^/\\]+\.csv$/i.test(part))
+}
+
+function goalTitle(value: string, defaults: TsfResearchTaskDefaults) {
+  const datasetName =
+    defaults.datasetPath === undefined
+      ? "TSF"
+      : path.basename(defaults.datasetPath).replace(/\.[^.]+$/, "") || "TSF"
+  const horizons = defaults.predictionLengths?.length ? ` horizon ${defaults.predictionLengths.join(",")}` : ""
+  const action = /\bforecast\b/i.test(value) ? "Forecast" : "TSF Research"
+  return `${action} ${datasetName}${horizons}`
+}
+
+export function parseTsfResearchGoalInput(value: string): TsfResearchTaskDefaults {
+  const datasetPath = datasetPathFromGoal(value)
+  const csvLike = datasetPath === undefined ? undefined : parseTsfCsvTaskInput([datasetPath, ...value.split(/\s+/)].join(" "))
+  const defaults: TsfResearchTaskDefaults = {
+    ...(csvLike ?? {}),
+    ...(datasetPath === undefined ? {} : { datasetPath }),
+    metadata: { userPrompt: value },
+  }
+  return defaults
 }
 
 function splitCsvOption(value: string) {
@@ -878,12 +1109,94 @@ function nonEmpty(value: string | undefined) {
   return trimmed && trimmed.length > 0 ? trimmed : undefined
 }
 
+export function interactionModeForTaskMode(mode: ResearchCockpitTask["mode"]): ResearchInteractionMode {
+  return mode === "review" ? "companion" : "socratic"
+}
+
+export function interactionModeForTask(task: ResearchCockpitTask | undefined): ResearchInteractionMode | undefined {
+  if (!task) return undefined
+  const metadata = task.taskSpec.metadata
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+    const value = (metadata as JsonRecord).interactionMode
+    if (value === "companion" || value === "socratic") return value
+  }
+  return interactionModeForTaskMode(task.mode)
+}
+
+export type SocraticClarificationState = {
+  active: boolean
+  missingSlots: string[]
+  nextQuestion?: string
+  questionCount: number
+}
+
+export function buildSocraticClarificationState(
+  task: ResearchCockpitTask | undefined,
+  approvals: ResearchCockpitApproval[],
+): SocraticClarificationState {
+  if (interactionModeForTask(task) !== "socratic") return { active: false, missingSlots: [], questionCount: 0 }
+  const approval = approvals.find(
+    (item) =>
+      item.status === "pending" &&
+      item.kind === "protocol" &&
+      /Intent clarification required/i.test(item.reason),
+  )
+  if (!approval) return { active: false, missingSlots: [], questionCount: 0 }
+  const questions = approval.reason
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("- "))
+    .map((line) => line.slice(2).trim())
+    .filter(Boolean)
+  return {
+    active: true,
+    missingSlots: questions.map(slotFromSocraticQuestion),
+    nextQuestion: questions[0],
+    questionCount: questions.length,
+  }
+}
+
+function slotFromSocraticQuestion(question: string) {
+  if (/dataset path|csv dataset/i.test(question)) return "dataset.path"
+  if (/target columns|target/i.test(question)) return "dataset.targetCols"
+  if (/horizon|prediction/i.test(question)) return "predictionLengths"
+  if (/metric|objective/i.test(question)) return "objective.primaryMetric"
+  return "unknown"
+}
+
+export function researchInteractionModeLabel(mode: ResearchInteractionMode | undefined) {
+  if (mode === "companion") return "认知伴随"
+  if (mode === "socratic") return "苏格拉底"
+  return "未选择"
+}
+
+export function taskModeForInteractionMode(mode: ResearchInteractionMode): ResearchCockpitTask["mode"] {
+  return mode === "companion" ? "review" : "autonomous"
+}
+
+export function parseResearchInteractionModeInput(value: string | undefined): ResearchInteractionMode | undefined {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized) return undefined
+  if (["1", "c", "companion", "cognitive"].includes(normalized)) return "companion"
+  if (["2", "s", "socratic", "socrates"].includes(normalized)) return "socratic"
+  return undefined
+}
+
 export function buildDefaultTsfResearchTask(
   mode: ResearchCockpitTask["mode"],
   neoCastProjectRoot?: string,
   defaults: TsfResearchTaskDefaults = {},
 ): CreateResearchTaskInput {
   const datasetPath = nonEmpty(defaults.datasetPath)
+  const interactionMode = defaults.interactionMode ?? interactionModeForTaskMode(mode)
+  const metadata: JsonRecord = {
+    ...(defaults.metadata ?? {}),
+    interactionMode,
+  }
+  const constraints: JsonRecord = {
+    ...(defaults.maxTrainingSeconds === undefined ? {} : { maxTrainingSeconds: defaults.maxTrainingSeconds }),
+    ...(defaults.maxRuns === undefined ? {} : { maxTrials: defaults.maxRuns }),
+  }
   return {
     title: mode === "review" ? "TSF Review Research" : "TSF Autonomous Research",
     domainID: "tsf",
@@ -897,6 +1210,8 @@ export function buildDefaultTsfResearchTask(
         ...(datasetPath ? { path: datasetPath } : {}),
         targetCols: defaults.targetCols && defaults.targetCols.length > 0 ? defaults.targetCols : ["OT"],
       },
+      ...(Object.keys(constraints).length === 0 ? {} : { constraints }),
+      metadata,
       runtime: tsfRuntime(neoCastProjectRoot, defaults.bridgeOnly ?? true),
     },
     objective: {
@@ -904,8 +1219,32 @@ export function buildDefaultTsfResearchTask(
       direction: "minimize",
     },
     budget: {
-      maxRuns: 12,
+      maxRuns: defaults.maxRuns ?? 12,
       maxParallel: 1,
+      ...(defaults.maxTrainingSeconds === undefined
+        ? {}
+        : { loop: { timeBudgetSeconds: defaults.maxTrainingSeconds } }),
     },
+  }
+}
+
+export function buildDefaultTsfResearchTaskFromGoal(
+  goal: string,
+  mode: ResearchCockpitTask["mode"],
+  neoCastProjectRoot?: string,
+  overrides: TsfResearchTaskDefaults = {},
+) {
+  const parsed = parseTsfResearchGoalInput(goal)
+  const defaults: TsfResearchTaskDefaults = {
+    ...parsed,
+    ...overrides,
+    metadata: {
+      ...(parsed.metadata ?? {}),
+      ...(overrides.metadata ?? {}),
+    },
+  }
+  return {
+    ...buildDefaultTsfResearchTask(mode, neoCastProjectRoot, defaults),
+    title: goalTitle(goal, defaults),
   }
 }

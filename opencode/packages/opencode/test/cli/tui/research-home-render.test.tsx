@@ -29,7 +29,7 @@ const API_KEY_ENV_KEYS = [
   "AIGCBEST_API_KEY",
   "ANTHROPIC_API_KEY",
 ]
-const HOME_READY_TEXT = "Autonomous TSF research workspace"
+const HOME_READY_TEXT = "Make Small Model Creation Simple"
 
 async function withClearedApiKeyEnv<T>(fn: () => Promise<T>) {
   const previous = new Map(API_KEY_ENV_KEYS.map((key) => [key, process.env[key]]))
@@ -235,17 +235,17 @@ describe("NeoResearch home launcher", () => {
     expect(hasNeoResearchApiKey({ ANTHROPIC_API_KEY: "anthropic-key" })).toBe(true)
   })
 
-  test("shows the Neo-Cast API key setup panel on first entry when no model key is configured", async () => {
+  test("opens the API key setup dialog on first entry when no model key is configured", async () => {
     await withClearedApiKeyEnv(async () => {
       await setupKv()
 
       const app = await testRender(() => <SyncedHomeHarness />, { width: 140, height: 36 })
 
       try {
-        const frame = await waitForFrame(app, "NEO_CAST_LLM_API_KEY")
+        const frame = await waitForFrame(app, "Connect a provider")
 
-        expect(frame).toContain("Configure API Key")
-        expect(frame).toContain("Show Setup Hint")
+        expect(frame).toContain("OpenAI")
+        expect(frame).toContain("API key")
       } finally {
         app.renderer.destroy()
       }
@@ -281,7 +281,7 @@ describe("NeoResearch home launcher", () => {
       })
 
       try {
-        await waitForFrame(app, "NEO_CAST_LLM_API_KEY")
+        await waitForFrame(app, "Connect a provider")
         command?.trigger("research.provider.configure")
         const frame = await waitForFrame(app, "Connect a provider")
 
@@ -300,14 +300,22 @@ describe("NeoResearch home launcher", () => {
     try {
       const frame = await waitForFrame(app, HOME_READY_TEXT)
 
-      expect(frame).toContain('Ask research goal... "Forecast ETTh1 horizon=24"')
-      expect(frame).toContain("Planner  Research Agent")
+      expect(frame).toContain(" _   _            ____")
+      expect(frame).toContain("Ask for a recommendation, approve a checkpoint, or export the bundle...")
+      expect(frame).toContain("认知伴随 Intent Agent Research Agent")
+      expect(frame).not.toContain("NeoResearch: Making Time-series Model Creation Simple")
+      expect(frame).not.toContain("Planner  Research Agent")
       expect(frame).toContain("New CSV Task")
       expect(frame).toContain("Open Cockpit")
       expect(frame).toContain("Run Doctor")
-      expect(frame).toContain("enter submit")
-      expect(frame).toContain("ctrl+p api-key / cockpit / csv / doctor")
-      expect(frame).toContain("doctor env")
+      expect(frame).toContain("Configure API Key")
+      expect(frame).not.toContain("Quick Start")
+      expect(frame).not.toContain("1 New CSV Task")
+      expect(frame).not.toContain("3 run /next in Cockpit")
+      expect(frame).not.toContain("Designed for Research OS")
+      expect(frame).not.toContain("enter submit")
+      expect(frame).not.toContain("ctrl+p api-key / cockpit / csv / doctor")
+      expect(frame).not.toContain("doctor env")
       expect(frame).not.toContain("Research Tasks")
       expect(frame).not.toContain("[ ] Auto Mode")
       expect(frame).not.toContain("Resume Last Task")
@@ -317,7 +325,7 @@ describe("NeoResearch home launcher", () => {
     }
   })
 
-  test("renders the NeoResearch brand as a four-times larger banner", async () => {
+  test("renders the launcher without the legacy NeoCast ASCII banner", async () => {
     await setupKv()
 
     const app = await testRender(() => <HomeHarness />, { width: 160, height: 40 })
@@ -325,15 +333,18 @@ describe("NeoResearch home launcher", () => {
     try {
       const frame = await waitForFrame(app, HOME_READY_TEXT)
 
-      expect(frame).toContain("N   N EEEE  OOO  RRR  EEEE  SSS  EEEE  A   RRR   CCC H  H")
-      expect(frame).toContain("N N N EEE  O   O RRR  EEE   SSS  EEE  AAA  RRR  C    HHHH")
+      expect(frame).toContain(HOME_READY_TEXT)
+      expect(frame).not.toContain("N   N EEEE  OOO   CCC   A   SSS  TTTTT")
+      expect(frame).not.toContain("N N N EEE  O   O C    AAAAA SSS    T")
+      expect(frame).not.toContain("N   N EEEE  OOO  RRR  EEEE  SSS  EEEE  A   RRR   CCC H  H")
+      expect(frame).not.toContain("N N N EEE  O   O RRR  EEE   SSS  EEE  AAA  RRR  C    HHHH")
       expect(frame).not.toContain("\n                                      NEORESEARCH")
     } finally {
       app.renderer.destroy()
     }
   })
 
-  test("hides API key setup actions after a model key is configured", async () => {
+  test("keeps the API key entry after a model key is configured without showing the setup panel", async () => {
     await withApiKeyEnv(async () => {
       await setupKv()
 
@@ -342,7 +353,7 @@ describe("NeoResearch home launcher", () => {
       try {
         const frame = await waitForFrame(app, HOME_READY_TEXT)
 
-        expect(frame).not.toContain("Configure API Key")
+        expect(frame).toContain("Configure API Key")
         expect(frame).not.toContain("Show Setup Hint")
         expect(frame).toContain("New CSV Task")
       } finally {
@@ -431,7 +442,7 @@ describe("NeoResearch home launcher", () => {
     }
   })
 
-  test("positions the launcher slash popup directly under the input", async () => {
+  test("keeps the launcher slash popup rows aligned", async () => {
     await setupKv()
 
     const app = await testRender(() => <HomeHarness />, { width: 160, height: 48 })
@@ -441,13 +452,11 @@ describe("NeoResearch home launcher", () => {
       await app.mockInput.typeText("/")
       await app.renderOnce()
       const frame = app.captureCharFrame()
-      const inputLine = frameLine(
-        frame,
-        (line) => line.includes("/") && !line.includes("/cockpit") && !line.includes("ctrl+p"),
-      )
       const commandLine = frameLine(frame, (line) => line.includes("Commands"))
+      const lines = frame.split("\n")
+      const optionLine = frameLine(frame, (line) => line.includes("/cockpit") && !line.includes("Selected"))
 
-      expect(commandLine - inputLine).toBeLessThanOrEqual(2)
+      expect(lines[optionLine]!.indexOf("/cockpit")).toBe(lines[commandLine]!.indexOf("Commands"))
     } finally {
       app.renderer.destroy()
     }

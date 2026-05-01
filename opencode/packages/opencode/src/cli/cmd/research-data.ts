@@ -4,6 +4,7 @@ import type { Research } from "@/research"
 import type { ResearchWorkerOnceResult } from "@/research/runtime"
 
 export type ResearchOutputFormat = "table" | "json"
+export type ResearchInteractionMode = "companion" | "socratic"
 
 export type TsfResearchTaskDefaults = {
   datasetPath?: string
@@ -12,6 +13,10 @@ export type TsfResearchTaskDefaults = {
   contextLength?: number
   predictionLengths?: number[]
   bridgeOnly?: boolean
+  maxRuns?: number
+  maxTrainingSeconds?: number
+  interactionMode?: ResearchInteractionMode
+  metadata?: Research.JsonRecord
 }
 
 function nonEmpty(value: string | undefined) {
@@ -19,9 +24,26 @@ function nonEmpty(value: string | undefined) {
   return trimmed && trimmed.length > 0 ? trimmed : undefined
 }
 
+export function interactionModeForResearchMode(mode: Research.ResearchMode): ResearchInteractionMode {
+  return mode === "review" ? "companion" : "socratic"
+}
+
+export function researchModeForInteractionMode(mode: ResearchInteractionMode): Research.ResearchMode {
+  return mode === "companion" ? "review" : "autonomous"
+}
+
 function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: string }): Research.JsonRecord {
   const root = nonEmpty(input.neoCastProjectRoot)
   const datasetPath = nonEmpty(input.datasetPath)
+  const interactionMode = input.interactionMode ?? "companion"
+  const metadata: Research.JsonRecord = {
+    ...(input.metadata ?? {}),
+    interactionMode,
+  }
+  const constraints = {
+    ...(input.maxTrainingSeconds === undefined ? {} : { maxTrainingSeconds: input.maxTrainingSeconds }),
+    ...(input.maxRuns === undefined ? {} : { maxTrials: input.maxRuns }),
+  }
   return {
     contextLength: input.contextLength ?? 96,
     predictionLengths: input.predictionLengths && input.predictionLengths.length > 0 ? input.predictionLengths : [24],
@@ -30,6 +52,8 @@ function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: str
       ...(datasetPath ? { path: datasetPath } : {}),
       targetCols: input.targetCols && input.targetCols.length > 0 ? input.targetCols : ["OT"],
     },
+    ...(Object.keys(constraints).length === 0 ? {} : { constraints }),
+    metadata,
     runtime: {
       bridgeOnly: input.bridgeOnly ?? true,
       ...(root ? { neoCastProjectRoot: root } : {}),
@@ -42,20 +66,123 @@ export function buildDefaultTsfResearchTaskInput(input: {
   title?: string
   neoCastProjectRoot?: string
 } & TsfResearchTaskDefaults): Research.CreateTaskInput {
+  const interactionMode = input.interactionMode ?? interactionModeForResearchMode(input.mode)
+  const mode = researchModeForInteractionMode(interactionMode)
   return {
-    title: input.title ?? (input.mode === "review" ? "TSF Review Research" : "TSF Autonomous Research"),
+    title: input.title ?? (mode === "review" ? "TSF Review Research" : "TSF Autonomous Research"),
     domainID: "tsf",
-    mode: input.mode,
-    taskSpec: tsfTaskSpec(input),
+    mode,
+    taskSpec: tsfTaskSpec({ ...input, interactionMode }),
     objective: {
       primaryMetric: "val_avg_mse",
       direction: "minimize",
     },
     budget: {
-      maxRuns: 12,
+      maxRuns: input.maxRuns ?? 12,
       maxParallel: 1,
+      ...(input.maxTrainingSeconds === undefined ? {} : { loop: { timeBudgetSeconds: input.maxTrainingSeconds } }),
     },
   } as Research.CreateTaskInput
+}
+
+function splitCsvOption(value: string) {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+}
+
+function splitNumberOption(value: string) {
+  return splitCsvOption(value)
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && item > 0)
+    .map((item) => Math.floor(item))
+}
+
+function parseDurationSeconds(value: string) {
+  const match = /^(\d+(?:\.\d+)?)(s|sec|m|min|h)?$/i.exec(value.trim())
+  if (!match) return undefined
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount) || amount <= 0) return undefined
+  const unit = (match[2] ?? "s").toLowerCase()
+  return Math.floor(unit === "h" ? amount * 3600 : unit === "m" || unit === "min" ? amount * 60 : amount)
+}
+
+function cleanGoalToken(value: string) {
+  return value.replace(/^["'`]+|["'`,.;:]+$/g, "")
+}
+
+function datasetPathFromGoal(value: string) {
+  return value
+    .split(/\s+/)
+    .map(cleanGoalToken)
+    .find((part) => /\.csv$/i.test(part) || /[/\\][^/\\]+\.csv$/i.test(part))
+}
+
+export function parseTsfResearchGoalInput(value: string): TsfResearchTaskDefaults {
+  const parts = value.trim().split(/\s+/).filter(Boolean)
+  const datasetPath = datasetPathFromGoal(value)
+  const result: TsfResearchTaskDefaults = {
+    ...(datasetPath === undefined ? {} : { datasetPath }),
+    metadata: { userPrompt: value },
+  }
+  for (const part of parts) {
+    const cleaned = cleanGoalToken(part)
+    if (cleaned === "full") {
+      result.bridgeOnly = false
+      continue
+    }
+    if (cleaned === "bridge") {
+      result.bridgeOnly = true
+      continue
+    }
+    const index = cleaned.indexOf("=")
+    if (index === -1) continue
+    const key = cleaned.slice(0, index).toLowerCase()
+    const raw = cleaned.slice(index + 1)
+    if (!raw) continue
+    if (key === "target" || key === "targets") result.targetCols = splitCsvOption(raw)
+    else if (key === "horizon" || key === "horizons" || key === "prediction" || key === "predictions") {
+      result.predictionLengths = splitNumberOption(raw)
+    } else if (key === "context" || key === "ctx") {
+      const context = Number(raw)
+      if (Number.isFinite(context) && context > 0) result.contextLength = Math.floor(context)
+    } else if (key === "preset" || key === "loader") result.datasetPreset = raw
+    else if (key === "max-runs" || key === "runs" || key === "trials" || key === "max-trials") {
+      const runs = Number(raw)
+      if (Number.isFinite(runs) && runs > 0) result.maxRuns = Math.floor(runs)
+    } else if (key === "time" || key === "time-budget" || key === "seconds" || key === "max-training-seconds") {
+      result.maxTrainingSeconds = parseDurationSeconds(raw)
+    }
+  }
+  return result
+}
+
+function goalTitle(value: string, defaults: TsfResearchTaskDefaults) {
+  const datasetName =
+    defaults.datasetPath === undefined
+      ? "TSF"
+      : defaults.datasetPath.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "TSF"
+  const horizons = defaults.predictionLengths?.length ? ` horizon ${defaults.predictionLengths.join(",")}` : ""
+  const action = /\bforecast\b/i.test(value) ? "Forecast" : "TSF Research"
+  return `${action} ${datasetName}${horizons}`
+}
+
+export function buildDefaultTsfResearchTaskInputFromGoal(input: {
+  goal: string
+  mode: Research.ResearchMode
+  title?: string
+  neoCastProjectRoot?: string
+  interactionMode?: ResearchInteractionMode
+}) {
+  const defaults = parseTsfResearchGoalInput(input.goal)
+  return buildDefaultTsfResearchTaskInput({
+    ...defaults,
+    mode: input.mode,
+    interactionMode: input.interactionMode ?? interactionModeForResearchMode(input.mode),
+    title: input.title ?? goalTitle(input.goal, defaults),
+    neoCastProjectRoot: input.neoCastProjectRoot,
+  })
 }
 
 function pad(value: string, width: number) {

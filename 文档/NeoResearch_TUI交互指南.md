@@ -23,7 +23,7 @@ Home 输入研究目标或创建 CSV Task
   → 配置 runner
   → /next 或 /agent-loop 开始实验
   → 查看 Candidate / Run / Champion
-  → Export Report
+  → Export Bundle
 ```
 
 ---
@@ -49,9 +49,10 @@ Forecast ETTh1 horizon=24 target=OT context=96
 结果：
 
 1. TUI 进入 Cockpit。
-2. 系统创建一个 `autonomous` research task。
-3. 如果 Neo-Cast runner 已就绪，会自动提交第一轮 research iteration。
-4. 如果 runner 未就绪，只创建任务，不会强行启动失败的实验。
+2. 系统先弹出 `Interaction mode`，要求选择交互模式。
+3. 选择 `1 companion` 会创建偏人工确认的 `review` task；选择 `2 socratic` 会创建偏自主执行的 `autonomous` task。
+4. 如果选择 `socratic` 且 Neo-Cast runner 已就绪，会自动进入 prepare/profile/loop 流程。
+5. 如果 runner 未就绪，只创建任务，不会强行启动失败的实验。
 
 适合场景：
 
@@ -66,7 +67,7 @@ Forecast ETTh1 horizon=24 target=OT context=96
 /csv
 ```
 
-进入 Cockpit 后会弹出 `CSV dataset path` 输入框，填写：
+进入 Cockpit 后会先弹出 `Interaction mode`，选择模式后再弹出 `CSV dataset path` 输入框，填写：
 
 ```text
 /path/to/ETTh1.csv target=OT horizon=24 context=96 full
@@ -169,6 +170,30 @@ Cockpit 左侧是主工作区，右侧是状态栏。
 
 ### 4.1 顶部导航栏
 
+顶部导航栏位于 Cockpit 主区域最上方，分两行阅读：
+
+```text
+NeoResearch Workspace
+Home alt+h  Previous Task ^K  Next Task ^J  New CSV Task ^N  Seed Baselines ^B  Agent Loop ^L  Export Bundle ^E
+```
+
+第一行是当前位置标题，表示你正在 Cockpit 工作区。第二行是全局操作入口，按从左到右的顺序分成四组：
+
+| 区域 | 入口 | 用途 |
+|---|---|---|
+| 返回 | `Home alt+h` | 回到 Home 启动页。适合重新输入研究目标、打开 doctor 或创建新任务。 |
+| 任务切换 | `Previous Task ^K`、`Next Task ^J` | 在已有 research tasks 之间切换。右侧 `Task N/M` 会同步变化。 |
+| 任务/候选生成 | `New CSV Task ^N`、`Seed Baselines ^B` | 创建新的 CSV 任务，或给当前任务生成 baseline candidates。 |
+| 自动化/导出 | `Agent Loop ^L`、`Export Bundle ^E` | 启动 autonomous loop，或导出当前研究 bundle。 |
+
+导航项的显示规则：
+
+- 橙色：当前可以执行，可以点击，也可以按对应快捷键。
+- 灰色：当前条件不足，入口会保留但不会执行。例如没有 task 时 `Seed Baselines` 会灰掉；runner 未 ready 时 `Agent Loop` 会灰掉。
+- 文案中的 `^K`、`^J`、`^N`、`^B`、`^L`、`^E` 分别表示 `ctrl+k`、`ctrl+j`、`ctrl+n`、`ctrl+b`、`ctrl+l`、`ctrl+e`。
+- `alt+h` 用于返回 Home。这里不用 `ctrl+h`，因为很多终端会把 `ctrl+h` 当成 Backspace。
+- 顶部导航是“常用快捷入口”；同样的能力也可以通过 `ctrl+p` 命令面板或 slash 命令执行。
+
 顶部常见操作：
 
 | 操作 | 快捷键 | 含义 |
@@ -176,10 +201,10 @@ Cockpit 左侧是主工作区，右侧是状态栏。
 | Home | `alt+h` | 返回 Home。 |
 | Previous Task | `ctrl+k` | 切换到上一个 task。 |
 | Next Task | `ctrl+j` | 切换到下一个 task。 |
-| New CSV Task | `ctrl+n` | 创建 CSV task。 |
+| New CSV Task | `ctrl+n` | 先选择交互模式，再创建 CSV task。 |
 | Seed Baselines | `ctrl+b` | 为当前任务生成 baseline candidates。 |
 | Agent Loop | `ctrl+l` | 启动 autonomous loop。 |
-| Export Report | `ctrl+e` | 导出研究报告。 |
+| Export Bundle | `ctrl+e` | 导出当前研究 bundle。 |
 
 注意：旧文档中出现过 `ctrl+h`、`ctrl+[`、`ctrl+]`，这些和终端 Backspace / Esc 存在冲突。当前交互应使用 `alt+h`、`alt+left`、`alt+right`。
 
@@ -262,8 +287,8 @@ pending approval
 |---|---|
 | `/task` | 创建 autonomous TSF task。别名：`/autonomous`。 |
 | `/task-full` | 创建 full-recipe autonomous task。别名：`/autonomous-full`。 |
-| `/csv` | 从 CSV 创建 autonomous task。别名：`/dataset`。 |
-| `/csv-full` | 从 CSV 创建 full-recipe autonomous task。别名：`/dataset-full`。 |
+| `/csv` | 先选择交互模式，再从 CSV 创建 task。别名：`/dataset`。 |
+| `/csv-full` | 先选择交互模式，再从 CSV 创建 full-recipe task。别名：`/dataset-full`。 |
 | `/review` | 创建 review task。 |
 | `/review-full` | 创建 full-recipe review task。 |
 | `/review-csv` | 从 CSV 创建 review task。 |
@@ -505,7 +530,7 @@ node ./bin/neo-cast.js init-runtime
 | `ctrl+n` | Cockpit | 新建 CSV task；在 slash menu 中也可向下选择。 |
 | `ctrl+b` | Cockpit | Seed Baselines。 |
 | `ctrl+l` | Cockpit | Agent Loop。 |
-| `ctrl+e` | Cockpit | Export Report。 |
+| `ctrl+e` | Cockpit | Export Bundle。 |
 | `ctrl+j` | Cockpit | 下一个 task。 |
 | `ctrl+k` | Cockpit | 上一个 task。 |
 | `alt+h` | Cockpit | 返回 Home。 |
@@ -541,4 +566,3 @@ Home 输入研究目标 → Enter → Cockpit 执行 /next
 ```text
 /use-project-runner
 ```
-

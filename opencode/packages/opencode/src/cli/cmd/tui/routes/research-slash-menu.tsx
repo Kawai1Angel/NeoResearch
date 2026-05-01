@@ -101,9 +101,21 @@ function slashNames(option: SlashOption) {
   return [option.display, ...(option.aliases ?? [])].map((value) => value.trim().toLowerCase())
 }
 
+function slashMatchRank(option: SlashOption, query: string) {
+  const names = slashNames(option)
+  if (names.some((name) => name.startsWith(`/${query}`) || name.startsWith(query))) return 0
+  if (names.some((name) => name.includes(query))) return 1
+  return 2
+}
+
 function rankOptions(options: SlashOption[], query: string) {
   if (query.length > 0) {
-    return options.sort((a, b) => priority(a) - priority(b) || a.display.localeCompare(b.display))
+    return options.sort(
+      (a, b) =>
+        slashMatchRank(a, query) - slashMatchRank(b, query) ||
+        priority(a) - priority(b) ||
+        a.display.localeCompare(b.display),
+    )
   }
 
   const byDisplay = new Map(options.map((option) => [option.display.trim().toLowerCase(), option]))
@@ -280,7 +292,7 @@ export function ResearchSlashMenu(props: {
         paddingRight={1}
         gap={0}
       >
-        <box height={1} flexDirection="row" gap={2}>
+        <box height={1} width="100%" flexDirection="row" gap={2}>
           <text fg={props.colors.primary} attributes={TextAttributes.BOLD}>
             Commands
           </text>
@@ -299,6 +311,7 @@ export function ResearchSlashMenu(props: {
           {(option, index) => (
             <box
               height={1}
+              width="100%"
               flexDirection="row"
               gap={2}
               backgroundColor={windowStart() + index() === selectedIndex() ? props.colors.primary : undefined}

@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
-const { _buildSystemPrompt, _ensureCandidateDefaults } = require("../src/llm");
+const { _buildSystemPrompt, _ensureCandidateDefaults, generateCandidate } = require("../src/llm");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 
@@ -103,4 +103,39 @@ test("LLM candidate defaults complete required frequency embedding fields", () =
 
   assert.equal(candidate.embedding.n_freq, 16);
   assert.equal(candidate.embedding.complex_mode, "magnitude");
+});
+
+test("OpenAI-compatible candidate generation honors llm timeout", async () => {
+  const originalFetch = global.fetch;
+  const originalKey = process.env.NEO_CAST_LLM_API_KEY;
+  process.env.NEO_CAST_LLM_API_KEY = "test-key";
+
+  let sawAbort = false;
+  global.fetch = async (_url, options = {}) => new Promise((_resolve, reject) => {
+    options.signal?.addEventListener("abort", () => {
+      sawAbort = true;
+      const error = new Error("aborted by timeout");
+      error.name = "AbortError";
+      reject(error);
+    });
+  });
+
+  try {
+    const result = await Promise.race([
+      generateCandidate(
+        "fast timeout test",
+        [],
+        { llm: { provider: "openai-compatible", base_url: "https://example.invalid/v1", model: "test", timeout_seconds: 0.01 } },
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("timed_out"), 75)),
+    ]);
+
+    assert.notEqual(result, "timed_out");
+    assert.equal(sawAbort, true);
+    assert.match(result.source, /^heuristic_fallback:/);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.NEO_CAST_LLM_API_KEY;
+    else process.env.NEO_CAST_LLM_API_KEY = originalKey;
+  }
 });

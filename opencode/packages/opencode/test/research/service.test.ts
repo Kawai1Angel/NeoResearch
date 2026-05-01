@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Cause, Effect, Layer } from "effect"
 import { mkdir, mkdtemp, readFile, writeFile } from "fs/promises"
 import { tmpdir as osTmpdir } from "os"
+import { Bus } from "../../src/bus"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
@@ -13,15 +14,22 @@ function runResearch<A, E>(fx: Effect.Effect<A, E, Research.Service>) {
   return Effect.runPromise(fx.pipe(Effect.provide(Research.defaultLayer)))
 }
 
+function runResearchWithBus<A, E>(fx: Effect.Effect<A, E, Research.Service | Bus.Service>) {
+  return Effect.runPromise(fx.pipe(Effect.provide(Research.layer.pipe(Layer.provideMerge(Bus.layer)))))
+}
+
 function validTsfTaskSpec(runtime: Research.JsonRecord = {}) {
+  const datasetPath = typeof runtime.datasetPath === "string" ? runtime.datasetPath : undefined
+  const { datasetPath: _datasetPath, ...runnerRuntime } = runtime
   return {
     contextLength: 96,
     predictionLengths: [24],
     dataset: {
       loaderID: "etth1_tslib_v1",
+      ...(datasetPath === undefined ? {} : { path: datasetPath }),
       targetCols: ["OT"],
     },
-    runtime,
+    runtime: runnerRuntime,
   }
 }
 
@@ -137,6 +145,14 @@ mkdir -p .neo-cast/artifacts/run_fake
 cat > .neo-cast/artifacts/run_fake/val_metrics.json <<'JSON'
 {"val_avg_mse":0.123,"val_avg_mae":0.456}
 JSON
+cat > .neo-cast/artifacts/run_fake/model_impl.py <<'PY'
+class Model:
+    pass
+PY
+cat > .neo-cast/artifacts/run_fake/inference.py <<'PY'
+def predict(rows):
+    return rows
+PY
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"smoke_eval_done","val_avg_mse":0.123,"val_avg_mae":0.456}\\n'
 printf '{"event":"artifact_ready","run_id":"fake","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_fake"
@@ -156,6 +172,60 @@ printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"runner_error","error_kind":"runner_exit"}\\n'
 printf 'runner failed before artifact creation\\n' >&2
 exit 7
+`,
+    "utf8",
+  )
+}
+
+async function writeMetriclessNeoCastRunner(root: string) {
+  await mkdir(path.join(root, "py"), { recursive: true })
+  await writeFile(
+    path.join(root, "py", "validate.py"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p .neo-cast/artifacts/run_metricless
+printf '{"event":"candidate_resolved"}\\n'
+printf '{"event":"smoke_eval_done"}\\n'
+printf '{"event":"artifact_ready","run_id":"metricless","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_metricless"
+printf '{"event":"done","status":"success"}\\n'
+`,
+    "utf8",
+  )
+}
+
+async function writePrepareDataNeoCastRunner(root: string) {
+  await mkdir(path.join(root, "bin"), { recursive: true })
+  await writeFile(
+    path.join(root, "bin", "neo-cast.js"),
+    `const fs = require("fs")
+const path = require("path")
+const args = process.argv.slice(2)
+if (args[0] !== "prepare-data") process.exit(9)
+function value(flag) {
+  const index = args.indexOf(flag)
+  return index === -1 ? undefined : args[index + 1]
+}
+const source = value("--source")
+const inputLen = Number(value("--input-len") || 96)
+const horizons = String(value("--horizons") || "24").split(",").map((item) => Number(item))
+const featureColumns = String(value("--feature-cols") || "OT").split(",").filter(Boolean)
+fs.mkdirSync(".neo-cast/dataset", { recursive: true })
+const spec = {
+  schema_version: "dataset.v1",
+  source_csv: path.resolve(source),
+  task_id: value("--task-id") || "local_csv",
+  timestamp_col: "date",
+  feature_columns: featureColumns,
+  input_len: inputLen,
+  horizons,
+  splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
+  normalization: { type: "standard", fit_split: "train" },
+  missing: { strategy: "forward_fill", limit: null },
+  time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 }
+}
+fs.writeFileSync(".neo-cast/dataset_spec.json", JSON.stringify(spec, null, 2) + "\\n")
+fs.writeFileSync(".neo-cast/dataset/dataset_spec.json", JSON.stringify(spec, null, 2) + "\\n")
+console.log(JSON.stringify({ event: "dataset_prepared", source_csv: spec.source_csv, input_len: inputLen, horizons }))
 `,
     "utf8",
   )
@@ -232,6 +302,14 @@ afterEach(async () => {
 })
 
 describe("Research service", () => {
+  test("exposes multi-agent task statuses and export artifact kinds", () => {
+    for (const status of ["idle", "intent_gathering", "analyzing", "data_analysis", "searching", "publishing"]) {
+      expect(Research.ResearchTaskStatus.zod.safeParse(status).success).toBe(true)
+    }
+    expect(Research.ExportArtifactKind.zod.safeParse("dataset_analysis_report").success).toBe(true)
+    expect(Research.ExportArtifactKind.zod.safeParse("model_export_package").success).toBe(true)
+  })
+
   test("manages research tasks, candidates, runs, artifacts, champions, and memory", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
@@ -251,7 +329,7 @@ describe("Research service", () => {
           ),
         )
         expect(task.id).toStartWith("rtsk_")
-        expect(task.status).toBe("created")
+        expect(task.status).toBe("idle")
 
         const tasks = await runResearch(Research.Service.use((svc) => svc.listTasks({ domainID: "tsf" })))
         expect(tasks.map((item) => item.id)).toContain(task.id)
@@ -389,6 +467,280 @@ describe("Research service", () => {
         expect(persisted.fingerprint.datasetProfile.crossVarCorrelation).toBeGreaterThan(0.8)
         const runs = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
         expect(runs.map((run) => run.id)).toContain(result.run.id)
+        const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        const analysisArtifacts = artifacts.filter((artifact) => artifact.runID === result.run.id)
+        expect(analysisArtifacts.map((artifact) => artifact.kind).sort()).toEqual([
+          "dataset_analysis_report",
+          "dataset_main_analysis_markdown",
+          "dataset_qualitative_analysis_markdown",
+          "dataset_quantitative_analysis_markdown",
+          "task_profile_json",
+        ])
+        expect(result.run.artifactRefs).toEqual(expect.arrayContaining(analysisArtifacts.map((artifact) => artifact.id)))
+        const mainSummary = analysisArtifacts.find((artifact) => artifact.kind === "dataset_main_analysis_markdown")
+        expect(mainSummary).toBeDefined()
+        const summaryPath = mainSummary!.uri.replace(/^file:\/\//, "")
+        const summary = await readFile(summaryPath, "utf8")
+        expect(summary).toContain("# Main Agent Data Analysis Summary")
+        expect(summary).toContain("Quantitative sub-agent")
+        expect(summary).toContain("Qualitative sub-agent")
+        expect(summary).toContain("cross-variate")
+        const unifiedReport = analysisArtifacts.find((artifact) => artifact.kind === "dataset_analysis_report")
+        expect(unifiedReport).toBeDefined()
+        const unified = await readFile(unifiedReport!.uri.replace(/^file:\/\//, ""), "utf8")
+        expect(unified).toContain("# Dataset Analysis Report")
+        expect(unified).toContain("## Search Handoff")
+        expect(unified).toContain("# Quantitative Sub-Agent Data Analysis")
+        expect(unified).toContain("# Qualitative Sub-Agent Data Analysis")
+        expect(unified).toContain("# Main Agent Data Analysis Summary")
+        expect(unified).toContain("ACF main period")
+        expect(unified).toContain("ADF stationarity")
+        expect(unified).toContain("## Correlation Matrix")
+      },
+    })
+  })
+
+  test("runs the service-level multi-agent pipeline and publishes an export package", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "pipeline autonomous task",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+            datasetPath,
+          },
+          "autonomous",
+        )
+
+        const result = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runFullPipeline({
+              taskID: task.id,
+              stage: "smoke",
+              description: "pipeline smoke",
+              maxIterations: 1,
+              outputDir: ".neo-research/pipeline",
+            }),
+          ),
+        )
+
+        expect(result.intent.taskID).toBe(task.id)
+        expect(result.intent.missingFields).toEqual([])
+        expect(result.dataAnalysis.artifact.kind).toBe("dataset_analysis_report")
+        expect(result.nas.loop.stoppedReason).toBe("max_iterations")
+        expect(result.nas.loop.iterations).toHaveLength(1)
+        expect(result.publish.artifact.kind).toBe("model_export_package")
+        const manifest = JSON.parse(await readFile(path.join(result.publish.path, "manifest.json"), "utf8"))
+        expect(manifest.schemaVersion).toBe("neo_research_model_export_package.v1")
+        expect(manifest.files.modelPy).toBe("model/model.py")
+
+        const finalTask = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(finalTask.status).toBe("completed")
+        const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        expect(artifacts.map((artifact) => artifact.kind)).toEqual(
+          expect.arrayContaining(["dataset_analysis_report", "research_autonomous_loop_json", "model_export_package"]),
+        )
+      },
+    })
+  })
+
+  test("pauses the pipeline when intent clarification is required", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "pipeline missing intent task",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+
+        await expect(
+          runResearch(
+            Research.Service.use((svc) =>
+              svc.runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+              }),
+            ),
+          ),
+        ).rejects.toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "intent_clarification_required",
+            missingFields: ["dataset.path"],
+          },
+        })
+
+        const blocked = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(blocked.status).toBe("paused")
+        const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
+        expect(approvals.find((approval) => approval.kind === "protocol")).toMatchObject({
+          status: "pending",
+          reason: expect.stringContaining("Which CSV dataset path"),
+        })
+        expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toHaveLength(0)
+      },
+    })
+  })
+
+  test("blocks full pipeline execution for review companion tasks before agent work starts", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "pipeline review task",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+            datasetPath,
+          },
+          "review",
+        )
+
+        await expect(
+          runResearch(
+            Research.Service.use((svc) =>
+              svc.runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+              }),
+            ),
+          ),
+        ).rejects.toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "pipeline_requires_autonomous",
+          },
+        })
+
+        const blocked = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(blocked.status).toBe("idle")
+        expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toHaveLength(0)
+      },
+    })
+  })
+
+  test("marks agent failures and publishes a failed stage event", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await createTSFTask("failed NAS agent review task")
+        const events = await runResearchWithBus(
+          Effect.gen(function* () {
+            const bus = yield* Bus.Service
+            const svc = yield* Research.Service
+            const received: Array<{ readonly status: string; readonly metadata?: Research.JsonRecord }> = []
+            const unsubscribe = yield* bus.subscribeCallback(Research.Event.NASAgentFailed, (event) => {
+              if (event.properties.taskID === task.id) {
+                received.push({ status: event.properties.status, metadata: event.properties.metadata })
+              }
+            })
+            const error = yield* svc
+              .runNASAgent({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+              })
+              .pipe(
+                Effect.as(undefined),
+                Effect.catchCause((cause) => Effect.succeed(Cause.squash(cause))),
+              )
+            yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)))
+            unsubscribe()
+            expect(error).toBeInstanceOf(Error)
+            expect(error instanceof Error ? error.message : String(error)).toContain("Research task is not autonomous")
+            return received
+          }),
+        )
+
+        const failed = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(failed.status).toBe("failed")
+        expect(events).toEqual([
+          {
+            status: "failed",
+            metadata: expect.objectContaining({
+              error: expect.stringContaining("Research task is not autonomous"),
+            }),
+          },
+        ])
+      },
+    })
+  })
+
+  test("prepares the Neo-Cast dataset for a task and persists the dataset contract artifact", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writePrepareDataNeoCastRunner(fakeNeoCastRoot)
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "Prepare dataset contract",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec({
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                }),
+                contextLength: 192,
+                predictionLengths: [24, 48],
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["a", "b"],
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+
+        const prepared = await runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id })))
+
+        expect(prepared.artifact.kind).toBe("dataset_preparation_json")
+        expect(prepared.datasetSpec).toMatchObject({
+          source_csv: path.resolve(datasetPath),
+          input_len: 192,
+          horizons: [24, 48],
+          feature_columns: ["a", "b"],
+        })
+        const payload = JSON.parse(await readFile(prepared.path, "utf8"))
+        expect(payload.command.args).toContain("--source")
+        expect(payload.datasetSpec.source_csv).toBe(path.resolve(datasetPath))
       },
     })
   })
@@ -1310,6 +1662,43 @@ describe("Research service", () => {
     })
   })
 
+  test("seeds data-profiled TSF baselines for full recipe autonomous search", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "profiled autonomous baseline workflow",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec({ bridgeOnly: false }),
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["a", "b", "c"],
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+
+        const seeded = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
+        const recipeIDs = seeded.candidates.map((candidate) => candidate.candidateSpec.recipeID)
+
+        expect(recipeIDs).toContain("tsf_profile_feature_fusion_baseline")
+        expect(recipeIDs).toContain("tsf_profile_shift_robust_baseline")
+        expect(seeded.candidates.every((item) => item.approvalStatus === "auto_approved")).toBe(true)
+      },
+    })
+  })
+
   test("executes an approved candidate run through a runner plan", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
@@ -1433,6 +1822,54 @@ describe("Research service", () => {
         const executionLogRecord = JSON.parse(await readFile(executionLog!.uri.replace("file://", ""), "utf8"))
         expect(executionLogRecord.stderr).toContain("runner failed before artifact creation")
         expect(executionLogRecord.records.map((record: { event?: string }) => record.event)).toContain("runner_error")
+      },
+    })
+  })
+
+  test("autonomous iteration retries a transient failed candidate once and marks failed trace steps accurately", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "failing-neo-cast")
+        await writeFailingNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "retry failed autonomous candidate",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+        const candidate = await createCandidate({ taskID: task.id })
+
+        const first = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousIteration({
+              taskID: task.id,
+              stage: "smoke",
+              description: "first failure",
+            }),
+          ),
+        )
+        const second = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousIteration({
+              taskID: task.id,
+              stage: "smoke",
+              description: "retry failure",
+            }),
+          ),
+        )
+
+        expect(first.run.status).toBe("failed")
+        expect(second.run.status).toBe("failed")
+        expect(first.candidate.id).toBe(candidate.id)
+        expect(second.candidate.id).toBe(candidate.id)
+        expect(first.managerTrace.find((step) => step.role === "runner")?.status).toBe("blocked")
+        expect(first.managerTrace.find((step) => step.role === "analyst")?.status).toBe("skipped")
       },
     })
   })
@@ -1570,6 +2007,172 @@ describe("Research service", () => {
 
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         expect(artifacts.map((artifact) => artifact.id)).toContain(exported.artifact.id)
+      },
+    })
+  })
+
+  test("exports data analysis agent artifacts in the TSF report", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "TSF data analysis report",
+              domainID: "tsf",
+              mode: "review",
+              taskSpec: {
+                ...validTsfTaskSpec(),
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["a", "b", "c"],
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+        await runResearch(Research.Service.use((svc) => svc.profileTask({ taskID: task.id })))
+
+        const exported = await runResearch(Research.Service.use((svc) => svc.exportTaskArtifact({ taskID: task.id })))
+        const report = await readFile(exported.path, "utf8")
+
+        expect(report).toContain("## Data Analysis Agents")
+        expect(report).toContain("dataset_quantitative_analysis_markdown")
+        expect(report).toContain("dataset_qualitative_analysis_markdown")
+        expect(report).toContain("dataset_main_analysis_markdown")
+        expect(report).toContain("main-data-analyst")
+      },
+    })
+  })
+
+  test("exports a final bundle with report, results, champion metadata, and model artifacts", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await createTask("bundle-ready TSF report")
+        const candidate = await createCandidate({ taskID: task.id })
+        const run = await createRun({
+          taskID: task.id,
+          candidateID: candidate.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.42, val_avg_mae: 0.31 },
+        })
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.setChampion({
+              taskID: task.id,
+              candidateID: candidate.id,
+              runID: run.id,
+              primaryMetric: 0.42,
+              utility: -0.42,
+            }),
+          ),
+        )
+        const runnerArtifactDir = path.join(tmp.path, ".neo-cast", "artifacts", "run_bundle")
+        await mkdir(runnerArtifactDir, { recursive: true })
+        await writeFile(path.join(runnerArtifactDir, "model.pt"), "weights", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "model_impl.py"), "# model\n", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "inference.py"), "# inference\n", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "metadata.json"), '{"model_family":"recipe_factory"}\n', "utf8")
+        await writeFile(path.join(runnerArtifactDir, "model_spec.json"), '{"recipe_id":"bundle"}\n', "utf8")
+        await writeFile(path.join(runnerArtifactDir, "patch_bundle.json"), '{"schema_version":"patch_bundle.v1"}\n', "utf8")
+        await writeFile(path.join(runnerArtifactDir, "preprocess.json"), '{"input_len":96}\n', "utf8")
+        await writeFile(path.join(runnerArtifactDir, "tool_schema.json"), '{"name":"forecast"}\n', "utf8")
+        await writeFile(path.join(runnerArtifactDir, "mcp_server.py"), "# mcp\n", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "example.py"), "# example\n", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "requirements.txt"), "torch\nnumpy\nmcp>=1.0\n", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "README.md"), "# Exported model\n", "utf8")
+        await writeFile(path.join(runnerArtifactDir, "eval_report.md"), "# Evaluation\n", "utf8")
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.createArtifact({
+              taskID: task.id,
+              runID: run.id,
+              kind: "runner_artifact",
+              uri: `file://${runnerArtifactDir}`,
+              metadata: { stage: "smoke" },
+            }),
+          ),
+        )
+
+        const exported = await runResearch(
+          Research.Service.use((svc) =>
+            svc.exportTaskArtifact({
+              taskID: task.id,
+              kind: "research_final_bundle",
+              outputDir: ".neo-research/final",
+            }),
+          ),
+        )
+
+        expect(exported.artifact.kind).toBe("research_final_bundle")
+        expect(exported.artifact.metadata).toMatchObject({
+          championCandidateID: candidate.id,
+          primaryMetricName: "val_avg_mse",
+          primaryMetricValue: 0.42,
+        })
+        expect(exported.artifact.metadata.copiedFiles).toEqual(
+          expect.arrayContaining(["report/research-report.md", "model/model.pt", "model/inference.py"]),
+        )
+        const manifest = JSON.parse(await readFile(path.join(exported.path, "manifest.json"), "utf8"))
+        expect(manifest).toMatchObject({
+          taskID: task.id,
+          champion: {
+            candidateID: candidate.id,
+            runID: run.id,
+          },
+          files: {
+            report: "report/research-report.md",
+            runs: "results/runs.json",
+            champion: "results/champion.json",
+            modelWeights: "model/model.pt",
+            modelImpl: "model/model_impl.py",
+            inference: "model/inference.py",
+          },
+        })
+        expect(await readFile(path.join(exported.path, "model", "model.pt"), "utf8")).toBe("weights")
+        expect(await readFile(path.join(exported.path, "report", "research-report.md"), "utf8")).toContain(
+          "# bundle-ready TSF report",
+        )
+
+        const modelExport = await runResearch(
+          Research.Service.use((svc) =>
+            svc.exportTaskArtifact({
+              taskID: task.id,
+              kind: "model_export_package",
+              outputDir: ".neo-research/model-export",
+            }),
+          ),
+        )
+        expect(modelExport.artifact.metadata).toMatchObject({
+          championCandidateID: candidate.id,
+          primaryMetricName: "val_avg_mse",
+          primaryMetricValue: 0.42,
+        })
+        expect(modelExport.artifact.metadata.copiedFiles).toEqual(
+          expect.arrayContaining(["model/requirements.txt", "model/README.md", "model/mcp_server.py"]),
+        )
+        const modelManifest = JSON.parse(await readFile(path.join(modelExport.path, "manifest.json"), "utf8"))
+        expect(modelManifest.files).toMatchObject({
+          modelPy: "model/model.py",
+          requirements: "model/requirements.txt",
+          readme: "model/README.md",
+          example: "model/example.py",
+          mcpServer: "model/mcp_server.py",
+          toolSchema: "model/tool_schema.json",
+          evalReport: "model/eval_report.md",
+          patchBundle: "model/patch_bundle.json",
+        })
+        expect(await readFile(path.join(modelExport.path, "model", "requirements.txt"), "utf8")).toContain("mcp>=1.0")
+        expect(await readFile(path.join(modelExport.path, "model", "mcp_server.py"), "utf8")).toContain("# mcp")
       },
     })
   })
@@ -1817,6 +2420,50 @@ describe("Research service", () => {
     })
   })
 
+  test("writes a candidate selection ranking artifact for existing ready frontier candidates", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "existing frontier ranking",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+        const existing = await createCandidate({ taskID: task.id })
+
+        const iteration = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousIteration({
+              taskID: task.id,
+              stage: "smoke",
+              description: "existing frontier",
+            }),
+          ),
+        )
+
+        expect(iteration.candidate.id).toBe(existing.id)
+        expect(iteration.selectionArtifact.metadata).toMatchObject({
+          selectionSource: "existing_frontier",
+          rankingCount: 1,
+        })
+        const selectionRecord = JSON.parse(await readFile(iteration.selectionArtifact.uri.replace("file://", ""), "utf8"))
+        expect(selectionRecord.rankings[0]).toMatchObject({
+          rank: 1,
+          recipeID: existing.candidateSpec.recipeID,
+          reasons: expect.arrayContaining(["existing approved frontier candidate"]),
+        })
+      },
+    })
+  })
+
   test("writes an autonomous loop summary artifact", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
@@ -1863,6 +2510,164 @@ describe("Research service", () => {
         expect(loopRecord.iterations.map((iteration: { managerTraceRoles: string[] }) => iteration.managerTraceRoles)).toEqual(
           loop.iterations.map((iteration) => iteration.managerTrace.map((step) => step.role)),
         )
+      },
+    })
+  })
+
+  test("autonomous loop defaults beyond one iteration when no maxIterations is provided", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "autonomous loop default iteration budget",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: validTsfTaskSpec({
+                bridgeOnly: true,
+                neoCastProjectRoot: fakeNeoCastRoot,
+                pythonExecutable: "bash",
+              }),
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 2 },
+            }),
+          ),
+        )
+
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({
+              taskID: task.id,
+              stage: "smoke",
+              description: "default iteration budget",
+            }),
+          ),
+        )
+
+        expect(loop.iterations).toHaveLength(2)
+      },
+    })
+  })
+
+  test("autonomous loop retries metricless succeeded runs as inconclusive candidates", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeMetriclessNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "autonomous metricless retry",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({
+              taskID: task.id,
+              stage: "smoke",
+              maxIterations: 2,
+              description: "metricless retry loop",
+            }),
+          ),
+        )
+
+        expect(loop.iterations).toHaveLength(2)
+        expect(loop.iterations[1]!.candidate.id).toBe(loop.iterations[0]!.candidate.id)
+
+        const designStep = loop.iterations[1]!.managerTrace.find((step) => step.role === "design")
+        expect(designStep?.metadata).toMatchObject({
+          inconclusiveCandidateCount: 1,
+        })
+
+        const selectionRecord = JSON.parse(
+          await readFile(loop.iterations[1]!.selectionArtifact.uri.replace("file://", ""), "utf8"),
+        )
+        expect(selectionRecord.inconclusiveCandidateIDs).toContain(loop.iterations[0]!.candidate.id)
+      },
+    })
+  })
+
+  test("autonomous loop stops when the target metric is reached", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "autonomous loop target",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({
+              taskID: task.id,
+              stage: "smoke",
+              maxIterations: 5,
+              targetMetricValue: 0.2,
+              description: "target stopped loop",
+            }),
+          ),
+        )
+
+        expect(loop.stoppedReason).toBe("target_reached")
+        expect(loop.iterations).toHaveLength(1)
+      },
+    })
+  })
+
+  test("autonomous loop stops on a no-improvement plateau", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "autonomous loop plateau",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({
+              taskID: task.id,
+              stage: "smoke",
+              maxIterations: 5,
+              maxNoImprove: 1,
+              description: "plateau stopped loop",
+            }),
+          ),
+        )
+
+        expect(loop.stoppedReason).toBe("plateau")
+        expect(loop.iterations).toHaveLength(2)
       },
     })
   })
@@ -1994,7 +2799,7 @@ describe("Research service", () => {
           ),
         )
 
-        for (let index = 0; index < 3; index++) {
+        for (let index = 0; index < 5; index++) {
           await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({
@@ -2035,7 +2840,7 @@ describe("Research service", () => {
           version: "tsf_profile_learned_memory_ranker_v1",
           featureSource: "taskFingerprint.datasetProfile",
           rankingCount: selectionRecord.rankings.length,
-          memoryEvidenceCount: 3,
+          memoryEvidenceCount: 5,
           benchmarkEvidenceCount: 0,
         })
         expect(selectionRecord.rankings[0].predictorVersion).toBe("tsf_profile_learned_memory_ranker_v1")
@@ -2044,14 +2849,14 @@ describe("Research service", () => {
           maxPredictionLength: 24,
           targetCount: 3,
           bridgeOnly: false,
-          historyRunCount: 3,
-          historyMetricRunCount: 3,
-          historyMemoryCount: 3,
-          learnedRankerTrainingExamples: 4,
-          learnedRankerPositiveExamples: 2,
-          learnedRankerNegativeExamples: 2,
-          hasChampion: true,
-          memoryEvidenceCount: 3,
+	          historyRunCount: 5,
+	          historyMetricRunCount: 5,
+	          historyMemoryCount: 5,
+	          learnedRankerTrainingExamples: 6,
+	          learnedRankerPositiveExamples: 2,
+	          learnedRankerNegativeExamples: 4,
+	          hasChampion: true,
+	          memoryEvidenceCount: 5,
           benchmarkEvidenceCount: 0,
           datasetProfileSignals: {
             source: "dataset.path",
@@ -2312,7 +3117,7 @@ describe("Research service", () => {
           ),
         )
 
-        for (let index = 0; index < 3; index++) {
+        for (let index = 0; index < 5; index++) {
           await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({
@@ -2340,14 +3145,14 @@ describe("Research service", () => {
         expect(iteration.selectionArtifact!.metadata).toMatchObject({
           rankPredictorVersion: "tsf_profile_learned_memory_ranker_v1",
           historyDomainMemoryCount: 1,
-          historyTaskMemoryCount: 3,
+          historyTaskMemoryCount: 5,
         })
         expect(selectionRecord.rankings[0].features).toMatchObject({
           historyDomainMemoryCount: 1,
-          learnedRankerTrainingExamples: 5,
-          learnedRankerPositiveExamples: 3,
-          learnedRankerNegativeExamples: 2,
-        })
+	          learnedRankerTrainingExamples: 7,
+	          learnedRankerPositiveExamples: 3,
+	          learnedRankerNegativeExamples: 4,
+	        })
         expect(selectionRecord.rankings[0].reasons.some((reason: string) => reason.includes("benchmark memory"))).toBe(
           true,
         )
@@ -2432,7 +3237,7 @@ describe("Research service", () => {
           ),
         )
 
-        for (let index = 0; index < 3; index++) {
+        for (let index = 0; index < 5; index++) {
           await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({

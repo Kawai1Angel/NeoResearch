@@ -190,6 +190,121 @@ describe("TSF research domain", () => {
     expect(fingerprint.searchBiases).toContain("distribution_shift")
   })
 
+  test("uses TSF dataset profiles to seed data-driven full-recipe baselines", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-profile-baselines-"))
+    const csvPath = path.join(root, "train.csv")
+    const lines = ["date,a,b,c"]
+    for (let index = 0; index < 128; index++) {
+      const seasonal = index % 24
+      const trend = index * 0.4
+      const a = trend + seasonal
+      const b = trend + seasonal * 2
+      const c = index < 64 ? a : a + 25
+      lines.push(`2024-01-${String((index % 28) + 1).padStart(2, "0")},${a},${b},${c}`)
+    }
+    await writeFile(csvPath, `${lines.join("\n")}\n`, "utf8")
+
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        path: csvPath,
+        targetCols: ["a", "b", "c"],
+      },
+      runtime: { bridgeOnly: false },
+    })
+    const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
+    const recipeIDs = baselines.map((item) => asRecord(item.candidateSpec).recipeID)
+
+    expect(recipeIDs).toContain("tsf_profile_feature_fusion_baseline")
+    expect(recipeIDs).toContain("tsf_profile_shift_robust_baseline")
+    for (const proposal of baselines) {
+      const result = Research.DomainRegistry.validateCandidate("tsf", {
+        taskSpec: normalizedTask,
+        candidateSpec: proposal.candidateSpec,
+      })
+      expect(result.ok).toBe(true)
+    }
+  })
+
+  test("does not classify pure trend as seasonality", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-trend-only-"))
+    const csvPath = path.join(root, "train.csv")
+    const lines = ["date,a"]
+    for (let index = 0; index < 96; index++) {
+      lines.push(`2024-01-${String((index % 28) + 1).padStart(2, "0")},${index * 10}`)
+    }
+    await writeFile(csvPath, `${lines.join("\n")}\n`, "utf8")
+
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        path: csvPath,
+        targetCols: ["a"],
+      },
+    })
+
+    const fingerprint = Research.DomainRegistry.summarizeTask("tsf", normalizedTask)
+    const datasetProfile = asRecord(fingerprint.datasetProfile)
+
+    expect(datasetProfile.trendStrength).toBeGreaterThan(0.9)
+    expect(datasetProfile.seasonalityStrength).toBeLessThan(0.1)
+    expect(fingerprint.searchBiases).not.toContain("seasonal")
+  })
+
+  test("uses timestamp spacing when profiling trend strength", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-irregular-time-"))
+    const csvPath = path.join(root, "train.csv")
+    const lines = ["timestamp,a"]
+    for (let index = 0; index < 9; index++) {
+      const timestamp = new Date(Date.UTC(2024, 0, 1 + index)).toISOString()
+      lines.push(`${timestamp},${index}`)
+    }
+    lines.push(`${new Date(Date.UTC(2024, 0, 101)).toISOString()},100`)
+    await writeFile(csvPath, `${lines.join("\n")}\n`, "utf8")
+
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        path: csvPath,
+        targetCols: ["a"],
+      },
+    })
+
+    const fingerprint = Research.DomainRegistry.summarizeTask("tsf", normalizedTask)
+    const datasetProfile = asRecord(fingerprint.datasetProfile)
+
+    expect(datasetProfile.trendStrength).toBeGreaterThan(0.99)
+  })
+
+  test("does not inflate distribution shift for near-constant high-magnitude columns", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-near-constant-"))
+    const csvPath = path.join(root, "train.csv")
+    const lines = ["date,a"]
+    for (let index = 0; index < 96; index++) {
+      const value = index < 48 ? 1_000_000_000 : 1_000_000_100
+      lines.push(`2024-01-${String((index % 28) + 1).padStart(2, "0")},${value}`)
+    }
+    await writeFile(csvPath, `${lines.join("\n")}\n`, "utf8")
+
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        path: csvPath,
+        targetCols: ["a"],
+      },
+    })
+
+    const fingerprint = Research.DomainRegistry.summarizeTask("tsf", normalizedTask)
+    const datasetProfile = asRecord(fingerprint.datasetProfile)
+
+    expect(datasetProfile.distributionShift).toBeLessThan(0.5)
+    expect(fingerprint.searchBiases).not.toContain("distribution_shift")
+  })
+
   test("keeps task fingerprinting usable when dataset profile files are unavailable", () => {
     const missingPath = path.join(tmpdir(), "opencode-tsf-profile-missing", "train.csv")
     const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
