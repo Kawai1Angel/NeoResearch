@@ -500,12 +500,23 @@ export function ResearchCockpit() {
   const routedGoalsHandled = new Set<string>()
   let routedCsvTaskHandled = false
   let actionQueue = Promise.resolve()
+  let activeActionAbort: AbortController | undefined
 
   onMount(() => {
     focusTimer = setTimeout(() => promptInput?.focus(), 0)
   })
   onCleanup(() => {
     if (focusTimer) clearTimeout(focusTimer)
+    activeActionAbort?.abort()
+  })
+
+  useKeyboard((evt) => {
+    const name = evt.name?.toLowerCase()
+    if (name !== "escape" && name !== "esc") return
+    if (!busy()) return
+    activeActionAbort?.abort()
+    evt.preventDefault()
+    evt.stopPropagation()
   })
 
   const [tasks] = createResource(refresh, async () => {
@@ -639,11 +650,13 @@ export function ResearchCockpit() {
       runnerReady: runnerReady(),
     }),
   )
-  async function runAction(name: string, fn: () => Promise<string>) {
+  async function runAction(name: string, fn: (signal: AbortSignal) => Promise<string>) {
     const run = async () => {
+      const abortController = new AbortController()
+      activeActionAbort = abortController
       setBusy(name)
       try {
-        const message = await fn()
+        const message = await fn(abortController.signal)
         setError(undefined)
         setActionEvents((events) => [
           ...events.slice(-(promptEventHistoryLimit - 1)),
@@ -652,7 +665,11 @@ export function ResearchCockpit() {
         toast.show({ variant: "info", message })
         setRefresh((value) => value + 1)
       } catch (err) {
-        const message = formatError(err)
+        const message = abortController.signal.aborted
+          ? name === "chat"
+            ? "Chat request canceled."
+            : `${name} canceled.`
+          : formatError(err)
         setError(message)
         setErrorEvents((events) => [
           ...events.slice(-(errorEventHistoryLimit - 1)),
@@ -660,6 +677,7 @@ export function ResearchCockpit() {
         ])
         toast.show({ variant: "error", message })
       } finally {
+        if (activeActionAbort === abortController) activeActionAbort = undefined
         setBusy(undefined)
       }
     }
@@ -802,12 +820,21 @@ export function ResearchCockpit() {
       researchRequest<ChatProviderList>(sdk, "/config/providers"),
       researchRequest<ChatAgent[]>(sdk, "/agent"),
     ])
-    return resolveResearchCockpitChatDefaults({
+    const defaults = resolveResearchCockpitChatDefaults({
       providersResult,
       agentsResult,
       selectedModel: local?.model.current(),
       selectedAgentName: local?.agent.current()?.name,
     })
+    const provider = providersResult.providers.find((item) => item.id === defaults.model.providerID)
+    const model = provider?.models?.[defaults.model.modelID]
+    const selectedModel = local?.model.current()
+    return {
+      ...defaults,
+      modelLabel: selectedModel
+        ? local?.model.parsed().model ?? defaults.model.modelID
+        : model?.name ?? model?.id ?? defaults.model.modelID,
+    }
   }
 
   async function ensureChatSession() {
@@ -851,21 +878,31 @@ export function ResearchCockpit() {
   }
 
   async function sendChatPrompt(value: string, resolvedDefaults?: Awaited<ReturnType<typeof resolveChatDefaults>>) {
-    await runAction("chat", async () => {
+    await runAction("chat", async (signal) => {
       const [sessionID, defaults] = await Promise.all([
         ensureChatSession(),
         resolvedDefaults ? Promise.resolve(resolvedDefaults) : resolveChatDefaults(),
       ])
-      const message = await researchRequest<unknown>(sdk, `/session/${encodeURIComponent(sessionID)}/message`, {
-        method: "POST",
-        body: JSON.stringify({
-          ...defaults.model,
-          agent: defaults.agent,
-          model: defaults.model,
-          parts: chatContextForPrompt(value),
-        }),
-      })
-      return assistantTextFromResponse(message)
+      try {
+        const message = await researchRequest<unknown>(sdk, `/session/${encodeURIComponent(sessionID)}/message`, {
+          method: "POST",
+          signal,
+          body: JSON.stringify({
+            ...defaults.model,
+            agent: defaults.agent,
+            model: defaults.model,
+            parts: chatContextForPrompt(value),
+          }),
+        })
+        return assistantTextFromResponse(message)
+      } catch (err) {
+        if (signal.aborted) throw new Error("Chat request canceled.")
+        const message = formatError(err)
+        if (message.startsWith("Request timed out after 90s")) {
+          throw new Error("Chat request to Research Agent timed out after 90s")
+        }
+        throw err
+      }
     })
   }
 
@@ -1669,7 +1706,13 @@ export function ResearchCockpit() {
       lines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
     const active = busy()
-    if (active) lines.push({ id: "busy", text: `Running ${active}...`, tone: "warning" })
+    if (active) {
+      lines.push({
+        id: "busy",
+        text: active === "chat" ? "Waiting for Research Agent response" : `Running ${active}...`,
+        tone: "warning",
+      })
+    }
     if (lines.length > 0) return lines
     const clarification = socraticClarification()
     if (clarification.active) {

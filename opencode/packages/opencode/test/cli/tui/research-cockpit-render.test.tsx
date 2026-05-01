@@ -687,6 +687,76 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("shows a model-specific waiting state while chat is pending and cancels it with escape", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    let aborted = false
+    const chatFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      const handled = await mockChatResponse(input, init, [], "unused")
+      if (handled && url.pathname !== "/session/session_research_chat/message") return handled
+      if (url.pathname === "/session/session_research_chat/message") {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            aborted = true
+            reject(new DOMException("Aborted", "AbortError"))
+          })
+        })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} />, { width: 170, height: 48 })
+
+    try {
+      await waitForFrame(app, "run_smoke")
+      await app.mockInput.typeText("请解释当前状态")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      await waitForFrame(app, "Waiting for Research Agent response")
+      app.mockInput.pressKey("ESCAPE")
+      const frame = await waitForFrame(app, "chat: Chat request canceled.")
+
+      expect(aborted).toBe(true)
+      expect(frame).not.toContain("Running chat")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("renders an explicit chat timeout error instead of leaving the cockpit looking stuck", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const chatFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      const handled = await mockChatResponse(input, init, [], "unused")
+      if (handled && url.pathname !== "/session/session_research_chat/message") return handled
+      if (url.pathname === "/session/session_research_chat/message") {
+        const timeout = new Error("timeout")
+        timeout.name = "TimeoutError"
+        throw timeout
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} />, { width: 170, height: 48 })
+
+    try {
+      await waitForFrame(app, "run_smoke")
+      await app.mockInput.typeText("请解释当前状态")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      const frame = await waitForFrame(app, "chat: Chat request to Research Agent timed out after 90s")
+      expect(frame).not.toContain("Running chat")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("renders user and agent chat turns in chronological order", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
