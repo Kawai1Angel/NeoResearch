@@ -7,7 +7,7 @@ const path = require("path");
 const DEFAULT_CONFIG = {
   llm: {
     provider: "anthropic",
-    model: "claude-sonnet-4",
+    model: "claude-sonnet-4-6",
     base_url: null,
     max_tokens: 4000,
     temperature: 0.2,

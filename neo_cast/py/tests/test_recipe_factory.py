@@ -388,6 +388,30 @@ class RecipeFactoryTest(unittest.TestCase):
 
             self.assertEqual(validate_payload("recipe", recipe_path), [])
 
+    def test_recipe_schema_rejects_runtime_required_action_fields(self) -> None:
+        recipe = make_recipe(embedding={"type": "patch"})
+        with tempfile.TemporaryDirectory() as tmp:
+            recipe_path = Path(tmp) / "recipe.json"
+            recipe_path.write_text(f"{json.dumps(recipe)}\n", encoding="utf-8")
+
+            errors = validate_payload("recipe", recipe_path)
+
+        self.assertTrue(any("embedding" in error and "d_model" in error for error in errors))
+        self.assertTrue(any("embedding" in error and "patch_len" in error for error in errors))
+
+    def test_registry_rejects_runtime_required_action_fields(self) -> None:
+        recipe = make_recipe(
+            preprocessing=[{"type": "series_decomposition"}],
+            embedding={"type": "patch"},
+            backbone={"type": "transformer", "d_model": 16},
+        )
+
+        errors = validate_recipe_against_registry(recipe, input_len=32)
+
+        self.assertIn("preprocessing.actions[0].type='series_decomposition' requires kernel_size", errors)
+        self.assertIn("embedding.type='patch' requires d_model", errors)
+        self.assertIn("backbone.type='transformer' requires n_heads", errors)
+
     def test_recipe_schema_accepts_opencode_fusion_parameters(self) -> None:
         for fusion in (
             {"type": "feature", "variate_token": True, "cross_attention": False},

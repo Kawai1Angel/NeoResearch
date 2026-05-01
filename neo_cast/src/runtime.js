@@ -31,7 +31,7 @@ function ensureRuntimeDirs(projectRoot = process.cwd()) {
 
 function runtimeReady(projectRoot = process.cwd()) {
   const paths = getRuntimePaths(projectRoot);
-  return fs.existsSync(paths.pythonPath);
+  return fs.existsSync(paths.pythonPath) && _pythonVersionSupported(paths.pythonPath);
 }
 
 function getRuntimeInstallRoot(_projectRoot = process.cwd()) {

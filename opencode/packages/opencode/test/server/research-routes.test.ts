@@ -181,6 +181,61 @@ describe("research routes", () => {
     })
   })
 
+  test("updates a task spec through an explicit repair route", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await json<Research.ResearchTask>(
+          await app().request(ResearchPaths.tasks, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              title: "Repair Neo-Cast root",
+              domainID: "tsf",
+              mode: "review",
+              taskSpec: validTsfTaskSpec(),
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 3 },
+            }),
+          }),
+        )
+
+        const taskSpec = {
+          ...task.taskSpec,
+          runtime: {
+            ...(task.taskSpec.runtime as Record<string, unknown>),
+            neoCastProjectRoot: tmp.path,
+          },
+        }
+
+        const updated = await json<Research.ResearchTask>(
+          await app().request(pathFor(ResearchPaths.taskSpec, { taskID: task.id }), {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({ taskSpec }),
+          }),
+        )
+
+        expect(updated.id).toBe(task.id)
+        expect(updated.taskSpec.runtime).toMatchObject({
+          bridgeOnly: true,
+          pythonExecutable: "python3",
+          neoCastProjectRoot: tmp.path,
+        })
+        expect(updated.taskSpec.taskType).toBe("forecasting")
+        expect(updated.time.updated).toBeGreaterThanOrEqual(task.time.updated)
+
+        const fetched = await json<Research.ResearchTask>(
+          await app().request(pathFor(ResearchPaths.task, { taskID: task.id }), { headers }),
+        )
+        expect(fetched.taskSpec.runtime).toMatchObject({ neoCastProjectRoot: tmp.path })
+      },
+    })
+  })
+
   test("profiles a task through an explicit diagnostic route", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }

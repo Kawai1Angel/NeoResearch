@@ -2,64 +2,131 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Purpose
+## Overview
 
-This directory is a research study hub for exploring autonomous AI research infrastructure, with a focus on applying ideas from Karpathy's `autoresearch` project to time series forecasting (TSF) / foundation model scenarios.
+NeoResearch is an autonomous TSF (Time Series Forecasting) research platform with two subsystems:
 
-- `autoresearch/` — A fork/copy of Karpathy's autoresearch project: an autonomous agent loop that edits `train.py`, runs 5-minute training experiments, and keeps changes that lower `val_bpb`.
-- `autoresearch解读.md` — Deep Chinese analysis of the autoresearch design philosophy and its implications for TSF research.
+- **`neo_cast/`** — Node.js CLI (`neo-cast`) + Python backend (`py/`) that designs, trains, and exports TSF models. The CLI is published to npm as `neo-cast`; the Python layer handles actual training and evaluation.
+- **`opencode/`** — Bun monorepo that provides the Research OS: a TUI cockpit, web dashboard, REST server, and domain-registry bridge connecting the `neo-cast` runner to the UI layer.
 
-## Running Experiments (autoresearch/)
+## Common Commands
 
-**Requirements:** Single NVIDIA GPU (H100 tested), Python 3.10+, `uv`.
+All `make` targets run from the repo root:
 
 ```bash
-# One-time setup
-uv sync
-uv run prepare.py          # downloads data, trains BPE tokenizer (~2 min)
-
-# Run a single training experiment (~5 min)
-uv run train.py
-
-# Redirect output for agent use
-uv run train.py > run.log 2>&1
-grep "^val_bpb:\|^peak_vram_mb:" run.log
+make setup       # bootstrap_local_dev.sh — install deps, write .env.local
+make doctor      # verify environment (Python, uv, API keys, runtime)
+make test        # quick targeted verification suite (Research OS + neo-cast Python)
+make dev-cli     # watch-rebuild + run the CLI
+make dev-web     # vite dev server for the web dashboard
+make verify-ui   # render-smoke the TUI cockpit
+make smoke       # smoke_tsf.sh — dry-run the full design pipeline
 ```
 
-## Architecture of autoresearch
+### neo_cast (Node CLI)
 
-Three files define the entire system:
+```bash
+cd neo_cast
+npm install
+node ./bin/neo-cast.js doctor
+node ./bin/neo-cast.js init-runtime          # one-time: create Python venv
+node ./bin/neo-cast.js prepare-data --source /path/to/ETTh1.csv
+node ./bin/neo-cast.js design --requirement "efficient ETTh1 model" --mode companion --max-candidates 3
+node ./bin/neo-cast.js design --mock-llm --mode companion --max-candidates 1  # offline debug
+npm test                                     # node:test suite in test/*.test.js
+```
 
-| File | Role | Editable? |
-|------|------|-----------|
-| `prepare.py` | Fixed constants (`MAX_SEQ_LEN`, `TIME_BUDGET=300s`), data prep, BPE tokenizer, dataloader, `evaluate_bpb()` | **No** |
-| `train.py` | GPT model (`GPTConfig`), Muon+AdamW optimizer, training loop | **Agent edits this** |
-| `program.md` | Agent behavior protocol: setup, experiment loop, keep/discard rules, logging format | **Human edits this** |
+### opencode (Bun monorepo)
 
-The metric is `val_bpb` (validation bits per byte) — lower is better, vocab-size-independent.
+```bash
+cd opencode
+bun install
+cd packages/opencode
+bun test                      # all unit tests (30 s timeout)
+bun test test/research/...    # single test file
+npm run typecheck             # tsgo --noEmit
+npm run build                 # bundle CLI binary
+npm run pack:dry-run          # build + dry-run publish script
+```
 
-## Agent Experiment Loop
+Targeted test group used for local alpha checks (mirrors `make test --quick`):
 
-When running the autonomous agent:
+```bash
+cd opencode/packages/opencode
+bun test \
+  test/research/domain-registry.test.ts \
+  test/research/runtime.test.ts \
+  test/research/tsf-domain.test.ts \
+  test/research/service.test.ts \
+  test/cli/research-command.test.ts \
+  test/cli/research-data.test.ts \
+  test/cli/tui/research-cockpit-data.test.ts \
+  test/cli/tui/research-cockpit-render.test.tsx \
+  --timeout 30000
+```
 
-1. Branch: `git checkout -b autoresearch/<tag>` (e.g. `autoresearch/apr21`)
-2. Initialize `results.tsv` with header: `commit\tval_bpb\tmemory_gb\tstatus\tdescription`
-3. Establish baseline: run `train.py` unmodified first
-4. Loop: modify `train.py` → `git commit` → run → read results → keep (advance branch) or discard (`git reset`)
-5. `results.tsv` is intentionally left untracked by git
+Web dashboard tests live in `opencode/packages/app`:
 
-**What the agent can change in `train.py`:** `GPTConfig` fields (`n_layer`, `n_head`, `n_embd`, `window_pattern`), optimizer hyperparameters, batch size, learning rate schedules, block structure, MLP form, value embeddings.
+```bash
+cd opencode/packages/app
+bun test --preload ./happydom.ts src/pages/research-dashboard-data.test.ts --timeout 30000
+npm run typecheck
+```
 
-## Key Design Constraints
+## Architecture
 
-- Training always runs exactly **5 minutes wall clock** (excluding startup/compilation) — set in `prepare.py` as `TIME_BUDGET`.
-- Only `train.py` is modified; `prepare.py` and evaluation harness are frozen.
-- No new packages can be installed; use only what's in `pyproject.toml`.
-- Simplicity matters: a change that improves `val_bpb` by 0.001 but adds 20 lines of complex code is not worth keeping.
+### neo_cast
 
-## TSF/Foundation Model Applicability
+| Layer | Location | Role |
+|---|---|---|
+| CLI entry | `bin/neo-cast.js`, `src/commands/` | Argument parsing, mode routing (Socratic / Companion) |
+| LLM bridge | `src/llm/` | Generates candidate JSON; supports Anthropic, OpenAI-compat, `--mock-llm` heuristics |
+| Python runner | `py/runner.py`, `py/validate.py` | Actual model training and evaluation via subprocess |
+| Renderer | `py/renderer.py` | Converts LLM candidate JSON → concrete PyTorch training config |
+| Model families | `py/models/` | `nlinear`, `tiny_transformer`, `patch_mlp` |
+| State | `.neo-cast/` | `results.tsv`, `current_candidate.json`, `resolved_candidate.json`, `runner_state.json`, `artifacts/` |
 
-Key ideas from `autoresearch解读.md` for adapting this approach to TSF:
-- Freeze data splits, evaluation windows, metrics, and seeds before opening model search
-- Design a cheap proxy metric if full training is expensive (analogous to 5-min budget)
-- Start with the minimal loop: one dataset, one evaluator, one editable file, clear keep/discard rules
+**Fixed task constants** (in `py/prepare_tsf.py`, frozen — do not modify):
+- `INPUT_LEN=512`, `HORIZONS=[96, 192, 336, 720]`, `NUM_CHANNELS=7`, `SEED=42`, `TIME_BUDGET=600s`
+- Data split: train `[0, 8640)`, val `[8640, 11520)`, ref_test `[11520, 14400)`
+- Metric: `val_avg_mse` across four horizons (lower is better)
+
+**Runner protocol** (`neo_cast/runner-manifest.json`, `protocolVersion: "runner.v1"`):
+- Four commands: `smoke` (60 s timeout, 2 epochs), `run`, `ref_test`, `blind_test`
+- The opencode layer invokes these via `neo-cast-runner.ts`
+
+### opencode/packages/opencode
+
+The core TypeScript package. Key namespaces under `src/`:
+
+| Module | Role |
+|---|---|
+| `research/` | Domain model, Effect-based `Service`, DB schema (`research.sql.ts`), event bus, `DomainRegistry` |
+| `research/runners/neo-cast-runner.ts` | Subprocess bridge to the Python runner; reads `runner-manifest.json` |
+| `research/runtime.ts` | File-system runtime: resolves venv, candidate paths, artifacts dir |
+| `cli/cmd/tui/routes/research-cockpit.tsx` | Full TUI cockpit UI (SolidJS via opentui); sends REST requests to the server |
+| `cli/cmd/tui/routes/research-cockpit-data.ts` | Pure formatting/projection helpers for the cockpit — tested in isolation |
+| `cli/cmd/tui/plugin/api.tsx` | Plugin API that registers routes, keybindings, dialog types |
+| `server/` | HTTP REST API consumed by both TUI and web dashboard |
+
+`opencode/packages/app/src/pages/research-dashboard.tsx` is the web UI equivalent of the cockpit.
+
+### Data flow
+
+```
+User → CLI design command
+  → LLM → candidate JSON written to .neo-cast/current_candidate.json
+  → py/validate.py smoke (60 s)
+  → py/runner.py run (up to 600 s)
+  → results appended to .neo-cast/results.tsv
+  → artifact written to .neo-cast/artifacts/run_<id>/
+  → opencode Research Service reads DB + events → TUI / web dashboard
+```
+
+## Key Invariants
+
+- The Python training layer (`py/`) is the frozen evaluation harness. Do not change data splits, seeds, or the `val_avg_mse` metric definition.
+- When changing a recipe action (model family or training step), update schema, DomainRegistry, examples, prompts, and tests together.
+- `neo_cast/` uses CommonJS (`require`); `opencode/` uses ESM with Bun APIs.
+- The npm package (`opencode/packages/opencode`) publishes under `neo-research@alpha` with a narrow file allowlist (`bin/`, `src/`, `README.md`, `LICENSE`, `package.json`). The `release-boundary.test.ts` enforces this — do not widen `files` without updating that test.
+- API keys go in environment variables (`ANTHROPIC_API_KEY`, `NEO_CAST_LLM_API_KEY`) or `.env.local`; never committed.

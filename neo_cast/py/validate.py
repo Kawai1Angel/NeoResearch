@@ -91,7 +91,8 @@ def _emit_validation_result(kind: str, payload: str | Path, errors: list[str]) -
 
 def _iter_ndjson_lines(stream) -> tuple[dict[str, Any], ...]:
     records: list[dict[str, Any]] = []
-    assert stream is not None
+    if stream is None:
+        raise RuntimeError("validation subprocess stdout pipe is unavailable")
     for raw_line in stream:
         line = raw_line.rstrip("\n")
         if not line:

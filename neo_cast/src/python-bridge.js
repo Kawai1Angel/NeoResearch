@@ -233,13 +233,21 @@ function loadArtifactData(projectRoot, runId) {
   const curvesPath = path.join(artifactDir, "training_curves.json");
   const summaryPath = path.join(artifactDir, "training_summary.json");
 
-  try {
-    result.training_curves = JSON.parse(fs.readFileSync(curvesPath, "utf8"));
-  } catch (_error) {}
+  if (fs.existsSync(curvesPath)) {
+    try {
+      result.training_curves = JSON.parse(fs.readFileSync(curvesPath, "utf8"));
+    } catch (error) {
+      result.training_curves_error = error.message;
+    }
+  }
 
-  try {
-    result.training_summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
-  } catch (_error) {}
+  if (fs.existsSync(summaryPath)) {
+    try {
+      result.training_summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+    } catch (error) {
+      result.training_summary_error = error.message;
+    }
+  }
 
   return Object.keys(result).length > 0 ? result : null;
 }

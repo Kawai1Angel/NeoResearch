@@ -67,6 +67,31 @@ ACTION_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     },
 }
 
+ACTION_REQUIRED_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "preprocessing": {
+        "series_decomposition": ("kernel_size",),
+        "seasonal_differencing": ("period",),
+    },
+    "embedding": {
+        "patch": ("patch_len", "stride", "d_model"),
+        "multiscale_patch": ("scales", "d_model"),
+        "invert": ("d_model",),
+        "frequency": ("n_freq", "d_model"),
+        "calendar": ("fields", "embed_dim"),
+    },
+    "backbone": {
+        "mlp": ("depth", "hidden_dim", "dropout"),
+        "transformer": ("d_model", "n_heads", "n_layers", "dropout"),
+        "rnn": ("hidden_dim",),
+        "dlinear": ("kernel_size",),
+        "tcn": ("hidden_dim", "n_layers", "kernel_size", "dropout"),
+        "nbeats": ("hidden_dim", "n_blocks", "n_layers", "dropout"),
+        "timesnet": ("hidden_dim", "n_layers", "top_k", "kernel_size", "dropout"),
+        "ssm": ("state_dim",),
+        "mixer": ("hidden_dim",),
+    },
+}
+
 
 def _preprocessing_types(recipe: dict[str, Any]) -> list[str]:
     actions = recipe.get("preprocessing", {}).get("actions", [])
@@ -78,6 +103,14 @@ def _get_type(recipe: dict[str, Any], field: str) -> str:
     if not isinstance(value, dict):
         return ""
     return str(value.get("type", ""))
+
+
+def _require_fields(errors: list[str], label: str, action: Any, action_type: str, kind: str) -> None:
+    if not isinstance(action, dict):
+        return
+    for field in ACTION_REQUIRED_FIELDS.get(kind, {}).get(action_type, ()):
+        if field not in action:
+            errors.append(f"{label}.type='{action_type}' requires {field}")
 
 
 def validate_recipe_against_registry(
@@ -94,6 +127,9 @@ def validate_recipe_against_registry(
     for action_type in preprocessing_types:
         if action_type not in ACTION_SPECS["preprocessing"]:
             errors.append(f"Unsupported preprocessing action: {action_type}")
+    for index, action in enumerate(recipe.get("preprocessing", {}).get("actions", [])):
+        if isinstance(action, dict):
+            _require_fields(errors, f"preprocessing.actions[{index}]", action, str(action.get("type", "")), "preprocessing")
     if "none" in preprocessing_types and len(preprocessing_types) > 1:
         errors.append("preprocessing action 'none' cannot be combined with other preprocessing actions")
 
@@ -117,6 +153,9 @@ def validate_recipe_against_registry(
         if action_type not in ACTION_SPECS[kind]:
             errors.append(f"Unsupported {kind} action: {action_type}")
 
+    _require_fields(errors, "embedding", recipe.get("embedding"), embedding_type, "embedding")
+    _require_fields(errors, "backbone", recipe.get("backbone"), backbone_type, "backbone")
+
     if fusion_type == "temporal":
         channel_mode = recipe.get("fusion", {}).get("channel_mode", "independent")
         if channel_mode not in {"independent", "shared"}:
@@ -136,7 +175,7 @@ def validate_recipe_against_registry(
         errors.append(f"prediction_head.type='{head_type}' does not support output_distribution='{output_distribution}'")
 
     if bridge_only:
-        bridge_supported_preprocessing = preprocessing_types in (["none"],)
+        bridge_supported_preprocessing = preprocessing_types == ["none"]
         if not bridge_supported_preprocessing:
             errors.append("Phase A/B bridge only supports preprocessing.actions=[{'type':'none'}]")
         if recipe.get("fusion", {}).get("channel_mode", "independent") != "independent":

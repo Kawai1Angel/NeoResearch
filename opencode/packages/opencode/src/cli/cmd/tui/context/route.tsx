@@ -10,6 +10,7 @@ export type HomeRoute = {
 export type CockpitRoute = {
   type: "cockpit"
   researchGoal?: string
+  newCsvTask?: boolean
 }
 
 export type SessionRoute = {

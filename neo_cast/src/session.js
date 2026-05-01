@@ -8,7 +8,11 @@ function loadRunnerState(projectRoot = process.cwd()) {
   if (!fs.existsSync(paths.runnerStatePath)) {
     return null;
   }
-  return JSON.parse(fs.readFileSync(paths.runnerStatePath, "utf8"));
+  try {
+    return JSON.parse(fs.readFileSync(paths.runnerStatePath, "utf8"));
+  } catch (_error) {
+    return null;
+  }
 }
 
 function getSessionRows(projectRoot = process.cwd()) {
@@ -27,7 +31,7 @@ function getLatestSessionRow(projectRoot = process.cwd()) {
 
 function getBestSessionRow(projectRoot = process.cwd()) {
   const rows = getSessionRows(projectRoot);
-  return rows.find((row) => row.is_best === "1") || null;
+  return [...rows].reverse().find((row) => row.is_best === "1") || null;
 }
 
 module.exports = {

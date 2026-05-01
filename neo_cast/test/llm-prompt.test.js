@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
-const { _buildSystemPrompt } = require("../src/llm");
+const { _buildSystemPrompt, _ensureCandidateDefaults } = require("../src/llm");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 
@@ -87,4 +87,20 @@ test("LLM system prompt exposes advanced fusion and probabilistic heads", () => 
     "quantile",
     "gaussian",
   ]);
+});
+
+test("LLM candidate defaults complete required frequency embedding fields", () => {
+  const candidate = _ensureCandidateDefaults(
+    {
+      embedding: { type: "frequency", d_model: 64 },
+      backbone: { type: "mixer", hidden_dim: 128, depth: 2, temporal_mixing: "mlp", channel_mixing: "mlp", dropout: 0.1 },
+      fusion: { type: "gated_hybrid", gate_type: "learned" },
+      prediction_head: { type: "linear", output_distribution: "point" },
+    },
+    "test",
+    1,
+  );
+
+  assert.equal(candidate.embedding.n_freq, 16);
+  assert.equal(candidate.embedding.complex_mode, "magnitude");
 });

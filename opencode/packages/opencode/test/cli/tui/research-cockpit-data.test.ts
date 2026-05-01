@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import {
   buildDefaultTsfResearchTask,
   buildResearchCockpitRecommendation,
@@ -24,6 +27,7 @@ import {
   researchCockpitCandidateTitle,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
+  updateResearchCockpitTaskRunnerRoot,
   type ResearchCockpitApproval,
   type ResearchCockpitArtifact,
   type ResearchCockpitCandidate,
@@ -31,6 +35,17 @@ import {
   type ResearchCockpitRun,
   type ResearchCockpitTask,
 } from "../../../src/cli/cmd/tui/routes/research-cockpit-data"
+
+async function createNeoCastRunnerRoot(version = "Python 3.12.0") {
+  const root = await mkdtemp(path.join(tmpdir(), "research-cockpit-runner-"))
+  await mkdir(path.join(root, "py"), { recursive: true })
+  await mkdir(path.join(root, ".neo-cast", "runtime", ".venv", "bin"), { recursive: true })
+  await writeFile(path.join(root, "py", "validate.py"), "# smoke runner placeholder\n", "utf8")
+  const pythonPath = path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
+  await writeFile(pythonPath, `#!/bin/sh\necho '${version}'\n`, "utf8")
+  await chmod(pythonPath, 0o755)
+  return root
+}
 
 const task = (input: Partial<ResearchCockpitTask> & Pick<ResearchCockpitTask, "id">): ResearchCockpitTask => ({
   id: input.id,
@@ -152,6 +167,7 @@ describe("research cockpit data helpers", () => {
         runnerReady: false,
       }),
     ).toMatchObject({
+      action: "create_task",
       title: "Create a dataset-backed TSF task",
     })
   })
@@ -209,9 +225,39 @@ describe("research cockpit data helpers", () => {
         runnerReady: true,
       }),
     ).toMatchObject({
+      action: "run_autonomous_loop",
       title: "Run autonomous loop",
     })
   })
+
+  test("keeps smoke experiments pending until the dataset profile exists", () => {
+    const currentTask = task({
+      id: "task_without_profile",
+      mode: "autonomous",
+      taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+      budget: { maxRuns: 12 },
+    })
+    const workflow = buildResearchCockpitWorkflow({
+      task: currentTask,
+      candidates: [candidate({ id: "candidate_a" })],
+      runs: [],
+      artifacts: [],
+      approvals: [],
+      champion: null,
+      fingerprint: {},
+      runnerReady: true,
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
+      "done:Create research task",
+      "active:Profile dataset",
+      "done:Design candidates",
+      "todo:Run smoke experiments",
+      "todo:Review gates",
+      "todo:Export report",
+    ])
+  })
+
 
   test("creates default TSF task payloads for review and autonomous modes", () => {
     expect(buildDefaultTsfResearchTask("review")).toMatchObject({
@@ -236,6 +282,43 @@ describe("research cockpit data helpers", () => {
           neoCastProjectRoot: "/tmp/neo-cast",
         },
       },
+    })
+  })
+
+  test("saves or updates the Cockpit Neo-Cast runner root on task runtime", () => {
+    const repaired = updateResearchCockpitTaskRunnerRoot(
+      task({
+        id: "missing_runner",
+        taskSpec: {
+          dataset: { loaderID: "etth1", targetCols: ["OT"] },
+          runtime: { bridgeOnly: true },
+        },
+      }),
+      "  /tmp/neo-cast  ",
+    )
+
+    expect(repaired.taskSpec).toEqual({
+      dataset: { loaderID: "etth1", targetCols: ["OT"] },
+      runtime: { bridgeOnly: true, neoCastProjectRoot: "/tmp/neo-cast" },
+    })
+    expect(canExecuteResearchCockpitTask(repaired)).toBe(true)
+
+    const updated = updateResearchCockpitTaskRunnerRoot(
+      task({
+        id: "old_runner",
+        taskSpec: {
+          runtime: {
+            bridgeOnly: false,
+            neoCastProjectRoot: "/tmp/old-neo-cast",
+          },
+        },
+      }),
+      "/tmp/new-neo-cast",
+    )
+
+    expect(updated.taskSpec.runtime).toEqual({
+      bridgeOnly: false,
+      neoCastProjectRoot: "/tmp/new-neo-cast",
     })
   })
 
@@ -373,6 +456,31 @@ describe("research cockpit data helpers", () => {
     expect(
       canExecuteResearchCockpitTask(
         task({ id: "runner", taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } } }),
+      ),
+    ).toBe(true)
+  })
+
+  test("validates Neo-Cast runtime readiness before enabling execution", async () => {
+    expect(
+      canExecuteResearchCockpitTask(
+        task({ id: "missing", taskSpec: { runtime: { neoCastProjectRoot: "/tmp/missing-neo-cast-runner" } } }),
+        { validateRuntime: true },
+      ),
+    ).toBe(false)
+
+    const unsupportedRoot = await createNeoCastRunnerRoot("Python 3.9.6")
+    expect(
+      canExecuteResearchCockpitTask(
+        task({ id: "unsupported", taskSpec: { runtime: { neoCastProjectRoot: unsupportedRoot } } }),
+        { validateRuntime: true },
+      ),
+    ).toBe(false)
+
+    const readyRoot = await createNeoCastRunnerRoot()
+    expect(
+      canExecuteResearchCockpitTask(
+        task({ id: "ready", taskSpec: { runtime: { neoCastProjectRoot: readyRoot } } }),
+        { validateRuntime: true },
       ),
     ).toBe(true)
   })

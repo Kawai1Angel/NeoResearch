@@ -8,6 +8,7 @@ const RunnerCommandManifest = z
   .object({
     script: z.string().min(1),
     args: z.array(z.string()).default([]),
+    timeout_ms: z.number().int().positive().optional(),
   })
   .strict()
 
@@ -60,14 +61,17 @@ const DEFAULT_NEO_CAST_MANIFEST: NeoCastRunnerManifest = {
     run: {
       script: "py/runner.py",
       args: ["run", "--description", "{description}"],
+      timeout_ms: 900000,
     },
     ref_test: {
       script: "py/runner.py",
       args: ["ref-test"],
+      timeout_ms: 300000,
     },
     blind_test: {
       script: "py/runner.py",
       args: ["blind-test"],
+      timeout_ms: 300000,
     },
   },
 }
@@ -122,6 +126,19 @@ function commandEnvironment(runnerRoot: string | undefined) {
   }
 }
 
+function projectRuntimePython(runnerRoot: string | undefined) {
+  return runnerRoot === undefined ? undefined : path.join(runnerRoot, ".neo-cast", "runtime", ".venv", "bin", "python")
+}
+
+function resolvePythonExecutable(runtime: NeoCastRuntime, runnerRoot: string | undefined) {
+  const configured = runtime.pythonExecutable.trim()
+  const runtimePython = projectRuntimePython(runnerRoot)
+  if ((configured.length === 0 || configured === "python3") && runtimePython !== undefined && existsSync(runtimePython)) {
+    return runtimePython
+  }
+  return configured.length === 0 ? "python3" : configured
+}
+
 export function createNeoCastRunnerCommand(input: {
   readonly stage: DomainRunStage
   readonly runtime: NeoCastRuntime
@@ -150,8 +167,9 @@ export function createNeoCastRunnerCommand(input: {
   const env = input.explicitRoot === undefined ? commandEnvironment(runnerRoot) : undefined
 
   return {
-    executable: input.runtime.pythonExecutable,
+    executable: resolvePythonExecutable(input.runtime, runnerRoot),
     args: [script, ...command.args.map((arg) => renderTemplate(arg, variables))],
+    ...(command.timeout_ms === undefined ? {} : { timeoutMs: command.timeout_ms }),
     ...cwd,
     ...(env === undefined ? {} : { env }),
   }

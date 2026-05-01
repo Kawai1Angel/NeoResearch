@@ -158,6 +158,7 @@ export const DomainRunnerCommand = z
     args: z.array(z.string()),
     cwd: z.string().optional(),
     env: z.record(z.string(), z.string()).optional(),
+    timeoutMs: z.number().int().positive().optional(),
   })
   .strict()
 export type DomainRunnerCommand = z.infer<typeof DomainRunnerCommand>

@@ -28,12 +28,18 @@ Use `neo-research serve` for the local API server and `neo-research dashboard` f
 git clone <repo-url>
 cd neo-research/opencode
 bun install
-bun run --cwd packages/opencode --conditions=browser ./src/index.ts doctor
+cd ..
+make dev-cli doctor
 ```
 
-During source development, run CLI commands through `bun run --cwd packages/opencode --conditions=browser ./src/index.ts`.
-`bun run --cwd packages/opencode build` builds only the current platform. Use
-`bun run --cwd packages/opencode build:all` only from release automation when all platform packages
+During source development, run CLI commands through the repository-level `make dev-cli` target. It
+loads `.env.local`, configures the local Neo-Cast environment, and starts the source CLI with the
+right Bun conditions. Avoid launching the TUI directly with
+`bun run --conditions=browser ./src/index.ts`; that path skips the local dev wrapper and can leave
+workers or terminal focus in an inconsistent state.
+
+`bun run --cwd opencode/packages/opencode build` builds only the current platform. Use
+`bun run --cwd opencode/packages/opencode build:all` only from release automation when all platform packages
 are required.
 
 ## npm Install

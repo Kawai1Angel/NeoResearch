@@ -50,11 +50,13 @@ import {
   ResearchTask,
   ResearchTaskID,
   SetChampionInput,
+  UpdateTaskSpecInput,
   UpdateRunStatusInput,
   UpdateTaskStatusInput,
 } from "./schema"
 import { Event } from "./event"
 import {
+  type DomainCandidateProposal,
   DomainRunPlan as DomainRunPlanSchema,
   issue,
   type DomainCandidateRanking,
@@ -64,6 +66,7 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
+import { proposeLLMCandidate } from "./llm-proposal"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
 
 type DbClient = Parameters<typeof Database.use>[0] extends (trx: infer D) => unknown ? D : never
@@ -172,7 +175,17 @@ interface RunBudgetExceeded {
   readonly used: number
 }
 
-const db = <T>(fn: (d: DbClient) => T) => Effect.sync(() => Database.use(fn))
+const db = <T>(fn: (d: DbClient) => T): Effect.Effect<T> =>
+  Effect.try({
+    try: () => Database.use(fn),
+    catch: (error) => error,
+  }).pipe(
+    Effect.catch((error: unknown) =>
+      Effect.sync(() => {
+        throw error
+      }),
+    ),
+  )
 
 function nowTime() {
   const now = Date.now()
@@ -491,7 +504,7 @@ function zodValidationIssues(error: z.ZodError): DomainValidationIssue[] {
   return error.issues.map((item) => issue(item.path.length ? item.path.join(".") : "$", item.message))
 }
 
-function normalizeTaskSpec(input: CreateTaskInput) {
+function normalizeTaskSpec(input: Pick<CreateTaskInput, "domainID" | "taskSpec">) {
   try {
     return DomainRegistry.createTaskSpec(input.domainID, input.taskSpec)
   } catch (error) {
@@ -761,8 +774,8 @@ function metricDominates(
   right: CandidateMetricSummary,
 ) {
   return direction === "minimize"
-    ? left.metricMean <= right.metricMean && left.metricMean < right.metricMean
-    : left.metricMean >= right.metricMean && left.metricMean > right.metricMean
+    ? left.metricMean < right.metricMean
+    : left.metricMean > right.metricMean
 }
 
 function paretoDominates(input: {
@@ -1099,6 +1112,7 @@ async function executeRunnerPlan(plan: DomainRunPlan): Promise<RunnerExecution> 
   const result = await Process.run([plan.command.executable, ...plan.command.args], {
     cwd,
     env: plan.command.env,
+    timeout: plan.command.timeoutMs,
     nothrow: true,
   })
   const stdout = result.stdout.toString()
@@ -1243,6 +1257,7 @@ export interface Interface {
   readonly listTasks: (input?: ListTaskInput) => Effect.Effect<ResearchTask[]>
   readonly getTask: (taskID: ResearchTaskID) => Effect.Effect<ResearchTask>
   readonly updateTaskStatus: (input: UpdateTaskStatusInput) => Effect.Effect<ResearchTask>
+  readonly updateTaskSpec: (input: UpdateTaskSpecInput) => Effect.Effect<ResearchTask>
   readonly createCandidate: (input: CreateCandidateInput) => Effect.Effect<ResearchCandidate>
   readonly listCandidates: (taskID: ResearchTaskID) => Effect.Effect<ResearchCandidate[]>
   readonly createRun: (input: CreateRunInput) => Effect.Effect<ResearchRun>
@@ -1337,6 +1352,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           .returning()
           .get(),
       )
+      if (!row) throw new Error("Research task insert returned no row")
       const task = mapTask(row)
       yield* bus.publish(Event.TaskCreated, { task })
       return task
@@ -1368,6 +1384,24 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         d
           .update(ResearchTaskTable)
           .set({ status: input.status, time_updated: Date.now() })
+          .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, projectID)))
+          .returning()
+          .get(),
+      )
+      if (!row) throw missing("Research task", input.taskID)
+      const task = mapTask(row)
+      yield* bus.publish(Event.TaskUpdated, { task })
+      return task
+    })
+
+    const updateTaskSpec = Effect.fn("Research.updateTaskSpec")(function* (input: UpdateTaskSpecInput) {
+      const existing = yield* getTask(input.taskID)
+      const taskSpec = normalizeTaskSpec({ domainID: existing.domainID, taskSpec: input.taskSpec })
+      const projectID = Instance.project.id
+      const row = yield* db((d) =>
+        d
+          .update(ResearchTaskTable)
+          .set({ task_spec: taskSpec, time_updated: Date.now() })
           .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, projectID)))
           .returning()
           .get(),
@@ -2517,6 +2551,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       let proposalCreated = false
       let selectionSource: "existing_frontier" | "domain_proposal" = "existing_frontier"
       let rankings: DomainCandidateRanking[] = []
+      let llmMetadata: JsonRecord = {}
       if (!candidate) {
         const memory = yield* listRelatedMemory(task)
         const champion = yield* getChampion(task.id)
@@ -2553,8 +2588,32 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                   utility: champion.utility,
                 },
         }
+        const llmResult = yield* Effect.promise(() =>
+          proposeLLMCandidate({
+            task,
+            proposalContext,
+            workspaceRoot: Instance.directory,
+          }),
+        )
+        llmMetadata = llmResult.metadata
+        let proposal: DomainCandidateProposal | undefined
+        if (llmResult.proposal) {
+          const validation = DomainRegistry.validateCandidate(task.domainID, {
+            taskSpec: task.taskSpec,
+            candidateSpec: llmResult.proposal.candidateSpec,
+          })
+          if (validation.ok) {
+            proposal = llmResult.proposal
+          } else {
+            llmMetadata = {
+              ...llmMetadata,
+              llmStatus: "invalid",
+              llmError: validation.issues[0]?.message ?? "LLM candidate failed domain validation",
+            }
+          }
+        }
         rankings = DomainRegistry.rankCandidateProposals(task.domainID, proposalContext)
-        const proposal = DomainRegistry.proposeCandidate(task.domainID, proposalContext)
+        if (!proposal) proposal = DomainRegistry.proposeCandidate(task.domainID, proposalContext)
 
         if (proposal) {
           proposalCreated = true
@@ -2618,6 +2677,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             ...(typeof rankPredictor.benchmarkEvidenceCount === "number"
               ? { benchmarkEvidenceCount: rankPredictor.benchmarkEvidenceCount }
               : {}),
+            ...llmMetadata,
           },
         ),
       )
@@ -3169,6 +3229,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       listTasks,
       getTask,
       updateTaskStatus,
+      updateTaskSpec,
       createCandidate,
       listCandidates,
       createApproval,

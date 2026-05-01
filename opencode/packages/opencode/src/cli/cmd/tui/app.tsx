@@ -42,6 +42,7 @@ import { DialogConsoleOrg } from "@tui/component/dialog-console-org"
 import { KeybindProvider, useKeybind } from "@tui/context/keybind"
 import { ThemeProvider, useTheme } from "@tui/context/theme"
 import { Home } from "@tui/routes/home"
+import { ResearchCockpit } from "@tui/routes/research-cockpit"
 import { Session } from "@tui/routes/session"
 import { PromptHistoryProvider } from "./component/prompt/history"
 import { FrecencyProvider } from "./component/prompt/frecency"
@@ -65,16 +66,17 @@ import { FormatError, FormatUnknownError } from "@/cli/error"
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
 
-function rendererConfig(_config: TuiConfig.Info): CliRendererConfig {
+export function rendererConfig(_config: TuiConfig.Info): CliRendererConfig {
   const mouseEnabled = !Flag.OPENCODE_DISABLE_MOUSE && (_config.mouse ?? true)
 
   return {
     externalOutputMode: "passthrough",
     targetFps: 60,
+    debounceDelay: 16,
     gatherStats: false,
     exitOnCtrlC: false,
     useKittyKeyboard: {},
-    autoFocus: false,
+    autoFocus: true,
     openConsoleOnError: false,
     useMouse: mouseEnabled,
     consoleOptions: {
@@ -151,6 +153,10 @@ export function tui(input: {
                             type: "session",
                             sessionID: "dummy",
                           }
+                        : input.args.launch === "cockpit"
+                          ? {
+                              type: "cockpit",
+                            }
                         : undefined
                     }
                   >
@@ -241,6 +247,16 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     toast,
     renderer,
   })
+  createEffect(
+    on(
+      dimensions,
+      () => {
+        renderer.currentRenderBuffer.clear()
+        renderer.requestRender()
+      },
+      { defer: true },
+    ),
+  )
   const [ready, setReady] = createSignal(false)
   TuiPluginRuntime.init({
     api,
@@ -305,24 +321,29 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     if (!terminalTitleEnabled() || Flag.OPENCODE_DISABLE_TERMINAL_TITLE) return
 
     if (route.data.type === "home") {
-      renderer.setTerminalTitle("OpenCode")
+      renderer.setTerminalTitle("NeoResearch")
+      return
+    }
+
+    if (route.data.type === "cockpit") {
+      renderer.setTerminalTitle("NeoResearch Cockpit")
       return
     }
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
       if (!session || SessionApi.isDefaultTitle(session.title)) {
-        renderer.setTerminalTitle("OpenCode")
+        renderer.setTerminalTitle("NeoResearch")
         return
       }
 
       const title = session.title.length > 40 ? session.title.slice(0, 37) + "..." : session.title
-      renderer.setTerminalTitle(`OC | ${title}`)
+      renderer.setTerminalTitle(`NR | ${title}`)
       return
     }
 
     if (route.data.type === "plugin") {
-      renderer.setTerminalTitle(`OC | ${route.data.id}`)
+      renderer.setTerminalTitle(`NR | ${route.data.id}`)
     }
   })
 
@@ -856,6 +877,9 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         <Switch>
           <Match when={route.data.type === "home"}>
             <Home />
+          </Match>
+          <Match when={route.data.type === "cockpit"}>
+            <ResearchCockpit />
           </Match>
           <Match when={route.data.type === "session"}>
             <Session />

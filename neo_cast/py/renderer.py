@@ -119,8 +119,12 @@ def main() -> None:
         raise SystemExit(2) from exc
 
     resolved_path = Path(args.resolved_path).expanduser()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_path.write_text(f"{json.dumps(resolved, indent=2, sort_keys=True)}\n", encoding="utf-8")
+    try:
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path.write_text(f"{json.dumps(resolved, indent=2, sort_keys=True)}\n", encoding="utf-8")
+    except OSError as exc:
+        print(json.dumps({"event": "runner_error", "error_kind": "write_failed", "message": str(exc)}))
+        raise SystemExit(4) from exc
 
     print(
         json.dumps(

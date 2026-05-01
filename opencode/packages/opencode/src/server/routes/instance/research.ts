@@ -311,6 +311,35 @@ export const ResearchRoutes = lazy(() =>
         }),
     )
     .patch(
+      "/tasks/:taskID/spec",
+      describeRoute({
+        summary: "Update research task spec",
+        description: "Replace and validate the task spec for a research task.",
+        operationId: "research.tasks.updateSpec",
+        responses: {
+          200: {
+            description: "Updated research task",
+            content: {
+              "application/json": {
+                schema: resolver(Research.ResearchTask.zod),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator("json", z.object({ taskSpec: Research.JsonRecord.zod })),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.updateSpec", c, function* () {
+          const svc = yield* Research.Service
+          return yield* svc.updateTaskSpec({
+            taskID: c.req.valid("param").taskID,
+            taskSpec: c.req.valid("json").taskSpec,
+          })
+        }),
+    )
+    .patch(
       "/tasks/:taskID/status",
       describeRoute({
         summary: "Update research task status",

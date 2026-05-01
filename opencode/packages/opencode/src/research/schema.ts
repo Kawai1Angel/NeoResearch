@@ -280,6 +280,13 @@ export class UpdateTaskStatusInput extends Schema.Class<UpdateTaskStatusInput>("
   static readonly zod = zod(this)
 }
 
+export class UpdateTaskSpecInput extends Schema.Class<UpdateTaskSpecInput>("ResearchUpdateTaskSpecInput")({
+  taskID: ResearchTaskID,
+  taskSpec: JsonRecord,
+}) {
+  static readonly zod = zod(this)
+}
+
 export class CreateCandidateInput extends Schema.Class<CreateCandidateInput>("ResearchCreateCandidateInput")({
   taskID: ResearchTaskID,
   parentCandidateID: Schema.optional(ResearchCandidateID),

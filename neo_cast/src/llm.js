@@ -334,6 +334,11 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
   if (candidate.training_strategy.budget.seed === undefined) candidate.training_strategy.budget.seed = 42;
   if (candidate.training_strategy.budget.time_budget_s === undefined) candidate.training_strategy.budget.time_budget_s = 600;
 
+  if (candidate.embedding?.type === "frequency") {
+    if (candidate.embedding.n_freq === undefined) candidate.embedding.n_freq = 16;
+    if (candidate.embedding.complex_mode === undefined) candidate.embedding.complex_mode = "magnitude";
+  }
+
   if (process.env.NEO_CAST_FAST_E2E) {
     candidate.training_strategy.budget = {
       ...candidate.training_strategy.budget,

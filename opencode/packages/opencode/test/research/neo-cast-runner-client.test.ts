@@ -43,14 +43,17 @@ async function createRunnerRoot() {
           run: {
             script: "py/runner.py",
             args: ["run", "--description", "{description}"],
+            timeout_ms: 900000,
           },
           ref_test: {
             script: "py/runner.py",
             args: ["ref-test"],
+            timeout_ms: 300000,
           },
           blind_test: {
             script: "py/runner.py",
             args: ["blind-test"],
+            timeout_ms: 300000,
           },
         },
       },
@@ -104,7 +107,25 @@ describe("Neo-Cast runner client", () => {
       executable: "python3",
       cwd: runnerRoot,
       args: ["py/runner.py", "run", "--description", "full training run"],
+      timeoutMs: 900000,
     })
+  })
+
+  test("uses the project-local Neo-Cast runtime python when the task did not override pythonExecutable", async () => {
+    const runnerRoot = await createRunnerRoot()
+    const binDir = path.join(runnerRoot, ".neo-cast", "runtime", ".venv", "bin")
+    await mkdir(binDir, { recursive: true })
+    const pythonPath = path.join(binDir, "python")
+    await writeFile(pythonPath, "#!/bin/sh\necho Python 3.12.0\n", "utf8")
+
+    const command = createNeoCastRunnerCommand({
+      stage: "smoke",
+      runtime,
+      description: "smoke run",
+      explicitRoot: runnerRoot,
+    })
+
+    expect(command.executable).toBe(pythonPath)
   })
 
   test("discovers a package-bundled runner and keeps project state in the caller cwd", async () => {

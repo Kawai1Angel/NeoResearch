@@ -144,7 +144,23 @@
           "type": "string",
           "enum": ["uniform", "horizon_tail", "outlier_robust"]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "series_decomposition" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["kernel_size"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "seasonal_differencing" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["period"] }
+        }
+      ]
     },
     "embeddingAction": {
       "type": "object",
@@ -214,7 +230,44 @@
           "minimum": 8,
           "maximum": 1024
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "patch" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["patch_len", "stride", "d_model"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "multiscale_patch" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["scales", "d_model"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "invert" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["d_model"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "frequency" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["n_freq", "d_model"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "calendar" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["fields", "embed_dim"] }
+        }
+      ]
     },
     "backboneAction": {
       "type": "object",
@@ -318,7 +371,72 @@
           "type": "string",
           "enum": ["mlp", "identity"]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "mlp" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["depth", "hidden_dim", "dropout"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "transformer" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["d_model", "n_heads", "n_layers", "dropout"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "rnn" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["hidden_dim"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "dlinear" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["kernel_size"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "tcn" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["hidden_dim", "n_layers", "kernel_size", "dropout"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "nbeats" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["hidden_dim", "n_blocks", "n_layers", "dropout"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "timesnet" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["hidden_dim", "n_layers", "top_k", "kernel_size", "dropout"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "ssm" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["state_dim"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "mixer" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["hidden_dim"] }
+        }
+      ]
     },
     "fusionAction": {
       "type": "object",

@@ -19,15 +19,18 @@
     },
     "run": {
       "script": "py/runner.py",
-      "args": ["run", "--description", "{description}"]
+      "args": ["run", "--description", "{description}"],
+      "timeout_ms": 900000
     },
     "ref_test": {
       "script": "py/runner.py",
-      "args": ["ref-test"]
+      "args": ["ref-test"],
+      "timeout_ms": 300000
     },
     "blind_test": {
       "script": "py/runner.py",
-      "args": ["blind-test"]
+      "args": ["blind-test"],
+      "timeout_ms": 300000
     }
   }
 }

@@ -11,6 +11,7 @@ export const ResearchPaths = {
   taskFingerprint: `${root}/tasks/:taskID/fingerprint`,
   taskProfile: `${root}/tasks/:taskID/profile`,
   taskStatus: `${root}/tasks/:taskID/status`,
+  taskSpec: `${root}/tasks/:taskID/spec`,
   taskBaselines: `${root}/tasks/:taskID/baselines`,
   taskExport: `${root}/tasks/:taskID/export`,
   taskAutonomousIterate: `${root}/tasks/:taskID/autonomous/iterate`,

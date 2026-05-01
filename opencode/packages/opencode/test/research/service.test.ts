@@ -2110,6 +2110,139 @@ describe("Research service", () => {
     })
   })
 
+  test("uses a configured LLM provider for autonomous proposals after local frontier candidates are exhausted", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    const previousFetch = globalThis.fetch
+    const previousProvider = process.env.NEO_CAST_LLM_PROVIDER
+    const previousBaseURL = process.env.NEO_CAST_LLM_BASE_URL
+    const previousModel = process.env.NEO_CAST_LLM_MODEL
+    const previousKey = process.env.NEO_CAST_LLM_API_KEY
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = []
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls.push({ url: input.toString(), init })
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    recipe_version: "recipe_schema_v1",
+                    recipe_id: "recipe_llm_patch_mlp_candidate",
+                    hypothesis: "LLM proposes a compact patch MLP after baselines are exhausted.",
+                    preprocessing: { actions: [{ type: "none" }] },
+                    embedding: { type: "patch", patch_len: 16, stride: 8, d_model: 64 },
+                    backbone: { type: "mlp", depth: 2, hidden_dim: 128, activation: "gelu", dropout: 0.1 },
+                    fusion: { type: "temporal", channel_mode: "independent" },
+                    prediction_head: { type: "linear", output_distribution: "point" },
+                    training_strategy: {
+                      loss: { base: "mse", horizon_weighting: "uniform" },
+                      optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.01 },
+                      scheduler: { type: "none", warmup_steps: 0 },
+                      regularization: { dropout: 0.1, grad_clip: 1 },
+                      budget: { max_epochs: 5, time_budget_s: 120, batch_size: 16, patience: 2, seed: 42 },
+                    },
+                  }),
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+    }) as typeof fetch
+    process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+    process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
+    process.env.NEO_CAST_LLM_MODEL = "test-model"
+    process.env.NEO_CAST_LLM_API_KEY = "test-key"
+
+    try {
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast-llm")
+          await writeFakeNeoCastRunner(fakeNeoCastRoot)
+          await mkdir(path.join(fakeNeoCastRoot, ".neo-cast"), { recursive: true })
+          await writeFile(
+            path.join(fakeNeoCastRoot, ".neo-cast", "config.json"),
+            `${JSON.stringify(
+              {
+                llm: {
+                  provider: "openai-compatible",
+                  base_url: "http://llm.test/v1",
+                  model: "test-model",
+                  max_tokens: 1024,
+                  temperature: 0.2,
+                },
+              },
+              null,
+              2,
+            )}\n`,
+            "utf8",
+          )
+
+          const task = await createTSFTask(
+            "autonomous llm proposal fake runner",
+            {
+              bridgeOnly: true,
+              neoCastProjectRoot: fakeNeoCastRoot,
+              pythonExecutable: "bash",
+            },
+            "autonomous",
+          )
+
+          for (let index = 0; index < 3; index++) {
+            await runResearch(
+              Research.Service.use((svc) =>
+                svc.runAutonomousIteration({
+                  taskID: task.id,
+                  stage: "smoke",
+                  description: `baseline ${index + 1}`,
+                }),
+              ),
+            )
+          }
+
+          const iteration = await runResearch(
+            Research.Service.use((svc) =>
+              svc.runAutonomousIteration({
+                taskID: task.id,
+                stage: "smoke",
+                description: "llm proposal",
+              }),
+            ),
+          )
+
+          expect(fetchCalls).toHaveLength(1)
+          expect(fetchCalls[0]!.url).toBe("http://llm.test/v1/chat/completions")
+          expect((fetchCalls[0]!.init?.headers as Record<string, string>).authorization).toBe("Bearer test-key")
+          expect(JSON.parse(String(fetchCalls[0]!.init?.body))).toMatchObject({ model: "test-model" })
+          expect(iteration.candidate.generatedBy).toBe("llm")
+          expect(iteration.candidate.candidateSpec.recipeID).toBe("recipe_llm_patch_mlp_candidate")
+          expect(iteration.managerTrace.find((step) => step.role === "design")?.metadata).toMatchObject({
+            generatedBy: "llm",
+            llmProvider: "openai-compatible",
+            llmStatus: "used",
+          })
+        },
+      })
+    } finally {
+      globalThis.fetch = previousFetch
+      if (previousProvider === undefined) delete process.env.NEO_CAST_LLM_PROVIDER
+      else process.env.NEO_CAST_LLM_PROVIDER = previousProvider
+      if (previousBaseURL === undefined) delete process.env.NEO_CAST_LLM_BASE_URL
+      else process.env.NEO_CAST_LLM_BASE_URL = previousBaseURL
+      if (previousModel === undefined) delete process.env.NEO_CAST_LLM_MODEL
+      else process.env.NEO_CAST_LLM_MODEL = previousModel
+      if (previousKey === undefined) delete process.env.NEO_CAST_LLM_API_KEY
+      else process.env.NEO_CAST_LLM_API_KEY = previousKey
+    }
+  })
+
   test("uses same-domain benchmark memory for autonomous proposal ranking", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const datasetPath = await writeProfileDataset()

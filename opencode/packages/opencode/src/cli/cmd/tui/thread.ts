@@ -38,6 +38,7 @@ type TuiArgs = NetworkOptions & {
   fork?: boolean
   prompt?: string
   agent?: string
+  launch?: "home" | "cockpit"
 }
 
 function createWorkerFetch(client: RpcClient): typeof fetch {
@@ -254,6 +255,7 @@ async function startTui(args: TuiArgs) {
             model: args.model,
             prompt,
             fork: args.fork,
+            launch: args.launch,
           },
         })
       } finally {
@@ -269,12 +271,12 @@ export const CockpitCommand = cmd({
   command: "cockpit [project]",
   describe: "start the NeoResearch TUI cockpit",
   builder: tuiBuilder,
-  handler: startTui,
+  handler: (args) => startTui({ ...args, launch: "cockpit" }),
 })
 
 export const TuiThreadCommand = cmd({
   command: "$0 [project]",
-  describe: "start the NeoResearch TUI cockpit",
+  describe: "start the NeoResearch TUI launcher",
   builder: tuiBuilder,
   handler: startTui,
 })

@@ -43,9 +43,10 @@ const checks = [
   },
   {
     name: "research Cockpit tests",
-    command: "bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx",
+    command:
+      "bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx test/cli/tui/research-home-render.test.tsx test/cli/tui/research-slash-menu.test.tsx",
     run: () =>
-      $`bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx`.env(
+      $`bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx test/cli/tui/research-home-render.test.tsx test/cli/tui/research-slash-menu.test.tsx`.env(
         releaseEnv,
       ),
   },

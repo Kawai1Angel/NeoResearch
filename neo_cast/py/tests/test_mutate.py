@@ -107,6 +107,20 @@ class MutateRecipeTest(unittest.TestCase):
         )
         self.assert_valid_recipe(mutated)
 
+    def test_raw_backbone_switch_resets_shared_channel_fusion(self) -> None:
+        recipe = base_recipe(
+            embedding={"type": "none"},
+            backbone={"type": "linear", "shared": False, "bias": True},
+            channel_mode="shared",
+        )
+
+        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.09177}, index=1)
+
+        self.assertEqual(mutated["embedding"], {"type": "none"})
+        self.assertNotEqual(mutated["backbone"]["type"], "linear")
+        self.assertEqual(mutated["fusion"], {"type": "temporal", "channel_mode": "independent"})
+        self.assert_valid_recipe(mutated)
+
     def test_policy_from_state_uses_relative_thresholds(self) -> None:
         policy = make_policy_from_state({"best_val_avg_mse": 1.09177})
 

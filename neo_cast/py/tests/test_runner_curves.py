@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 PY_ROOT = Path(__file__).resolve().parents[1]
 if str(PY_ROOT) not in sys.path:
@@ -47,6 +48,65 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
             payload = json.loads((artifact_dir / "training_curves.json").read_text(encoding="utf-8"))
 
         self.assertEqual(payload, {"curves_by_horizon": {"96": [0.724, 0.712], "720": [1.518, 1.514]}})
+
+    def test_write_training_curves_skips_invalid_epoch_losses(self) -> None:
+        records = [
+            {"event": "epoch_end", "horizon": 96, "epoch": 1, "val_loss": 0.724},
+            {"event": "epoch_end", "horizon": 96, "epoch": 2, "val_loss": "not-a-float"},
+            {"event": "epoch_end", "horizon": 720, "epoch": 1, "val_loss": None},
+            {"event": "epoch_end", "horizon": 720, "epoch": 2, "val_loss": 1.514},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp)
+            runner._write_training_curves(records, artifact_dir)
+
+            payload = json.loads((artifact_dir / "training_curves.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload, {"curves_by_horizon": {"96": [0.724], "720": [1.514]}})
+
+    def test_smoke_validation_failure_records_current_candidate_context_without_resolved_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".neo-cast"
+            artifacts_dir = state_dir / "artifacts"
+            state_dir.mkdir(parents=True)
+            current_path = state_dir / "current_candidate.json"
+            resolved_path = state_dir / "resolved_candidate.json"
+            state_path = state_dir / "runner_state.json"
+            results_path = state_dir / "results.tsv"
+            current_path.write_text("{}\n", encoding="utf-8")
+            resolved_path.write_text(
+                '{"candidate_id":"stale_candidate","model_family":"stale_family"}\n',
+                encoding="utf-8",
+            )
+            state = runner.RunnerState(
+                session_id="session_test",
+                best_run_id=None,
+                best_val_avg_mse=None,
+                keep_count=0,
+                crash_streak=0,
+                candidate_counter=0,
+                initialized_at="2026-04-29T00:00:00Z",
+                session_started_at="2026-04-29T00:00:00Z",
+            )
+
+            with (
+                patch.object(runner, "STATE_DIR", state_dir),
+                patch.object(runner, "ARTIFACTS_DIR", artifacts_dir),
+                patch.object(runner, "CURRENT_CANDIDATE_PATH", current_path),
+                patch.object(runner, "RESOLVED_CANDIDATE_PATH", resolved_path),
+                patch.object(runner, "STATE_PATH", state_path),
+                patch.object(runner, "RESULTS_PATH", results_path),
+                patch.object(runner, "_run_and_capture", return_value=(2, [])),
+            ):
+                runner.ensure_results_file(force=True)
+                exit_code = runner.run_experiment(state, description="bad candidate", skip_smoke=False)
+                rows = runner.load_results()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(rows[-1]["status"], "invalid")
+        self.assertEqual(rows[-1]["candidate_id"], "smoke_1")
+        self.assertEqual(rows[-1]["model_family"], "unknown")
 
 
 if __name__ == "__main__":

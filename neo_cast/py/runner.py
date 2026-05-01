@@ -186,7 +186,8 @@ def _run_and_capture(cmd: list[str]) -> tuple[int, list[dict[str, Any]]]:
         text=True,
     )
     records: list[dict[str, Any]] = []
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        raise RuntimeError("runner subprocess stdout pipe is unavailable")
     for raw_line in proc.stdout:
         line = raw_line.rstrip("\n")
         if not line:
@@ -232,9 +233,11 @@ def _write_training_curves(records: list[dict[str, Any]], artifact_dir: Path | N
     for record in epoch_records:
         horizon = str(record.get("horizon", "unknown"))
         try:
-            value = float(record.get("val_loss", 0.0))
+            value = float(record["val_loss"])
         except (TypeError, ValueError):
-            value = 0.0
+            continue
+        except KeyError:
+            continue
         curves.setdefault(horizon, []).append(value)
 
     try:
@@ -288,6 +291,23 @@ def _candidate_context() -> tuple[str, str]:
     return str(resolved["candidate_id"]), str(resolved["model_family"])
 
 
+def _candidate_context_from_current(fallback_candidate_id: str) -> tuple[str, str]:
+    try:
+        payload = read_json(CURRENT_CANDIDATE_PATH)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return fallback_candidate_id, "unknown"
+    if not isinstance(payload, dict):
+        return fallback_candidate_id, "unknown"
+
+    candidate_id = payload.get("candidate_id") or payload.get("recipe_id") or fallback_candidate_id
+    model_family = payload.get("model_family")
+    if model_family is None and payload.get("recipe_version") == "recipe_schema_v1":
+        backbone = payload.get("backbone")
+        backbone_type = backbone.get("type") if isinstance(backbone, dict) else "unknown"
+        model_family = f"recipe:{backbone_type}"
+    return str(candidate_id), str(model_family or "unknown")
+
+
 def _write_result_row(
     *,
     state: RunnerState,
@@ -331,6 +351,10 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         renderer_exit = _resolve_candidate()
         if renderer_exit != 0:
             return renderer_exit
+        candidate_id, model_family = _candidate_context()
+    else:
+        candidate_id = f"smoke_{state.candidate_counter}"
+        model_family = "unknown"
 
     if not skip_smoke:
         smoke_cmd = [
@@ -345,9 +369,9 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
             str(ARTIFACTS_DIR),
         ]
         smoke_exit, smoke_records = _run_and_capture(smoke_cmd)
-        candidate_id, model_family = _candidate_context()
 
         if smoke_exit != 0:
+            candidate_id, model_family = _candidate_context_from_current(f"smoke_{state.candidate_counter}")
             status = "invalid" if smoke_exit == 2 else "smoke_fail"
             state.crash_streak = state.crash_streak + 1 if status == "smoke_fail" else state.crash_streak
             save_state(state)
@@ -363,6 +387,8 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
                 is_best=False,
             )
             return smoke_exit
+
+        candidate_id, model_family = _candidate_context()
 
     train_cmd = [
         sys.executable,

@@ -81,11 +81,17 @@ function routeNavigate(route: ReturnType<typeof useRoute>, name: string, params?
     return
   }
 
+  if (name === "cockpit") {
+    route.navigate({ type: "cockpit" })
+    return
+  }
+
   route.navigate({ type: "plugin", id: name, data: params })
 }
 
 function routeCurrent(route: ReturnType<typeof useRoute>): TuiPluginApi["route"]["current"] {
   if (route.data.type === "home") return { name: "home" }
+  if (route.data.type === "cockpit") return { name: "cockpit" }
   if (route.data.type === "session") {
     return {
       name: "session",

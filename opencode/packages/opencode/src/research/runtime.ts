@@ -418,6 +418,7 @@ export async function executeSubprocessResearchJob(job: ResearchJob): Promise<Re
   const result = await Process.run([plan.command.executable, ...plan.command.args], {
     cwd,
     env: plan.command.env,
+    timeout: plan.command.timeoutMs,
     nothrow: true,
   })
   const stdout = result.stdout.toString()

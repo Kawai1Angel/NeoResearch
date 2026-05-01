@@ -173,6 +173,7 @@ def _switch_to_raw_backbone(recipe: dict[str, Any], backbone: dict[str, Any], no
         return None
     recipe["embedding"] = {"type": "none"}
     recipe["backbone"] = copy.deepcopy(backbone)
+    recipe["fusion"] = {"type": "temporal", "channel_mode": "independent"}
     return note
 
 

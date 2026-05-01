@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
+import path from "node:path"
+
 export type JsonRecord = Record<string, unknown>
 
 export type ResearchCockpitTask = {
@@ -21,6 +25,7 @@ export type ResearchCockpitRun = {
   stage?: "profile" | "baseline" | "smoke" | "low_fidelity" | "full" | "ref_test" | "blind_test"
   status: "queued" | "running" | "succeeded" | "failed" | "rejected"
   metrics: JsonRecord
+  error?: string
   resourceUsage?: JsonRecord
   time: {
     created: number
@@ -152,6 +157,16 @@ export type ResearchCockpitWorkflowItem = {
 }
 
 export type ResearchCockpitRecommendation = {
+  action:
+    | "create_task"
+    | "approve_gate"
+    | "configure_runner"
+    | "profile"
+    | "seed_baselines"
+    | "run_autonomous_loop"
+    | "run_smoke"
+    | "export_report"
+    | "review_state"
   title: string
   detail: string
 }
@@ -235,7 +250,7 @@ export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput
     },
     {
       label: "Run smoke experiments",
-      status: hasSucceededRun ? "done" : hasCandidates && input.runnerReady ? "active" : "todo",
+      status: hasSucceededRun ? "done" : hasProfile && hasCandidates && input.runnerReady ? "active" : "todo",
       detail: hasSucceededRun ? "At least one non-profile run succeeded." : "Execute approved candidates against the runner.",
     },
     {
@@ -261,53 +276,62 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
 
   if (!input.task) {
     return {
+      action: "create_task",
       title: "Create a dataset-backed TSF task",
       detail: "Enter a research goal to create a full-recipe autonomous task, or use New CSV Task to bind a local CSV.",
     }
   }
   if (pendingApproval) {
     return {
+      action: "approve_gate",
       title: "Approve pending gate",
       detail: `${pendingApproval.kind} approval is waiting before the next promotion step.`,
     }
   }
   if (!input.runnerReady) {
     return {
+      action: "configure_runner",
       title: "Configure Neo-Cast runner",
       detail: "Set taskSpec.runtime.neoCastProjectRoot before executing candidate runs.",
     }
   }
   if (!hasProfile) {
     return {
+      action: "profile",
       title: "Profile dataset",
       detail: "Generate the dataset fingerprint before comparing architectures.",
     }
   }
   if (!hasCandidates) {
     return {
+      action: "seed_baselines",
       title: "Seed baseline candidates",
       detail: "Create initial recipes so the runner has concrete experiments to evaluate.",
     }
   }
   if (input.task.mode === "autonomous") {
     return {
+      action: "run_autonomous_loop",
       title: "Run autonomous loop",
       detail: "Let the manager iterate across design, runner, analyst, and memory steps.",
     }
   }
   if (runnableCandidate) {
     return {
+      action: "run_smoke",
       title: "Run smoke execution",
       detail: `Execute ${runnableCandidate.id} and compare the primary metric.`,
     }
   }
   if (hasSucceededRun && !hasReport) {
     return {
+      action: "export_report",
       title: "Export research report",
       detail: "Package the latest evidence into a markdown report.",
     }
   }
   return {
+    action: "review_state",
     title: "Review latest research state",
     detail: hasReport ? "Inspect the exported report and decide whether to continue." : "No immediate blocking action is pending.",
   }
@@ -528,11 +552,188 @@ export function canRunResearchCockpitCandidate(candidate: ResearchCockpitCandida
   return candidate.approvalStatus === "approved" || candidate.approvalStatus === "auto_approved"
 }
 
-export function canExecuteResearchCockpitTask(task: ResearchCockpitTask | undefined) {
+export function updateResearchCockpitTaskRunnerRoot(
+  task: ResearchCockpitTask,
+  neoCastProjectRoot: string,
+): ResearchCockpitTask {
+  const root = neoCastProjectRoot.trim()
+  const taskSpec = asRecord(task.taskSpec)
+  const runtime = asRecord(taskSpec.runtime)
+  return {
+    ...task,
+    taskSpec: {
+      ...taskSpec,
+      runtime: {
+        ...runtime,
+        neoCastProjectRoot: root,
+      },
+    },
+  }
+}
+
+export type ResearchCockpitRunnerStatus = {
+  configured: boolean
+  ready: boolean
+  root?: string
+  pythonExecutable?: string
+  reason:
+    | "missing_task"
+    | "missing_runtime"
+    | "missing_root"
+    | "missing_root_path"
+    | "missing_runner_script"
+    | "missing_python"
+    | "python_unavailable"
+    | "unsupported_python"
+    | "ready"
+  detail: string
+}
+
+type ResearchCockpitRunnerStatusOptions = {
+  validateRuntime?: boolean
+}
+
+function parsePythonVersion(raw: string) {
+  const match = /Python\s+(\d+)\.(\d+)\.(\d+)/.exec(raw)
+  if (!match) return undefined
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    raw,
+  }
+}
+
+function isSupportedPythonVersion(raw: string) {
+  const version = parsePythonVersion(raw)
+  return version !== undefined && (version.major > 3 || (version.major === 3 && version.minor >= 10))
+}
+
+function neoCastRuntimePython(root: string) {
+  return path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
+}
+
+export function getResearchCockpitRunnerStatus(
+  task: ResearchCockpitTask | undefined,
+  options: ResearchCockpitRunnerStatusOptions = {},
+): ResearchCockpitRunnerStatus {
+  if (!task) {
+    return {
+      configured: false,
+      ready: false,
+      reason: "missing_task",
+      detail: "No research task is selected.",
+    }
+  }
   const runtime = task?.taskSpec.runtime
-  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) return false
+  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) {
+    return {
+      configured: false,
+      ready: false,
+      reason: "missing_runtime",
+      detail: "taskSpec.runtime is not configured.",
+    }
+  }
   const root = (runtime as Record<string, unknown>).neoCastProjectRoot
-  return typeof root === "string" && root.trim().length > 0
+  if (typeof root !== "string" || root.trim().length === 0) {
+    return {
+      configured: false,
+      ready: false,
+      reason: "missing_root",
+      detail: "taskSpec.runtime.neoCastProjectRoot is not configured.",
+    }
+  }
+
+  const resolvedRoot = path.resolve(root.trim())
+  if (options.validateRuntime !== true) {
+    return {
+      configured: true,
+      ready: true,
+      root: resolvedRoot,
+      reason: "ready",
+      detail: "Neo-Cast runner root is configured.",
+    }
+  }
+  if (!existsSync(resolvedRoot)) {
+    return {
+      configured: true,
+      ready: false,
+      root: resolvedRoot,
+      reason: "missing_root_path",
+      detail: `Neo-Cast runner root does not exist: ${resolvedRoot}`,
+    }
+  }
+
+  const smokeScript = path.join(resolvedRoot, "py", "validate.py")
+  if (!existsSync(smokeScript)) {
+    return {
+      configured: true,
+      ready: false,
+      root: resolvedRoot,
+      reason: "missing_runner_script",
+      detail: `Neo-Cast smoke runner is missing: ${smokeScript}`,
+    }
+  }
+
+  const rawPythonExecutable = (runtime as Record<string, unknown>).pythonExecutable
+  const configuredPython =
+    typeof rawPythonExecutable === "string" && rawPythonExecutable.trim().length > 0
+      ? rawPythonExecutable.trim()
+      : undefined
+  const pythonExecutable =
+    configuredPython && configuredPython !== "python3" ? configuredPython : neoCastRuntimePython(resolvedRoot)
+  if (!existsSync(pythonExecutable) && pythonExecutable === neoCastRuntimePython(resolvedRoot)) {
+    return {
+      configured: true,
+      ready: false,
+      root: resolvedRoot,
+      pythonExecutable,
+      reason: "missing_python",
+      detail: "Neo-Cast project runtime is not initialized. Run `node ./bin/neo-cast.js init-runtime` in the runner root.",
+    }
+  }
+
+  const result = spawnSync(pythonExecutable, ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  const versionText = `${result.stdout || ""}${result.stderr || ""}`.trim()
+  if (result.error || result.status !== 0) {
+    return {
+      configured: true,
+      ready: false,
+      root: resolvedRoot,
+      pythonExecutable,
+      reason: "python_unavailable",
+      detail: `Neo-Cast runtime python is not available: ${pythonExecutable}`,
+    }
+  }
+  if (!isSupportedPythonVersion(versionText)) {
+    return {
+      configured: true,
+      ready: false,
+      root: resolvedRoot,
+      pythonExecutable,
+      reason: "unsupported_python",
+      detail: `Neo-Cast requires Python >= 3.10; detected ${versionText || "unknown"}.`,
+    }
+  }
+  return {
+    configured: true,
+    ready: true,
+    root: resolvedRoot,
+    pythonExecutable,
+    reason: "ready",
+    detail: `Neo-Cast runtime is ready at ${pythonExecutable}.`,
+  }
+}
+
+export function canExecuteResearchCockpitTask(
+  task: ResearchCockpitTask | undefined,
+  options: ResearchCockpitRunnerStatusOptions = {},
+) {
+  const status = getResearchCockpitRunnerStatus(task, options)
+  return options.validateRuntime === true ? status.ready : status.configured
 }
 
 export function hasApprovedResearchCockpitRefTestGate(approvals: ResearchCockpitApproval[], candidateID: string) {
