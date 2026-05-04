@@ -71,12 +71,16 @@ function formatMinutes(timeBudgetMs) {
 }
 
 function printAttemptResult(attempt, source, candidate, row) {
+  const statusPrefix = `R${attempt}`;
   const status = row?.status ? String(row.status).toUpperCase() : "UNKNOWN";
   const mse = row?.val_avg_mse || "NA";
-  const noImprove = row?.status === "discard" ? ` no_improve=${row.no_improve_streak || "?"}` : "";
-  console.log(
-    `[attempt ${String(attempt).padStart(2, " ")}] source=${source} family=${describeCandidateFamily(candidate)} val_avg_mse=${mse} -> ${status}${noImprove}`,
-  );
+  console.log(`${statusPrefix}:SRC=${source}`);
+  console.log(`${statusPrefix}:FAM=${describeCandidateFamily(candidate)}`);
+  console.log(`${statusPrefix}:VAL=${mse}`);
+  console.log(`${statusPrefix}:DEC=${status}`);
+  if (row?.no_improve_streak !== undefined && row?.no_improve_streak !== null) {
+    console.log(`${statusPrefix}:NOIMP=${row.no_improve_streak}`);
+  }
 }
 
 async function proposeCandidate(requirementBundle, history, previousRow, resolvedConfig, options) {
@@ -131,8 +135,9 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
   let previousRow = getLatestSessionRow(projectRoot);
   let stoppedReason = null;
 
-  console.log("[loop] autonomous iteration started");
-  console.log(`[loop] time_budget=${formatMinutes(timeBudgetMs)} max_no_improve=${maxNoImprove}`);
+  console.log(`LOOP:START=autonomous`);
+  console.log(`LOOP:TIME=${formatMinutes(timeBudgetMs)}`);
+  console.log(`LOOP:NOIMPROVE=${maxNoImprove}`);
 
   while (true) {
     const state = readRunnerState(projectRoot);
@@ -144,7 +149,7 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
     });
     if (stop.stop) {
       stoppedReason = stop.reason;
-      console.log(`[loop] stopping: ${stop.reason}`);
+      console.log(`LOOP:STOP=${stop.reason}`);
       break;
     }
 
@@ -160,11 +165,11 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
 
     const candidate = result.candidate;
     const candidatePath = writeCurrentCandidate(projectRoot, candidate);
-    console.log(`design_attempt=${attempt}`);
-    console.log(`candidate_source=${result.source}`);
-    console.log(`candidate_path=${candidatePath}`);
-    console.log(`candidate_family=${describeCandidateFamily(candidate)}`);
-    console.log(`candidate_id=${describeCandidateId(candidate)}`);
+    console.log(`R${attempt}:CAN=ready`);
+    console.log(`R${attempt}:SRC=${result.source}`);
+    console.log(`R${attempt}:PATH=${candidatePath}`);
+    console.log(`R${attempt}:FAM=${describeCandidateFamily(candidate)}`);
+    console.log(`R${attempt}:ID=${describeCandidateId(candidate)}`);
 
     const description = candidate.hypothesis || `${describeCandidateFamily(candidate)} autonomous attempt ${attempt}`;
     const exitCode = await runRunner(projectRoot, description, {
@@ -180,16 +185,16 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
 
     if (exitCode > 1) {
       stoppedReason = `hard_failure:${exitCode}`;
-      console.log(`[loop] hard failure at attempt ${attempt}, exiting`);
+      console.log(`LOOP:HARD_FAIL=${attempt}`);
       break;
     }
   }
 
   const finalState = readRunnerState(projectRoot);
   console.log(
-    `[loop] total_time=${formatMinutes(Date.now() - sessionStartMs)} total_attempts=${attempt} keep_count=${numeric(finalState?.keep_count, 0)}`,
+    `LOOP:END attempts=${attempt} time=${formatMinutes(Date.now() - sessionStartMs)} keep=${numeric(finalState?.keep_count, 0)}`,
   );
-  if (stoppedReason) console.log(`[loop] stopped_reason=${stoppedReason}`);
+  if (stoppedReason) console.log(`LOOP:STOP_REASON=${stoppedReason}`);
   return getBestSessionRow(projectRoot);
 }
 

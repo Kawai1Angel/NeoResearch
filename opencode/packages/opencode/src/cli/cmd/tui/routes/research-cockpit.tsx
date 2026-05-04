@@ -3,6 +3,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useCommandDialog } from "@tui/component/dialog-command"
+import { Spinner } from "@tui/component/spinner"
 import { useTextareaKeybindings } from "@tui/component/textarea-keybindings"
 import { useEvent } from "@tui/context/event"
 import { useLocal } from "@tui/context/local"
@@ -31,12 +32,16 @@ import {
   hasApprovedResearchCockpitRefTestGate,
   interactionModeForTask,
   parseTsfCsvTaskInput,
+  slotFromSocraticQuestion,
   validateTsfCsvTaskInput,
   researchInteractionModeLabel,
   researchCockpitCandidateTitle,
+  resolveResearchCockpitProjectRunnerRoot,
+  resolveNeoCastSubdirectory,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
   taskModeForInteractionMode,
+  updateResearchCockpitTaskInteractionMode,
   updateResearchCockpitTaskRunnerRoot,
   type CreateResearchTaskInput,
   type JsonRecord,
@@ -66,6 +71,8 @@ import {
 import packageJson from "../../../../../package.json"
 
 type CandidateRunStage = Extract<NonNullable<ResearchCockpitRun["stage"]>, "smoke" | "ref_test" | "blind_test">
+
+const chatRequestTimeoutMs = 90_000
 
 async function researchRequest<T>(
   sdk: ReturnType<typeof useSDK>,
@@ -106,6 +113,44 @@ async function researchRequest<T>(
   return (await response.json()) as T
 }
 
+async function researchRequestNoContent(
+  sdk: ReturnType<typeof useSDK>,
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = 90_000,
+) {
+  const url = new URL(path, sdk.url)
+  if (sdk.directory) url.searchParams.set("directory", sdk.directory)
+
+  const headers = new Headers(init.headers)
+  if (init.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json")
+  }
+
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const signal =
+    init.signal && !init.signal.aborted
+      ? (AbortSignal as unknown as { any: (signals: AbortSignal[]) => AbortSignal }).any?.([
+          init.signal,
+          timeoutSignal,
+        ]) ?? timeoutSignal
+      : timeoutSignal
+
+  let response: Response
+  try {
+    response = await sdk.fetch(url, { ...init, headers, signal })
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s (${path})`)
+    }
+    throw err
+  }
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(text || `${response.status} ${response.statusText}`)
+  }
+}
+
 function shortID(value: string | undefined) {
   if (!value) return "-"
   return value.slice(0, 8)
@@ -114,6 +159,37 @@ function shortID(value: string | undefined) {
 function formatError(error: unknown) {
   const text = error instanceof Error ? error.message : String(error)
   return text.length > 180 ? text.slice(0, 177) + "..." : text
+}
+
+const busySpinnerFrames = ["-", "\\", "|", "/"]
+
+function formatBusyElapsed(ms: number) {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes === 0) return `${rest}s`
+  return `${minutes}:${String(rest).padStart(2, "0")}`
+}
+
+function busyActionText(action: string, activity?: string) {
+  const prefix = activity ? `${activity} ` : ""
+  if (action.startsWith("chat:")) {
+    return `${prefix}Waiting for ${action.slice("chat:".length)} response... Press Esc to cancel.`
+  }
+  if (action === "chat") return `${prefix}Waiting for model response... Press Esc to cancel.`
+  return `${prefix}Running ${action}...`
+}
+
+function localResearchChatReply(value: string) {
+  const normalized = value.trim().toLowerCase().replace(/[!！.。?？\s]+$/g, "")
+  const greetings = new Set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽", "在吗"])
+  if (!greetings.has(normalized)) return undefined
+  return "你好，我在。可以直接告诉我研究目标、CSV 数据路径，或让我解释当前任务状态。"
+}
+
+function socraticSlotLine(slot: ReturnType<typeof buildSocraticClarificationState>["slots"][number]) {
+  const mark = slot.status === "filled" ? "✓" : "→"
+  return `${mark} ${slot.label}${slot.value ? `: ${slot.value}` : ""}`
 }
 
 function metricText(metrics: JsonRecord) {
@@ -194,13 +270,14 @@ type StreamLine = {
   id: string
   text: string
   tone?: "text" | "muted" | "primary" | "success" | "warning" | "error"
+  spinner?: boolean
 }
 
 type ChatProviderList = {
   providers: Array<{
     id: string
     name?: string
-    models?: Record<string, { id?: string; name?: string }>
+    models?: Record<string, { id?: string; name?: string; limit?: { context?: number } }>
   }>
   default: Record<string, string>
 }
@@ -216,11 +293,89 @@ type ChatModelSelection = {
   modelID: string
 }
 
+type ResolvedChatDefaults = {
+  agent: string
+  model: ChatModelSelection
+  modelLabel: string
+  modelLimit?: number
+  providerLabel?: string
+}
+
+type ChatUsageEntry = {
+  messageID: string
+  providerID?: string
+  modelID?: string
+  total: number
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+  time: number
+}
+
 function useOptionalLocal() {
   try {
     return useLocal()
   } catch {
     return undefined
+  }
+}
+
+function finiteNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function formatTokenNumber(value: number) {
+  return new Intl.NumberFormat("en-US").format(Math.round(value))
+}
+
+function formatDollar(value: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(value)
+}
+
+function chatUsageEntryFromInfo(info: unknown): ChatUsageEntry | undefined {
+  if (!info || typeof info !== "object") return
+  const candidate = info as {
+    id?: unknown
+    role?: unknown
+    providerID?: unknown
+    modelID?: unknown
+    cost?: unknown
+    tokens?: {
+      total?: unknown
+      input?: unknown
+      output?: unknown
+      reasoning?: unknown
+      cache?: { read?: unknown; write?: unknown }
+    }
+    time?: { completed?: unknown; created?: unknown }
+  }
+  if (candidate.role !== "assistant" || typeof candidate.id !== "string") return
+  const input = finiteNumber(candidate.tokens?.input)
+  const output = finiteNumber(candidate.tokens?.output)
+  const reasoning = finiteNumber(candidate.tokens?.reasoning)
+  const cacheRead = finiteNumber(candidate.tokens?.cache?.read)
+  const cacheWrite = finiteNumber(candidate.tokens?.cache?.write)
+  const fallbackTotal = input + output + reasoning + cacheRead + cacheWrite
+  const total = finiteNumber(candidate.tokens?.total) || fallbackTotal
+  if (total <= 0 && fallbackTotal <= 0) return
+  return {
+    messageID: candidate.id,
+    providerID: typeof candidate.providerID === "string" ? candidate.providerID : undefined,
+    modelID: typeof candidate.modelID === "string" ? candidate.modelID : undefined,
+    total,
+    input,
+    output,
+    reasoning,
+    cacheRead,
+    cacheWrite,
+    cost: finiteNumber(candidate.cost),
+    time: finiteNumber(candidate.time?.completed) || finiteNumber(candidate.time?.created),
   }
 }
 
@@ -488,6 +643,7 @@ export function ResearchCockpit() {
   const [selectedIndex, setSelectedIndex] = createSignal(0)
   const [selectedCandidateIndex, setSelectedCandidateIndex] = createSignal(0)
   const [busy, setBusy] = createSignal<string>()
+  const [chatBusy, setChatBusy] = createSignal<string>()
   const [error, setError] = createSignal<string>()
   const [errorEvents, setErrorEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
   const [actionEvents, setActionEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
@@ -496,28 +652,113 @@ export function ResearchCockpit() {
   const [promptEvents, setPromptEvents] = createSignal<Array<{ id: number; text: string; taskID?: string; detail?: string }>>(
     [],
   )
+  const [streamingChat, setStreamingChat] = createSignal<{
+    id: number
+    sessionID: string
+    messageID?: string
+    partID?: string
+    text: string
+    modelLabel?: string
+  }>()
   const [chatSessionID, setChatSessionID] = createSignal<string>()
+  const [chatUsageByMessage, setChatUsageByMessage] = createSignal<Record<string, ChatUsageEntry>>({})
+  const [interactionModeByTask, setInteractionModeByTask] = createSignal<Record<string, ResearchInteractionMode>>({})
   const routedGoalsHandled = new Set<string>()
   let routedCsvTaskHandled = false
   let actionQueue = Promise.resolve()
   let activeActionAbort: AbortController | undefined
+  let activeChatAbort: AbortController | undefined
+  let chatDefaultsKey: string | undefined
+  let chatDefaultsPromise: Promise<ResolvedChatDefaults> | undefined
+  let activeApiActionKey: string | undefined
+  let activeApiTimer: ReturnType<typeof setInterval> | undefined
+  const [activeApiStartedAt, setActiveApiStartedAt] = createSignal<number>()
+  const [activeApiTick, setActiveApiTick] = createSignal(0)
+
+  function stopActiveApiTimer() {
+    if (!activeApiTimer) return
+    clearInterval(activeApiTimer)
+    activeApiTimer = undefined
+  }
 
   onMount(() => {
     focusTimer = setTimeout(() => promptInput?.focus(), 0)
   })
   onCleanup(() => {
     if (focusTimer) clearTimeout(focusTimer)
+    stopActiveApiTimer()
     activeActionAbort?.abort()
+    activeChatAbort?.abort()
   })
 
   useKeyboard((evt) => {
     const name = evt.name?.toLowerCase()
     if (name !== "escape" && name !== "esc") return
-    if (!busy()) return
-    activeActionAbort?.abort()
+    if (!abortActiveOperation(false)) return
     evt.preventDefault()
     evt.stopPropagation()
   })
+
+  function handleStreamingChatEvent(payload: { type: string; properties?: any }) {
+    const current = streamingChat()
+    if (!current) return
+    const properties = payload.properties ?? {}
+    if (payload.type === "message.updated") {
+      const info = properties.info
+      if (info?.sessionID !== current.sessionID || info.role !== "assistant") return
+      recordChatUsage(info)
+      setStreamingChat((draft) => (draft ? { ...draft, messageID: info.id } : draft))
+      return
+    }
+    if (payload.type === "message.part.updated") {
+      const part = properties.part
+      if (!current.messageID || part?.sessionID !== current.sessionID || part.messageID !== current.messageID) return
+      if (part.type !== "text") return
+      setStreamingChat((draft) =>
+        draft
+          ? {
+              ...draft,
+              partID: part.id,
+              text: typeof part.text === "string" ? part.text : draft.text,
+            }
+          : draft,
+      )
+      return
+    }
+    if (payload.type === "message.part.delta") {
+      if (!current.messageID || properties.sessionID !== current.sessionID || properties.messageID !== current.messageID) return
+      if (current.partID && properties.partID !== current.partID) return
+      if (properties.field !== "text" || typeof properties.delta !== "string") return
+      setStreamingChat((draft) =>
+        draft
+          ? {
+              ...draft,
+              partID: draft.partID ?? properties.partID,
+              text: draft.text + properties.delta,
+            }
+          : draft,
+      )
+    }
+  }
+
+  function recordChatUsage(info: unknown) {
+    const entry = chatUsageEntryFromInfo(info)
+    if (!entry) return
+    setChatUsageByMessage((current) => ({
+      ...current,
+      [entry.messageID]: entry,
+    }))
+  }
+
+  function persistStreamingChat() {
+    const current = streamingChat()
+    if (!current?.text) return
+    setActionEvents((events) => [
+      ...events.slice(-(promptEventHistoryLimit - 1)),
+      { id: current.id, action: "chat-stream", text: current.text },
+    ])
+    setStreamingChat(undefined)
+  }
 
   const [tasks] = createResource(refresh, async () => {
     return researchRequest<ResearchCockpitTask[]>(sdk, "/research/tasks?limit=30")
@@ -546,6 +787,7 @@ export function ResearchCockpit() {
   })
 
   const unsubscribeResearchEvents = event.subscribe((payload) => {
+    handleStreamingChatEvent(payload)
     if (!shouldRefreshResearchCockpitOnEvent(payload)) return
     setRefresh((value) => value + 1)
   })
@@ -604,13 +846,50 @@ export function ResearchCockpit() {
   })
 
   const pendingApproval = createMemo(() => approvals()?.find((approval) => approval.status === "pending"))
+  const chatAwaitingFirstToken = createMemo(() => !!chatBusy() || (!!streamingChat() && !streamingChat()?.text))
+  const activeApiAction = createMemo(() => {
+    return chatBusy() ?? (streamingChat() && !streamingChat()?.text ? `chat:${streamingChat()?.modelLabel ?? "model"}` : busy())
+  })
+  createEffect(() => {
+    const active = activeApiAction()
+    if (!active) {
+      activeApiActionKey = undefined
+      setActiveApiStartedAt(undefined)
+      setActiveApiTick(0)
+      stopActiveApiTimer()
+      return
+    }
+    if (activeApiActionKey !== active) {
+      activeApiActionKey = active
+      setActiveApiStartedAt(Date.now())
+      setActiveApiTick(0)
+    }
+    if (!activeApiTimer) {
+      activeApiTimer = setInterval(() => setActiveApiTick((value) => value + 1), 250)
+    }
+  })
+  const activeApiActivity = createMemo(() => {
+    const startedAt = activeApiStartedAt()
+    if (startedAt === undefined) return undefined
+    const tick = activeApiTick()
+    const frame = busySpinnerFrames[tick % busySpinnerFrames.length]
+    return `${frame} ${formatBusyElapsed(Date.now() - startedAt)}`
+  })
+  const interruptHint = createMemo(() => {
+    const activity = activeApiActivity()
+    return activity ? `${activity} esc interrupt` : "esc interrupt"
+  })
   const runnerStatus = createMemo(() => getResearchCockpitRunnerStatus(selectedTask(), { validateRuntime: true }))
   const runnerReady = createMemo(() => runnerStatus().ready)
   const taskCandidates = createMemo(() => candidates() ?? [])
   const taskRuns = createMemo(() => runs() ?? [])
   const taskArtifacts = createMemo(() => artifacts() ?? [])
   const taskApprovals = createMemo(() => approvals() ?? [])
-  const taskInteractionMode = createMemo(() => interactionModeForTask(selectedTask()))
+  const taskInteractionMode = createMemo(() => {
+    const task = selectedTask()
+    if (!task) return undefined
+    return interactionModeByTask()[task.id] ?? interactionModeForTask(task)
+  })
   const socraticClarification = createMemo(() => buildSocraticClarificationState(selectedTask(), taskApprovals()))
   const validChampion = createMemo(() => {
     const item = champion()
@@ -689,6 +968,69 @@ export function ResearchCockpit() {
     await queued
   }
 
+  function abortActiveOperation(notifyIdle = true) {
+    if (chatBusy()) {
+      activeChatAbort?.abort()
+      return true
+    }
+    const streaming = streamingChat()
+    if (streaming) {
+      void researchRequest<boolean>(sdk, `/session/${encodeURIComponent(streaming.sessionID)}/abort`, { method: "POST" }).catch(
+        () => undefined,
+      )
+      setStreamingChat(undefined)
+      const message = "Chat request canceled."
+      setError(message)
+      setErrorEvents((events) => [
+        ...events.slice(-(errorEventHistoryLimit - 1)),
+        { id: ++streamEventID, action: "chat", text: message },
+      ])
+      toast.show({ variant: "error", message })
+      return true
+    }
+    if (busy()) {
+      activeActionAbort?.abort()
+      return true
+    }
+    if (notifyIdle) {
+      toast.show({
+        variant: "info",
+        message: "No active cockpit action to abort.",
+        duration: 3000,
+      })
+    }
+    return false
+  }
+
+  async function runChatAction(fn: (signal: AbortSignal) => Promise<string>) {
+    const abortController = new AbortController()
+    activeChatAbort = abortController
+    setChatBusy("chat")
+    try {
+      const message = await fn(abortController.signal)
+      setError(undefined)
+      if (message) {
+        setActionEvents((events) => [
+          ...events.slice(-(promptEventHistoryLimit - 1)),
+          { id: ++streamEventID, action: message.startsWith("请求已提交给 ") ? "chat-status" : "chat", text: message },
+        ])
+        toast.show({ variant: "info", message })
+      }
+      setRefresh((value) => value + 1)
+    } catch (err) {
+      const message = abortController.signal.aborted ? "Chat request canceled." : formatError(err)
+      setError(message)
+      setErrorEvents((events) => [
+        ...events.slice(-(errorEventHistoryLimit - 1)),
+        { id: ++streamEventID, action: "chat", text: message },
+      ])
+      toast.show({ variant: "error", message })
+    } finally {
+      if (activeChatAbort === abortController) activeChatAbort = undefined
+      if (activeChatAbort === undefined) setChatBusy(undefined)
+    }
+  }
+
   async function chooseInteractionMode() {
     return new Promise<ResearchInteractionMode | undefined>((resolve) => {
       let settled = false
@@ -712,10 +1054,14 @@ export function ResearchCockpit() {
     const resolvedMode = mode ?? (interactionMode === undefined ? undefined : taskModeForInteractionMode(interactionMode))
     if (!resolvedMode) return
     await runAction(`create-${resolvedMode}`, async () => {
-      const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask(resolvedMode, sdk.directory ?? process.cwd(), {
-        ...defaults,
-        ...(interactionMode === undefined ? {} : { interactionMode }),
-      })
+      const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask(
+        resolvedMode,
+        resolveNeoCastSubdirectory(sdk.directory ?? process.cwd()),
+        {
+          ...defaults,
+          ...(interactionMode === undefined ? {} : { interactionMode }),
+        },
+      )
       const task = await researchRequest<ResearchCockpitTask>(sdk, "/research/tasks", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -735,6 +1081,9 @@ export function ResearchCockpit() {
       const value = await DialogPrompt.show(dialog, "CSV dataset path", {
         value: inputValue,
         placeholder: "/path/to/ETTh1.csv target=OT horizon=24 context=96 full",
+        onChange: (next) => {
+          setCsvInputErrors(next.trim().length === 0 ? [] : validateTsfCsvTaskInput(next))
+        },
         description: () => (
           <box gap={1}>
             <text fg={theme.textMuted}>Options: target=OT,HUFL horizon=24,48 context=96 preset=etth1 full|bridge.</text>
@@ -783,20 +1132,28 @@ export function ResearchCockpit() {
     })
   }
 
-  async function approvePending() {
+  async function replyPendingApproval(status: "approved" | "rejected") {
     const approval = pendingApproval()
     if (!approval) return
-    await runAction("approve-pending", async () => {
+    await runAction(`${status === "approved" ? "approve" : "reject"}-pending`, async () => {
       const updated = await researchRequest<ResearchCockpitApproval>(
         sdk,
         `/research/approvals/${encodeURIComponent(approval.id)}/reply`,
         {
           method: "POST",
-          body: JSON.stringify({ status: "approved" }),
+          body: JSON.stringify({ status }),
         },
       )
       return `${shortID(updated.id)} ${updated.status}`
     })
+  }
+
+  async function approvePending() {
+    await replyPendingApproval("approved")
+  }
+
+  async function rejectPending() {
+    await replyPendingApproval("rejected")
   }
 
   async function runAutonomousIteration(description = "cockpit autonomous iteration") {
@@ -815,26 +1172,52 @@ export function ResearchCockpit() {
     })
   }
 
-  async function resolveChatDefaults() {
+  function currentChatDefaultsKey() {
+    const selectedModel = local?.model.current()
+    const selectedAgent = local?.agent.current()?.name
+    return JSON.stringify({
+      providerID: selectedModel?.providerID,
+      modelID: selectedModel?.modelID,
+      agent: selectedAgent,
+    })
+  }
+
+  async function loadChatDefaults(): Promise<ResolvedChatDefaults> {
     const [providersResult, agentsResult] = await Promise.all([
       researchRequest<ChatProviderList>(sdk, "/config/providers"),
       researchRequest<ChatAgent[]>(sdk, "/agent"),
     ])
+    const selectedModel = local?.model.current()
     const defaults = resolveResearchCockpitChatDefaults({
       providersResult,
       agentsResult,
-      selectedModel: local?.model.current(),
+      selectedModel,
       selectedAgentName: local?.agent.current()?.name,
     })
     const provider = providersResult.providers.find((item) => item.id === defaults.model.providerID)
     const model = provider?.models?.[defaults.model.modelID]
-    const selectedModel = local?.model.current()
     return {
       ...defaults,
       modelLabel: selectedModel
         ? local?.model.parsed().model ?? defaults.model.modelID
         : model?.name ?? model?.id ?? defaults.model.modelID,
+      modelLimit: model?.limit?.context,
+      providerLabel: provider?.name ?? provider?.id,
     }
+  }
+
+  async function resolveChatDefaults() {
+    const key = currentChatDefaultsKey()
+    if (chatDefaultsPromise && chatDefaultsKey === key) return chatDefaultsPromise
+    chatDefaultsKey = key
+    chatDefaultsPromise = loadChatDefaults().catch((err) => {
+      if (chatDefaultsKey === key) {
+        chatDefaultsKey = undefined
+        chatDefaultsPromise = undefined
+      }
+      throw err
+    })
+    return chatDefaultsPromise
   }
 
   async function ensureChatSession() {
@@ -854,7 +1237,8 @@ export function ResearchCockpit() {
     const run = latestRun()
     const context = [
       "You are NeoResearch's Research Agent inside a time-series forecasting cockpit.",
-      "Answer conversationally and help the user operate the current research workspace.",
+      "尽量用中文回答用户，并用简洁、可执行的方式帮助用户操作当前研究 workspace。",
+      "保留 JSON 字段名、schema 名称、指标名、命令、文件路径、模型族和技术术语的英文原文。",
       "Do not claim that an experiment ran unless the Research OS task state or run history says so.",
       task ? `Task: ${task.title} / ${task.mode} / ${task.status}` : "Task: none selected",
       task ? `Objective: ${task.objective.primaryMetric ?? "unknown"} ${task.objective.direction ?? ""}`.trim() : "",
@@ -878,38 +1262,56 @@ export function ResearchCockpit() {
   }
 
   async function sendChatPrompt(value: string, resolvedDefaults?: Awaited<ReturnType<typeof resolveChatDefaults>>) {
-    await runAction("chat", async (signal) => {
+    await runChatAction(async (signal) => {
+      const localReply = localResearchChatReply(value)
+      if (localReply) return localReply
       const [sessionID, defaults] = await Promise.all([
         ensureChatSession(),
         resolvedDefaults ? Promise.resolve(resolvedDefaults) : resolveChatDefaults(),
       ])
+      persistStreamingChat()
+      setStreamingChat({ id: ++streamEventID, sessionID, text: "", modelLabel: defaults.modelLabel })
+      setChatBusy(`chat:${defaults.modelLabel}`)
       try {
-        const message = await researchRequest<unknown>(sdk, `/session/${encodeURIComponent(sessionID)}/message`, {
-          method: "POST",
-          signal,
-          body: JSON.stringify({
-            ...defaults.model,
-            agent: defaults.agent,
-            model: defaults.model,
-            parts: chatContextForPrompt(value),
-          }),
-        })
-        return assistantTextFromResponse(message)
+        await researchRequestNoContent(
+          sdk,
+          `/session/${encodeURIComponent(sessionID)}/prompt_async`,
+          {
+            method: "POST",
+            signal,
+            body: JSON.stringify({
+              ...defaults.model,
+              agent: defaults.agent,
+              model: defaults.model,
+              parts: chatContextForPrompt(value),
+            }),
+          },
+          chatRequestTimeoutMs,
+        )
+        return `请求已提交给 ${defaults.modelLabel}，正在等待回复流...`
       } catch (err) {
-        if (signal.aborted) throw new Error("Chat request canceled.")
+        if (signal.aborted) throw err
         const message = formatError(err)
-        if (message.startsWith("Request timed out after 90s")) {
-          throw new Error("Chat request to Research Agent timed out after 90s")
+        if (message.includes("Request timed out")) {
+          throw new Error(
+            `Chat request to ${defaults.modelLabel} timed out after ${chatRequestTimeoutMs / 1000}s. Check the model API key/network or switch models.`,
+          )
         }
-        throw err
+        throw new Error(`Chat request to ${defaults.modelLabel} failed: ${message}`)
       }
     })
   }
 
   async function runAutonomousLoop() {
     const task = selectedTask()
-    if (!task || task.mode !== "autonomous" || !runnerReady()) return
+    if (!task || task.mode !== "autonomous") return
     await runAction("autonomous-loop", async () => {
+      if (!runnerReady()) {
+        const status = runnerStatus()
+        throw new Error(
+          `Runner not ready: ${status.detail ?? status.reason}. Configure taskSpec.runtime.neoCastProjectRoot and ensure py/validate.py exists.`,
+        )
+      }
       const result = await researchRequest<ResearchCockpitLoopResult>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/autonomous/loop`,
@@ -1049,7 +1451,7 @@ export function ResearchCockpit() {
   }
 
   async function useProjectRunnerRoot() {
-    const root = sdk.directory ?? process.cwd()
+    const root = resolveResearchCockpitProjectRunnerRoot(sdk.directory ?? process.cwd())
     const task = selectedTask()
     if (!task || !root.trim()) return
     await runAction("configure-runner-root", async () => {
@@ -1090,6 +1492,32 @@ export function ResearchCockpit() {
     dialog.clear()
   }
 
+  async function switchInteractionMode(interactionMode?: ResearchInteractionMode) {
+    const task = selectedTask()
+    if (!task) {
+      toast.show({ variant: "info", message: "Select a research task before switching interaction mode.", duration: 3000 })
+      return
+    }
+    const nextMode = interactionMode ?? (await chooseInteractionMode())
+    if (!nextMode) return
+    await runAction("switch-interaction-mode", async () => {
+      const updated = updateResearchCockpitTaskInteractionMode(task, nextMode)
+      const saved = await researchRequest<ResearchCockpitTask>(
+        sdk,
+        `/research/tasks/${encodeURIComponent(task.id)}/spec`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ interactionMode: nextMode, taskSpec: updated.taskSpec }),
+        },
+      )
+      setInteractionModeByTask((current) => ({
+        ...current,
+        [saved.id]: nextMode,
+      }))
+      return `interaction mode switched to ${researchInteractionModeLabel(interactionModeForTask(saved))}`
+    })
+  }
+
   async function runRecommendedAction() {
     const task = selectedTask()
     const next = recommendation().action
@@ -1097,7 +1525,7 @@ export function ResearchCockpit() {
       promptInput?.focus()
       toast.show({
         variant: "info",
-        message: "Describe a forecasting goal to create the next research task.",
+        message: "描述一个预测目标来创建下一个研究任务。",
         duration: 4000,
       })
       return
@@ -1148,6 +1576,22 @@ export function ResearchCockpit() {
       route.navigate({ type: "home" })
       return
     }
+    if (name === "abort" || name === "cancel" || name === "stop") {
+      abortActiveOperation()
+      return
+    }
+    if (name === "mode") {
+      await switchInteractionMode()
+      return
+    }
+    if (name === "mode-socratic" || name === "socratic") {
+      await switchInteractionMode("socratic")
+      return
+    }
+    if (name === "mode-companion" || name === "companion") {
+      await switchInteractionMode("companion")
+      return
+    }
     if (name === "review") {
       await createTask("review")
       return
@@ -1190,6 +1634,10 @@ export function ResearchCockpit() {
     }
     if (name === "approve") {
       await approvePending()
+      return
+    }
+    if (name === "reject") {
+      await rejectPending()
       return
     }
     if (name === "iterate") {
@@ -1263,14 +1711,14 @@ export function ResearchCockpit() {
   }
 
   async function createTaskFromPrompt(value: string, source: "prompt" | "home" = "prompt") {
-    const interactionMode = source === "home" ? "socratic" : await chooseInteractionMode()
+    const interactionMode = await chooseInteractionMode()
     if (!interactionMode) return
     const mode = taskModeForInteractionMode(interactionMode)
     await runAction(source === "home" ? "create-from-home-goal" : "create-from-prompt", async () => {
       const payload: CreateResearchTaskInput = buildDefaultTsfResearchTaskFromGoal(
         value,
         mode,
-        sdk.directory ?? process.cwd(),
+        resolveNeoCastSubdirectory(sdk.directory ?? process.cwd()),
         { interactionMode },
       )
       const metadata = payload.taskSpec.metadata
@@ -1351,6 +1799,22 @@ export function ResearchCockpit() {
         taskID: task?.id,
       },
     ])
+    const clarification = socraticClarification()
+    if (clarification.active && task.status === "paused" && clarification.nextQuestion) {
+      const slotID = slotFromSocraticQuestion(clarification.nextQuestion)
+      if (slotID !== "unknown") {
+        try {
+          await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/answer`, {
+            method: "POST",
+            body: JSON.stringify({ slots: { [slotID]: value } }),
+          })
+        } catch {
+          // fall through to chat
+        }
+        promptInput?.focus()
+        return
+      }
+    }
     if (task.mode === "autonomous" && runnerReady()) {
       await sendChatPrompt(value)
       promptInput?.focus()
@@ -1424,6 +1888,37 @@ export function ResearchCockpit() {
       category: "Research",
       slash: { name: "doctor" },
       onSelect: () => route.navigate({ type: "home" }),
+    },
+    {
+      title: "Abort active cockpit action",
+      value: "research.abort.active",
+      category: "Research",
+      slash: { name: "abort", aliases: ["cancel", "stop"] },
+      onSelect: () => abortActiveOperation(),
+    },
+    {
+      title: "Switch interaction mode",
+      value: "research.interaction.mode",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "mode" },
+      onSelect: () => void switchInteractionMode(),
+    },
+    {
+      title: "Switch to Companion mode",
+      value: "research.interaction.mode.companion",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "mode-companion", aliases: ["companion"] },
+      onSelect: () => void switchInteractionMode("companion"),
+    },
+    {
+      title: "Switch to Socratic mode",
+      value: "research.interaction.mode.socratic",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "mode-socratic", aliases: ["socratic"] },
+      onSelect: () => void switchInteractionMode("socratic"),
     },
     {
       title: "Create TSF review task",
@@ -1506,6 +2001,14 @@ export function ResearchCockpit() {
       enabled: !!pendingApproval(),
       slash: { name: "approve" },
       onSelect: () => void approvePending(),
+    },
+    {
+      title: "Reject pending research candidate",
+      value: "research.reject.pending",
+      category: "Research",
+      enabled: !!pendingApproval(),
+      slash: { name: "reject" },
+      onSelect: () => void rejectPending(),
     },
     {
       title: "Run autonomous research iteration",
@@ -1661,9 +2164,8 @@ export function ResearchCockpit() {
   const latestRun = createMemo(() => (runs() ?? [])[0])
   const streamLines = createMemo<StreamLine[]>(() => {
     const lines: StreamLine[] = []
-    const hasConversation = promptEvents().length > 0 || actionEvents().length > 0 || errorEvents().length > 0 || !!busy()
     const run = latestRun()
-    if (!hasConversation && run) {
+    if (run) {
       const tone = run.status === "succeeded" ? "success" : run.status === "failed" ? "error" : "warning"
       lines.push({
         id: `run-${run.id}`,
@@ -1678,9 +2180,88 @@ export function ResearchCockpit() {
           tone: "error",
         })
       }
+    } else {
+      const clarification = socraticClarification()
+      if (clarification.active) {
+        lines.push(
+          {
+            id: "socratic-clarification",
+            text: `Socratic clarification: slots: ${clarification.missingSlots.join(", ") || "unknown"}`,
+            tone: "warning",
+          },
+          {
+            id: "socratic-next-question",
+            text: `Next question: ${clarification.nextQuestion ?? "请确认缺失的研究意图。"}`,
+            tone: "primary",
+          },
+          ...clarification.slots.map((slot) => ({
+            id: `socratic-slot-${slot.id}`,
+            text: socraticSlotLine(slot),
+            tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
+          })),
+        )
+      } else {
+        const approval = pendingApproval()
+        if (approval) {
+          lines.push(
+            {
+              id: "approval-requested",
+              text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue or /reject to stop.`,
+              tone: "warning",
+            },
+            {
+              id: "approval-reason",
+              text: approval.reason,
+              tone: "muted",
+            },
+          )
+        } else {
+          const task = selectedTask()
+          if (task) {
+            const mode = taskInteractionMode()
+            if (mode === "socratic") {
+              lines.push(
+                {
+                  id: "idle-task-socratic",
+                  text: "Socratic onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。",
+                  tone: "primary",
+                },
+                ...clarification.slots.map((slot) => ({
+                  id: `idle-socratic-slot-${slot.id}`,
+                  text: socraticSlotLine(slot),
+                  tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
+                })),
+              )
+              if (clarification.nextQuestion) {
+                lines.push({
+                  id: "idle-task-socratic-next",
+                  text: `Next question: ${clarification.nextQuestion}`,
+                  tone: "primary",
+                })
+              }
+            } else if (mode === "companion") {
+              lines.push({
+                id: "idle-task-companion",
+                text: "Companion checkpoint: review the proposed next step, approve gates, or ask for a recommendation.",
+                tone: "primary",
+              })
+            } else {
+              lines.push({ id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" })
+            }
+          } else {
+            lines.push({ id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" })
+          }
+        }
+      }
     }
     const timeline = [
       ...promptEvents().map((event) => ({ id: event.id, kind: "prompt" as const, event })),
+      ...(streamingChat()?.text
+        ? [{ id: streamingChat()!.id, kind: "streaming-chat" as const, event: streamingChat()! }]
+        : []),
+      ...(streamingChat() && !streamingChat()?.text
+        ? [{ id: streamingChat()!.id, kind: "chat-loading" as const, event: streamingChat()! }]
+        : []),
       ...actionEvents().map((event) => ({ id: event.id, kind: "action" as const, event })),
       ...errorEvents()
         .slice(-errorEventHistoryLimit)
@@ -1692,114 +2273,109 @@ export function ResearchCockpit() {
         if (item.event.detail) lines.push({ id: `prompt-detail-${item.event.id}`, text: item.event.detail, tone: "muted" })
         continue
       }
-      if (item.kind === "action") {
+      if (item.kind === "streaming-chat") {
         const parts = compactStreamTextParts(item.event.text)
         parts.forEach((part, index) => {
           lines.push({
-            id: `action-${item.event.id}-${index}`,
+            id: `streaming-chat-${item.event.id}-${index}`,
             text: index === 0 ? `Research Agent: ${part}` : `  ${part}`,
             tone: "primary",
           })
         })
         continue
       }
+      if (item.kind === "chat-loading") {
+        lines.push({
+          id: `chat-loading-${item.event.id}`,
+          text: "Research Agent 正在生成回复...",
+          tone: "primary",
+          spinner: true,
+        })
+        continue
+      }
+      if (item.kind === "action") {
+        if (item.event.action === "chat-status" && streamingChat()?.text) continue
+        const parts = compactStreamTextParts(item.event.text)
+        parts.forEach((part, index) => {
+          lines.push({
+            id: `action-${item.event.id}-${index}`,
+            text: index === 0 ? `${item.event.action === "chat-status" ? "Status" : "Research Agent"}: ${part}` : `  ${part}`,
+            tone: item.event.action === "chat-status" ? "muted" : "primary",
+          })
+        })
+        continue
+      }
       lines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
-    const active = busy()
+    const active = activeApiAction()
     if (active) {
       lines.push({
         id: "busy",
-        text: active === "chat" ? "Waiting for Research Agent response" : `Running ${active}...`,
+        text: busyActionText(active, activeApiActivity()),
         tone: "warning",
       })
     }
-    if (lines.length > 0) return lines
-    const clarification = socraticClarification()
-    if (clarification.active) {
-      return [
-        {
-          id: "socratic-clarification",
-          text: `Socratic clarification: slots: ${clarification.missingSlots.join(", ") || "unknown"}`,
-          tone: "warning",
-        },
-        {
-          id: "socratic-next-question",
-          text: `Next question: ${clarification.nextQuestion ?? "Confirm the missing research intent."}`,
-          tone: "primary",
-        },
-      ]
-    }
-    const approval = pendingApproval()
-    if (approval) {
-      return [
-        {
-          id: "approval-requested",
-          text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue.`,
-          tone: "warning",
-        },
-        {
-          id: "approval-reason",
-          text: approval.reason,
-          tone: "muted",
-        },
-      ]
-    }
-    const task = selectedTask()
-    if (task) {
-      const mode = taskInteractionMode()
-      if (mode === "socratic") {
-        return [
-          {
-            id: "idle-task-socratic",
-            text: "Socratic onboarding: confirm dataset, target columns, horizon, and metric before the first autonomous loop.",
-            tone: "primary",
-          },
-        ]
-      }
-      if (mode === "companion") {
-        return [
-          {
-            id: "idle-task-companion",
-            text: "Companion checkpoint: review the proposed next step, approve gates, or ask for a recommendation.",
-            tone: "primary",
-          },
-        ]
-      }
-      return [{ id: "idle-task", text: "Research output will appear here as the agent runs.", tone: "muted" }]
-    }
-    return [{ id: "idle-empty", text: "Describe a forecasting goal or create a CSV task to begin.", tone: "muted" }]
+    return lines
   })
   const promptPlaceholder = createMemo(() => {
-    if (!selectedTask()) return "Ask Research Agent, or use New CSV Task to create a dataset-backed task..."
-    if (socraticClarification().active) return "Answer the current Socratic question..."
-    if (taskInteractionMode() === "companion") return "Ask for a recommendation, approve a checkpoint, or export the bundle..."
-    if (taskInteractionMode() === "socratic") return "Answer the next clarifying question, request an experiment, or export..."
-    return "Ask for the next experiment, approve a gate, or export the report..."
+    if (!selectedTask()) return "询问 Research Agent，或使用 New CSV Task 创建带数据集的任务..."
+    if (socraticClarification().active) return "回答当前 Socratic 问题..."
+    if (taskInteractionMode() === "companion") return "请求建议、批准 checkpoint，或导出 bundle..."
+    if (taskInteractionMode() === "socratic") return "回答下一个澄清问题、请求实验或导出..."
+    return "请求下一个实验、批准 gate，或导出报告..."
   })
   const [chatMetadata] = createResource(async () => {
     try {
-      const [providersResult, agentsResult] = await Promise.all([
-        researchRequest<ChatProviderList>(sdk, "/config/providers"),
-        researchRequest<ChatAgent[]>(sdk, "/agent"),
-      ])
-      const defaults = resolveResearchCockpitChatDefaults({
-        providersResult,
-        agentsResult,
-        selectedModel: local?.model.current(),
-        selectedAgentName: local?.agent.current()?.name,
-      })
-      const provider = providersResult.providers.find((item) => item.id === defaults.model.providerID)
-      const model = provider?.models?.[defaults.model.modelID]
+      const defaults = await resolveChatDefaults()
       const modelID = defaults.model.modelID
-      const modelName = model?.name ?? model?.id ?? modelID
       return {
         agent: defaults.agent,
-        model: modelName,
-        provider: provider?.name ?? provider?.id,
+        model: defaults.modelLabel,
+        modelLimit: defaults.modelLimit,
+        provider: defaults.providerLabel,
       }
     } catch {
       return undefined
     }
+  })
+  const chatUsageEntries = createMemo(() => Object.values(chatUsageByMessage()))
+  const latestChatUsage = createMemo(() => chatUsageEntries().toSorted((left, right) => left.time - right.time).at(-1))
+  const chatUsageTotals = createMemo(() =>
+    chatUsageEntries().reduce(
+      (sum, entry) => ({
+        total: sum.total + entry.total,
+        input: sum.input + entry.input,
+        output: sum.output + entry.output,
+        reasoning: sum.reasoning + entry.reasoning,
+        cacheRead: sum.cacheRead + entry.cacheRead,
+        cacheWrite: sum.cacheWrite + entry.cacheWrite,
+        cost: sum.cost + entry.cost,
+      }),
+      { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    ),
+  )
+  const contextWindowLine = createMemo(() => {
+    const latest = latestChatUsage()
+    if (!latest) return
+    const limit = chatMetadata()?.modelLimit
+    if (!limit || limit <= 0) return formatTokenNumber(latest.total)
+    const pct = Math.max(1, Math.round((latest.total / limit) * 100))
+    return `${formatTokenNumber(latest.total)} / ${formatTokenNumber(limit)} (${pct}%)`
+  })
+  const sessionTokenLines = createMemo(() => {
+    const totals = chatUsageTotals()
+    if (totals.total <= 0) return []
+    const cache = totals.cacheRead + totals.cacheWrite
+    return [
+      `tokens in=${formatTokenNumber(totals.input)} out=${formatTokenNumber(totals.output)}`,
+      `reason=${formatTokenNumber(totals.reasoning)} cache=${formatTokenNumber(cache)}`,
+      totals.cost > 0 ? `cost ${formatDollar(totals.cost)}` : undefined,
+    ].filter((item): item is string => Boolean(item))
+  })
+  const contextModelLabel = createMemo(() => {
+    const selectedModel = local?.model.current()
+    if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
+    return chatMetadata()?.model ?? "-"
   })
   const promptMetadataText = createMemo(() => {
     const selectedModel = local?.model.current()
@@ -1865,6 +2441,12 @@ export function ResearchCockpit() {
   const taskSummary = createMemo(() => `${selectedTaskPosition()} · ${candidatePosition()}`)
   const hasResultsProgress = createMemo(() => Boolean(validChampion()) || hasResultArtifact())
   const progressState = (done: boolean, active: boolean) => (done ? "done" : active ? "active" : "todo")
+  const intentProgress = createMemo(() => progressState(Boolean(selectedTask()), !selectedTask()))
+  const dataProgress = createMemo(() => progressState(hasProfileProgress(), Boolean(selectedTask()) && !hasProfileProgress()))
+  const nasProgress = createMemo(() =>
+    progressState(hasExplorationProgress(), hasProfileProgress() && !hasExplorationProgress() && runnerReady()),
+  )
+  const publishProgress = createMemo(() => progressState(hasResultsProgress(), hasExplorationProgress() && !hasResultsProgress()))
   const taskPath = createMemo(() => sdk.directory ?? process.cwd())
   const compactTaskPath = createMemo(() => compactTailPath(taskPath()))
   const runnerIssueTitle = createMemo(() => {
@@ -1949,6 +2531,23 @@ export function ResearchCockpit() {
             >
               Export Bundle
             </text>
+            <text
+              fg={busy() || chatAwaitingFirstToken() ? cockpitColors.warning : cockpitColors.textMuted}
+              onMouseUp={() => {
+                abortActiveOperation()
+              }}
+            >
+              Abort
+            </text>
+            <text
+              fg={!selectedTask() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
+              onMouseUp={() => {
+                if (!selectedTask() || busy()) return
+                void switchInteractionMode()
+              }}
+            >
+              Mode {researchInteractionModeLabel(taskInteractionMode())}
+            </text>
           </box>
         </box>
 
@@ -1981,6 +2580,8 @@ export function ResearchCockpit() {
                   >
                     <text fg={cockpitColors.text}>{line.text.slice(5)}</text>
                   </box>
+                ) : line.spinner ? (
+                  <Spinner>{line.text}</Spinner>
                 ) : (
                   <text fg={streamLineColor(line.tone)}>{line.text}</text>
                 )
@@ -1991,7 +2592,7 @@ export function ResearchCockpit() {
 
         <box
           flexShrink={0}
-          height={4}
+          height={5}
           backgroundColor={cockpitColors.panel}
           border={["left"]}
           borderColor={cockpitColors.primary}
@@ -2045,7 +2646,10 @@ export function ResearchCockpit() {
           </box>
         </box>
 
-        <box flexShrink={0} flexDirection="row" justifyContent="flex-end">
+        <box flexShrink={0} flexDirection="row" justifyContent="space-between">
+          <text fg={busy() || chatAwaitingFirstToken() ? cockpitColors.primary : cockpitColors.textMuted}>
+            {interruptHint()}
+          </text>
           <box flexDirection="row" gap={2}>
             <text fg={cockpitColors.textMuted}>tab agents</text>
             <text fg={cockpitColors.textMuted}>ctrl+p commands</text>
@@ -2094,59 +2698,6 @@ export function ResearchCockpit() {
 
               <box gap={0} paddingTop={1}>
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                  ▾ AutoResearch进展
-                </text>
-                <text fg={hasInputProgress() ? cockpitColors.success : selectedTask() ? cockpitColors.primary : cockpitColors.textMuted}>
-                  {statusMark(progressState(hasInputProgress(), Boolean(selectedTask())))} Intent Agent
-                </text>
-                <For each={taskRequirementSummary()}>
-                  {(summary) => (
-                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                      {summary}
-                    </text>
-                  )}
-                </For>
-                <text fg={hasExplorationProgress() || hasResultArtifact() ? cockpitColors.success : hasProfileProgress() ? cockpitColors.primary : cockpitColors.textMuted}>
-                  {statusMark(progressState(hasExplorationProgress() || hasResultArtifact(), hasProfileProgress()))} Data Analysis Agent
-                </text>
-                <For each={profileSummary() === "-" ? [] : profileSummaryLines()}>
-                  {(summary) => (
-                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                      {summary}
-                    </text>
-                  )}
-                </For>
-                <text fg={hasExplorationProgress() ? cockpitColors.success : cockpitColors.textMuted}>
-                  {statusMark(progressState(hasExplorationProgress(), hasProfileProgress() && runnerReady()))} NAS Agent {succeededRuns()}/{maxRuns()} runs
-                </text>
-                <Show when={bestMetricSummary()}>
-                  {(summary) => (
-                    <text fg={cockpitColors.success} width="100%" overflow="hidden" wrapMode="none">
-                      {summary()}
-                    </text>
-                  )}
-                </Show>
-                <text fg={hasResultsProgress() ? cockpitColors.success : cockpitColors.textMuted}>
-                  {statusMark(progressState(hasResultsProgress(), hasExplorationProgress()))} Publish Agent
-                </text>
-              </box>
-
-              <Show when={pendingApproval()}>
-                {(approval) => (
-                  <box gap={0} paddingTop={1}>
-                    <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                      {taskInteractionMode() === "companion" ? "Companion checkpoint" : "Approval gate"}
-                    </text>
-                    <text fg={cockpitColors.warning}>{approval().kind} pending</text>
-                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                      /approve to continue
-                    </text>
-                  </box>
-                )}
-              </Show>
-
-              <box gap={0} paddingTop={1}>
-                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
                   下一步
                 </text>
                 <text fg={cockpitColors.primary} width="100%" overflow="hidden" wrapMode="none">
@@ -2186,17 +2737,94 @@ export function ResearchCockpit() {
                 </Show>
               </box>
 
+              <box gap={0} paddingTop={1}>
+                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                  ▾ AutoResearch进展
+                </text>
+                <text fg={intentProgress() === "done" ? cockpitColors.success : intentProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                  {statusMark(intentProgress())} Intent Agent
+                </text>
+                <For each={taskRequirementSummary()}>
+                  {(summary) => (
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      {summary}
+                    </text>
+                  )}
+                </For>
+                <text fg={dataProgress() === "done" ? cockpitColors.success : dataProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                  {statusMark(dataProgress())} Data Analysis Agent
+                </text>
+                <For each={profileSummary() === "-" ? [] : profileSummaryLines()}>
+                  {(summary) => (
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      {summary}
+                    </text>
+                  )}
+                </For>
+                <text fg={nasProgress() === "done" ? cockpitColors.success : nasProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                  {statusMark(nasProgress())} NAS Agent {succeededRuns()}/{maxRuns()} runs
+                </text>
+                <Show when={bestMetricSummary()}>
+                  {(summary) => (
+                    <text fg={cockpitColors.success} width="100%" overflow="hidden" wrapMode="none">
+                      {summary()}
+                    </text>
+                  )}
+                </Show>
+                <text fg={publishProgress() === "done" ? cockpitColors.success : publishProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                  {statusMark(publishProgress())} Publish Agent
+                </text>
+              </box>
+
+              <Show when={pendingApproval()}>
+                {(approval) => (
+                  <box gap={0} paddingTop={1}>
+                    <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                      {taskInteractionMode() === "companion" ? "Companion checkpoint" : "Approval gate"}
+                    </text>
+                    <text fg={cockpitColors.warning}>{approval().kind} pending</text>
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      /approve 继续 · /reject 驳回
+                    </text>
+                  </box>
+                )}
+              </Show>
+
+              <box gap={0} paddingTop={1}>
+                <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                  Context
+                </text>
+                <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                  model {contextModelLabel()}
+                </text>
+                <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                  session {chatSessionID() ? shortID(chatSessionID()) : "-"}
+                </text>
+                <Show when={contextWindowLine()}>
+                  {(line) => (
+                    <text fg={cockpitColors.primary} width="100%" overflow="hidden" wrapMode="none">
+                      {line()}
+                    </text>
+                  )}
+                </Show>
+                <For each={sessionTokenLines()}>
+                  {(line) => (
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      {line}
+                    </text>
+                  )}
+                </For>
+              </box>
+
               <Show when={validChampion()}>
                 {(item) => (
                   <box gap={0} paddingTop={1}>
                     <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
                       Champion
                     </text>
-                    <>
-                      <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
-                      <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
-                      <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
-                    </>
+                    <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
+                    <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
+                    <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
                   </box>
                 )}
               </Show>

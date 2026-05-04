@@ -31,8 +31,10 @@ import {
   researchCockpitArtifactTarget,
   researchCockpitCandidatePipeline,
   researchCockpitCandidateTitle,
+  resolveResearchCockpitProjectRunnerRoot,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
+  updateResearchCockpitTaskInteractionMode,
   updateResearchCockpitTaskRunnerRoot,
   type ResearchCockpitApproval,
   type ResearchCockpitArtifact,
@@ -65,6 +67,7 @@ const task = (input: Partial<ResearchCockpitTask> & Pick<ResearchCockpitTask, "i
   title: input.title ?? input.id,
   domainID: input.domainID ?? "tsf",
   mode: input.mode ?? "review",
+  interactionMode: input.interactionMode,
   status: input.status ?? "created",
   taskSpec: input.taskSpec ?? {},
   objective: input.objective ?? {},
@@ -166,6 +169,34 @@ describe("research cockpit data helpers", () => {
     expect(researchInteractionModeLabel(interactionModeForTask(task({ id: "auto_default", mode: "autonomous" })))).toBe(
       "苏格拉底",
     )
+
+    expect(
+      researchInteractionModeLabel(
+        interactionModeForTask(task({ id: "top_level_companion", mode: "autonomous", interactionMode: "companion" })),
+      ),
+    ).toBe("认知伴随")
+  })
+
+  test("updates research interaction mode without changing execution mode", () => {
+    const updated = updateResearchCockpitTaskInteractionMode(
+      task({
+        id: "switch_mode",
+        mode: "autonomous",
+        interactionMode: "socratic",
+        taskSpec: {
+          metadata: { interactionMode: "socratic", source: "test" },
+          runtime: { bridgeOnly: true },
+        },
+      }),
+      "companion",
+    )
+
+    expect(updated.mode).toBe("autonomous")
+    expect(updated.interactionMode).toBe("companion")
+    expect(updated.taskSpec).toEqual({
+      metadata: { interactionMode: "companion", source: "test" },
+      runtime: { bridgeOnly: true },
+    })
   })
 
   test("builds an actionable empty cockpit workflow", () => {
@@ -293,6 +324,7 @@ describe("research cockpit data helpers", () => {
   test("creates default TSF task payloads for review and autonomous modes", () => {
     const reviewTask = buildDefaultTsfResearchTask("review")
     const autonomousTask = buildDefaultTsfResearchTask("autonomous")
+    const companionTask = buildDefaultTsfResearchTask("review", undefined, { interactionMode: "companion" })
 
     expect(reviewTask).toMatchObject({
       title: "TSF Review Research",
@@ -316,6 +348,7 @@ describe("research cockpit data helpers", () => {
       title: "TSF Autonomous Research",
       domainID: "tsf",
       mode: "autonomous",
+      interactionMode: "socratic",
       taskSpec: {
         contextLength: 96,
         predictionLengths: [24],
@@ -330,6 +363,13 @@ describe("research cockpit data helpers", () => {
       },
       budget: { maxRuns: 12, maxParallel: 1 },
     })
+    expect(companionTask).toMatchObject({
+      mode: "autonomous",
+      interactionMode: "companion",
+      taskSpec: {
+        metadata: { interactionMode: "companion" },
+      },
+    })
   })
 
   test("uses the selected project as the default Cockpit Neo-Cast runner root", () => {
@@ -341,6 +381,24 @@ describe("research cockpit data helpers", () => {
         },
       },
     })
+  })
+
+  test("resolves a nested neo_cast project runner root before the workspace root", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "neo-research-workspace-"))
+    await mkdir(path.join(workspace, "neo_cast", "py"), { recursive: true })
+    await writeFile(path.join(workspace, "neo_cast", "py", "validate.py"), "# runner\n", "utf8")
+
+    expect(resolveResearchCockpitProjectRunnerRoot(workspace)).toBe(path.join(workspace, "neo_cast"))
+  })
+
+  test("resolves a sibling neo_cast runner when the selected project is opencode", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "neo-research-workspace-"))
+    const opencodeRoot = path.join(workspace, "opencode")
+    await mkdir(opencodeRoot, { recursive: true })
+    await mkdir(path.join(workspace, "neo_cast", "py"), { recursive: true })
+    await writeFile(path.join(workspace, "neo_cast", "py", "validate.py"), "# runner\n", "utf8")
+
+    expect(resolveResearchCockpitProjectRunnerRoot(opencodeRoot)).toBe(path.join(workspace, "neo_cast"))
   })
 
   test("saves or updates the Cockpit Neo-Cast runner root on task runtime", () => {
@@ -531,6 +589,26 @@ describe("research cockpit data helpers", () => {
     ).toBe(
       "model_export_package exported: /tmp/pkg / champion=candidate_best / val_avg_mse=0.123456 / files=README.md, requirements.txt, mcp_server.py",
     )
+    expect(
+      formatResearchCockpitExport({
+        artifact: artifact({
+          id: "artifact_bundle",
+          kind: "research_final_bundle",
+          metadata: {
+            championCandidateID: "candidate_best",
+            primaryMetricName: "val_avg_mse",
+            primaryMetricValue: 0.08123,
+            runCount: 7,
+            candidateCount: 5,
+            reportPath: "/tmp/final/report.md",
+            manifestPath: "/tmp/final/manifest.json",
+          },
+        }),
+        path: "/tmp/final",
+      }),
+    ).toBe(
+      "research_final_bundle exported: /tmp/final / champion=candidate_best / val_avg_mse=0.08123 / runs=7 / candidates=5 / report=/tmp/final/report.md / manifest=/tmp/final/manifest.json",
+    )
   })
 
   test("formats autonomous iteration messages", () => {
@@ -581,7 +659,40 @@ describe("research cockpit data helpers", () => {
         artifact: artifact({ id: "artifact_loop", kind: "research_autonomous_loop_json" }),
       }),
     ).toBe(
-      "loop stopped: reached max iterations / 2 iterations / 1 succeeded / selected candidate_a / val_avg_mse=0.1234 / artifact research_autonomous_loop_json",
+      "loop stopped: reached max iterations / 2 iterations / 1 succeeded / 1 failed / selected candidate_a / val_avg_mse=0.1234 / artifact research_autonomous_loop_json",
+    )
+    expect(
+      formatResearchCockpitLoop({
+        stoppedReason: "approval_required",
+        iterations: [
+          {
+            candidate: candidate({ id: "candidate_pending" }),
+            seededCandidates: [candidate({ id: "candidate_seeded" })],
+            approvals: [
+              {
+                id: "approval_candidate",
+                kind: "candidate",
+                status: "pending",
+                reason: "Review candidate before execution.",
+                time: { created: 1, updated: 1 },
+              },
+            ],
+            run: { id: "run_pending", status: "queued", metrics: {}, time: { created: 1, updated: 1 } },
+            selectionArtifact: artifact({
+              id: "artifact_selection",
+              kind: "research_candidate_selection_json",
+              metadata: {
+                rankPredictorVersion: "tsf_profile_heuristic_v1",
+                selectionSource: "domain_proposal",
+                rankingCount: 2,
+                topScore: 0.73,
+              },
+            }),
+          },
+        ],
+      }),
+    ).toBe(
+      "loop stopped: waiting for approval / 1 iteration / 0 succeeded / 0 failed / 1 approval pending / seeded=1 / selection ranker=tsf_profile_heuristic_v1 / source=domain_proposal / rankings=2 / top=0.73",
     )
   })
 
@@ -925,33 +1036,93 @@ describe("research cockpit data helpers", () => {
   })
 
   test("builds Socratic clarification state from pending protocol approvals", () => {
-    expect(
-      buildSocraticClarificationState(
-        task({
-          id: "task_socratic",
-          mode: "autonomous",
-          status: "paused",
-          taskSpec: { metadata: { interactionMode: "socratic" } },
-        }),
-        [
-          {
-            id: "approval_protocol",
-            kind: "protocol",
-            status: "pending",
-            reason: [
-              "Intent clarification required before running the autonomous pipeline.",
-              "- Which CSV dataset path should NeoResearch use for profiling and execution?",
-              "- Which target columns should be forecast?",
-            ].join("\n"),
-            time: { created: 1, updated: 1 },
-          },
-        ],
-      ),
-    ).toEqual({
-      active: true,
-      missingSlots: ["dataset.path", "dataset.targetCols"],
-      nextQuestion: "Which CSV dataset path should NeoResearch use for profiling and execution?",
-      questionCount: 2,
+    const result = buildSocraticClarificationState(
+      task({
+        id: "task_socratic",
+        mode: "autonomous",
+        status: "paused",
+        taskSpec: { metadata: { interactionMode: "socratic" } },
+      }),
+      [
+        {
+          id: "approval_protocol",
+          kind: "protocol",
+          status: "pending",
+          reason: [
+            "运行自主研究流水线前需要先澄清研究意图。",
+            "- NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
+            "- 需要预测哪些目标列？",
+          ].join("\n"),
+          time: { created: 1, updated: 1 },
+        },
+      ],
+    )
+    expect(result.active).toBe(true)
+    expect(result.missingSlots).toEqual(["dataset.path", "dataset.targetCols"])
+    expect(result.nextQuestion).toBe("NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
+    expect(result.questionCount).toBe(2)
+    expect(result.slots).toHaveLength(15)
+    expect(result.slots.find((s) => s.id === "dataset.path")).toMatchObject({
+      id: "dataset.path",
+      label: "CSV 数据集路径",
+      question: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
+      status: "missing",
+    })
+    expect(result.slots.find((s) => s.id === "dataset.targetCols")).toMatchObject({
+      id: "dataset.targetCols",
+      label: "目标列",
+      question: "需要预测哪些目标列？",
+      status: "missing",
+    })
+    expect(result.slots.find((s) => s.id === "interaction_mode")).toMatchObject({
+      id: "interaction_mode",
+      status: "filled",
+      value: "socratic",
+    })
+    expect(result.slots.find((s) => s.id === "objective.secondaryMetrics")).toMatchObject({
+      id: "objective.secondaryMetrics",
+      required: false,
+      status: "filled",
+    })
+  })
+
+  test("builds Socratic slot state and next question from incomplete task specs", () => {
+    const result = buildSocraticClarificationState(
+      task({
+        id: "task_socratic_partial",
+        mode: "autonomous",
+        taskSpec: {
+          metadata: { interactionMode: "socratic" },
+          dataset: { path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
+          predictionLengths: [24],
+        },
+        objective: {},
+      }),
+      [],
+    )
+    expect(result.active).toBe(false)
+    expect(result.slots).toHaveLength(15)
+    expect(result.missingSlots).toContain("objective.primaryMetric")
+    expect(result.missingSlots).not.toContain("dataset.path")
+    expect(result.missingSlots).not.toContain("dataset.targetCols")
+    expect(result.missingSlots).not.toContain("predictionLengths")
+    expect(result.missingSlots).not.toContain("interaction_mode")
+    expect(result.slots.find((s) => s.id === "dataset.path")).toMatchObject({
+      status: "filled",
+      value: "/tmp/ETTh1.csv",
+    })
+    expect(result.slots.find((s) => s.id === "dataset.targetCols")).toMatchObject({
+      status: "filled",
+      value: "OT",
+    })
+    expect(result.slots.find((s) => s.id === "predictionLengths")).toMatchObject({
+      status: "filled",
+      value: "24",
+    })
+    expect(result.slots.find((s) => s.id === "objective.primaryMetric")).toMatchObject({
+      label: "主指标",
+      question: "模型搜索应该优化哪个验证指标？",
+      status: "missing",
     })
   })
 

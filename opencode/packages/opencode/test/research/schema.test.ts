@@ -16,6 +16,7 @@ describe("Research schemas", () => {
       title: "ETTh1 horizon 96 search",
       domainID: "tsf",
       mode: "review",
+      interactionMode: "companion",
       taskSpec: { dataset: "ETTh1", horizon: 96 },
       objective: { primaryMetric: "mse", direction: "minimize" },
       budget: { maxRuns: 20, maxGpuHours: 8 },
@@ -25,6 +26,7 @@ describe("Research schemas", () => {
       title: "ETTh1 horizon 96 search",
       domainID: "tsf",
       mode: "review",
+      interactionMode: "companion",
     })
   })
 

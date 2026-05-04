@@ -6,7 +6,7 @@ import type { JsonRecord, ResearchTask } from "./schema"
 
 type LLMProvider = "anthropic" | "openai-compatible"
 
-type NeoCastLLMConfig = {
+export type NeoCastLLMConfig = {
   readonly provider: LLMProvider
   readonly model: string
   readonly baseURL?: string
@@ -122,7 +122,7 @@ function normalizeConfig(raw: unknown): NeoCastLLMConfig {
   }
 }
 
-async function resolveNeoCastLLMConfig(input: { readonly workspaceRoot: string; readonly neoCastProjectRoot?: string }) {
+export async function resolveNeoCastLLMConfig(input: { readonly workspaceRoot: string; readonly neoCastProjectRoot?: string }) {
   const userConfig = path.join(os.homedir(), ".config", "neo-cast", "config.json")
   const workspaceConfig = path.join(input.workspaceRoot, ".neo-cast", "config.json")
   const runnerConfig =
@@ -140,12 +140,12 @@ async function resolveNeoCastLLMConfig(input: { readonly workspaceRoot: string; 
   return normalizeConfig(merged)
 }
 
-function apiKeyFor(config: NeoCastLLMConfig) {
+export function apiKeyFor(config: NeoCastLLMConfig) {
   if (config.provider === "anthropic") return process.env.ANTHROPIC_API_KEY
   return process.env.NEO_CAST_LLM_API_KEY || process.env.OPENAI_API_KEY || process.env.AIGCBEST_API_KEY
 }
 
-function extractJsonObject(text: string) {
+export function extractJsonObject(text: string) {
   const stripped = text.replace(/```(?:json)?\s*/g, "").replace(/```\s*/g, "").trim()
   const start = stripped.indexOf("{")
   const end = stripped.lastIndexOf("}")
@@ -201,17 +201,73 @@ function pruneCandidateSpec(value: unknown): JsonRecord {
 function buildSystemPrompt() {
   return [
     "You are the NeoResearch TSF model-design planner.",
+    "Language policy: 尽量用中文表达 hypothesis、rationale、notes 等自然语言内容；保留 JSON 字段名、schema 名称、模块名、指标名、命令和文件路径的英文原文。",
     "Return exactly one JSON object using Neo-Cast recipe_schema_v1 snake_case field names.",
     "Do not return markdown or prose outside JSON.",
     "Use only these modules: preprocessing none, instance_norm, series_decomposition, seasonal_differencing, missing_mask, sample_reweighting; embedding none, patch, multiscale_patch, invert, frequency, calendar; backbone linear, mlp, transformer, dlinear, tcn, nbeats, timesnet, rnn, ssm, mixer; fusion temporal, feature, temporal_then_feature, feature_then_temporal, graph, gated_hybrid; prediction_head linear, direct_multi_horizon, quantile, gaussian, residual_correction.",
+    "Treat profileDerivedSearchDirectives as high-priority search priors unless they conflict with runtime constraints or validation rules.",
     "Include training_strategy.loss, optimizer, scheduler, regularization, and budget.",
   ].join("\n")
+}
+
+function numberFromRecord(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function stringList(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : []
+}
+
+function profileRecord(taskFingerprint: unknown) {
+  if (!isRecord(taskFingerprint)) return {}
+  return isRecord(taskFingerprint.datasetProfile) ? taskFingerprint.datasetProfile : {}
+}
+
+function profileDerivedSearchDirectives(taskFingerprint: unknown) {
+  const fingerprint = isRecord(taskFingerprint) ? taskFingerprint : {}
+  const profile = profileRecord(fingerprint)
+  const biases = new Set(stringList(fingerprint.searchBiases))
+  const directives: string[] = []
+
+  if ((numberFromRecord(profile, "seasonalityStrength") ?? 0) >= 0.4 || biases.has("seasonal")) {
+    const period = numberFromRecord(profile, "acfMainPeriod")
+    directives.push(
+      [
+        "seasonal: prefer frequency embedding, series_decomposition, seasonal_differencing, or dlinear/timesnet-style seasonal structure.",
+        period === undefined ? undefined : `acfMainPeriod=${period} can guide decomposition kernel, seasonal period, or n_freq.`,
+      ]
+        .filter((item): item is string => Boolean(item))
+        .join(" "),
+    )
+  }
+  if ((numberFromRecord(profile, "crossVarCorrelation") ?? 0) >= 0.5 || biases.has("cross_var_correlated")) {
+    directives.push("cross_var_correlated: prefer invert/calendar embeddings with feature, gated_hybrid, or graph fusion.")
+  }
+  if ((numberFromRecord(profile, "missingRate") ?? 0) > 0 || biases.has("missing_values")) {
+    directives.push("missing_values: include missing_mask preprocessing and avoid recipes that assume dense targets.")
+  }
+  if ((numberFromRecord(profile, "distributionShift") ?? 0) >= 0.5 || biases.has("distribution_shift")) {
+    directives.push("distribution_shift: include sample_reweighting or instance_norm and use robust huber loss.")
+  }
+  if ((numberFromRecord(profile, "trendStrength") ?? 0) >= 0.2 || biases.has("trend")) {
+    directives.push("trend: preserve long lookback context and consider residual_correction or decomposition-aware heads.")
+  }
+  if (biases.has("probabilistic")) {
+    directives.push("probabilistic: prefer quantile or gaussian prediction_head with matching loss.")
+  }
+
+  return directives
 }
 
 function buildUserPrompt(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
 }) {
+  const profile = profileRecord(input.proposalContext.taskFingerprint)
+  const searchBiases = isRecord(input.proposalContext.taskFingerprint)
+    ? stringList(input.proposalContext.taskFingerprint.searchBiases)
+    : []
   return JSON.stringify(
     {
       task: {
@@ -223,11 +279,15 @@ function buildUserPrompt(input: {
         taskSpec: input.task.taskSpec,
       },
       taskFingerprint: input.proposalContext.taskFingerprint,
+      datasetProfileSummary: profile,
+      searchBiases,
+      profileDerivedSearchDirectives: profileDerivedSearchDirectives(input.proposalContext.taskFingerprint),
       existingCandidates: input.proposalContext.candidates.slice(-8),
       runs: input.proposalContext.runs.slice(-12),
       memory: input.proposalContext.memory.slice(0, 8),
       champion: input.proposalContext.champion,
-      instruction: "Propose a new candidate that is different from existing candidates and suitable for the task.",
+      instruction:
+        "Propose a new candidate that is different from existing candidates and suitable for the task. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
     },
     null,
     2,
@@ -288,6 +348,12 @@ async function requestAnthropic(config: NeoCastLLMConfig, apiKey: string, system
   return text
 }
 
+export async function requestNeoCastLLM(config: NeoCastLLMConfig, apiKey: string, system: string, user: string) {
+  return config.provider === "anthropic"
+    ? requestAnthropic(config, apiKey, system, user)
+    : requestOpenAICompatible(config, apiKey, system, user)
+}
+
 function llmMetadata(config: NeoCastLLMConfig, status: string, extra: JsonRecord = {}): JsonRecord {
   return {
     llmStatus: status,
@@ -324,10 +390,7 @@ export async function proposeLLMCandidate(input: {
   try {
     const system = buildSystemPrompt()
     const user = buildUserPrompt(input)
-    const text =
-      config.provider === "anthropic"
-        ? await requestAnthropic(config, apiKey, system, user)
-        : await requestOpenAICompatible(config, apiKey, system, user)
+    const text = await requestNeoCastLLM(config, apiKey, system, user)
     const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
     const bridgeOnly = runtime.bridgeOnly !== false
     const governance = bridgeOnly

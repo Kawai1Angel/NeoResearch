@@ -711,6 +711,7 @@ describe("research routes", () => {
           "diagnostic",
           "design",
           "coder",
+          "verifier",
           "runner",
           "analyst",
           "librarian",
@@ -726,13 +727,14 @@ describe("research routes", () => {
           candidateID: iteration.candidate.id,
           runID: iteration.run.id,
           stage: "smoke",
-          roleCount: 6,
+          roleCount: 7,
         })
         const managerTraceRecord = JSON.parse(await readFile(managerTraceArtifact!.uri.replace("file://", ""), "utf8"))
         expect(managerTraceRecord.managerTrace.map((step: { role: string }) => step.role)).toEqual([
           "diagnostic",
           "design",
           "coder",
+          "verifier",
           "runner",
           "analyst",
           "librarian",
@@ -766,9 +768,23 @@ describe("research routes", () => {
                   neoCastProjectRoot: fakeNeoCastRoot,
                   pythonExecutable: "bash",
                 },
+                metadata: {
+                  businessContext: "ETTh1 oil temperature forecasting for operations planning.",
+                  interpretability: "prefer explainable candidates when metrics are close",
+                  deploymentTarget: "local CPU batch scoring",
+                },
               },
-              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
-              budget: { maxRuns: 12, maxParallel: 1 },
+              objective: {
+                primaryMetric: "val_avg_mse",
+                direction: "minimize",
+                errorPreferences: "prioritize average validation error across the smoke horizon",
+              },
+              budget: {
+                maxRuns: 12,
+                maxParallel: 1,
+                latencyBudget: "offline batch",
+                parameterBudget: "small bridge-safe model",
+              },
             }),
           }),
         )
@@ -837,9 +853,23 @@ describe("research routes", () => {
                   neoCastProjectRoot: fakeNeoCastRoot,
                   pythonExecutable: "bash",
                 },
+                metadata: {
+                  businessContext: "ETTh1 oil temperature forecasting for operations planning.",
+                  interpretability: "prefer explainable candidates when metrics are close",
+                  deploymentTarget: "local CPU batch scoring",
+                },
               },
-              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
-              budget: { maxRuns: 12, maxParallel: 1 },
+              objective: {
+                primaryMetric: "val_avg_mse",
+                direction: "minimize",
+                errorPreferences: "prioritize average validation error across the smoke horizon",
+              },
+              budget: {
+                maxRuns: 12,
+                maxParallel: 1,
+                latencyBudget: "offline batch",
+                parameterBudget: "small bridge-safe model",
+              },
             }),
           }),
         )
@@ -866,7 +896,7 @@ describe("research routes", () => {
     })
   })
 
-  test("pipeline API rejects review companion tasks without starting NAS", async () => {
+  test("pipeline API pauses explicit companion tasks at the data analysis checkpoint", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
     const datasetPath = await writeProfileDataset()
@@ -897,9 +927,24 @@ describe("research routes", () => {
                   neoCastProjectRoot: fakeNeoCastRoot,
                   pythonExecutable: "bash",
                 },
+                metadata: {
+                  interactionMode: "companion",
+                  businessContext: "ETTh1 oil temperature forecasting for operations planning.",
+                  interpretability: "prefer explainable candidates when metrics are close",
+                  deploymentTarget: "local CPU batch scoring",
+                },
               },
-              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
-              budget: { maxRuns: 12, maxParallel: 1 },
+              objective: {
+                primaryMetric: "val_avg_mse",
+                direction: "minimize",
+                errorPreferences: "prioritize average validation error across the smoke horizon",
+              },
+              budget: {
+                maxRuns: 12,
+                maxParallel: 1,
+                latencyBudget: "offline batch",
+                parameterBudget: "small bridge-safe model",
+              },
             }),
           }),
         )
@@ -918,14 +963,16 @@ describe("research routes", () => {
           name: "ResearchPipelineBlockedError",
           data: {
             taskID: task.id,
-            reason: "pipeline_requires_autonomous",
+            reason: "human_checkpoint_required",
+            checkpointPhase: "data_analysis_done",
           },
         })
 
         const runs = await json<Research.ResearchRun[]>(
           await app().request(pathFor(ResearchPaths.taskRuns, { taskID: task.id }), { headers }),
         )
-        expect(runs).toHaveLength(0)
+        expect(runs).toHaveLength(1)
+        expect(runs[0]!.stage).toBe("profile")
       },
     })
   })

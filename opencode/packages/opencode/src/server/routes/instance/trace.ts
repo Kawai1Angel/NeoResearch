@@ -44,6 +44,19 @@ export function runRequest<A, E>(name: string, c: Context, effect: Effect.Effect
   return AppRuntime.runPromise(effect.pipe(Effect.withSpan(name, { attributes: requestAttributes(c) })))
 }
 
+export function runRequestDeferred<A, E>(
+  name: string,
+  c: Context,
+  effect: Effect.Effect<A, E, AppEnv>,
+  onError?: (error: unknown) => void,
+) {
+  setTimeout(() => {
+    void runRequest(name, c, effect).catch((error) => {
+      onError?.(error)
+    })
+  }, 0)
+}
+
 export async function jsonRequest<C extends Context, A, E>(
   name: string,
   c: C,

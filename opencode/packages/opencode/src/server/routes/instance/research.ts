@@ -358,14 +358,56 @@ export const ResearchRoutes = lazy(() =>
         },
       }),
       validator("param", taskParam),
-      validator("json", z.object({ taskSpec: Research.JsonRecord.zod })),
+      validator(
+        "json",
+        z.object({
+          interactionMode: Research.ResearchInteractionMode.zod.optional(),
+          taskSpec: Research.JsonRecord.zod,
+        }),
+      ),
       async (c) =>
         jsonRequest("ResearchRoutes.tasks.updateSpec", c, function* () {
           const svc = yield* Research.Service
+          const body = c.req.valid("json")
           return yield* svc.updateTaskSpec({
             taskID: c.req.valid("param").taskID,
-            taskSpec: c.req.valid("json").taskSpec,
+            interactionMode: body.interactionMode,
+            taskSpec: body.taskSpec,
           })
+        }),
+    )
+    .post(
+      "/tasks/:taskID/intent/answer",
+      describeRoute({
+        summary: "Answer intent clarification questions",
+        description: "Provide slot answers to intent clarification questions for a research task, re-run the intent agent, and trigger the full pipeline if all fields are satisfied.",
+        operationId: "research.tasks.answerIntent",
+        responses: {
+          200: {
+            description: "Updated intent agent result",
+            content: {
+              "application/json": {
+                schema: resolver(Research.JsonRecord.zod),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator("json", z.object({ slots: Research.JsonRecord.zod })),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.answerIntent", c, function* () {
+          const svc = yield* Research.Service
+          const taskID = c.req.valid("param").taskID
+          const result = yield* svc.answerIntentQuestion({
+            taskID,
+            slots: c.req.valid("json").slots,
+          })
+          if (result.missingFields.length === 0) {
+            yield* svc.runFullPipeline({ taskID })
+          }
+          return result
         }),
     )
     .patch(

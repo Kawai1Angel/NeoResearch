@@ -729,21 +729,23 @@ export const sessionHandlers = Layer.unwrap(
     }) {
       const instance = yield* InstanceState.context
       yield* Effect.sync(() => {
-        Instance.restore(instance, () => {
-          void AppRuntime.runPromise(
-            SessionPrompt.Service.use((svc) =>
-              svc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID } as unknown as SessionPrompt.PromptInput),
-            ).pipe(Effect.provide(SessionPrompt.defaultLayer)),
-          ).catch((error) => {
-            log.error("prompt_async failed", { sessionID: ctx.params.sessionID, error })
-            void Bus.publish(Session.Event.Error, {
-              sessionID: ctx.params.sessionID,
-              error: new NamedError.Unknown({
-                message: error instanceof Error ? error.message : String(error),
-              }).toObject(),
+        setTimeout(() => {
+          Instance.restore(instance, () => {
+            void AppRuntime.runPromise(
+              SessionPrompt.Service.use((svc) =>
+                svc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID } as unknown as SessionPrompt.PromptInput),
+              ).pipe(Effect.provide(SessionPrompt.defaultLayer)),
+            ).catch((error) => {
+              log.error("prompt_async failed", { sessionID: ctx.params.sessionID, error })
+              void Bus.publish(Session.Event.Error, {
+                sessionID: ctx.params.sessionID,
+                error: new NamedError.Unknown({
+                  message: error instanceof Error ? error.message : String(error),
+                }).toObject(),
+              })
             })
           })
-        })
+        }, 0)
       })
       return HttpApiSchema.NoContent.make()
     })

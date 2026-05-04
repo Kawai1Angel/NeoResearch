@@ -26,7 +26,7 @@ import { lazy } from "@/util/lazy"
 import { zodObject } from "@/util/effect-zod"
 import { Bus } from "@/bus"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { jsonRequest, runRequest } from "./trace"
+import { jsonRequest, runRequest, runRequestDeferred } from "./trace"
 
 const log = Log.create({ service: "server" })
 
@@ -910,19 +910,20 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const sessionID = c.req.valid("param").sessionID
         const body = c.req.valid("json")
-        void runRequest(
+        runRequestDeferred(
           "SessionRoutes.prompt_async",
           c,
           SessionPrompt.Service.use((svc) =>
             svc.prompt({ ...body, sessionID } as unknown as SessionPrompt.PromptInput),
           ),
-        ).catch((err) => {
-          log.error("prompt_async failed", { sessionID, error: err })
-          void Bus.publish(Session.Event.Error, {
-            sessionID,
-            error: new NamedError.Unknown({ message: err instanceof Error ? err.message : String(err) }).toObject(),
-          })
-        })
+          (err) => {
+            log.error("prompt_async failed", { sessionID, error: err })
+            void Bus.publish(Session.Event.Error, {
+              sessionID,
+              error: new NamedError.Unknown({ message: err instanceof Error ? err.message : String(err) }).toObject(),
+            })
+          },
+        )
 
         return c.body(null, 204)
       },

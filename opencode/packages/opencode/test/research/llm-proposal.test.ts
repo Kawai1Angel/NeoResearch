@@ -79,13 +79,17 @@ test("full-recipe LLM proposals require review instead of auto-approval", async 
   process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
   process.env.NEO_CAST_LLM_MODEL = "test-model"
   process.env.NEO_CAST_LLM_API_KEY = "test-key"
-  globalThis.fetch = (() =>
-    Promise.resolve(
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+    const [, init] = args
+    requestBody = JSON.parse(String(init?.body ?? "{}"))
+    return Promise.resolve(
       new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(llmRecipe()) } }] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
-    )) as unknown as typeof fetch
+    ) as ReturnType<typeof fetch>
+  }) as unknown as typeof fetch
 
   const result = await proposeLLMCandidate({
     task: task(false),
@@ -98,4 +102,57 @@ test("full-recipe LLM proposals require review instead of auto-approval", async 
     riskLevel: "medium",
     approvalStatus: "pending",
   })
+  expect(JSON.stringify(requestBody)).toContain("中文")
+  expect(JSON.stringify(requestBody)).toContain("JSON 字段")
+})
+
+test("LLM proposal prompt exposes profile-derived search directives", async () => {
+  const workspaceRoot = await mkdtemp(path.join(tmpdir(), "opencode-llm-proposal-profile-"))
+  process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+  process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
+  process.env.NEO_CAST_LLM_MODEL = "test-model"
+  process.env.NEO_CAST_LLM_API_KEY = "test-key"
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+    const [, init] = args
+    requestBody = JSON.parse(String(init?.body ?? "{}"))
+    return Promise.resolve(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(llmRecipe()) } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ) as ReturnType<typeof fetch>
+  }) as unknown as typeof fetch
+
+  await proposeLLMCandidate({
+    task: task(false),
+    proposalContext: {
+      ...proposalContext,
+      taskFingerprint: {
+        searchBiases: ["seasonal", "cross_var_correlated", "missing_values", "distribution_shift"],
+        datasetProfile: {
+          source: "dataset.path",
+          path: "/tmp/profiled.csv",
+          rowCount: 2048,
+          targetCount: 5,
+          numericColumnCount: 5,
+          missingRate: 0.03,
+          trendStrength: 0.22,
+          seasonalityStrength: 0.88,
+          crossVarCorrelation: 0.71,
+          distributionShift: 0.64,
+          acfMainPeriod: 24,
+        },
+      },
+    },
+    workspaceRoot,
+  })
+
+  const prompt = JSON.stringify(requestBody)
+  expect(prompt).toContain("profileDerivedSearchDirectives")
+  expect(prompt).toContain("series_decomposition")
+  expect(prompt).toContain("missing_mask")
+  expect(prompt).toContain("sample_reweighting")
+  expect(prompt).toContain("huber")
+  expect(prompt).toContain("acfMainPeriod")
 })

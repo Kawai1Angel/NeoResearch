@@ -16,6 +16,7 @@ export const ResearchPaths = {
   taskBaselines: `${root}/tasks/:taskID/baselines`,
   taskExport: `${root}/tasks/:taskID/export`,
   taskPipeline: `${root}/tasks/:taskID/pipeline`,
+  taskAnswerIntent: `${root}/tasks/:taskID/intent/answer`,
   taskAutonomousIterate: `${root}/tasks/:taskID/autonomous/iterate`,
   taskAutonomousLoop: `${root}/tasks/:taskID/autonomous/loop`,
   taskCandidates: `${root}/tasks/:taskID/candidates`,

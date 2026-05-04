@@ -3,6 +3,7 @@ import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { cp, mkdir, readFile, writeFile } from "fs/promises"
 import { existsSync } from "fs"
 import path from "path"
+import { deflateSync } from "zlib"
 import z from "zod"
 import { and, desc, eq, inArray, isNull, ne, Database, NotFoundError } from "@/storage"
 import { Bus } from "@/bus"
@@ -18,6 +19,7 @@ import {
   ResearchTaskTable,
 } from "./research.sql"
 import {
+  AnswerIntentInput,
   AutonomousIterationInput,
   AutonomousLoopInput,
   CreateApprovalInput,
@@ -37,6 +39,8 @@ import {
   PrepareTaskDatasetResult,
   ProfileTaskInput,
   ProfileTaskResult,
+  ReflectionAgentInput,
+  VerifierAgentRunInput,
   ReplyApprovalInput,
   ResearchApproval,
   ResearchApprovalID,
@@ -70,17 +74,28 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { proposeLLMCandidate } from "./llm-proposal"
+import { apiKeyFor, proposeLLMCandidate, requestNeoCastLLM, resolveNeoCastLLMConfig } from "./llm-proposal"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
-import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
+import { analyzeIntentTaskWithLLM, type IntentAgentResult } from "./agents/intent-agent"
 import {
   buildDatasetAnalysisReportMarkdown,
   type DatasetAnalysisSourceReport,
   summarizeDataAnalysisAgent,
   type DataAnalysisAgentResult,
 } from "./agents/data-analysis-agent"
-import { summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
+import { buildNASAgentResult, summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
 import { summarizePublishAgent, type PublishAgentResult } from "./agents/publish-agent"
+import {
+  reflectionAgentMetadata,
+  summarizeReflectionAgent,
+  type ReflectionAgentResult,
+} from "./agents/reflection-agent"
+import {
+  evaluateRun as evaluateRunWithVerifiers,
+  verifierAgentMetadata,
+  type VerifierAgentResult,
+} from "./agents/verifier-agent"
+import { buildEvaluationResultMarkdown, buildVerifierDecisionRecord, runVerifiers } from "./verifiers"
 
 type DbClient = Parameters<typeof Database.use>[0] extends (trx: infer D) => unknown ? D : never
 type ResearchTaskRow = typeof ResearchTaskTable.$inferSelect
@@ -114,7 +129,7 @@ export interface SeedSweepResult {
   readonly runs: readonly PreparedRun[]
 }
 
-export type ResearchManagerRole = "diagnostic" | "design" | "coder" | "runner" | "analyst" | "librarian"
+export type ResearchManagerRole = "diagnostic" | "design" | "coder" | "runner" | "analyst" | "verifier" | "librarian"
 
 export interface ResearchManagerStep {
   readonly role: ResearchManagerRole
@@ -146,7 +161,22 @@ export interface RunFullPipelineResult {
   readonly intent: IntentAgentResult
   readonly dataAnalysis: DataAnalysisAgentResult
   readonly nas: NASAgentResult
+  readonly reflection: ReflectionAgentResult
   readonly publish: PublishAgentResult
+}
+
+const PipelineWorkflowPhases = [
+  "intent_gathering",
+  "data_analysis",
+  "searching",
+  "reflection",
+  "publishing",
+] as const
+type PipelineWorkflowPhase = (typeof PipelineWorkflowPhases)[number]
+
+interface PipelineWorkflowMetadata {
+  readonly completedPhases: readonly PipelineWorkflowPhase[]
+  readonly lastCheckpoint?: string
 }
 
 const ResearchValidationIssueSchema = z
@@ -196,9 +226,16 @@ export const PipelineBlockedError = NamedError.create(
   "ResearchPipelineBlockedError",
   z.object({
     taskID: z.string(),
-    reason: z.enum(["pipeline_requires_autonomous", "intent_clarification_required"]),
+    reason: z.enum([
+      "pipeline_requires_autonomous",
+      "intent_clarification_required",
+      "human_checkpoint_required",
+      "reflection_requested_human_review",
+      "runner_not_configured",
+    ]),
     missingFields: z.array(z.string()).optional(),
     clarifyingQuestions: z.array(z.string()).optional(),
+    checkpointPhase: z.string().optional(),
   }),
 )
 
@@ -249,6 +286,30 @@ function isTerminal(status: ResearchRun["status"]) {
 
 function runnerPath(cwd: string, target: string) {
   return path.isAbsolute(target) ? target : path.join(cwd, target)
+}
+
+function taskInteractionMode(task: ResearchTask) {
+  if (task.interactionMode === "companion" || task.interactionMode === "socratic") return task.interactionMode
+  const taskSpec = task.taskSpec
+  const metadata =
+    taskSpec.metadata && typeof taskSpec.metadata === "object" && !Array.isArray(taskSpec.metadata)
+      ? (taskSpec.metadata as Record<string, unknown>)
+      : {}
+  const raw = metadata.interactionMode ?? metadata.interaction_mode
+  if (raw === "companion" || raw === "cognitive_companion") return "companion"
+  if (raw === "socratic") return "socratic"
+  return task.mode === "autonomous" ? "socratic" : undefined
+}
+
+function taskInteractionModeFromFields(mode: string, taskSpec: JsonRecord) {
+  const metadata =
+    taskSpec.metadata && typeof taskSpec.metadata === "object" && !Array.isArray(taskSpec.metadata)
+      ? (taskSpec.metadata as Record<string, unknown>)
+      : {}
+  const raw = metadata.interactionMode ?? metadata.interaction_mode
+  if (raw === "companion" || raw === "cognitive_companion") return "companion"
+  if (raw === "socratic") return "socratic"
+  return mode === "autonomous" ? "socratic" : undefined
 }
 
 function parseRunnerRecords(stdout: string) {
@@ -420,6 +481,44 @@ function managerStep(
 function recordValue(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
+}
+
+function asPipelineWorkflowMetadata(input: unknown): PipelineWorkflowMetadata {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { completedPhases: [] }
+  const candidate = input as Record<string, unknown>
+  const raw = candidate.completedPhases
+  const completedPhases = Array.isArray(raw)
+    ? raw
+        .filter((phase): phase is PipelineWorkflowPhase =>
+          typeof phase === "string" &&
+          (PipelineWorkflowPhases.includes(phase as PipelineWorkflowPhase) || phase === "intent_gathering" || phase === "data_analysis"),
+        )
+    : []
+  return {
+    completedPhases: [...new Set(completedPhases)],
+    lastCheckpoint: typeof candidate.lastCheckpoint === "string" ? candidate.lastCheckpoint : undefined,
+  }
+}
+
+function workflowMetadataFromTask(task: ResearchTask): PipelineWorkflowMetadata {
+  const metadata = recordValue(task.taskSpec.metadata)
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return { completedPhases: [] }
+  return asPipelineWorkflowMetadata(metadata.workflow)
+}
+
+function normalizeWorkflowMetadata(input: PipelineWorkflowMetadata): PipelineWorkflowMetadata {
+  const completedPhases = new Map<string, PipelineWorkflowPhase>()
+  for (const phase of input.completedPhases) {
+    if (PipelineWorkflowPhases.includes(phase)) completedPhases.set(phase, phase)
+  }
+  return {
+    completedPhases: PipelineWorkflowPhases.filter((phase) => completedPhases.has(phase)),
+    ...(input.lastCheckpoint === undefined ? {} : { lastCheckpoint: input.lastCheckpoint }),
+  }
+}
+
+function hasCompletedWorkflowPhase(task: ResearchTask, phase: PipelineWorkflowPhase) {
+  return normalizeWorkflowMetadata(workflowMetadataFromTask(task)).completedPhases.includes(phase)
 }
 
 function errorMetadata(error: unknown): JsonRecord {
@@ -665,9 +764,21 @@ function zodValidationIssues(error: z.ZodError): DomainValidationIssue[] {
   return error.issues.map((item) => issue(item.path.length ? item.path.join(".") : "$", item.message))
 }
 
-function normalizeTaskSpec(input: Pick<CreateTaskInput, "domainID" | "taskSpec">) {
+function normalizeTaskSpec(input: Pick<CreateTaskInput, "domainID" | "mode" | "interactionMode" | "taskSpec">) {
+  const taskSpec =
+    input.interactionMode === undefined
+      ? input.taskSpec
+      : {
+          ...input.taskSpec,
+          metadata: {
+            ...(input.taskSpec.metadata && typeof input.taskSpec.metadata === "object" && !Array.isArray(input.taskSpec.metadata)
+              ? (input.taskSpec.metadata as Record<string, unknown>)
+              : {}),
+            interactionMode: input.interactionMode,
+          },
+        }
   try {
-    return DomainRegistry.createTaskSpec(input.domainID, input.taskSpec)
+    return DomainRegistry.createTaskSpec(input.domainID, taskSpec)
   } catch (error) {
     if (error instanceof z.ZodError) {
       throw new TaskSpecValidationError({
@@ -1274,6 +1385,61 @@ type DatasetAnalysisReport = {
   readonly metadata: JsonRecord
 }
 
+type DatasetAnalysisPlot = {
+  readonly kind: "dataset_analysis_plot_png"
+  readonly filename: string
+  readonly relativePath: string
+  readonly role: string
+  readonly data: Uint8Array
+  readonly metadata: JsonRecord
+}
+
+type DatasetSeriesMatrix = {
+  readonly columns: readonly string[]
+  readonly values: readonly (readonly number[])[]
+}
+
+type DatasetStatisticalAnalysis = {
+  readonly stationarity: {
+    readonly adfStatistic?: number
+    readonly adfStationary?: boolean
+    readonly kpssStatistic?: number
+    readonly kpssStationary?: boolean
+  }
+  readonly acf: {
+    readonly topLag?: number
+    readonly topCorrelation?: number
+    readonly pacfTopLag?: number
+    readonly pacfTopCorrelation?: number
+  }
+  readonly decomposition: {
+    readonly period?: number
+    readonly trendVarianceShare?: number
+    readonly seasonalVarianceShare?: number
+    readonly residualVarianceShare?: number
+  }
+  readonly frequency: {
+    readonly dominantPeriod?: number
+    readonly dominantPowerShare?: number
+  }
+  readonly changepoint: {
+    readonly index?: number
+    readonly score?: number
+    readonly severity?: string
+  }
+  readonly crossLag: {
+    readonly source?: string
+    readonly target?: string
+    readonly lag?: number
+    readonly correlation?: number
+  }
+}
+
+type DatasetAnalysisContext = {
+  readonly statistics: DatasetStatisticalAnalysis
+  readonly plotRefs: readonly DatasetAnalysisPlot[]
+}
+
 function markdownValue(value: unknown) {
   if (typeof value === "number") return formatMetricValue(value)
   if (typeof value === "string" && value.length > 0) return value
@@ -1290,8 +1456,435 @@ function dataAnalysisSignal(value: number | undefined, threshold: number, active
   return value !== undefined && value >= threshold ? active : inactive
 }
 
-function renderDatasetQuantitativeAnalysis(task: ResearchTask, fingerprint: JsonRecord) {
+function roundAnalysisValue(value: number | undefined) {
+  return value === undefined || !Number.isFinite(value) ? undefined : Number(value.toFixed(6))
+}
+
+function csvCells(line: string) {
+  const cells: string[] = []
+  let current = ""
+  let quoted = false
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index]!
+    if (char === '"') {
+      if (quoted && line[index + 1] === '"') {
+        current += '"'
+        index++
+      } else {
+        quoted = !quoted
+      }
+      continue
+    }
+    if (char === "," && !quoted) {
+      cells.push(current)
+      current = ""
+      continue
+    }
+    current += char
+  }
+  cells.push(current)
+  return cells
+}
+
+function taskDatasetSpec(task: ResearchTask) {
+  const taskSpec = recordValue(task.taskSpec)
+  return recordValue(taskSpec.dataset)
+}
+
+function datasetTargetColumns(task: ResearchTask, header: readonly string[]) {
+  const dataset = taskDatasetSpec(task)
+  const targetCols = Array.isArray(dataset.targetCols)
+    ? dataset.targetCols.filter((item): item is string => typeof item === "string" && header.includes(item))
+    : []
+  if (targetCols.length > 0) return targetCols
+  return header.slice(1)
+}
+
+async function loadDatasetSeriesMatrix(task: ResearchTask): Promise<DatasetSeriesMatrix | undefined> {
+  const dataset = taskDatasetSpec(task)
+  if (typeof dataset.path !== "string" || dataset.path.length === 0) return undefined
+  const datasetPath = path.isAbsolute(dataset.path) ? dataset.path : path.join(Instance.directory, dataset.path)
+  if (!existsSync(datasetPath)) return undefined
+  const text = await readFile(datasetPath, "utf8")
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0)
+  if (lines.length < 3) return undefined
+  const header = csvCells(lines[0]!)
+  const columns = datasetTargetColumns(task, header)
+  const columnIndexes = columns.map((column) => header.indexOf(column))
+  if (columns.length === 0 || columnIndexes.some((index) => index < 0)) return undefined
+  const values = lines.slice(1).map((line) => {
+    const row = csvCells(line)
+    return columnIndexes.map((columnIndex) => {
+      const parsed = Number(row[columnIndex])
+      return Number.isFinite(parsed) ? parsed : Number.NaN
+    })
+  })
+  return { columns, values }
+}
+
+function finiteSeries(values: readonly number[]) {
+  return values.filter((value) => Number.isFinite(value))
+}
+
+function finiteMean(values: readonly number[]) {
+  const finite = finiteSeries(values)
+  if (finite.length === 0) return undefined
+  return finite.reduce((sum, value) => sum + value, 0) / finite.length
+}
+
+function variance(values: readonly number[]) {
+  const finite = finiteSeries(values)
+  const avg = finiteMean(finite)
+  if (avg === undefined || finite.length < 2) return undefined
+  return finite.reduce((sum, value) => sum + (value - avg) ** 2, 0) / (finite.length - 1)
+}
+
+function matrixColumn(matrix: DatasetSeriesMatrix, columnIndex: number) {
+  return matrix.values.map((row) => row[columnIndex] ?? Number.NaN)
+}
+
+function aggregateSeries(matrix: DatasetSeriesMatrix) {
+  return matrix.values.map((row) => {
+    const finite = finiteSeries(row)
+    return finite.length === 0 ? Number.NaN : finite.reduce((sum, value) => sum + value, 0) / finite.length
+  })
+}
+
+function correlationAtLag(left: readonly number[], right: readonly number[], lag: number) {
+  const xs: number[] = []
+  const ys: number[] = []
+  const start = Math.max(0, -lag)
+  const end = Math.min(left.length, right.length - lag)
+  for (let index = start; index < end; index++) {
+    const x = left[index]
+    const y = right[index + lag]
+    if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y)) continue
+    xs.push(x)
+    ys.push(y)
+  }
+  if (xs.length < 3) return undefined
+  const xMean = finiteMean(xs)
+  const yMean = finiteMean(ys)
+  if (xMean === undefined || yMean === undefined) return undefined
+  let numerator = 0
+  let xDenom = 0
+  let yDenom = 0
+  for (let index = 0; index < xs.length; index++) {
+    const dx = xs[index]! - xMean
+    const dy = ys[index]! - yMean
+    numerator += dx * dy
+    xDenom += dx * dx
+    yDenom += dy * dy
+  }
+  const denom = Math.sqrt(xDenom * yDenom)
+  return denom === 0 ? undefined : numerator / denom
+}
+
+function averageAutocorrelation(matrix: DatasetSeriesMatrix, lag: number) {
+  const correlations = matrix.columns
+    .map((_, index) => correlationAtLag(matrixColumn(matrix, index), matrixColumn(matrix, index), lag))
+    .filter((value): value is number => value !== undefined && Number.isFinite(value))
+  if (correlations.length === 0) return undefined
+  return correlations.reduce((sum, value) => sum + value, 0) / correlations.length
+}
+
+function topLag(values: readonly { lag: number; value: number }[]) {
+  return values.toSorted((left, right) => Math.abs(right.value) - Math.abs(left.value))[0]
+}
+
+function stationarityAnalysis(matrix: DatasetSeriesMatrix, profile: Record<string, unknown>) {
+  const series = finiteSeries(aggregateSeries(matrix))
+  const avg = finiteMean(series)
+  const seriesVariance = variance(series)
+  let kpssStatistic: number | undefined
+  if (avg !== undefined && seriesVariance !== undefined && seriesVariance > 0 && series.length > 2) {
+    let cumulative = 0
+    const cumulativeSquares = series.reduce((sum, value) => {
+      cumulative += value - avg
+      return sum + cumulative * cumulative
+    }, 0)
+    kpssStatistic = cumulativeSquares / (series.length * series.length * seriesVariance)
+  }
+  return {
+    adfStatistic: roundAnalysisValue(numericProfileValue(profile, "adfStatistic")),
+    adfStationary: typeof profile.adfStationary === "boolean" ? profile.adfStationary : undefined,
+    kpssStatistic: roundAnalysisValue(kpssStatistic),
+    kpssStationary: kpssStatistic === undefined ? undefined : kpssStatistic < 0.463,
+  }
+}
+
+function acfPacfAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
+  const acfValues = Array.from({ length: maxLag }, (_, index) => {
+    const lag = index + 1
+    return { lag, value: averageAutocorrelation(matrix, lag) ?? 0 }
+  })
+  const pacfValues = acfValues.map((item, index) => ({
+    lag: item.lag,
+    value: index === 0 ? item.value : item.value - acfValues[index - 1]!.value * acfValues[0]!.value,
+  }))
+  const acfTop = topLag(acfValues)
+  const pacfTop = topLag(pacfValues)
+  return {
+    topLag: acfTop?.lag,
+    topCorrelation: roundAnalysisValue(acfTop?.value),
+    pacfTopLag: pacfTop?.lag,
+    pacfTopCorrelation: roundAnalysisValue(pacfTop?.value),
+  }
+}
+
+function frequencyAnalysis(series: readonly number[]) {
+  const values = finiteSeries(series)
+  const avg = finiteMean(values) ?? 0
+  const centered = values.map((value) => value - avg)
+  if (centered.length < 4) return {}
+  const powers: Array<{ period: number; power: number }> = []
+  for (let k = 1; k <= Math.floor(centered.length / 2); k++) {
+    let real = 0
+    let imag = 0
+    for (let index = 0; index < centered.length; index++) {
+      const angle = (2 * Math.PI * k * index) / centered.length
+      real += centered[index]! * Math.cos(angle)
+      imag -= centered[index]! * Math.sin(angle)
+    }
+    powers.push({ period: centered.length / k, power: real * real + imag * imag })
+  }
+  const totalPower = powers.reduce((sum, item) => sum + item.power, 0)
+  const best = powers.toSorted((left, right) => right.power - left.power)[0]
+  return {
+    dominantPeriod: roundAnalysisValue(best?.period),
+    dominantPowerShare: roundAnalysisValue(best && totalPower > 0 ? best.power / totalPower : undefined),
+  }
+}
+
+function movingAverage(values: readonly number[], window: number) {
+  const radius = Math.max(1, Math.floor(window / 2))
+  return values.map((_, index) => {
+    const slice = values.slice(Math.max(0, index - radius), Math.min(values.length, index + radius + 1))
+    return finiteMean(slice) ?? values[index] ?? 0
+  })
+}
+
+function decompositionAnalysis(series: readonly number[], period: number | undefined) {
+  const values = finiteSeries(series)
+  if (values.length < 4) return {}
+  const resolvedPeriod = Math.max(2, Math.min(Math.floor(values.length / 2), Math.round(period ?? 12)))
+  const trend = movingAverage(values, resolvedPeriod)
+  const detrended = values.map((value, index) => value - trend[index]!)
+  const seasonalMeans = Array.from({ length: resolvedPeriod }, (_, seasonalIndex) =>
+    finiteMean(detrended.filter((_, index) => index % resolvedPeriod === seasonalIndex)) ?? 0,
+  )
+  const seasonal = detrended.map((_, index) => seasonalMeans[index % resolvedPeriod]!)
+  const residual = values.map((value, index) => value - trend[index]! - seasonal[index]!)
+  const totalVariance = variance(values) ?? 0
+  const share = (part: readonly number[]) => (totalVariance > 0 ? (variance(part) ?? 0) / totalVariance : undefined)
+  return {
+    period: resolvedPeriod,
+    trendVarianceShare: roundAnalysisValue(share(trend)),
+    seasonalVarianceShare: roundAnalysisValue(share(seasonal)),
+    residualVarianceShare: roundAnalysisValue(share(residual)),
+  }
+}
+
+function changepointAnalysis(series: readonly number[]) {
+  const values = finiteSeries(series)
+  const std = Math.sqrt(variance(values) ?? 0)
+  const minWindow = Math.max(6, Math.floor(values.length * 0.1))
+  if (values.length < minWindow * 2 || std === 0) return {}
+  let best: { index: number; score: number } | undefined
+  for (let index = minWindow; index <= values.length - minWindow; index++) {
+    const left = finiteMean(values.slice(0, index))
+    const right = finiteMean(values.slice(index))
+    if (left === undefined || right === undefined) continue
+    const score = Math.abs(left - right) / std
+    if (!best || score > best.score) best = { index, score }
+  }
+  return {
+    index: best?.index,
+    score: roundAnalysisValue(best?.score),
+    severity: best === undefined ? undefined : best.score >= 1 ? "high" : best.score >= 0.5 ? "medium" : "low",
+  }
+}
+
+function crossLagAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
+  let best: DatasetStatisticalAnalysis["crossLag"] = {}
+  for (let leftIndex = 0; leftIndex < matrix.columns.length; leftIndex++) {
+    for (let rightIndex = 0; rightIndex < matrix.columns.length; rightIndex++) {
+      if (leftIndex === rightIndex) continue
+      const left = matrixColumn(matrix, leftIndex)
+      const right = matrixColumn(matrix, rightIndex)
+      for (let lag = -maxLag; lag <= maxLag; lag++) {
+        if (lag === 0) continue
+        const correlation = correlationAtLag(left, right, lag)
+        if (correlation === undefined) continue
+        if (best.correlation === undefined || Math.abs(correlation) > Math.abs(best.correlation)) {
+          best = {
+            source: matrix.columns[leftIndex],
+            target: matrix.columns[rightIndex],
+            lag,
+            correlation: roundAnalysisValue(correlation),
+          }
+        }
+      }
+    }
+  }
+  return best
+}
+
+function buildStatisticalAnalysis(matrix: DatasetSeriesMatrix | undefined, fingerprint: JsonRecord): DatasetStatisticalAnalysis {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  if (!matrix) {
+    return {
+      stationarity: {
+        adfStatistic: roundAnalysisValue(numericProfileValue(profile, "adfStatistic")),
+        adfStationary: typeof profile.adfStationary === "boolean" ? profile.adfStationary : undefined,
+      },
+      acf: {
+        topLag: typeof profile.acfMainPeriod === "number" ? profile.acfMainPeriod : undefined,
+        topCorrelation: roundAnalysisValue(numericProfileValue(profile, "acfMainPeriodStrength")),
+      },
+      decomposition: {},
+      frequency: {},
+      changepoint: {},
+      crossLag: {},
+    }
+  }
+  const maxLag = Math.max(1, Math.min(40, Math.floor(matrix.values.length / 2)))
+  const series = aggregateSeries(matrix)
+  return {
+    stationarity: stationarityAnalysis(matrix, profile),
+    acf: acfPacfAnalysis(matrix, maxLag),
+    decomposition: decompositionAnalysis(series, numericProfileValue(profile, "acfMainPeriod")),
+    frequency: frequencyAnalysis(series),
+    changepoint: changepointAnalysis(series),
+    crossLag: crossLagAnalysis(matrix, Math.min(24, maxLag)),
+  }
+}
+
+const pngSignature = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10])
+
+function crc32(buffer: Uint8Array) {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function pngChunk(type: string, data: Uint8Array) {
+  const typeBytes = Buffer.from(type, "ascii")
+  const length = Buffer.alloc(4)
+  length.writeUInt32BE(data.length, 0)
+  const crcInput = Buffer.concat([typeBytes, Buffer.from(data)])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(crcInput), 0)
+  return Buffer.concat([length, typeBytes, Buffer.from(data), crc])
+}
+
+function simplePng(width: number, height: number, values: readonly number[], accent: [number, number, number]) {
+  const pixels = Buffer.alloc((width * 3 + 1) * height, 255)
+  const setPixel = (x: number, y: number, color: [number, number, number]) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return
+    const offset = y * (width * 3 + 1) + 1 + x * 3
+    pixels[offset] = color[0]
+    pixels[offset + 1] = color[1]
+    pixels[offset + 2] = color[2]
+  }
+  for (let x = 28; x < width - 8; x++) setPixel(x, height - 24, [70, 70, 80])
+  for (let y = 8; y < height - 24; y++) setPixel(28, y, [70, 70, 80])
+  const finite = finiteSeries(values)
+  const min = finite.length ? Math.min(...finite) : 0
+  const max = finite.length ? Math.max(...finite) : 1
+  const span = max - min || 1
+  const chartWidth = width - 40
+  const chartHeight = height - 36
+  const samples = values.length > 0 ? values : [0]
+  for (let index = 0; index < samples.length; index++) {
+    const value = Number.isFinite(samples[index]!) ? samples[index]! : min
+    const x = 30 + Math.floor((index / Math.max(1, samples.length - 1)) * (chartWidth - 1))
+    const y = 8 + Math.floor((1 - (value - min) / span) * (chartHeight - 1))
+    for (let dy = y; dy < height - 24; dy++) setPixel(x, dy, accent)
+    setPixel(x, y, [20, 24, 32])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 2
+  const compressed = deflateSync(pixels)
+  return Buffer.concat([
+    Buffer.from(pngSignature),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", compressed),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ])
+}
+
+function buildDatasetAnalysisPlots(
+  matrix: DatasetSeriesMatrix | undefined,
+  statistics: DatasetStatisticalAnalysis,
+): DatasetAnalysisPlot[] {
+  const series = matrix ? aggregateSeries(matrix) : [0]
+  const acfValues = matrix
+    ? Array.from({ length: Math.max(1, Math.min(24, Math.floor(matrix.values.length / 2))) }, (_, index) =>
+        Math.abs(averageAutocorrelation(matrix, index + 1) ?? 0),
+      )
+    : [0]
+  const decompositionValues = [
+    statistics.decomposition.trendVarianceShare ?? 0,
+    statistics.decomposition.seasonalVarianceShare ?? 0,
+    statistics.decomposition.residualVarianceShare ?? 0,
+  ]
+  const crossLagValue = statistics.crossLag.correlation === undefined ? [0] : [Math.abs(statistics.crossLag.correlation)]
+  const baseMetadata = { format: "png", role: "quantitative-data-analyst", phase: "data_analysis" } as JsonRecord
+  return [
+    {
+      kind: "dataset_analysis_plot_png",
+      filename: "time-series-overview.png",
+      relativePath: "quantitative/plots/time-series-overview.png",
+      role: "quantitative-data-analyst",
+      data: simplePng(480, 240, series, [80, 140, 240]),
+      metadata: { ...baseMetadata, plotType: "time_series_overview", title: "Time series overview" },
+    },
+    {
+      kind: "dataset_analysis_plot_png",
+      filename: "acf-pacf.png",
+      relativePath: "quantitative/plots/acf-pacf.png",
+      role: "quantitative-data-analyst",
+      data: simplePng(480, 240, acfValues, [240, 150, 80]),
+      metadata: { ...baseMetadata, plotType: "acf_pacf", title: "ACF/PACF diagnostics" },
+    },
+    {
+      kind: "dataset_analysis_plot_png",
+      filename: "stl-decomposition.png",
+      relativePath: "quantitative/plots/stl-decomposition.png",
+      role: "quantitative-data-analyst",
+      data: simplePng(480, 240, decompositionValues, [110, 190, 120]),
+      metadata: { ...baseMetadata, plotType: "stl_decomposition", title: "STL-style decomposition" },
+    },
+    {
+      kind: "dataset_analysis_plot_png",
+      filename: "cross-lag.png",
+      relativePath: "quantitative/plots/cross-lag.png",
+      role: "quantitative-data-analyst",
+      data: simplePng(480, 240, crossLagValue, [190, 110, 220]),
+      metadata: { ...baseMetadata, plotType: "cross_lag", title: "Cross-lag correlation" },
+    },
+  ]
+}
+
+async function buildDatasetAnalysisContext(task: ResearchTask, fingerprint: JsonRecord): Promise<DatasetAnalysisContext> {
+  const matrix = await loadDatasetSeriesMatrix(task)
+  const statistics = buildStatisticalAnalysis(matrix, fingerprint)
+  return {
+    statistics,
+    plotRefs: buildDatasetAnalysisPlots(matrix, statistics),
+  }
+}
+
+function renderDatasetQuantitativeAnalysis(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext) {
+  const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  const stats = context.statistics
   const rows = [
     ["Rows", profile.rowCount, "usable observations detected in the CSV profile"],
     ["Targets", profile.targetCount, "forecast target columns used by the task"],
@@ -1307,6 +1900,18 @@ function renderDatasetQuantitativeAnalysis(task: ResearchTask, fingerprint: Json
     ["ADF stationarity", profile.adfStationary, "whether the profile suggests stationarity at the default threshold"],
     ["Irregular interval ratio", profile.irregularIntervalRatio, "timestamp cadence instability"],
     ["Duplicate timestamp rate", profile.duplicateTimestampRate, "duplicate timestamp share"],
+    ["KPSS statistic", stats.stationarity.kpssStatistic, "level-stationarity diagnostic; lower values support stationary residual behavior"],
+    ["KPSS stationarity", stats.stationarity.kpssStationary, "whether the KPSS-style statistic remains below the default level threshold"],
+    ["ACF top lag", stats.acf.topLag, "lag with strongest average autocorrelation across target columns"],
+    ["ACF top correlation", stats.acf.topCorrelation, "strength of the strongest average autocorrelation lag"],
+    ["PACF top lag", stats.acf.pacfTopLag, "lag with strongest approximate partial autocorrelation"],
+    ["PACF top correlation", stats.acf.pacfTopCorrelation, "approximate partial autocorrelation strength at the selected lag"],
+    ["Dominant frequency period", stats.frequency.dominantPeriod, "DFT-derived period with highest spectral power"],
+    ["Dominant frequency power share", stats.frequency.dominantPowerShare, "share of spectral energy explained by the dominant period"],
+    ["Change point", stats.changepoint.index, "index with largest normalized mean shift between prefix and suffix windows"],
+    ["Change point score", stats.changepoint.score, "normalized change-point severity score"],
+    ["Cross-lag", stats.crossLag.lag, "best non-zero lag between target columns"],
+    ["Cross-lag correlation", stats.crossLag.correlation, "strongest absolute lead-lag correlation across target pairs"],
   ]
   const lines = [
     "# Quantitative Sub-Agent Data Analysis",
@@ -1329,42 +1934,84 @@ function renderDatasetQuantitativeAnalysis(task: ResearchTask, fingerprint: Json
     `- Horizon/context ratio: ${markdownValue(recordValue(fingerprint).horizonContextRatio)}`,
     `- Max params: ${markdownValue(recordValue(fingerprint).maxParams)}`,
     `- Max training seconds: ${markdownValue(recordValue(fingerprint).maxTrainingSeconds)}`,
+    "",
+    "## Statistical Tests",
+    "",
+    `- ADF statistic: ${markdownValue(stats.stationarity.adfStatistic)}; stationary=${markdownValue(stats.stationarity.adfStationary)}`,
+    `- KPSS statistic: ${markdownValue(stats.stationarity.kpssStatistic)}; stationary=${markdownValue(stats.stationarity.kpssStationary)}`,
+    `- PACF top lag: ${markdownValue(stats.acf.pacfTopLag)} (${markdownValue(stats.acf.pacfTopCorrelation)})`,
+    "",
+    "## STL-style decomposition",
+    "",
+    `- Period: ${markdownValue(stats.decomposition.period)}`,
+    `- Trend variance share: ${markdownValue(stats.decomposition.trendVarianceShare)}`,
+    `- Seasonal variance share: ${markdownValue(stats.decomposition.seasonalVarianceShare)}`,
+    `- Residual variance share: ${markdownValue(stats.decomposition.residualVarianceShare)}`,
+    "",
+    "## Frequency and Change Diagnostics",
+    "",
+    `- Dominant frequency period: ${markdownValue(stats.frequency.dominantPeriod)} with power share ${markdownValue(stats.frequency.dominantPowerShare)}`,
+    `- Change point: ${markdownValue(stats.changepoint.index)} score=${markdownValue(stats.changepoint.score)} severity=${markdownValue(stats.changepoint.severity)}`,
+    `- Cross-lag: ${markdownValue(stats.crossLag.source)} -> ${markdownValue(stats.crossLag.target)} lag=${markdownValue(stats.crossLag.lag)} corr=${markdownValue(stats.crossLag.correlation)}`,
+    "",
+    "## Visualizations",
+    "",
+    ...context.plotRefs.map((plot) => `![${plot.metadata.title}](${plot.relativePath})`),
   ]
   return `${lines.join("\n")}\n`
 }
 
-function renderDatasetQualitativeAnalysis(task: ResearchTask, fingerprint: JsonRecord) {
+function renderDatasetQualitativeAnalysis(
+  task: ResearchTask,
+  fingerprint: JsonRecord,
+  context: DatasetAnalysisContext,
+  llmGenerated?: string,
+) {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  const dataset = taskDatasetSpec(task)
   const biases = Array.isArray(recordValue(fingerprint).searchBiases)
     ? (recordValue(fingerprint).searchBiases as unknown[]).filter((item): item is string => typeof item === "string")
     : []
-  const seasonality = numericProfileValue(profile, "seasonalityStrength")
-  const trend = numericProfileValue(profile, "trendStrength")
-  const crossVar = numericProfileValue(profile, "crossVarCorrelation")
-  const shift = numericProfileValue(profile, "distributionShift")
-  const missing = numericProfileValue(profile, "missingRate")
   const lines = [
     "# Qualitative Sub-Agent Data Analysis",
     "",
     "- Agent: qualitative-data-analyst",
     `- Task ID: ${task.id}`,
     "",
-    "## Reading",
-    "",
-    `- ${dataAnalysisSignal(seasonality, 0.4, "Seasonal structure is a strong prior for candidate design.", "Seasonality is not dominant from the profile.")}`,
-    `- ${dataAnalysisSignal(trend, 0.2, "Trend is present and should be handled by baseline and residual designs.", "Trend is weak enough for simple baselines to remain useful.")}`,
-    `- ${dataAnalysisSignal(crossVar, 0.5, "Cross-variate dependence is material; feature fusion or graph-style candidates are justified.", "Cross-variate dependence is limited; independent temporal candidates are acceptable.")}`,
-    `- ${dataAnalysisSignal(shift, 0.5, "Distribution shift is visible; robust loss or reweighting should be considered.", "Distribution shift is not the dominant risk.")}`,
-    `- ${missing !== undefined && missing > 0 ? "Missing values are present; candidate recipes should include missing-aware preprocessing." : "Missing values are not a primary concern in the profiled targets."}`,
-    "",
-    "## Search Priors",
-    "",
-    biases.length === 0 ? "- No explicit search bias detected." : `- ${biases.join(", ")}`,
   ]
+  if (llmGenerated && llmGenerated.trim().length > 0) {
+    lines.push(llmGenerated.trim(), "")
+  } else {
+    const seasonality = numericProfileValue(profile, "seasonalityStrength")
+    const trend = numericProfileValue(profile, "trendStrength")
+    const crossVar = numericProfileValue(profile, "crossVarCorrelation")
+    const shift = numericProfileValue(profile, "distributionShift")
+    const missing = numericProfileValue(profile, "missingRate")
+    lines.push(
+      "## Reading",
+      "",
+      `- ${dataAnalysisSignal(seasonality, 0.4, "Seasonal structure is a strong prior for candidate design.", "Seasonality is not dominant from the profile.")}`,
+      `- ${dataAnalysisSignal(trend, 0.2, "Trend is present and should be handled by baseline and residual designs.", "Trend is weak enough for simple baselines to remain useful.")}`,
+      `- ${dataAnalysisSignal(crossVar, 0.5, "Cross-variate dependence is material; feature fusion or graph-style candidates are justified.", "Cross-variate dependence is limited; independent temporal candidates are acceptable.")}`,
+      `- ${dataAnalysisSignal(shift, 0.5, "Distribution shift is visible; robust loss or reweighting should be considered.", "Distribution shift is not the dominant risk.")}`,
+      `- ${missing !== undefined && missing > 0 ? "Missing values are present; candidate recipes should include missing-aware preprocessing." : "Missing values are not a primary concern in the profiled targets."}`,
+      "",
+      "## 领域解读",
+      "",
+      `- 字段语义: target=${Array.isArray(dataset.targetCols) ? dataset.targetCols.join(", ") : "-"}; loader=${markdownValue(dataset.loaderID)}.`,
+      `- 业务机制: ${dataAnalysisSignal(seasonality, 0.4, "周期信号明显，可能对应生产节律、日历周期或批处理节奏。", "周期信号不强，业务解读应优先关注趋势和局部变化。")}`,
+      `- 外部因素: ${dataAnalysisSignal(crossVar, 0.5, "多变量联动较强，外生变量、同步扰动或共享上游驱动值得纳入建模假设。", "变量间联动较弱，外部因素更可能体现在单变量局部事件中。")}`,
+      `- 潜在事件: change_point=${markdownValue(context.statistics.changepoint.index)} severity=${markdownValue(context.statistics.changepoint.severity)}，需要人工核对该时间段是否存在口径、设备或环境变化。`,
+      `- 风险: ${dataAnalysisSignal(shift, 0.5, "存在分布漂移，离线验证和线上表现可能不一致。", "分布漂移风险较低，但仍需保留 holdout 检查。")}`,
+      `- 领域建模建议: ${context.statistics.crossLag.source ? `关注 ${context.statistics.crossLag.source}->${context.statistics.crossLag.target} 的 lag=${context.statistics.crossLag.lag} lead-lag 关系。` : "未发现稳定跨变量滞后关系，先使用简单 temporal baseline。"}`,
+      "",
+    )
+  }
+  lines.push("## Search Priors", "", biases.length === 0 ? "- No explicit search bias detected." : `- ${biases.join(", ")}`)
   return `${lines.join("\n")}\n`
 }
 
-function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonRecord) {
+function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext) {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
   const crossVar = numericProfileValue(profile, "crossVarCorrelation")
   const seasonality = numericProfileValue(profile, "seasonalityStrength")
@@ -1376,11 +2023,14 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
       ? "Prioritize at least one cross-variate candidate because the quantitative and qualitative sub-agents both flag cross-variate structure."
       : "Keep the first pass focused on independent temporal candidates because cross-variate evidence is limited.",
     seasonality !== undefined && seasonality >= 0.4
-      ? "Include patch or frequency-aware variants to exploit seasonal structure."
+      ? `Include decomposition or frequency-aware variants; dominant period=${markdownValue(context.statistics.frequency.dominantPeriod)} and STL period=${markdownValue(context.statistics.decomposition.period)}.`
       : "Avoid over-indexing on frequency modules until run evidence supports them.",
     (shift !== undefined && shift >= 0.5) || (missing !== undefined && missing > 0)
       ? "Use robust loss or preprocessing in later candidates if the bridge runner supports it."
       : "Keep preprocessing minimal in the first autonomous pass.",
+    context.statistics.changepoint.severity === "high"
+      ? "Treat the detected change point as a validation risk and prefer robust losses or split-aware evaluation."
+      : "No severe change point dominates the initial analysis.",
   ]
   const lines = [
     "# Main Agent Data Analysis Summary",
@@ -1391,7 +2041,8 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
     "## Inputs Reviewed",
     "",
     "- Quantitative sub-agent: numeric dataset profile, objective, horizon, and resource constraints.",
-    "- Qualitative sub-agent: structural interpretation of trend, seasonality, cross-variate behavior, shift, and missingness.",
+    "- Quantitative sub-agent: ADF/KPSS stationarity, ACF/PACF, STL-style decomposition, frequency, change-point, cross-lag, and plot artifacts.",
+    "- Qualitative sub-agent: field semantics, business mechanisms, external factors, potential events, risk, and domain modeling advice.",
     "",
     "## Synthesis",
     "",
@@ -1406,13 +2057,110 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
   return `${lines.join("\n")}\n`
 }
 
-function buildDatasetAnalysisReports(task: ResearchTask, fingerprint: JsonRecord): DatasetAnalysisReport[] {
+function buildQualitativeSystemPrompt(): string {
+  return [
+    "You are the NeoResearch qualitative data analyst for time series forecasting.",
+    "Language policy: 用中文写领域解读、业务机制、风险分析、建模建议；保留英文的技术术语、指标名和模块名。",
+    "Task: Interpret the provided time series dataset statistics from a domain and business perspective.",
+    "Output format: Return exactly two markdown sections as plain text (no code blocks, no JSON):",
+    "## Reading",
+    "(2-4 bullet points: key statistical patterns and their implications for model design)",
+    "## 领域解读",
+    "(4-6 bullet points: 字段语义、业务机制、外部因素、潜在事件、风险、领域建模建议 — one bullet per aspect)",
+    "Do not include any other heading, section, or text outside these two sections.",
+  ].join("\n")
+}
+
+function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext): string {
+  const profile = recordValue(recordValue(fingerprint).datasetProfile)
+  const dataset = taskDatasetSpec(task)
+  const biases = Array.isArray(fingerprint.searchBiases)
+    ? (fingerprint.searchBiases as unknown[]).filter((item): item is string => typeof item === "string")
+    : []
+  return JSON.stringify(
+    {
+      task: {
+        id: task.id,
+        title: task.title,
+        domainID: task.domainID,
+        objective: task.objective,
+        dataset: { targetCols: dataset.targetCols, loaderID: dataset.loaderID },
+      },
+      datasetProfile: {
+        rowCount: profile.rowCount,
+        targetCount: profile.targetCount,
+        missingRate: profile.missingRate,
+        trendStrength: profile.trendStrength,
+        seasonalityStrength: profile.seasonalityStrength,
+        crossVarCorrelation: profile.crossVarCorrelation,
+        distributionShift: profile.distributionShift,
+        outlierRate: profile.outlierRate,
+        acfMainPeriod: profile.acfMainPeriod,
+        adfStatistic: profile.adfStatistic,
+        adfStationary: profile.adfStationary,
+      },
+      extendedStatistics: {
+        kpssStatistic: context.statistics.stationarity.kpssStatistic,
+        kpssStationary: context.statistics.stationarity.kpssStationary,
+        acfTopLag: context.statistics.acf.topLag,
+        pacfTopLag: context.statistics.acf.pacfTopLag,
+        decompositionPeriod: context.statistics.decomposition.period,
+        trendVarianceShare: context.statistics.decomposition.trendVarianceShare,
+        seasonalVarianceShare: context.statistics.decomposition.seasonalVarianceShare,
+        dominantFrequencyPeriod: context.statistics.frequency.dominantPeriod,
+        dominantPowerShare: context.statistics.frequency.dominantPowerShare,
+        changepointIndex: context.statistics.changepoint.index,
+        changepointScore: context.statistics.changepoint.score,
+        changepointSeverity: context.statistics.changepoint.severity,
+        crossLagSource: context.statistics.crossLag.source,
+        crossLagTarget: context.statistics.crossLag.target,
+        crossLagLag: context.statistics.crossLag.lag,
+        crossLagCorrelation: context.statistics.crossLag.correlation,
+      },
+      searchBiasesAlreadyDetected: biases,
+      instruction:
+        "Analyze the dataset characteristics and provide qualitative domain insights for guiding TSF model search.",
+    },
+    null,
+    2,
+  )
+}
+
+async function generateLLMQualitativeAnalysis(
+  task: ResearchTask,
+  fingerprint: JsonRecord,
+  context: DatasetAnalysisContext,
+  workspaceRoot: string,
+): Promise<string | undefined> {
+  try {
+    const runtime = recordValue(recordValue(task.taskSpec).runtime)
+    const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
+    const config = await resolveNeoCastLLMConfig({ workspaceRoot, neoCastProjectRoot })
+    const apiKey = apiKeyFor(config)
+    if (!apiKey) return undefined
+    const system = buildQualitativeSystemPrompt()
+    const user = buildQualitativeUserPrompt(task, fingerprint, context)
+    // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
+    const llmPromise = requestNeoCastLLM(config, apiKey, system, user)
+    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
+    return await Promise.race([llmPromise, timeoutPromise])
+  } catch {
+    return undefined
+  }
+}
+
+function buildDatasetAnalysisReports(
+  task: ResearchTask,
+  fingerprint: JsonRecord,
+  context: DatasetAnalysisContext,
+  llmQualitative?: string,
+): DatasetAnalysisReport[] {
   return [
     {
       kind: "dataset_quantitative_analysis_markdown",
-      filename: "quantitative-subagent.md",
+      filename: "quantitative_analysis.md",
       role: "quantitative-data-analyst",
-      content: renderDatasetQuantitativeAnalysis(task, fingerprint),
+      content: renderDatasetQuantitativeAnalysis(task, fingerprint, context),
       metadata: {
         format: "markdown",
         role: "quantitative-data-analyst",
@@ -1421,20 +2169,21 @@ function buildDatasetAnalysisReports(task: ResearchTask, fingerprint: JsonRecord
     },
     {
       kind: "dataset_qualitative_analysis_markdown",
-      filename: "qualitative-subagent.md",
+      filename: "qualitative_analysis.md",
       role: "qualitative-data-analyst",
-      content: renderDatasetQualitativeAnalysis(task, fingerprint),
+      content: renderDatasetQualitativeAnalysis(task, fingerprint, context, llmQualitative),
       metadata: {
         format: "markdown",
         role: "qualitative-data-analyst",
         phase: "data_analysis",
+        llmGenerated: llmQualitative !== undefined,
       } as JsonRecord,
     },
     {
       kind: "dataset_main_analysis_markdown",
-      filename: "main-agent-summary.md",
+      filename: "main_agent_summary.md",
       role: "main-data-analyst",
-      content: renderDatasetMainAnalysisSummary(task, fingerprint),
+      content: renderDatasetMainAnalysisSummary(task, fingerprint, context),
       metadata: {
         format: "markdown",
         role: "main-data-analyst",
@@ -1443,6 +2192,68 @@ function buildDatasetAnalysisReports(task: ResearchTask, fingerprint: JsonRecord
       } as JsonRecord,
     },
   ]
+}
+
+function buildReleaseIntegrity(kind: string, copiedFiles: Record<string, string>) {
+  const required = [
+    "reports/final_report.md",
+    "artifacts/release_package.md",
+    "results/runs.json",
+    "results/candidates.json",
+    "results/champion.json",
+    "results/artifacts.json",
+    "manifest.json",
+  ]
+  if (kind === "model_export_package" || kind === "research_final_bundle") {
+    required.push("model/model.py")
+  }
+  const present = new Set(Object.values(copiedFiles))
+  const missing = required.filter((item) => !present.has(item))
+  return {
+    status: missing.length === 0 ? "complete" : "incomplete",
+    required,
+    missing,
+  }
+}
+
+function renderReleasePackageMarkdown(input: {
+  readonly task: ResearchTask
+  readonly kind: string
+  readonly champion: ResearchChampion | undefined
+  readonly copiedFiles: Record<string, string>
+  readonly integrity: ReturnType<typeof buildReleaseIntegrity>
+}) {
+  return [
+    "# Release Package",
+    "",
+    `- Task ID: ${input.task.id}`,
+    `- Task title: ${input.task.title}`,
+    `- Artifact kind: ${input.kind}`,
+    `- Champion candidate: ${input.champion?.candidateID ?? "none"}`,
+    "",
+    "## Reproduce",
+    "",
+    "- Inspect `manifest.json` for the exact file contract.",
+    "- Use `model/training_script.py` when a NAS-generated training entrypoint is present.",
+    "- Use `model/model.py` or `model/best_model.py` for local inference scaffolding.",
+    "",
+    "## Input / Output Contract",
+    "",
+    "- Inputs: task specification, candidate registry, run metrics, champion metadata, and copied model artifacts.",
+    "- Outputs: final report, result JSON snapshots, trace files, model files, and this release package note.",
+    "",
+    "## Release Integrity",
+    "",
+    `- Status: ${input.integrity.status}`,
+    `- Missing: ${input.integrity.missing.length ? input.integrity.missing.join(", ") : "none"}`,
+    "",
+    "## File Manifest",
+    "",
+    ...Object.entries(input.copiedFiles)
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([key, value]) => `- ${key}: ${value}`),
+    "",
+  ].join("\n")
 }
 
 async function executeRunnerPlan(plan: DomainRunPlan): Promise<RunnerExecution> {
@@ -1492,6 +2303,14 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
     predictionLengths: predictionLengths.map((item) => Math.floor(item)),
     targetCols,
   }
+}
+
+function tsfRunnerScriptPath(task: ResearchTask): string | undefined {
+  if (task.domainID !== "tsf") return undefined
+  const runtime = recordValue(recordValue(task.taskSpec).runtime)
+  const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
+  if (!root) return undefined
+  return path.join(path.resolve(root), "py", "validate.py")
 }
 
 function datasetPresetFromLoader(loaderID: string) {
@@ -1550,6 +2369,7 @@ function mapTask(row: ResearchTaskRow) {
     title: row.title,
     domainID: row.domain_id,
     mode: row.mode,
+    interactionMode: taskInteractionModeFromFields(row.mode, row.task_spec),
     status: row.status,
     taskSpec: row.task_spec,
     objective: row.objective,
@@ -1692,8 +2512,11 @@ export interface Interface {
   readonly runAutonomousIteration: (input: AutonomousIterationInput) => Effect.Effect<AutonomousIterationResult>
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
+  readonly answerIntentQuestion: (input: AnswerIntentInput) => Effect.Effect<IntentAgentResult>
   readonly runDataAnalysisAgent: (input: ProfileTaskInput) => Effect.Effect<DataAnalysisAgentResult>
   readonly runNASAgent: (input: AutonomousLoopInput) => Effect.Effect<NASAgentResult>
+  readonly runVerifierAgent: (input: VerifierAgentRunInput) => Effect.Effect<VerifierAgentResult>
+  readonly runReflectionAgent: (input: ReflectionAgentInput) => Effect.Effect<ReflectionAgentResult>
   readonly runPublishAgent: (input: ExportTaskArtifactInput) => Effect.Effect<PublishAgentResult>
   readonly runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult>
 }
@@ -1812,12 +2635,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
     const updateTaskSpec = Effect.fn("Research.updateTaskSpec")(function* (input: UpdateTaskSpecInput) {
       const existing = yield* getTask(input.taskID)
-      const taskSpec = normalizeTaskSpec({ domainID: existing.domainID, taskSpec: input.taskSpec })
+      const taskSpec = normalizeTaskSpec({
+        domainID: existing.domainID,
+        mode: existing.mode,
+        interactionMode: input.interactionMode ?? existing.interactionMode,
+        taskSpec: input.taskSpec,
+      })
+      const taskSpecMetadata = recordValue(taskSpec.metadata)
+      const nextMetadata = { ...taskSpecMetadata }
+      if (nextMetadata.workflow !== undefined) delete nextMetadata.workflow
       const projectID = Instance.project.id
       const row = yield* db((d) =>
         d
           .update(ResearchTaskTable)
-          .set({ task_spec: taskSpec, time_updated: Date.now() })
+          .set({ task_spec: { ...taskSpec, metadata: nextMetadata as unknown as JsonRecord }, time_updated: Date.now() })
           .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, projectID)))
           .returning()
           .get(),
@@ -1826,6 +2657,39 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const task = mapTask(row)
       yield* bus.publish(Event.TaskUpdated, { task })
       return task
+    })
+
+    const updateTaskWorkflow = Effect.fn("Research.updateTaskWorkflow")(function* (input: {
+      taskID: ResearchTaskID
+      completedPhases?: readonly PipelineWorkflowPhase[]
+      lastCheckpoint?: string
+    }) {
+      const task = yield* getTask(input.taskID)
+      const current = workflowMetadataFromTask(task)
+      const next: PipelineWorkflowMetadata = normalizeWorkflowMetadata({
+        completedPhases: input.completedPhases ?? current.completedPhases,
+        ...(input.lastCheckpoint === undefined ? {} : { lastCheckpoint: input.lastCheckpoint }),
+      })
+      const metadata = recordValue(task.taskSpec.metadata)
+      const nextTaskSpec = {
+        ...task.taskSpec,
+        metadata: { ...metadata, workflow: next } as unknown as JsonRecord,
+      }
+      const row = yield* db((d) =>
+        d
+          .update(ResearchTaskTable)
+          .set({
+            task_spec: nextTaskSpec,
+            time_updated: Date.now(),
+          })
+          .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
+          .returning()
+          .get(),
+      )
+      if (!row) throw missing("Research task", input.taskID)
+      const updated = mapTask(row)
+      yield* bus.publish(Event.TaskUpdated, { task: updated })
+      return updated
     })
 
     const createCandidate = Effect.fn("Research.createCandidate")(function* (input: CreateCandidateInput) {
@@ -2111,6 +2975,36 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       )
       if (existing) return mapApproval(existing)
       return yield* createApproval(input)
+    })
+
+    const ensureHumanCheckpoint = Effect.fn("Research.ensureHumanCheckpoint")(function* (input: {
+      readonly taskID: ResearchTaskID
+      readonly phase: string
+      readonly reason: string
+    }) {
+      const checkpointTag = `[checkpoint:${input.phase}]`
+      const rows = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchApprovalTable)
+          .where(
+            and(
+              eq(ResearchApprovalTable.task_id, input.taskID),
+              isNull(ResearchApprovalTable.candidate_id),
+              eq(ResearchApprovalTable.kind, "protocol"),
+            ),
+          )
+          .all(),
+      )
+      const approved = rows.find((row) => row.status === "approved" && row.reason.includes(checkpointTag))
+      if (approved) return mapApproval(approved)
+      const pending = rows.find((row) => row.status === "pending" && row.reason.includes(checkpointTag))
+      if (pending) return mapApproval(pending)
+      return yield* createApproval({
+        taskID: input.taskID,
+        kind: "protocol",
+        reason: `${checkpointTag}\n${input.reason}`,
+      })
     })
 
     const ensureRunBudget = Effect.fn("Research.ensureRunBudget")(function* (
@@ -2924,6 +3818,60 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       readonly stoppedReason: AutonomousLoopStoppedReason
     }) {
       const artifact = yield* writeAutonomousLoopArtifact(input)
+
+      if (input.iterations.length > 0) {
+        const reflection = yield* runReflectionAgent({
+          taskID: input.task.id,
+          stoppedReason: input.stoppedReason,
+        }).pipe(
+          Effect.catchCause(() =>
+            Effect.succeed({
+              agent: "ReflectionAgent" as const,
+              taskID: input.task.id,
+              reflectionNotesMarkdown: "",
+              nextExperimentPlanMarkdown: "",
+              failureLogMarkdown: "",
+              analysis: {
+                primaryMetricName: "val_avg_mse",
+                direction: "minimize" as const,
+                succeededRuns: 0,
+                failedRuns: 0,
+                rejectedRuns: 0,
+                plateauStreak: 0,
+                effectiveChanges: [],
+                ineffectiveChanges: [],
+                failures: [],
+                nextHypotheses: [],
+                decision: "continue" as const,
+                decisionReason: "Reflection failed",
+              },
+              llm: { status: "failed" as const },
+            }),
+          ),
+        )
+
+        const hypothesisTitles = reflection.analysis.nextHypotheses.map((h) => h.title)
+        if (hypothesisTitles.length > 0) {
+          const existingMeta =
+            typeof input.task.taskSpec.metadata === "object" &&
+            input.task.taskSpec.metadata !== null &&
+            !Array.isArray(input.task.taskSpec.metadata)
+              ? (input.task.taskSpec.metadata as Record<string, unknown>)
+              : {}
+          const updatedTaskSpec = {
+            ...input.task.taskSpec,
+            metadata: {
+              ...existingMeta,
+              reflectionHypotheses: hypothesisTitles,
+            },
+          }
+          yield* updateTaskSpec({
+            taskID: input.task.id,
+            taskSpec: updatedTaskSpec as JsonRecord,
+          })
+        }
+      }
+
       return {
         iterations: input.iterations,
         stoppedReason: input.stoppedReason,
@@ -2937,15 +3885,35 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
       yield* ensureRunBudget(task, "queued")
-      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+      const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+
+      const existingMeta =
+        typeof task.taskSpec.metadata === "object" && task.taskSpec.metadata !== null && !Array.isArray(task.taskSpec.metadata)
+          ? (task.taskSpec.metadata as Record<string, unknown>)
+          : {}
+      const reflectionHypotheses = Array.isArray(existingMeta.reflectionHypotheses)
+        ? (existingMeta.reflectionHypotheses as string[])
+        : []
+
+      const baseSearchBiases = Array.isArray(baseFingerprint.searchBiases)
+        ? (baseFingerprint.searchBiases as unknown[])
+        : []
+      const mergedSearchBiases = [...baseSearchBiases, ...reflectionHypotheses]
+
+      const taskFingerprint = {
+        ...baseFingerprint,
+        searchBiases: mergedSearchBiases,
+      } as JsonRecord
+
       const managerTrace: ResearchManagerStep[] = [
         managerStep("diagnostic", "completed", "Built task fingerprint for autonomous planning.", {
           domainID: task.domainID,
-          targetCount: taskFingerprint.targetCount,
-          contextLength: taskFingerprint.contextLength,
-          maxPredictionLength: taskFingerprint.maxPredictionLength,
-          bridgeOnly: taskFingerprint.bridgeOnly,
-          searchBiases: taskFingerprint.searchBiases,
+          targetCount: (taskFingerprint as Record<string, unknown>).targetCount,
+          contextLength: (taskFingerprint as Record<string, unknown>).contextLength,
+          maxPredictionLength: (taskFingerprint as Record<string, unknown>).maxPredictionLength,
+          bridgeOnly: (taskFingerprint as Record<string, unknown>).bridgeOnly,
+          searchBiases: mergedSearchBiases,
+          reflectionHypothesesCount: reflectionHypotheses.length,
         }),
       ]
 
@@ -3145,28 +4113,138 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         stage: input.stage,
         description: input.description,
       })
-      const runSucceeded = executed.run.status === "succeeded"
+      // --- Verifier Agent: run post-execution checks only when primary metric is present ---
+      let finalRun = executed.run
+      const primaryMetric = metricValue(executed.run.metrics, primaryMetricName)
+      if (executed.run.status === "succeeded" && primaryMetric !== undefined) {
+        const prevRuns = runs.filter((r) => r.id !== executed.run.id)
+        const currentChampion = yield* getChampion(task.id)
+        const verReport = runVerifiers({
+          task,
+          run: executed.run,
+          candidate,
+          previousRuns: prevRuns,
+          champion: currentChampion,
+        })
+        const evalMarkdown = buildEvaluationResultMarkdown({
+          task,
+          run: executed.run,
+          candidate,
+          report: verReport,
+        })
+        const decisionRecord = buildVerifierDecisionRecord({
+          task,
+          run: executed.run,
+          candidate,
+          report: verReport,
+        })
+        const evalDir = path.join(Instance.directory, ".neo-research", "evaluation-results", task.id)
+        const evalPath = path.join(evalDir, `${executed.run.id}.md`)
+        const decisionPath = path.join(evalDir, `${executed.run.id}.verifier_decision.json`)
+        yield* Effect.promise(async () => {
+          await mkdir(evalDir, { recursive: true })
+          await writeFile(evalPath, evalMarkdown, "utf8")
+          await writeFile(decisionPath, `${JSON.stringify(decisionRecord, null, 2)}\n`, "utf8")
+        })
+        const evalArtifact = yield* createArtifact({
+          taskID: task.id,
+          runID: executed.run.id,
+          kind: "evaluation_result_md",
+          uri: `file://${evalPath}`,
+          metadata: {
+            accepted: verReport.accepted,
+            rejectReason: verReport.rejectReason ?? null,
+            verifierCount: verReport.results.length,
+            rejectedVerifiers: verReport.results.filter((r) => !r.accepted).map((r) => r.name),
+          },
+        })
+        const decisionArtifact = yield* createArtifact({
+          taskID: task.id,
+          runID: executed.run.id,
+          kind: "verifier_decision_json",
+          uri: `file://${decisionPath}`,
+          metadata: {
+            accepted: decisionRecord.accepted,
+            decision: decisionRecord.decision,
+            rejectReason: decisionRecord.rejectReason,
+            failureCategory: decisionRecord.failure?.category ?? null,
+            recoveryAction: decisionRecord.failure?.recoveryAction.type ?? null,
+            verifierCount: decisionRecord.checks.length,
+          },
+        })
+        if (!verReport.accepted) {
+          finalRun = yield* updateRunStatus({
+            runID: executed.run.id,
+            status: "rejected",
+            error: verReport.rejectReason ?? "Rejected by VerifierAgent",
+            artifactRefs: [...executed.run.artifactRefs, evalArtifact.id, decisionArtifact.id],
+          })
+          yield* bus.publish(Event.RunRejectedByVerifier, {
+            taskID: task.id,
+            agent: "VerifierAgent",
+            stage: "verification",
+            status: "completed",
+            metadata: {
+              runID: executed.run.id,
+              accepted: false,
+              rejectReason: verReport.rejectReason ?? null,
+              verifierCount: verReport.results.length,
+            },
+          })
+        } else {
+          finalRun = yield* attachArtifactRefToRun(executed.run, evalArtifact.id)
+          finalRun = yield* attachArtifactRefToRun(finalRun, decisionArtifact.id)
+          yield* bus.publish(Event.RunVerified, {
+            taskID: task.id,
+            agent: "VerifierAgent",
+            stage: "verification",
+            status: "completed",
+            metadata: {
+              runID: executed.run.id,
+              accepted: true,
+              verifierCount: verReport.results.length,
+            },
+          })
+        }
+        managerTrace.push(
+          managerStep(
+            "verifier",
+            verReport.accepted ? "completed" : "blocked",
+            verReport.accepted
+              ? "VerifierAgent accepted the run after all checks passed."
+              : `VerifierAgent rejected the run: ${verReport.rejectReason}`,
+            {
+              runID: executed.run.id,
+              selectedCandidateID: candidate.id,
+              verifierAccepted: verReport.accepted,
+              ...(verReport.rejectReason !== undefined ? { rejectReason: verReport.rejectReason } : {}),
+              rejectedVerifiers: verReport.results.filter((r) => !r.accepted).map((r) => r.name),
+            },
+          ),
+        )
+      }
+
+      const runSucceeded = finalRun.status === "succeeded"
       managerTrace.push(
         managerStep(
           "runner",
           runSucceeded ? "completed" : "blocked",
           runSucceeded
             ? "Prepared and executed the selected candidate run."
-            : "Runner execution failed for the selected candidate.",
+            : "Runner execution failed or was rejected for the selected candidate.",
           {
-            runID: executed.run.id,
+            runID: finalRun.id,
             selectedCandidateID: candidate.id,
-            stage: executed.run.stage,
-            status: executed.run.status,
-            metrics: executed.run.metrics,
-            ...(executed.run.error === undefined ? {} : { error: executed.run.error }),
+            stage: finalRun.stage,
+            status: finalRun.status,
+            metrics: finalRun.metrics,
+            ...(finalRun.error === undefined ? {} : { error: finalRun.error }),
             rankPredictorVersion: rankPredictor.version,
           },
         ),
       )
 
-      const primaryMetric = metricValue(executed.run.metrics, primaryMetricName)
-      const primaryMetricMissing = executed.run.status === "succeeded" && primaryMetric === undefined
+      const primaryMetricMissing = finalRun.status === "succeeded" && primaryMetric === undefined
       managerTrace.push(
         managerStep(
           "analyst",
@@ -3175,9 +4253,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             ? "Run succeeded but did not produce the primary metric; marked the candidate inconclusive."
             : primaryMetric === undefined
               ? "Skipped metric analysis because the run did not produce the primary metric."
-            : "Analyzed run metrics against the task objective.",
+              : "Analyzed run metrics against the task objective.",
           {
-            runID: executed.run.id,
+            runID: finalRun.id,
             selectedCandidateID: candidate.id,
             selectedRecipeID,
             primaryMetricName,
@@ -3213,7 +4291,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const selectionArtifact = yield* writeCandidateSelectionArtifact({
         task,
         candidate,
-        run: executed.run,
+        run: finalRun,
         taskFingerprint,
         selectionSource,
         rankings,
@@ -3221,7 +4299,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         attemptedCandidateIDs: [...attemptState.attemptedCandidateIDs],
         inconclusiveCandidateIDs: [...attemptState.inconclusiveCandidateIDs],
       })
-      const selectedRun = yield* attachArtifactRefToRun(executed.run, selectionArtifact.id)
+      const selectedRun = yield* attachArtifactRefToRun(finalRun, selectionArtifact.id)
 
       const managerTraceArtifact = yield* writeManagerTraceArtifact({
         task,
@@ -3612,10 +4690,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         .filter((section) => section.length > 0)
       if (kind === "research_final_bundle" || kind === "model_export_package") {
         const reportDirectory = path.join(directory, "report")
+        const reportsDirectory = path.join(directory, "reports")
         const resultsDirectory = path.join(directory, "results")
+        const releaseArtifactsDirectory = path.join(directory, "artifacts")
+        const configsDirectory = path.join(directory, "configs")
+        const experimentsDirectory = path.join(directory, "experiments")
         const modelDirectory = path.join(directory, "model")
         const traceDirectory = path.join(directory, "trace")
         const reportPath = path.join(reportDirectory, "research-report.md")
+        const finalReportPath = path.join(reportsDirectory, "final_report.md")
+        const releasePackagePath = path.join(releaseArtifactsDirectory, "release_package.md")
         const runsPath = path.join(resultsDirectory, "runs.json")
         const candidatesPath = path.join(resultsDirectory, "candidates.json")
         const championPath = path.join(resultsDirectory, "champion.json")
@@ -3631,6 +4715,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           championRunnerArtifact === undefined ? undefined : filePathFromURI(championRunnerArtifact.uri)
         const copiedFiles: Record<string, string> = {
           report: "report/research-report.md",
+          finalReport: "reports/final_report.md",
+          releasePackage: "artifacts/release_package.md",
           runs: "results/runs.json",
           candidates: "results/candidates.json",
           champion: "results/champion.json",
@@ -3639,6 +4725,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           memory: "results/memory.json",
           manifest: "manifest.json",
         }
+        const standardArtifactCopies = [
+          ["nas_search_space_yaml", configsDirectory, "search_space.yaml", "searchSpace"],
+          ["nas_best_model_config_yaml", configsDirectory, "best_model_config.yaml", "bestModelConfig"],
+          ["nas_model_search_plan_md", experimentsDirectory, "model_search_plan.md", "modelSearchPlan"],
+          ["nas_experiment_log_md", experimentsDirectory, "experiment_log.md", "experimentLog"],
+          ["nas_leaderboard_md", experimentsDirectory, "leaderboard.md", "leaderboard"],
+          ["nas_evaluation_result_md", experimentsDirectory, "evaluation_result.md", "evaluationResult"],
+          ["nas_reflection_notes_md", experimentsDirectory, "reflection_notes.md", "reflectionNotes"],
+          ["nas_best_model_py", modelDirectory, "best_model.py", "bestModelPy"],
+          ["nas_training_script_py", modelDirectory, "training_script.py", "trainingScript"],
+        ] as const
 	        const modelCopies = [
 	          ["model.pt", "modelWeights"],
 	          ["model_impl.py", "modelImpl"],
@@ -3657,10 +4754,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
         yield* Effect.promise(async () => {
           await mkdir(reportDirectory, { recursive: true })
+          await mkdir(reportsDirectory, { recursive: true })
           await mkdir(resultsDirectory, { recursive: true })
+          await mkdir(releaseArtifactsDirectory, { recursive: true })
+          await mkdir(configsDirectory, { recursive: true })
+          await mkdir(experimentsDirectory, { recursive: true })
           await mkdir(modelDirectory, { recursive: true })
           await mkdir(traceDirectory, { recursive: true })
           await writeFile(reportPath, `${sections.join("\n\n")}\n`, "utf8")
+          await writeFile(finalReportPath, `${sections.join("\n\n")}\n`, "utf8")
           await writeFile(runsPath, `${JSON.stringify(runs, null, 2)}\n`, "utf8")
           await writeFile(candidatesPath, `${JSON.stringify(candidates, null, 2)}\n`, "utf8")
           await writeFile(championPath, `${JSON.stringify(champion ?? null, null, 2)}\n`, "utf8")
@@ -3681,12 +4783,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               copiedFiles.modelPy = "model/model.py"
             }
           }
+          for (const [artifactKind, targetDirectory, filename, manifestKey] of standardArtifactCopies) {
+            const sourceArtifact = artifacts.find((artifact) => artifact.kind === artifactKind)
+            const source = sourceArtifact === undefined ? undefined : filePathFromURI(sourceArtifact.uri)
+            if (source === undefined || !existsSync(source)) continue
+            const target = path.join(targetDirectory, filename)
+            await cp(source, target, { force: true })
+            copiedFiles[manifestKey] = `${path.basename(targetDirectory)}/${filename}`
+          }
           const loopArtifacts = artifacts.filter((artifact) => artifact.kind === "research_autonomous_loop_json")
           for (const artifact of loopArtifacts) {
             const source = filePathFromURI(artifact.uri)
             if (source === undefined || !existsSync(source)) continue
             await cp(source, path.join(traceDirectory, `${artifact.id}.json`), { force: true })
           }
+          const integrity = buildReleaseIntegrity(kind, copiedFiles)
+          await writeFile(
+            releasePackagePath,
+            renderReleasePackageMarkdown({ task, kind, champion, copiedFiles, integrity }),
+            "utf8",
+          )
           const manifest = {
             schemaVersion:
               kind === "model_export_package"
@@ -3711,6 +4827,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               artifacts: artifacts.length,
               memory: memory.length,
             },
+            integrity,
             files: copiedFiles,
           }
           await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
@@ -3728,6 +4845,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             artifactCount: artifacts.length,
             primaryMetricName: experimentAnalysis.primaryMetricName,
             copiedFiles: Object.values(copiedFiles),
+            releaseIntegrityStatus: buildReleaseIntegrity(kind, copiedFiles).status,
             ...(champion === undefined
               ? {}
               : {
@@ -3869,11 +4987,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           ...(profileWarningMessage === undefined ? {} : { profileWarningMessage }),
         },
       })
-      const analysisDirectory = path.join(directory, "data-analysis")
-      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord)
+      const analysisDirectory = path.join(Instance.directory, ".neo-research", "sessions", task.id, "analysis")
+      const analysisContext = yield* Effect.promise(() => buildDatasetAnalysisContext(task, fingerprint as JsonRecord))
+      const llmQualitative = yield* Effect.promise(() =>
+        generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory),
+      )
+      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative)
       const analysisArtifacts: ResearchArtifact[] = []
-	      for (const item of analysisFiles) {
-	        const reportPath = path.join(analysisDirectory, item.filename)
+      for (const item of analysisFiles) {
+        const reportPath = path.join(analysisDirectory, item.filename)
         yield* Effect.promise(async () => {
           await mkdir(analysisDirectory, { recursive: true })
           await writeFile(reportPath, item.content, "utf8")
@@ -3891,31 +5013,55 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               role: item.role,
               profileArtifactID: artifact.id,
             },
-	          }),
-	        )
-	      }
-	      const sourceReports: DatasetAnalysisSourceReport[] = analysisArtifacts.map((artifact, index) => {
-	        const source = analysisFiles[index]!
-	        return {
-	          id: artifact.id,
-	          kind: artifact.kind,
-	          role: source.role,
-	          content: source.content,
-	        }
-	      })
-	      const unifiedReportPath = path.join(analysisDirectory, "dataset-analysis-report.md")
-	      yield* Effect.promise(async () => {
-	        await mkdir(analysisDirectory, { recursive: true })
+          }),
+        )
+      }
+      const plotArtifacts: ResearchArtifact[] = []
+      for (const plot of analysisContext.plotRefs) {
+        const plotPath = path.join(analysisDirectory, plot.relativePath)
+        yield* Effect.promise(async () => {
+          await mkdir(path.dirname(plotPath), { recursive: true })
+          await writeFile(plotPath, plot.data)
+        })
+        plotArtifacts.push(
+          yield* createArtifact({
+            taskID: task.id,
+            runID: run.id,
+            kind: plot.kind,
+            uri: `file://${plotPath}`,
+            metadata: {
+              ...plot.metadata,
+              taskID: task.id,
+              domainID: task.domainID,
+              role: plot.role,
+              profileArtifactID: artifact.id,
+            },
+          }),
+        )
+      }
+      analysisArtifacts.push(...plotArtifacts)
+      const sourceReports: DatasetAnalysisSourceReport[] = analysisFiles.map((source, index) => {
+        const sourceArtifact = analysisArtifacts[index]!
+        return {
+          id: sourceArtifact.id,
+          kind: sourceArtifact.kind,
+          role: source.role,
+          content: source.content,
+        }
+      })
+      const unifiedReportPath = path.join(analysisDirectory, "data_analysis_summary.md")
+      yield* Effect.promise(async () => {
+        await mkdir(analysisDirectory, { recursive: true })
         await writeFile(
           unifiedReportPath,
           buildDatasetAnalysisReportMarkdown({
-	            task,
-	            fingerprint: fingerprint as JsonRecord,
-	            sourceArtifactIDs: analysisArtifacts.map((item) => item.id),
-	            sourceReports,
-	          }),
-	          "utf8",
-	        )
+            task,
+            fingerprint: fingerprint as JsonRecord,
+            sourceArtifactIDs: analysisArtifacts.map((item) => item.id),
+            sourceReports,
+          }),
+          "utf8",
+        )
       })
       const dataAnalysisArtifact = yield* createArtifact({
         taskID: task.id,
@@ -3930,6 +5076,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           domainID: task.domainID,
           profileArtifactID: artifact.id,
           sourceArtifactIDs: analysisArtifacts.map((item) => item.id),
+          plotArtifactIDs: plotArtifacts.map((item) => item.id),
         },
       })
       analysisArtifacts.push(dataAnalysisArtifact)
@@ -3952,6 +5099,33 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       return { fingerprint, run, artifact, path: outputPath }
     })
 
+	    const writeIntentSpecArtifact = Effect.fn("Research.writeIntentSpecArtifact")(function* (
+	      result: IntentAgentResult,
+	    ) {
+	      const dir = path.join(Instance.directory, ".neo-research", "sessions", result.taskID, "intent")
+	      const file = path.join(dir, "intent_spec.md")
+	      yield* Effect.promise(async () => {
+	        await mkdir(dir, { recursive: true })
+	        await writeFile(file, result.intentSpecMarkdown, "utf8")
+	      })
+	      return yield* createArtifact({
+	        taskID: result.taskID,
+	        kind: "intent_spec_markdown",
+	        uri: `file://${file}`,
+	        metadata: {
+	          format: "markdown",
+	          role: "intent-agent",
+	          phase: "intent_gathering",
+	          taskID: result.taskID,
+	          interactionMode: result.intentSpec.interaction_mode,
+	          confidence: result.confidence,
+	          confidenceThreshold: result.dialogueStrategy.confidenceThreshold,
+	          missingFields: result.missingFields,
+	          llmStatus: result.llm.status,
+	        },
+	      })
+	    })
+
 	    const runIntentAgent = Effect.fn("Research.runIntentAgent")(function* (taskID: ResearchTaskID) {
 	      yield* updateTaskStatus({ taskID, status: "intent_gathering" })
 	      yield* bus.publish(Event.IntentAgentStarted, {
@@ -3962,7 +5136,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	      })
 	      return yield* Effect.gen(function* () {
 	        const task = yield* getTask(taskID)
-	        const result = analyzeIntentTask({ task })
+	        const result = yield* Effect.promise(() => analyzeIntentTaskWithLLM({ task, workspaceRoot: Instance.directory }))
+	        const artifact = yield* writeIntentSpecArtifact(result)
 	        yield* bus.publish(Event.IntentAgentCompleted, {
 	          taskID,
 	          agent: "IntentAgent",
@@ -3972,6 +5147,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            confidence: result.confidence,
 	            missingFields: result.missingFields,
 	            clarifyingQuestionCount: result.clarifyingQuestions.length,
+	            artifactID: artifact.id,
+	            interactionMode: result.intentSpec.interaction_mode,
+	            llmStatus: result.llm.status,
 	          },
 	        })
 	        return result
@@ -3991,6 +5169,29 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	          }),
 	        ),
 	      )
+	    })
+
+	    const answerIntentQuestion = Effect.fn("Research.answerIntentQuestion")(function* (input: AnswerIntentInput) {
+	      const task = yield* getTask(input.taskID)
+	      const existingMeta =
+	        typeof task.taskSpec.metadata === "object" && task.taskSpec.metadata !== null && !Array.isArray(task.taskSpec.metadata)
+	          ? (task.taskSpec.metadata as Record<string, unknown>)
+	          : {}
+	      const existingIntentSlots =
+	        typeof existingMeta.intentSlots === "object" && existingMeta.intentSlots !== null && !Array.isArray(existingMeta.intentSlots)
+	          ? (existingMeta.intentSlots as Record<string, unknown>)
+	          : {}
+	      const mergedSlots = { ...existingIntentSlots, ...input.slots }
+	      const updatedTaskSpec = {
+	        ...task.taskSpec,
+	        metadata: { ...existingMeta, intentSlots: mergedSlots },
+	      }
+	      yield* updateTaskSpec({ taskID: input.taskID, taskSpec: updatedTaskSpec as JsonRecord })
+	      const result = yield* runIntentAgent(input.taskID)
+	      if (result.missingFields.length === 0 && task.status === "paused") {
+	        yield* updateTaskStatus({ taskID: input.taskID, status: "idle" })
+	      }
+	      return result
 	    })
 
 	    const runDataAnalysisAgent = Effect.fn("Research.runDataAnalysisAgent")(function* (input: ProfileTaskInput) {
@@ -4065,34 +5266,250 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	      })
 	      return yield* Effect.gen(function* () {
 	        const loop = yield* runAutonomousLoop(input)
-	        const result = summarizeNASAgentLoop({ taskID: input.taskID, loop })
-	        for (let index = 0; index < loop.iterations.length; index++) {
-	          const iteration = loop.iterations[index]!
-	          yield* bus.publish(Event.NASIterationCompleted, {
+
+	        // Build rich NAS result with per-iteration summaries
+	        const task = yield* getTask(input.taskID)
+	        const taskFp = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+	        const primaryMetricName = objectiveMetricName(task.objective)
+	        const direction = objectiveDirection(task.objective)
+	        const result = buildNASAgentResult({
+	          taskID: input.taskID,
+	          loop,
+	          primaryMetricName,
+	          direction,
+	          taskFingerprint: taskFp as JsonRecord,
+	        })
+
+	        const sessionDir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID)
+	        const nasOutputs = [
+	          {
+	            kind: "nas_model_search_plan_md",
+	            relativePath: "experiments/model_search_plan.md",
+	            content: result.modelSearchPlanMarkdown,
+	            format: "markdown",
+	          },
+	          {
+	            kind: "nas_experiment_log_md",
+	            relativePath: "experiments/experiment_log.md",
+	            content: result.experimentLogMarkdown,
+	            format: "markdown",
+	          },
+	          {
+	            kind: "nas_leaderboard_md",
+	            relativePath: "experiments/leaderboard.md",
+	            content: result.leaderboardMarkdown,
+	            format: "markdown",
+	          },
+	          {
+	            kind: "nas_evaluation_result_md",
+	            relativePath: "experiments/evaluation_result.md",
+	            content: result.evaluationResultMarkdown,
+	            format: "markdown",
+	          },
+	          {
+	            kind: "nas_reflection_notes_md",
+	            relativePath: "experiments/reflection_notes.md",
+	            content: result.reflectionNotesMarkdown,
+	            format: "markdown",
+	          },
+	          {
+	            kind: "nas_search_space_yaml",
+	            relativePath: "configs/search_space.yaml",
+	            content: result.searchSpaceYaml,
+	            format: "yaml",
+	          },
+	          {
+	            kind: "nas_best_model_config_yaml",
+	            relativePath: "configs/best_model_config.yaml",
+	            content: result.bestModelConfigYaml,
+	            format: "yaml",
+	          },
+	          {
+	            kind: "nas_best_model_py",
+	            relativePath: "model/best_model.py",
+	            content: result.bestModelPython,
+	            format: "python",
+	          },
+	          {
+	            kind: "nas_training_script_py",
+	            relativePath: "model/training_script.py",
+	            content: result.trainingScriptPython,
+	            format: "python",
+	          },
+	        ] as const
+	        for (const item of nasOutputs) {
+	          const outputPath = path.join(sessionDir, item.relativePath)
+	          yield* Effect.promise(async () => {
+	            await mkdir(path.dirname(outputPath), { recursive: true })
+	            await writeFile(outputPath, item.content, "utf8")
+	          })
+	          yield* createArtifact({
 	            taskID: input.taskID,
-	            agent: "NASAgent",
-	            stage: "searching",
-	            status: "completed",
+	            kind: item.kind,
+	            uri: `file://${outputPath}`,
 	            metadata: {
-	              iterationIndex: index + 1,
-	              candidateID: iteration.candidate.id,
-	              runID: iteration.run.id,
-	              runStatus: iteration.run.status,
-	              metrics: iteration.run.metrics,
+	              format: item.format,
+	              phase: "searching",
+	              relativePath: item.relativePath,
+	              iterationCount: result.iterationCount,
+	              succeededCount: result.succeededCount,
+	              failedCount: result.failedCount,
+	              stoppedReason: loop.stoppedReason,
 	            },
 	          })
 	        }
-	        yield* bus.publish(Event.NASAgentCompleted, {
+
+	        for (let index = 0; index < loop.iterations.length; index++) {
+          const iteration = loop.iterations[index]!
+          yield* bus.publish(Event.NASIterationCompleted, {
+            taskID: input.taskID,
+            agent: "NASAgent",
+            stage: "searching",
+            status: "completed",
+            metadata: {
+              iterationIndex: index + 1,
+              candidateID: iteration.candidate.id,
+              runID: iteration.run.id,
+              runStatus: iteration.run.status,
+              metrics: iteration.run.metrics,
+            },
+          })
+        }
+        yield* bus.publish(Event.NASAgentCompleted, {
+          taskID: input.taskID,
+          agent: "NASAgent",
+          stage: "searching",
+          status: "completed",
+          metadata: {
+            stoppedReason: loop.stoppedReason,
+            iterationCount: result.iterationCount,
+            succeededCount: result.succeededCount,
+            failedCount: result.failedCount,
+            artifactID: loop.artifact.id,
+          },
+        })
+        return result
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            const error = Cause.squash(cause)
+            yield* updateTaskStatus({ taskID: input.taskID, status: "failed" })
+            yield* bus.publish(Event.NASAgentFailed, {
+              taskID: input.taskID,
+              agent: "NASAgent",
+              stage: "searching",
+              status: "failed",
+              metadata: errorMetadata(error),
+            })
+            return yield* Effect.failCause(cause)
+          }),
+        ),
+      )
+    })
+	    const runVerifierAgent = Effect.fn("Research.runVerifierAgent")(function* (input: VerifierAgentRunInput) {
+	      const task = yield* getTask(input.taskID)
+	      const run = yield* getRunForTask(input.taskID, input.runID)
+	      const candidate =
+	        run.candidateID !== undefined ? yield* getCandidateForTask(task.id, run.candidateID) : undefined
+	      const allRuns = yield* listRuns(task.id)
+	      const prevRuns = allRuns.filter((r) => r.id !== run.id)
+	      const champion = yield* getChampion(task.id)
+	      const result = evaluateRunWithVerifiers({ task, run, candidate, previousRuns: prevRuns, champion })
+	      const evalDir = path.join(
+	        runnerPath(Instance.directory, input.outputDir ?? ".neo-research/evaluation-results"),
+	        task.id,
+	      )
+	      const evalPath = path.join(evalDir, `${run.id}.md`)
+	      const decisionPath = path.join(evalDir, `${run.id}.verifier_decision.json`)
+	      yield* Effect.promise(async () => {
+	        await mkdir(evalDir, { recursive: true })
+	        await writeFile(evalPath, result.evaluationResultMarkdown, "utf8")
+	        await writeFile(decisionPath, `${JSON.stringify(result.verifierDecision, null, 2)}\n`, "utf8")
+	      })
+	      const artifact = yield* createArtifact({
+	        taskID: task.id,
+	        runID: run.id,
+	        kind: "evaluation_result_md",
+	        uri: `file://${evalPath}`,
+	        metadata: verifierAgentMetadata(result) as Record<string, string | number | boolean | null>,
+	      })
+	      const decisionArtifact = yield* createArtifact({
+	        taskID: task.id,
+	        runID: run.id,
+	        kind: "verifier_decision_json",
+	        uri: `file://${decisionPath}`,
+	        metadata: {
+	          ...(verifierAgentMetadata(result) as Record<string, string | number | boolean | null>),
+	          decision: result.verifierDecision.decision,
+	          failureCategory: result.verifierDecision.failure?.category ?? null,
+	          recoveryAction: result.verifierDecision.failure?.recoveryAction.type ?? null,
+	          format: "json",
+	        },
+	      })
+	      return { ...result, artifact, decisionArtifact }
+	    })
+
+	    const runReflectionAgent = Effect.fn("Research.runReflectionAgent")(function* (input: ReflectionAgentInput) {
+	      yield* bus.publish(Event.ReflectionAgentStarted, {
+	        taskID: input.taskID,
+	        agent: "ReflectionAgent",
+	        stage: "reflection",
+	        status: "started",
+	      })
+	      return yield* Effect.gen(function* () {
+	        const task = yield* getTask(input.taskID)
+	        const runs = yield* listRuns(input.taskID)
+	        const candidates = yield* listCandidates(input.taskID)
+	        const champion = yield* getChampion(input.taskID)
+	        const result = summarizeReflectionAgent({
+	          task,
+	          runs,
+	          candidates,
+	          champion,
+	          stoppedReason: input.stoppedReason,
+	        })
+	        const directory = path.join(
+	          runnerPath(Instance.directory, input.outputDir ?? ".neo-research/reflection"),
+	          task.id,
+	        )
+	        const notesPath = path.join(directory, "reflection_notes.md")
+	        const planPath = path.join(directory, "next_experiment_plan.md")
+	        const failureLogPath = path.join(directory, "failure_log.md")
+	        yield* Effect.promise(async () => {
+	          await mkdir(directory, { recursive: true })
+	          await writeFile(notesPath, result.reflectionNotesMarkdown, "utf8")
+	          await writeFile(planPath, result.nextExperimentPlanMarkdown, "utf8")
+	          await writeFile(failureLogPath, result.failureLogMarkdown, "utf8")
+	        })
+	        const baseMetadata = reflectionAgentMetadata(result)
+	        const notesArtifact = yield* createArtifact({
+	          taskID: task.id,
+	          kind: "reflection_notes_md",
+	          uri: `file://${notesPath}`,
+	          metadata: { ...baseMetadata, role: "reflection-agent", format: "markdown" },
+	        })
+	        const planArtifact = yield* createArtifact({
+	          taskID: task.id,
+	          kind: "next_experiment_plan_md",
+	          uri: `file://${planPath}`,
+	          metadata: { ...baseMetadata, role: "reflection-agent", format: "markdown" },
+	        })
+	        const failureLogArtifact = yield* createArtifact({
+	          taskID: task.id,
+	          kind: "failure_log_md",
+	          uri: `file://${failureLogPath}`,
+	          metadata: { ...baseMetadata, role: "reflection-agent", format: "markdown" },
+	        })
+	        yield* bus.publish(Event.ReflectionAgentCompleted, {
 	          taskID: input.taskID,
-	          agent: "NASAgent",
-	          stage: "searching",
+	          agent: "ReflectionAgent",
+	          stage: "reflection",
 	          status: "completed",
 	          metadata: {
-	            stoppedReason: loop.stoppedReason,
-	            iterationCount: result.iterationCount,
-	            succeededCount: result.succeededCount,
-	            failedCount: result.failedCount,
-	            artifactID: loop.artifact.id,
+	            ...baseMetadata,
+	            reflectionNotesArtifactID: notesArtifact.id,
+	            nextExperimentPlanArtifactID: planArtifact.id,
+	            failureLogArtifactID: failureLogArtifact.id,
 	          },
 	        })
 	        return result
@@ -4100,11 +5517,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        Effect.catchCause((cause) =>
 	          Effect.gen(function* () {
 	            const error = Cause.squash(cause)
-	            yield* updateTaskStatus({ taskID: input.taskID, status: "failed" })
-	            yield* bus.publish(Event.NASAgentFailed, {
+	            yield* bus.publish(Event.ReflectionAgentFailed, {
 	              taskID: input.taskID,
-	              agent: "NASAgent",
-	              stage: "searching",
+	              agent: "ReflectionAgent",
+	              stage: "reflection",
 	              status: "failed",
 	              metadata: errorMetadata(error),
 	            })
@@ -4159,33 +5575,211 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	      )
 	    })
 
-	    const runFullPipeline = Effect.fn("Research.runFullPipeline")(function* (input: RunFullPipelineInput) {
-	      const initialTask = yield* getTask(input.taskID)
-	      if (initialTask.mode !== "autonomous") {
-	        throw new PipelineBlockedError({
-	          taskID: input.taskID,
-	          reason: "pipeline_requires_autonomous",
-	        })
-	      }
-	      const intent = yield* runIntentAgent(input.taskID)
-	      if (intent.missingFields.length > 0) {
-	        yield* ensurePendingApproval({
-	          taskID: input.taskID,
-	          kind: "protocol",
-	          reason: [
-	            "Intent clarification required before running the autonomous pipeline.",
-	            ...intent.clarifyingQuestions.map((question) => `- ${question}`),
-	          ].join("\n"),
-	        })
-	        yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
-	        throw new PipelineBlockedError({
-	          taskID: input.taskID,
-	          reason: "intent_clarification_required",
-	          missingFields: intent.missingFields,
-	          clarifyingQuestions: intent.clarifyingQuestions,
-	        })
-	      }
-	      const task = yield* getTask(input.taskID)
+    const runFullPipeline = Effect.fn("Research.runFullPipeline")(function* (input: RunFullPipelineInput) {
+      const initialTask = yield* getTask(input.taskID)
+      const initialInteractionMode = taskInteractionMode(initialTask)
+      // Socratic mode requires autonomous task mode (fully autonomous after clarification).
+      // Companion mode can run in any task mode (pauses at human checkpoints).
+      if (initialTask.mode !== "autonomous" && initialInteractionMode !== "companion") {
+        throw new PipelineBlockedError({
+          taskID: input.taskID,
+          reason: "pipeline_requires_autonomous",
+        })
+      }
+
+      const markWorkflowPhase = (phase: PipelineWorkflowPhase, checkpoint?: string) =>
+        Effect.gen(function* () {
+          const task = yield* getTask(input.taskID)
+          const workflow = workflowMetadataFromTask(task)
+          const nextPhases = normalizeWorkflowMetadata({
+            completedPhases: [...workflow.completedPhases, phase],
+            ...(checkpoint === undefined ? {} : { lastCheckpoint: checkpoint }),
+          })
+          yield* updateTaskWorkflow({
+            taskID: input.taskID,
+            completedPhases: nextPhases.completedPhases,
+            ...(checkpoint === undefined ? {} : { lastCheckpoint: checkpoint }),
+          })
+        })
+
+      const recoverDataAnalysis = (task: ResearchTask) =>
+        Effect.gen(function* () {
+          const artifacts = yield* listArtifacts(input.taskID)
+          const dataAnalysisArtifact = artifacts.find((item) => item.kind === "dataset_analysis_report")
+          if (!dataAnalysisArtifact) throw new Error(`Missing dataset analysis artifact for task: ${input.taskID}`)
+          const metadata = recordValue(dataAnalysisArtifact.metadata)
+          const sourceArtifactIDs = Array.isArray(metadata.sourceArtifactIDs)
+            ? metadata.sourceArtifactIDs
+                .map((id) => (typeof id === "string" ? (id as ResearchArtifactID) : undefined))
+                .filter((id): id is ResearchArtifactID => id !== undefined)
+            : []
+          const warningCount =
+            typeof metadata.warningCount === "number"
+              ? metadata.warningCount
+              : typeof metadata.warningCount === "string"
+                ? Number(metadata.warningCount)
+                : 0
+          const searchBiases = Array.isArray(metadata.searchBiases)
+            ? metadata.searchBiases.filter((item): item is string => typeof item === "string")
+            : []
+          return {
+            agent: "DataAnalysisAgent" as const,
+            taskID: task.id,
+            artifact: dataAnalysisArtifact,
+            sourceArtifactIDs,
+            searchBiases,
+            warningCount: Number.isFinite(warningCount) ? warningCount : 0,
+          } satisfies DataAnalysisAgentResult
+        })
+
+      const recoverNAS = (task: ResearchTask) =>
+        Effect.gen(function* () {
+          const artifacts = yield* listArtifacts(input.taskID)
+          const loopArtifact = artifacts.find((item) => item.kind === "research_autonomous_loop_json")
+          if (!loopArtifact) throw new Error(`Missing NAS loop artifact for task: ${input.taskID}`)
+          const loopPath = filePathFromURI(loopArtifact.uri)
+          if (loopPath === undefined) throw new Error(`Invalid NAS loop artifact path for task: ${input.taskID}`)
+          const payloadText = yield* Effect.promise(() => readFile(loopPath, "utf8"))
+          const payload = recordValue(JSON.parse(payloadText))
+          const rawIterations = Array.isArray(payload.iterations) ? payload.iterations : []
+          const iterations: AutonomousIterationResult[] = []
+          for (const item of rawIterations) {
+            const raw = recordValue(item)
+            const runID = typeof raw.runID === "string" ? (raw.runID as ResearchRunID) : undefined
+            const candidateID = typeof raw.candidateID === "string" ? (raw.candidateID as ResearchCandidateID) : undefined
+            if (runID === undefined || candidateID === undefined) continue
+            const run = yield* getRunForTask(input.taskID, runID).pipe(
+              Effect.orElseSucceed((): ResearchRun | undefined => undefined),
+            )
+            const candidate = yield* getCandidateForTask(input.taskID, candidateID).pipe(
+              Effect.orElseSucceed((): ResearchCandidate | undefined => undefined),
+            )
+            if (!run || !candidate) continue
+            const selectionArtifact =
+              artifacts.find((item) => item.runID === run.id && item.kind === "research_candidate_selection_json") ??
+              ({
+                id: ResearchArtifactID.ascending(),
+                taskID: input.taskID,
+                kind: "research_candidate_selection_json",
+                uri: `file://${path.join(Instance.directory, ".neo-research", "placeholder")}`,
+                metadata: {},
+                time: { created: 0, updated: 0 },
+              } as ResearchArtifact)
+            iterations.push({
+              run,
+              candidate,
+              runPlan: {
+                domainID: task.domainID,
+                runnerID: "restored",
+                runnerKind: "subprocess",
+                stage: run.stage,
+                approvalRequired: false,
+                validation: { ok: true, issues: [] },
+                writes: [],
+                command: {
+                  executable: "",
+                  path: "",
+                  args: [],
+                },
+                expectedEvents: [],
+                expectedMetrics: [],
+                expectedArtifacts: [],
+              },
+              seededCandidates: [],
+              approvals: [],
+              managerTrace: [],
+              selectionArtifact,
+            } as AutonomousIterationResult)
+          }
+          const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+          const loop = {
+            iterations,
+            stoppedReason:
+              typeof payload.stoppedReason === "string" && payload.stoppedReason.length > 0
+                ? (payload.stoppedReason as AutonomousLoopStoppedReason)
+                : "max_iterations",
+            artifact: loopArtifact,
+          }
+          return buildNASAgentResult({
+            taskID: input.taskID,
+            loop: loop as unknown as AutonomousLoopResult,
+            taskFingerprint,
+          })
+        })
+
+      const recoverReflection = (task: ResearchTask, stoppedReason: AutonomousLoopStoppedReason) =>
+        Effect.gen(function* () {
+          const runs = yield* listRuns(input.taskID)
+          const candidates = yield* listCandidates(input.taskID)
+          const champion = yield* getChampion(input.taskID)
+          const result = summarizeReflectionAgent({
+            task,
+            runs,
+            candidates,
+            champion,
+            stoppedReason,
+          })
+          const artifacts = yield* listArtifacts(input.taskID)
+          const notesArtifact = artifacts.find((item) => item.kind === "reflection_notes_md")
+          const planArtifact = artifacts.find((item) => item.kind === "next_experiment_plan_md")
+          const failureArtifact = artifacts.find((item) => item.kind === "failure_log_md")
+          const readArtifactContent = (artifact?: ResearchArtifact) =>
+            Effect.promise(async () => {
+              const contentPath = artifact === undefined ? undefined : filePathFromURI(artifact.uri)
+              if (!contentPath) return ""
+              return (await readFile(contentPath, "utf8")).toString()
+            }).pipe(Effect.orElseSucceed(() => ""))
+          const reflectionNotesMarkdown = yield* readArtifactContent(notesArtifact)
+          const nextExperimentPlanMarkdown = yield* readArtifactContent(planArtifact)
+          const failureLogMarkdown = yield* readArtifactContent(failureArtifact)
+          return {
+            ...result,
+            reflectionNotesMarkdown: reflectionNotesMarkdown.length === 0 ? result.reflectionNotesMarkdown : reflectionNotesMarkdown,
+            nextExperimentPlanMarkdown:
+              nextExperimentPlanMarkdown.length === 0 ? result.nextExperimentPlanMarkdown : nextExperimentPlanMarkdown,
+            failureLogMarkdown: failureLogMarkdown.length === 0 ? result.failureLogMarkdown : failureLogMarkdown,
+          } satisfies ReflectionAgentResult
+        })
+
+      const recoverPublish = (task: ResearchTask) =>
+        Effect.gen(function* () {
+          const artifacts = yield* listArtifacts(input.taskID)
+          const artifact =
+            artifacts.find((item) => item.kind === "model_export_package") ??
+            artifacts.find((item) => item.kind === "research_final_bundle")
+          if (!artifact) throw new Error(`Missing export artifact for task: ${input.taskID}`)
+          const publishPath = filePathFromURI(artifact.uri)
+          if (publishPath === undefined) throw new Error(`Invalid publish artifact path for task: ${input.taskID}`)
+          return summarizePublishAgent({
+            taskID: task.id,
+            exportResult: {
+              artifact,
+              path: publishPath,
+            },
+          })
+        })
+
+      const intent = yield* runIntentAgent(input.taskID)
+      if (intent.missingFields.length > 0) {
+        yield* ensurePendingApproval({
+          taskID: input.taskID,
+          kind: "protocol",
+          reason: [
+            "运行自主研究流水线前需要先澄清研究意图。",
+            ...intent.clarifyingQuestions.map((question) => `- ${question}`),
+          ].join("\n"),
+        })
+        yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+        throw new PipelineBlockedError({
+          taskID: input.taskID,
+          reason: "intent_clarification_required",
+          missingFields: intent.missingFields,
+          clarifyingQuestions: intent.clarifyingQuestions,
+        })
+      }
+
+      const task = yield* getTask(input.taskID)
+      const workflow = workflowMetadataFromTask(task)
       const datasetPreparation = tsfDatasetPreparationConfig(task)
       if (
         datasetPreparation !== undefined &&
@@ -4196,29 +5790,223 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           force: input.forceDatasetPreparation ?? true,
         })
       }
-      const profileOutputDir = input.outputDir === undefined ? undefined : path.join(input.outputDir, "profile")
-      const dataAnalysis = yield* runDataAnalysisAgent({
-        taskID: input.taskID,
-        outputDir: profileOutputDir,
-      })
-      const nas = yield* runNASAgent({
-        taskID: input.taskID,
-        stage: input.stage,
-        description: input.description,
-        maxIterations: input.maxIterations,
-        targetMetricValue: input.targetMetricValue,
-        minRelativeImprovement: input.minRelativeImprovement,
-        maxNoImprove: input.maxNoImprove,
-        timeBudgetSeconds: input.timeBudgetSeconds,
-        maxCrashStreak: input.maxCrashStreak,
-      })
-      const publish = yield* runPublishAgent({
-        taskID: input.taskID,
-        kind: "model_export_package",
-        outputDir: input.outputDir,
-      })
+
+      const dataAnalysis = workflow.completedPhases.includes("data_analysis")
+        ? yield* recoverDataAnalysis(task)
+        : yield* runDataAnalysisAgent({
+            taskID: input.taskID,
+            outputDir: input.outputDir === undefined ? undefined : path.join(input.outputDir, "profile"),
+          }).pipe(
+            Effect.tap(() => markWorkflowPhase("data_analysis")),
+          )
+
+      if (intent.intentSpec.interaction_mode === "companion") {
+        const checkpoint = yield* ensureHumanCheckpoint({
+          taskID: input.taskID,
+          phase: "data_analysis_done",
+          reason: [
+            "Companion checkpoint: data analysis finished.",
+            `Data analysis artifact: ${dataAnalysis.artifact.id}`,
+            "Recommended action: review the data-analysis report, confirm whether the interpretation matches domain knowledge, then approve this protocol checkpoint to continue model search.",
+          ].join("\n"),
+        })
+        if (checkpoint.status === "pending") {
+          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: input.taskID,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "data_analysis_done",
+          })
+        }
+        yield* updateTaskWorkflow({
+          taskID: input.taskID,
+          lastCheckpoint: "data_analysis_done",
+          completedPhases: workflow.completedPhases.includes("data_analysis") ? workflow.completedPhases : ["data_analysis"],
+        })
+      }
+
+      const currentTask = yield* getTask(input.taskID)
+      const currentWorkflow = workflowMetadataFromTask(currentTask)
+      const shouldRunSearchSpaceCheckpoint = intent.intentSpec.interaction_mode === "companion" && !currentWorkflow.completedPhases.includes("searching")
+      if (shouldRunSearchSpaceCheckpoint) {
+        const fingerprint = DomainRegistry.summarizeTask(currentTask.domainID, currentTask.taskSpec)
+        const biases = (Array.isArray(fingerprint.searchBiases) ? fingerprint.searchBiases : []).join(", ") || "none"
+        const baselines = DomainRegistry.buildBaselines(currentTask.domainID, currentTask.taskSpec)
+        const baselineList = baselines
+          .map((b) => {
+            const spec = b.candidateSpec as Record<string, unknown>
+            return `- ${typeof spec.recipeID === "string" ? spec.recipeID : "candidate"}: ${b.rationale?.slice(0, 80) ?? ""}`
+          })
+          .join("\n")
+        const ssCheckpoint = yield* ensureHumanCheckpoint({
+          taskID: input.taskID,
+          phase: "search_space_confirmed",
+          reason: [
+            "## 搜索空间已确认，等待确认后开始模型搜索",
+            "",
+            "**搜索偏置：** " + biases,
+            "",
+            "**计划 Baseline 方案：**",
+            baselineList,
+            "",
+            "**建议操作：** 确认搜索方向正确后 approve，或 reject 并调整 taskSpec 后重新运行。",
+          ].join("\n"),
+        })
+        if (ssCheckpoint.status === "pending") {
+          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: input.taskID,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "search_space_confirmed",
+          })
+        }
+        yield* updateTaskWorkflow({
+          taskID: input.taskID,
+          completedPhases: currentWorkflow.completedPhases.includes("searching") ? currentWorkflow.completedPhases : ["searching"],
+          lastCheckpoint: "search_space_confirmed",
+        })
+      }
+
+      const nas = currentWorkflow.completedPhases.includes("searching")
+        ? yield* recoverNAS(currentTask)
+        : yield* Effect.gen(function* () {
+            const nasTask = yield* getTask(input.taskID)
+            const runnerScript = tsfRunnerScriptPath(nasTask)
+            if (runnerScript !== undefined && !existsSync(runnerScript)) {
+              yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+              throw new PipelineBlockedError({
+                taskID: input.taskID,
+                reason: "runner_not_configured",
+              })
+            }
+            const result = yield* runNASAgent({
+              taskID: input.taskID,
+              stage: input.stage,
+              description: input.description,
+              maxIterations: input.maxIterations,
+              targetMetricValue: input.targetMetricValue,
+              minRelativeImprovement: input.minRelativeImprovement,
+              maxNoImprove: input.maxNoImprove,
+              timeBudgetSeconds: input.timeBudgetSeconds,
+              maxCrashStreak: input.maxCrashStreak ?? 3,
+            })
+            yield* markWorkflowPhase("searching")
+            return result
+          })
+
+      if (intent.intentSpec.interaction_mode === "companion") {
+        if (nas.loop.stoppedReason === "max_iterations") {
+          const budgetCheckpoint = yield* ensureHumanCheckpoint({
+            taskID: input.taskID,
+            phase: "experiment_budget_extended",
+            reason: [
+              "## NAS 搜索已达迭代上限",
+              "",
+              `**完成迭代：** ${nas.iterationCount} 轮`,
+              `**成功运行：** ${nas.succeededCount}，**失败：** ${nas.failedCount}`,
+              "",
+              "**建议操作：** approve 继续搜索（将增加 maxIterations），reject 接受当前结果。",
+            ].join("\n"),
+          })
+          if (budgetCheckpoint.status === "pending") {
+            yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+            throw new PipelineBlockedError({
+              taskID: input.taskID,
+              reason: "human_checkpoint_required",
+              checkpointPhase: "experiment_budget_extended",
+            })
+          }
+          yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "experiment_budget_extended" })
+        }
+        const champion = yield* getChampion(input.taskID)
+        const finalCheckpoint = yield* ensureHumanCheckpoint({
+          taskID: input.taskID,
+          phase: "final_model_selection",
+          reason: [
+            "## 模型搜索完成，请确认最终候选模型",
+            "",
+            champion
+              ? [
+                  `**当前 Champion：** ${champion.candidateID}`,
+                  `**Primary metric：** ${champion.primaryMetric}`,
+                  `**Utility score：** ${champion.utility}`,
+                ].join("\n")
+              : "**当前无 Champion**（所有 run 均未成功）",
+            "",
+            "**建议操作：** approve 接受此模型并进入反思与发布阶段，reject 中止发布。",
+          ].join("\n"),
+        })
+        if (finalCheckpoint.status === "pending") {
+          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: input.taskID,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "final_model_selection",
+          })
+        }
+        yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
+      }
+
+      const reflection = currentWorkflow.completedPhases.includes("reflection")
+        ? yield* recoverReflection(currentTask, nas.loop.stoppedReason)
+        : yield* runReflectionAgent({
+            taskID: input.taskID,
+            outputDir: input.outputDir === undefined ? undefined : path.join(input.outputDir, "reflection"),
+            stoppedReason: nas.loop.stoppedReason,
+          })
+
+      if (reflection.analysis.decision === "request_human") {
+        yield* ensurePendingApproval({
+          taskID: input.taskID,
+          kind: "protocol",
+          reason: ["Reflection Agent 建议人工介入：", reflection.analysis.decisionReason].join("\n"),
+        })
+        yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+        throw new PipelineBlockedError({
+          taskID: input.taskID,
+          reason: "reflection_requested_human_review",
+        })
+      }
+      if (!currentWorkflow.completedPhases.includes("reflection")) {
+        yield* markWorkflowPhase("reflection")
+      }
+
+      const publish = currentWorkflow.completedPhases.includes("publishing")
+        ? yield* recoverPublish(currentTask)
+        : yield* runPublishAgent({
+            taskID: input.taskID,
+            kind: "model_export_package",
+            outputDir: input.outputDir,
+          }).pipe(
+            Effect.tap(() => markWorkflowPhase("publishing")),
+          )
+
+      if (intent.intentSpec.interaction_mode === "companion") {
+        const releaseCheckpoint = yield* ensureHumanCheckpoint({
+          taskID: input.taskID,
+          phase: "report_release",
+          reason: [
+            "## 准备发布模型报告",
+            "",
+            `**Reflection 决策：** ${reflection.analysis.decision}`,
+            `**决策依据：** ${reflection.analysis.decisionReason}`,
+            "",
+            "**建议操作：** approve 发布最终模型包，reject 放弃本次发布。",
+          ].join("\n"),
+        })
+        if (releaseCheckpoint.status === "pending") {
+          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: input.taskID,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "report_release",
+          })
+        }
+        yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "report_release" })
+      }
+
       const completed = yield* getTask(input.taskID)
-      return { task: completed, intent, dataAnalysis, nas, publish }
+      return { task: completed, intent, dataAnalysis, nas, reflection, publish }
     })
 
     const createMemory = Effect.fn("Research.createMemory")(function* (input: CreateMemoryInput) {
@@ -4348,8 +6136,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       runAutonomousIteration,
       runAutonomousLoop,
       runIntentAgent,
+      answerIntentQuestion,
       runDataAnalysisAgent,
       runNASAgent,
+      runVerifierAgent,
+      runReflectionAgent,
       runPublishAgent,
       runFullPipeline,
       createRun,

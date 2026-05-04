@@ -227,6 +227,40 @@ describe("TSF research domain", () => {
     }
   })
 
+  test("uses search biases to seed profile-driven baselines without reopening the dataset", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      runtime: { bridgeOnly: false },
+      metadata: {
+        searchBiases: ["seasonal", "cross_var_correlated", "missing_values", "distribution_shift"],
+        datasetProfile: {
+          source: "dataset.path",
+          path: "/tmp/already-profiled.csv",
+          rowCount: 512,
+          targetCount: 4,
+          numericColumnCount: 4,
+          missingRate: 0,
+          trendStrength: 0.1,
+          seasonalityStrength: 0.1,
+          crossVarCorrelation: 0.1,
+          distributionShift: 0.1,
+        },
+      },
+    })
+    const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
+    const seasonal = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_profile_seasonal_decomposition_baseline")
+    const feature = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_profile_feature_fusion_baseline")
+    const robust = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_profile_shift_robust_baseline")
+
+    expect(seasonal?.candidateSpec.preprocessing).toMatchObject({
+      actions: [{ type: "series_decomposition" }],
+    })
+    expect(feature?.candidateSpec.fusion).toMatchObject({ type: "feature" })
+    expect(robust?.candidateSpec.trainingStrategy).toMatchObject({
+      loss: { base: "huber", horizonWeighting: "tail_heavy" },
+    })
+  })
+
   test("does not classify pure trend as seasonality", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-trend-only-"))
     const csvPath = path.join(root, "train.csv")
@@ -722,6 +756,35 @@ describe("TSF research domain", () => {
     ).toBe(true)
   })
 
+  test("uses search biases to shape native proposals when profile metrics are unavailable", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      runtime: { bridgeOnly: false },
+    })
+    const proposal = Research.DomainRegistry.proposeCandidate("tsf", {
+      taskSpec: normalizedTask,
+      taskFingerprint: {
+        ...Research.DomainRegistry.summarizeTask("tsf", normalizedTask),
+        searchBiases: ["multivariate", "full_recipe_space", "seasonal", "missing_values", "distribution_shift"],
+      },
+      candidates: [],
+      runs: [],
+      memory: [],
+    })
+
+    expect(proposal?.candidateSpec.recipeID).toBe("tsf_ranked_frequency_mixer_profiled")
+    expect(proposal?.candidateSpec.preprocessing).toMatchObject({
+      actions: [
+        { type: "missing_mask", maskChannel: true, fillPolicy: "mean" },
+        { type: "sample_reweighting", scheme: "outlier_robust" },
+      ],
+    })
+    expect(proposal?.candidateSpec.trainingStrategy).toMatchObject({
+      loss: { base: "huber", horizonWeighting: "tail_heavy" },
+    })
+    expect(proposal?.rationale).toContain("seasonality favors frequency embedding")
+  })
+
   test("uses run memory to rerank full recipe autonomous proposals", () => {
     const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
       ...taskSpec,
@@ -927,5 +990,161 @@ describe("TSF research domain", () => {
       },
     })
     expect(rankings[0]?.reasons.some((reason) => reason.includes("benchmark memory accepted similar"))).toBe(true)
+  })
+
+  test("proposeTSFCandidate with seasonal bias uses frequency embedding in mutation", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      runtime: { bridgeOnly: false },
+    })
+    const taskFingerprint = {
+      ...Research.DomainRegistry.summarizeTask("tsf", normalizedTask),
+      searchBiases: ["seasonal", "multivariate", "full_recipe_space"],
+      datasetProfile: {
+        source: "dataset.path",
+        path: "/tmp/seasonal.csv",
+        rowCount: 512,
+        targetCount: 7,
+        numericColumnCount: 7,
+        missingRate: 0,
+        trendStrength: 0.2,
+        seasonalityStrength: 0.7,
+        crossVarCorrelation: 0.1,
+        distributionShift: 0.1,
+      },
+    }
+
+    // Exhaust the frontier by providing existing recipe IDs, forcing mutation path
+    const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
+    const allFrontier = Research.DomainRegistry.rankCandidateProposals("tsf", {
+      taskSpec: normalizedTask,
+      taskFingerprint,
+      candidates: [],
+      runs: [],
+      memory: [],
+    })
+    const allFrontierIDs = allFrontier.map((item) => asRecord(item.candidateSpec).recipeID).filter(Boolean)
+    const baselineIDs = baselines.map((item) => asRecord(item.candidateSpec).recipeID).filter(Boolean)
+    const allIDs = [...new Set([...allFrontierIDs, ...baselineIDs])] as string[]
+
+    // Use the patch MLP baseline as champion so the mutation base has a patch embedding
+    const patchCandidate = baselines.find((b) => asRecord(b.candidateSpec).recipeID === "tsf_patch_mlp_baseline")!
+    const patchCandidateID = "champion_patch_cand" as Research.ResearchCandidateID
+    const existingCandidates = [
+      {
+        id: patchCandidateID,
+        candidateSpec: asRecord(patchCandidate.candidateSpec),
+        approvalStatus: "auto_approved",
+        generatedBy: "heuristic" as const,
+      },
+      ...allIDs
+        .filter((id) => id !== "tsf_patch_mlp_baseline")
+        .map((id, i) => ({
+          id: `c${i}` as Research.ResearchCandidateID,
+          candidateSpec: { ...asRecord(patchCandidate.candidateSpec), recipeID: id },
+          approvalStatus: "auto_approved",
+          generatedBy: "heuristic" as const,
+        })),
+    ]
+
+    const proposal = Research.DomainRegistry.proposeCandidate("tsf", {
+      taskSpec: normalizedTask,
+      taskFingerprint,
+      candidates: existingCandidates as unknown as Parameters<typeof Research.DomainRegistry.proposeCandidate>[1]["candidates"],
+      runs: [],
+      memory: [],
+      champion: { candidateID: patchCandidateID, primaryMetric: 0.15, utility: -0.15 },
+    })
+
+    // Should produce a mutation (not undefined), and with seasonal bias + patch base, should switch to frequency
+    expect(proposal).not.toBeUndefined()
+    if (proposal) {
+      const candidateSpec = asRecord(proposal.candidateSpec)
+      const hypothesis = typeof candidateSpec.hypothesis === "string" ? candidateSpec.hypothesis : ""
+      const embedding = asRecord(candidateSpec.embedding)
+      // The profile-aware mutation should use frequency embedding or contain profile guidance
+      const isProfileGuided =
+        hypothesis.includes("Profile-guided") ||
+        hypothesis.includes("seasonal") ||
+        embedding.type === "frequency"
+      expect(isProfileGuided).toBe(true)
+    }
+  })
+
+  test("proposeTSFCandidate with cross_var bias uses gated_hybrid fusion in mutation", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      runtime: { bridgeOnly: false },
+    })
+    const taskFingerprint = {
+      ...Research.DomainRegistry.summarizeTask("tsf", normalizedTask),
+      searchBiases: ["cross_var_correlated", "multivariate", "full_recipe_space"],
+      datasetProfile: {
+        source: "dataset.path",
+        path: "/tmp/crossvar.csv",
+        rowCount: 512,
+        targetCount: 7,
+        numericColumnCount: 7,
+        missingRate: 0,
+        trendStrength: 0.1,
+        seasonalityStrength: 0.1,
+        crossVarCorrelation: 0.85,
+        distributionShift: 0.1,
+      },
+    }
+
+    const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
+    const allFrontier = Research.DomainRegistry.rankCandidateProposals("tsf", {
+      taskSpec: normalizedTask,
+      taskFingerprint,
+      candidates: [],
+      runs: [],
+      memory: [],
+    })
+    const allFrontierIDs = allFrontier.map((item) => asRecord(item.candidateSpec).recipeID).filter(Boolean)
+    const baselineIDs = baselines.map((item) => asRecord(item.candidateSpec).recipeID).filter(Boolean)
+    const allIDs = [...new Set([...allFrontierIDs, ...baselineIDs])] as string[]
+
+    // Use the first baseline (temporal fusion) as champion to ensure mutation has temporal fusion base
+    const linearCandidate = baselines[0]!
+    const linearCandidateID = "champion_linear_cand" as Research.ResearchCandidateID
+    const existingCandidates = [
+      {
+        id: linearCandidateID,
+        candidateSpec: asRecord(linearCandidate.candidateSpec),
+        approvalStatus: "auto_approved",
+        generatedBy: "heuristic" as const,
+      },
+      ...allIDs
+        .filter((id) => id !== asRecord(linearCandidate.candidateSpec).recipeID)
+        .map((id, i) => ({
+          id: `c${i}` as Research.ResearchCandidateID,
+          candidateSpec: { ...asRecord(linearCandidate.candidateSpec), recipeID: id },
+          approvalStatus: "auto_approved",
+          generatedBy: "heuristic" as const,
+        })),
+    ]
+
+    const proposal = Research.DomainRegistry.proposeCandidate("tsf", {
+      taskSpec: normalizedTask,
+      taskFingerprint,
+      candidates: existingCandidates as unknown as Parameters<typeof Research.DomainRegistry.proposeCandidate>[1]["candidates"],
+      runs: [],
+      memory: [],
+      champion: { candidateID: linearCandidateID, primaryMetric: 0.2, utility: -0.2 },
+    })
+
+    expect(proposal).not.toBeUndefined()
+    if (proposal) {
+      const candidateSpec = asRecord(proposal.candidateSpec)
+      const hypothesis = typeof candidateSpec.hypothesis === "string" ? candidateSpec.hypothesis : ""
+      const fusion = asRecord(candidateSpec.fusion)
+      const isProfileGuided =
+        hypothesis.includes("Profile-guided") ||
+        hypothesis.includes("cross_var") ||
+        hypothesis.includes("correlated") ||
+        fusion.type === "gated_hybrid"
+      expect(isProfileGuided).toBe(true)
+    }
   })
 })

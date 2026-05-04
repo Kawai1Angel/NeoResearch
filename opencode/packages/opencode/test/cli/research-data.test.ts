@@ -24,6 +24,7 @@ const task = (input: Omit<Partial<Research.ResearchTask>, "id"> & { id: string }
     title: input.title ?? input.id,
     domainID: input.domainID ?? "tsf",
     mode: input.mode ?? "review",
+    interactionMode: input.interactionMode,
     status: input.status ?? "created",
     taskSpec: input.taskSpec ?? {},
     objective: input.objective ?? {},
@@ -105,9 +106,17 @@ describe("research CLI data helpers", () => {
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
       budget: { maxRuns: 12, maxParallel: 1 },
     })
+    expect(buildDefaultTsfResearchTaskInput({ mode: "review", interactionMode: "companion" })).toMatchObject({
+      mode: "autonomous",
+      interactionMode: "companion",
+      taskSpec: {
+        metadata: { interactionMode: "companion" },
+      },
+    })
     expect(buildDefaultTsfResearchTaskInput({ mode: "autonomous", title: "Long horizon search" })).toMatchObject({
       title: "Long horizon search",
       mode: "autonomous",
+      interactionMode: "socratic",
       taskSpec: {
         contextLength: 96,
         predictionLengths: [24],

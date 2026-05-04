@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { paramToAttributeKey, requestAttributes } from "../../src/server/routes/instance/trace"
+import { Effect } from "effect"
+import { paramToAttributeKey, requestAttributes, runRequestDeferred } from "../../src/server/routes/instance/trace"
 
 function fakeContext(method: string, url: string, params: Record<string, string>) {
   return {
@@ -72,5 +73,29 @@ describe("requestAttributes", () => {
     )
     expect(attrs["opencode.name"]).toBe("exa")
     expect(attrs["name"]).toBeUndefined()
+  })
+})
+
+describe("runRequestDeferred", () => {
+  test("does not start the effect until after the current request handler yields", async () => {
+    let started = false
+    let failed: unknown
+    runRequestDeferred(
+      "test.deferred",
+      fakeContext("POST", "http://localhost/session/ses_abc/prompt_async", { sessionID: "ses_abc" }) as any,
+      Effect.sync(() => {
+        started = true
+      }) as any,
+      (error) => {
+        failed = error
+      },
+    )
+
+    expect(started).toBe(false)
+    for (let attempt = 0; attempt < 40 && !started && !failed; attempt++) {
+      await Bun.sleep(25)
+    }
+    expect(failed).toBeUndefined()
+    expect(started).toBe(true)
   })
 })

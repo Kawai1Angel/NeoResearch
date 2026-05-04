@@ -10,6 +10,7 @@ export type ResearchCockpitTask = {
   title: string
   domainID: string
   mode: "review" | "autonomous"
+  interactionMode?: ResearchInteractionMode
   status:
     | "idle"
     | "created"
@@ -157,6 +158,7 @@ export type CreateResearchTaskInput = {
   title: string
   domainID: string
   mode: ResearchCockpitTask["mode"]
+  interactionMode?: ResearchInteractionMode
   taskSpec: JsonRecord
   objective: JsonRecord
   budget: JsonRecord
@@ -615,6 +617,50 @@ export function updateResearchCockpitTaskRunnerRoot(
   }
 }
 
+// Used during task creation: only looks inside the given directory, never at siblings.
+// This prevents false-positive resolution (e.g. resolving /tmp/foo to /tmp/neo-cast).
+export function resolveNeoCastSubdirectory(projectRoot: string) {
+  const root = projectRoot.trim()
+  if (!root) return root
+  const resolved = path.resolve(root)
+  const subdirs = [path.join(resolved, "neo_cast"), path.join(resolved, "neo-cast")]
+  return subdirs.find((candidate) => existsSync(path.join(candidate, "py", "validate.py"))) ?? resolved
+}
+
+// Used by the "Use Project Runner" repair command: broader search including sibling directories.
+export function resolveResearchCockpitProjectRunnerRoot(projectRoot: string) {
+  const root = projectRoot.trim()
+  if (!root) return root
+  const resolved = path.resolve(root)
+  const candidates = [
+    path.join(resolved, "neo_cast"),
+    path.join(resolved, "neo-cast"),
+    path.join(path.dirname(resolved), "neo_cast"),
+    path.join(path.dirname(resolved), "neo-cast"),
+    resolved,
+  ]
+  return candidates.find((candidate) => existsSync(path.join(candidate, "py", "validate.py"))) ?? resolved
+}
+
+export function updateResearchCockpitTaskInteractionMode(
+  task: ResearchCockpitTask,
+  interactionMode: ResearchInteractionMode,
+): ResearchCockpitTask {
+  const taskSpec = asRecord(task.taskSpec)
+  const metadata = asRecord(taskSpec.metadata)
+  return {
+    ...task,
+    interactionMode,
+    taskSpec: {
+      ...taskSpec,
+      metadata: {
+        ...metadata,
+        interactionMode,
+      },
+    },
+  }
+}
+
 export type ResearchCockpitRunnerStatus = {
   configured: boolean
   ready: boolean
@@ -870,6 +916,10 @@ export function formatResearchCockpitExport(result: ResearchCockpitExportResult)
   const champion = metadataString(metadata, "championCandidateID")
   const metricName = metadataString(metadata, "primaryMetricName")
   const metricValue = compactValue(metadata.primaryMetricValue)
+  const runCount = compactValue(metadata.runCount)
+  const candidateCount = compactValue(metadata.candidateCount)
+  const reportPath = metadataString(metadata, "reportPath")
+  const manifestPath = metadataString(metadata, "manifestPath")
   const copiedFiles = Array.isArray(metadata.copiedFiles)
     ? metadata.copiedFiles.filter((item): item is string => typeof item === "string" && item.length > 0)
     : []
@@ -877,6 +927,10 @@ export function formatResearchCockpitExport(result: ResearchCockpitExportResult)
     `${result.artifact.kind} exported: ${result.path}`,
     champion ? `champion=${champion}` : undefined,
     metricName && metricValue ? `${metricName}=${metricValue}` : undefined,
+    runCount ? `runs=${runCount}` : undefined,
+    candidateCount ? `candidates=${candidateCount}` : undefined,
+    reportPath ? `report=${reportPath}` : undefined,
+    manifestPath ? `manifest=${manifestPath}` : undefined,
     copiedFiles.length > 0 ? `files=${copiedFiles.join(", ")}` : undefined,
   ].filter((item): item is string => Boolean(item))
   return parts.join(" / ")
@@ -911,17 +965,28 @@ export function formatResearchCockpitIteration(result: ResearchCockpitIterationR
 
 export function formatResearchCockpitLoop(result: ResearchCockpitLoopResult) {
   const succeeded = result.iterations.filter((iteration) => iteration.run.status === "succeeded").length
+  const failed = result.iterations.filter((iteration) => iteration.run.status === "failed").length
+  const pendingApprovals = result.iterations.reduce(
+    (sum, iteration) => sum + iteration.approvals.filter((approval) => approval.status === "pending").length,
+    0,
+  )
+  const seeded = result.iterations.reduce((sum, iteration) => sum + iteration.seededCandidates.length, 0)
   const bestIteration = result.iterations.find((iteration) => iteration.run.status === "succeeded")
   const selected = bestIteration ? ` / selected ${bestIteration.candidate.id} / ${primaryMetricText(bestIteration.run.metrics)}` : ""
+  const selectionArtifact = result.iterations.find((iteration) => iteration.selectionArtifact)?.selectionArtifact
+  const selection = selectionArtifact ? ` / selection ${formatResearchCockpitArtifactMetadata(selectionArtifact) ?? selectionArtifact.kind}` : ""
+  const pending = pendingApprovals > 0 ? ` / ${pendingApprovals} approval pending` : ""
+  const seededText = seeded > 0 ? ` / seeded=${seeded}` : ""
   const artifact = result.artifact ? ` / artifact ${result.artifact.kind}` : ""
   const iterationLabel = result.iterations.length === 1 ? "iteration" : "iterations"
-  return `loop stopped: ${formatLoopStopReason(result.stoppedReason)} / ${result.iterations.length} ${iterationLabel} / ${succeeded} succeeded${selected}${artifact}`
+  return `loop stopped: ${formatLoopStopReason(result.stoppedReason)} / ${result.iterations.length} ${iterationLabel} / ${succeeded} succeeded / ${failed} failed${pending}${seededText}${selected}${selection}${artifact}`
 }
 
 function formatLoopStopReason(reason: string) {
   if (reason === "max_iterations") return "reached max iterations"
   if (reason === "budget_exhausted") return "budget exhausted"
   if (reason === "no_candidate") return "no runnable candidate"
+  if (reason === "approval_required") return "waiting for approval"
   if (reason === "completed") return "completed"
   return reason.replace(/_/g, " ")
 }
@@ -1115,6 +1180,7 @@ export function interactionModeForTaskMode(mode: ResearchCockpitTask["mode"]): R
 
 export function interactionModeForTask(task: ResearchCockpitTask | undefined): ResearchInteractionMode | undefined {
   if (!task) return undefined
+  if (task.interactionMode === "companion" || task.interactionMode === "socratic") return task.interactionMode
   const metadata = task.taskSpec.metadata
   if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
     const value = (metadata as JsonRecord).interactionMode
@@ -1128,40 +1194,273 @@ export type SocraticClarificationState = {
   missingSlots: string[]
   nextQuestion?: string
   questionCount: number
+  slots: SocraticIntentSlot[]
 }
+
+export type SocraticIntentSlotID =
+  | "interaction_mode"
+  | "forecast_object"
+  | "dataset.path"
+  | "dataset.targetCols"
+  | "contextLength"
+  | "predictionLengths"
+  | "intent.exogenous_variables"
+  | "intent.business_context"
+  | "objective.primaryMetric"
+  | "objective.secondaryMetrics"
+  | "objective.error_preferences"
+  | "budget.latency_budget"
+  | "budget.parameter_budget"
+  | "intent.interpretability"
+  | "runtime.deployment_target"
+
+export type SocraticIntentSlot = {
+  id: SocraticIntentSlotID
+  label: string
+  question: string
+  required?: boolean
+  status: "filled" | "missing"
+  value?: string
+}
+
+const socraticIntentSlotDefinitions: Array<Omit<SocraticIntentSlot, "status" | "value">> = [
+  {
+    id: "interaction_mode",
+    label: "交互模式",
+    question: "这次任务是否按 Socratic 模式执行：前期充分澄清，后续自主运行？",
+  },
+  {
+    id: "forecast_object",
+    label: "预测对象",
+    question: "这次预测对象具体是什么？请说明业务对象和被预测现象。",
+  },
+  {
+    id: "dataset.path",
+    label: "CSV 数据集路径",
+    question: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
+  },
+  {
+    id: "dataset.targetCols",
+    label: "目标列",
+    question: "需要预测哪些目标列？",
+  },
+  {
+    id: "contextLength",
+    label: "lookback window",
+    question: "模型应使用多长的 lookback window 作为输入上下文？",
+  },
+  {
+    id: "predictionLengths",
+    label: "预测 horizon",
+    question: "需要评估哪些预测 horizon？",
+  },
+  {
+    id: "intent.exogenous_variables",
+    label: "外生变量",
+    question: "是否有天气、节假日、价格、事件等外生变量？如果没有，请明确为 none。",
+  },
+  {
+    id: "intent.business_context",
+    label: "业务背景",
+    question: "这个预测结果最终服务哪个业务决策或研究判断？",
+  },
+  {
+    id: "objective.primaryMetric",
+    label: "主指标",
+    question: "模型搜索应该优化哪个验证指标？",
+  },
+  {
+    id: "objective.secondaryMetrics",
+    label: "辅助指标",
+    required: false,
+    question: "除了主指标，还要同时关注哪些辅助指标或 horizon-wise trade-off？",
+  },
+  {
+    id: "objective.error_preferences",
+    label: "误差偏好",
+    question: "误差偏好是什么：更重视短期、长期、峰值、平均误差，还是稳定性？",
+  },
+  {
+    id: "budget.latency_budget",
+    label: "延迟预算",
+    question: "部署或推理是否有延迟预算？例如单次推理、批处理窗口或无硬约束。",
+  },
+  {
+    id: "budget.parameter_budget",
+    label: "参数预算",
+    question: "模型参数量或资源预算有什么限制？",
+  },
+  {
+    id: "intent.interpretability",
+    label: "可解释性",
+    question: "是否需要可解释性、消融解释或简单模型优先？",
+  },
+  {
+    id: "runtime.deployment_target",
+    label: "部署目标",
+    question: "最终模型部署目标是什么：本地 CPU、GPU 服务、边缘设备、离线批处理，还是仅研究报告？",
+  },
+]
 
 export function buildSocraticClarificationState(
   task: ResearchCockpitTask | undefined,
   approvals: ResearchCockpitApproval[],
 ): SocraticClarificationState {
-  if (interactionModeForTask(task) !== "socratic") return { active: false, missingSlots: [], questionCount: 0 }
+  if (interactionModeForTask(task) !== "socratic") return { active: false, missingSlots: [], questionCount: 0, slots: [] }
   const approval = approvals.find(
     (item) =>
       item.status === "pending" &&
       item.kind === "protocol" &&
-      /Intent clarification required/i.test(item.reason),
+      (/Intent clarification required/i.test(item.reason) || /澄清研究意图/.test(item.reason)),
   )
-  if (!approval) return { active: false, missingSlots: [], questionCount: 0 }
-  const questions = approval.reason
+  const questions = approval
+    ? approval.reason
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).trim())
     .filter(Boolean)
+    : []
+  const approvalMissingSlots = questions.map(slotFromSocraticQuestion).filter((slot) => slot !== "unknown")
+  const slots = socraticSlotsForTask(task, new Set(approvalMissingSlots))
+  const taskMissingSlots = slots.filter((slot) => slot.status === "missing").map((slot) => slot.id)
+  if (!approval) {
+    const firstMissing = slots.find((slot) => slot.status === "missing")
+    return {
+      active: false,
+      missingSlots: taskMissingSlots,
+      nextQuestion: firstMissing?.question,
+      questionCount: taskMissingSlots.length,
+      slots,
+    }
+  }
+  const missingSlots = approvalMissingSlots.length > 0 ? approvalMissingSlots : taskMissingSlots
+  const nextQuestion =
+    questions[0] ??
+    socraticIntentSlotDefinitions.find((slot) => slot.id === missingSlots[0])?.question ??
+    slots.find((slot) => slot.status === "missing")?.question
   return {
     active: true,
-    missingSlots: questions.map(slotFromSocraticQuestion),
-    nextQuestion: questions[0],
-    questionCount: questions.length,
+    missingSlots,
+    nextQuestion,
+    questionCount: missingSlots.length,
+    slots,
   }
 }
 
-function slotFromSocraticQuestion(question: string) {
-  if (/dataset path|csv dataset/i.test(question)) return "dataset.path"
-  if (/target columns|target/i.test(question)) return "dataset.targetCols"
-  if (/horizon|prediction/i.test(question)) return "predictionLengths"
-  if (/metric|objective/i.test(question)) return "objective.primaryMetric"
+export function slotFromSocraticQuestion(question: string): string {
+  if (/数据集路径|csv.*路径|dataset path/i.test(question)) return "dataset.path"
+  if (/目标列|target.*col/i.test(question)) return "dataset.targetCols"
+  if (/lookback.*window|lookback/i.test(question)) return "contextLength"
+  if (/horizon|预测.*horizon|predictionLength/i.test(question)) return "predictionLengths"
+  if (/外生变量|exogenous/i.test(question)) return "intent.exogenous_variables"
+  if (/业务背景|业务决策|business.*context/i.test(question)) return "intent.business_context"
+  if (/主指标|优化.*指标|primary.*metric/i.test(question)) return "objective.primaryMetric"
+  if (/辅助指标|secondary.*metric/i.test(question)) return "objective.secondaryMetrics"
+  if (/误差偏好|error.*prefer/i.test(question)) return "objective.error_preferences"
+  if (/延迟预算|latency.*budget/i.test(question)) return "budget.latency_budget"
+  if (/参数预算|parameter.*budget/i.test(question)) return "budget.parameter_budget"
+  if (/可解释性|interpretab/i.test(question)) return "intent.interpretability"
+  if (/部署目标|deployment.*target/i.test(question)) return "runtime.deployment_target"
+  if (/交互模式|interaction.*mode/i.test(question)) return "interaction_mode"
+  if (/预测对象|forecast.*object/i.test(question)) return "forecast_object"
   return "unknown"
+}
+
+function socraticSlotsForTask(task: ResearchCockpitTask | undefined, forcedMissing: Set<string>) {
+  const taskSpec = asRecord(task?.taskSpec)
+  const dataset = asRecord(taskSpec.dataset)
+  const objective = asRecord(task?.objective)
+  const budget = asRecord(task?.budget)
+  const metadata = asRecord(taskSpec.metadata)
+  const intentSlots = asRecord(metadata.intentSlots)
+  return socraticIntentSlotDefinitions.map((slot) => {
+    // intentSlots (from answerIntentQuestion) override everything
+    const answeredValue = intentSlots[slot.id] !== undefined
+      ? String(intentSlots[slot.id])
+      : undefined
+    const value = answeredValue ?? socraticSlotValue(slot.id, dataset, taskSpec, objective, budget, metadata)
+    const isRequired = slot.required !== false
+    const missing = forcedMissing.has(slot.id) || (value === undefined && isRequired)
+    return {
+      ...slot,
+      status: missing ? ("missing" as const) : ("filled" as const),
+      ...(value !== undefined ? { value } : {}),
+    }
+  })
+}
+
+function socraticSlotValue(
+  slot: SocraticIntentSlotID,
+  dataset: Record<string, unknown>,
+  taskSpec: Record<string, unknown>,
+  objective: Record<string, unknown>,
+  budget: Record<string, unknown>,
+  metadata: Record<string, unknown>,
+): string | undefined {
+  if (slot === "interaction_mode") {
+    const value = metadata.interactionMode ?? metadata.interaction_mode
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "forecast_object") {
+    const value = taskSpec.forecastObject ?? taskSpec.predictionObject ?? metadata.forecastObject
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "dataset.path") {
+    const value = dataset.path
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "dataset.targetCols") {
+    const values = optionalStringArray(dataset.targetCols)
+    return values && values.length > 0 ? values.join(",") : undefined
+  }
+  if (slot === "contextLength") {
+    const value = taskSpec.contextLength
+    return typeof value === "number" && Number.isFinite(value) ? String(value) : undefined
+  }
+  if (slot === "predictionLengths") {
+    const values = optionalNumberArray(taskSpec.predictionLengths)
+    return values && values.length > 0 ? values.join(",") : undefined
+  }
+  if (slot === "intent.exogenous_variables") {
+    const value = dataset.exogenousCols ?? dataset.exogenousVariables ?? dataset.knownFutureCovariates
+    if (Array.isArray(value)) return value.join(",") || "none"
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "intent.business_context") {
+    const value = taskSpec.businessContext ?? taskSpec.business_context ?? objective.businessContext ?? metadata.businessContext ?? metadata.userPrompt
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "objective.primaryMetric") {
+    const value = objective.primaryMetric
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "objective.secondaryMetrics") {
+    const values = optionalStringArray(objective.secondaryMetrics)
+    return values && values.length > 0 ? values.join(",") : undefined
+  }
+  if (slot === "objective.error_preferences") {
+    const value = objective.errorPreferences ?? objective.errorPreference
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "budget.latency_budget") {
+    const value = budget.latencyBudget
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "budget.parameter_budget") {
+    const value = budget.parameterBudget
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "intent.interpretability") {
+    const value = taskSpec.interpretability ?? objective.interpretability ?? metadata.interpretability
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  if (slot === "runtime.deployment_target") {
+    const runtime = asRecord(taskSpec.runtime)
+    const value = runtime.deploymentTarget ?? taskSpec.deploymentTarget ?? metadata.deploymentTarget
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+  }
+  return undefined
 }
 
 export function researchInteractionModeLabel(mode: ResearchInteractionMode | undefined) {
@@ -1171,7 +1470,9 @@ export function researchInteractionModeLabel(mode: ResearchInteractionMode | und
 }
 
 export function taskModeForInteractionMode(mode: ResearchInteractionMode): ResearchCockpitTask["mode"] {
-  return mode === "companion" ? "review" : "autonomous"
+  // Both Socratic and Companion interaction modes require autonomous task mode.
+  // Socratic runs fully autonomous after initial clarification; Companion pauses at checkpoints.
+  return "autonomous"
 }
 
 export function parseResearchInteractionModeInput(value: string | undefined): ResearchInteractionMode | undefined {
@@ -1189,7 +1490,15 @@ export function buildDefaultTsfResearchTask(
 ): CreateResearchTaskInput {
   const datasetPath = nonEmpty(defaults.datasetPath)
   const interactionMode = defaults.interactionMode ?? interactionModeForTaskMode(mode)
+  const resolvedMode = defaults.interactionMode === undefined ? mode : taskModeForInteractionMode(interactionMode)
+  const userPrompt =
+    typeof defaults.metadata?.userPrompt === "string" && defaults.metadata.userPrompt.trim().length > 0
+      ? defaults.metadata.userPrompt.trim()
+      : undefined
   const metadata: JsonRecord = {
+    businessContext: userPrompt ?? "General time-series forecasting model development.",
+    interpretability: "prefer simple explainable candidates when metrics are close",
+    deploymentTarget: "local research runtime",
     ...(defaults.metadata ?? {}),
     interactionMode,
   }
@@ -1200,7 +1509,8 @@ export function buildDefaultTsfResearchTask(
   return {
     title: mode === "review" ? "TSF Review Research" : "TSF Autonomous Research",
     domainID: "tsf",
-    mode,
+    mode: resolvedMode,
+    interactionMode,
     taskSpec: {
       contextLength: defaults.contextLength ?? 96,
       predictionLengths:
@@ -1209,6 +1519,9 @@ export function buildDefaultTsfResearchTask(
         loaderID: nonEmpty(defaults.datasetPreset) ?? "etth1_tslib_v1",
         ...(datasetPath ? { path: datasetPath } : {}),
         targetCols: defaults.targetCols && defaults.targetCols.length > 0 ? defaults.targetCols : ["OT"],
+        knownFutureCovariates: [],
+        observedPastCovariates: [],
+        staticCovariates: [],
       },
       ...(Object.keys(constraints).length === 0 ? {} : { constraints }),
       metadata,
@@ -1216,11 +1529,15 @@ export function buildDefaultTsfResearchTask(
     },
     objective: {
       primaryMetric: "val_avg_mse",
+      secondaryMetrics: ["val_avg_mae"],
+      errorPreferences: "minimize average validation error while watching long-horizon degradation",
       direction: "minimize",
     },
     budget: {
       maxRuns: defaults.maxRuns ?? 12,
       maxParallel: 1,
+      latencyBudget: "offline batch scoring unless the user specifies stricter latency",
+      parameterBudget: "prefer lightweight models under 2M parameters when accuracy is close",
       ...(defaults.maxTrainingSeconds === undefined
         ? {}
         : { loop: { timeBudgetSeconds: defaults.maxTrainingSeconds } }),

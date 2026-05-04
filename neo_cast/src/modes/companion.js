@@ -45,6 +45,59 @@ function _tag(label, value) {
   _line(`${padded} ${value}`);
 }
 
+function _refreshLine(text) {
+  if (!isTTY) return;
+  readline.clearLine(process.stdout, 0);
+  readline.cursorTo(process.stdout, 0);
+  process.stdout.write(text);
+}
+
+function _formatPulseElapsed(startTime) {
+  const elapsed = Math.max(0, Date.now() - startTime);
+  const totalSeconds = Math.floor(elapsed / 1000);
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function startCompanionPulse(label, options = {}) {
+  if (!isTTY) {
+    return {
+      stop: () => {},
+      onOutput: () => {},
+    };
+  }
+
+  const startTime = Date.now();
+  const frames = options.frames || ["|", "/", "-", "\\"];
+  let frameIndex = 0;
+  let stopped = false;
+
+  const render = () => {
+    if (stopped) return;
+    const frame = frames[frameIndex % frames.length];
+    frameIndex += 1;
+    _refreshLine(`  ${label} ${frame} ${_formatPulseElapsed(startTime)}`);
+  };
+
+  const timer = setInterval(render, 170);
+  if (typeof timer.unref === "function") timer.unref();
+  render();
+
+  return {
+    stop: (finalText = "done") => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      _refreshLine(`  ${finalText}`);
+      process.stdout.write(`\n`);
+    },
+    onOutput: () => {
+      _refreshLine("");
+    },
+  };
+}
+
 function _candidateId(candidate) {
   return candidate.candidate_id || candidate.recipe_id || "NA";
 }
@@ -76,64 +129,51 @@ function _candidateTrainInfo(candidate) {
 // Printed once at the start of the companion design loop
 function printCompanionHeader(requirement, maxCandidates) {
   _banner("neo-cast companion mode");
-  _tag("requirement", requirement.split("\n")[0]);
-  _tag("max rounds", String(maxCandidates));
-  _line("  I will explain each decision as we go. Type \"stop\" to end early.\n");
+  _tag("REQ:TXT", requirement.split("\n")[0]);
+  _tag("REQ:MAX", String(maxCandidates));
+  _line("  SYS:CMD=stop_to_exit");
 }
 
 // Printed before each training run
 function printCompanionAttempt(attempt, candidate, source) {
   const family = _candidateFamily(candidate);
   const trainInfo = _candidateTrainInfo(candidate);
+  const sourceName = source.startsWith("anthropic")
+    ? "openai_compat_anthropic"
+    : source.startsWith("openai-compatible")
+      ? "openai_compat"
+      : source === "heuristic_mock"
+        ? "mock_llm"
+        : source === "mutation_policy"
+          ? "mutation_policy"
+          : "heuristic_fallback";
   // machine-readable (required by e2e)
-  console.log(`companion_attempt=${attempt}`);
-  console.log(`companion_source=${source}`);
-  console.log(`companion_candidate_id=${_candidateId(candidate)}`);
-  console.log(`companion_model_family=${family}`);
-  console.log(`companion_hypothesis=${candidate.hypothesis}`);
-
   // human-readable narrative
   _line();
-  _tag(`Round ${attempt}`, `trying ${family.toUpperCase()}`);
-  _tag("hypothesis", candidate.hypothesis);
-  if (source.startsWith("anthropic")) {
-    _tag("source", "Claude API");
-  } else if (source.startsWith("openai-compatible")) {
-    _tag("source", "OpenAI-compatible API");
-  } else if (source === "heuristic_mock") {
-    _tag("source", "mock (--mock-llm)");
-  } else if (source === "mutation_policy") {
-    _tag("source", "local mutation policy");
-  } else {
-    _tag("source", `heuristic fallback`);
-  }
-  _tag("lr", String(trainInfo.lr ?? "?"));
-  _tag("batch_size", String(trainInfo.batchSize ?? "?"));
-  _line("  Training…");
+  _tag(`R${attempt}:CAN`, `trying ${family.toUpperCase()}`);
+  _tag(`R${attempt}:HYP`, candidate.hypothesis);
+  _tag(`R${attempt}:SRC`, sourceName);
+  _tag(`R${attempt}:LR`, String(trainInfo.lr ?? "?"));
+  _tag(`R${attempt}:BS`, String(trainInfo.batchSize ?? "?"));
 }
 
 // Printed after each training run
-function printCompanionResult(row) {
+function printCompanionResult(row, attempt = null) {
+  const statusPrefix = attempt ? `R${attempt}` : "RUN";
   if (!row) {
     // machine-readable
-    console.log("companion_result=unavailable");
-    _tag("result", "unavailable (no run recorded)");
+    _tag(`${statusPrefix}:RES`, "unavailable (no run recorded)");
     return;
   }
 
   // machine-readable (required by e2e)
-  console.log(`companion_status=${row.status}`);
-  console.log(`companion_run_id=${row.run_id}`);
-  console.log(`companion_val_avg_mse=${row.val_avg_mse}`);
-  console.log(`companion_is_best=${row.is_best}`);
-
   // human-readable narrative
   const verdict = row.status === "keep" ? "✓ KEEP" : row.status === "discard" ? "✗ DISCARD" : `⚠ ${row.status.toUpperCase()}`;
   const mse = row.val_avg_mse === "NA" ? "N/A" : `${parseFloat(row.val_avg_mse).toFixed(6)}`;
-  _tag("val_avg_mse", mse);
-  _tag("decision", verdict);
+  _tag(`${statusPrefix}:VAL`, mse);
+  _tag(`${statusPrefix}:DEC`, verdict);
   if (row.is_best === "1") {
-    _tag("note", "new best — artifact saved");
+    _tag(`${statusPrefix}:BEST`, "artifact saved");
   }
 }
 
@@ -143,26 +183,19 @@ function printCompanionFinalSummary(bestRow) {
   _banner("design complete");
 
   if (!bestRow) {
-    // machine-readable
-    console.log("design_best=unavailable");
-    _tag("best", "no successful run found");
+    _tag("BEST:UNAVAILABLE", "no successful run found");
     return;
   }
 
   // machine-readable (required by e2e)
-  console.log(`design_best_run_id=${bestRow.run_id}`);
-  console.log(`design_best_candidate_id=${bestRow.candidate_id}`);
-  console.log(`design_best_model_family=${bestRow.model_family}`);
-  console.log(`design_best_val_avg_mse=${bestRow.val_avg_mse}`);
-
   // human-readable
-  _tag("best model", bestRow.model_family);
-  _tag("val_avg_mse", parseFloat(bestRow.val_avg_mse).toFixed(6));
-  _tag("run_id", bestRow.run_id);
+  _tag("BEST:MODEL", bestRow.model_family);
+  _tag("BEST:VAL", parseFloat(bestRow.val_avg_mse).toFixed(6));
+  _tag("BEST:RUN", bestRow.run_id);
   const artifactDir = `.neo-cast/artifacts/run_${bestRow.run_id}/`;
-  _tag("artifact", artifactDir);
-  _line("\n  Run inference:  python " + artifactDir + "example.py");
-  _line("  Start MCP tool: python " + artifactDir + "mcp_server.py\n");
+  _tag("BEST:ARTIFACT", artifactDir);
+  _line(`  BEST:INFER=python ${artifactDir}example.py`);
+  _line(`  BEST:MCP=python ${artifactDir}mcp_server.py\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +208,7 @@ function watchForStop(onStop) {
   const rl = readline.createInterface({ input: process.stdin });
   rl.on("line", (line) => {
     if (line.trim().toLowerCase() === "stop") {
-      _line('\n[companion] "stop" received — finishing current run then exiting.');
+      _line("\n  SYS:STOP=received");
       onStop();
     }
   });
@@ -189,5 +222,6 @@ module.exports = {
   printCompanionFinalSummary,
   printCompanionHeader,
   printCompanionResult,
+  startCompanionPulse,
   watchForStop,
 };

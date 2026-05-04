@@ -73,4 +73,9 @@ export const Event = {
   PublishAgentStarted: BusEvent.define("research.agent.publish.started", ResearchAgentStageChanged),
   PublishAgentCompleted: BusEvent.define("research.agent.publish.completed", ResearchAgentStageChanged),
   PublishAgentFailed: BusEvent.define("research.agent.publish.failed", ResearchAgentStageChanged),
+  ReflectionAgentStarted: BusEvent.define("research.agent.reflection.started", ResearchAgentStageChanged),
+  ReflectionAgentCompleted: BusEvent.define("research.agent.reflection.completed", ResearchAgentStageChanged),
+  ReflectionAgentFailed: BusEvent.define("research.agent.reflection.failed", ResearchAgentStageChanged),
+  RunVerified: BusEvent.define("research.run.verified", ResearchAgentStageChanged),
+  RunRejectedByVerifier: BusEvent.define("research.run.rejected_by_verifier", ResearchAgentStageChanged),
 }

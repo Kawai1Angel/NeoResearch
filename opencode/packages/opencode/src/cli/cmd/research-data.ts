@@ -29,14 +29,22 @@ export function interactionModeForResearchMode(mode: Research.ResearchMode): Res
 }
 
 export function researchModeForInteractionMode(mode: ResearchInteractionMode): Research.ResearchMode {
-  return mode === "companion" ? "review" : "autonomous"
+  if (mode === "companion") return "autonomous"
+  return "autonomous"
 }
 
 function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: string }): Research.JsonRecord {
   const root = nonEmpty(input.neoCastProjectRoot)
   const datasetPath = nonEmpty(input.datasetPath)
   const interactionMode = input.interactionMode ?? "companion"
+  const userPrompt =
+    typeof input.metadata?.userPrompt === "string" && input.metadata.userPrompt.trim().length > 0
+      ? input.metadata.userPrompt.trim()
+      : undefined
   const metadata: Research.JsonRecord = {
+    businessContext: userPrompt ?? "General time-series forecasting model development.",
+    interpretability: "prefer simple explainable candidates when metrics are close",
+    deploymentTarget: "local research runtime",
     ...(input.metadata ?? {}),
     interactionMode,
   }
@@ -51,6 +59,9 @@ function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: str
       loaderID: nonEmpty(input.datasetPreset) ?? "etth1_tslib_v1",
       ...(datasetPath ? { path: datasetPath } : {}),
       targetCols: input.targetCols && input.targetCols.length > 0 ? input.targetCols : ["OT"],
+      knownFutureCovariates: [],
+      observedPastCovariates: [],
+      staticCovariates: [],
     },
     ...(Object.keys(constraints).length === 0 ? {} : { constraints }),
     metadata,
@@ -67,19 +78,24 @@ export function buildDefaultTsfResearchTaskInput(input: {
   neoCastProjectRoot?: string
 } & TsfResearchTaskDefaults): Research.CreateTaskInput {
   const interactionMode = input.interactionMode ?? interactionModeForResearchMode(input.mode)
-  const mode = researchModeForInteractionMode(interactionMode)
+  const mode = input.interactionMode === undefined ? input.mode : researchModeForInteractionMode(interactionMode)
   return {
     title: input.title ?? (mode === "review" ? "TSF Review Research" : "TSF Autonomous Research"),
     domainID: "tsf",
     mode,
+    interactionMode,
     taskSpec: tsfTaskSpec({ ...input, interactionMode }),
     objective: {
       primaryMetric: "val_avg_mse",
+      secondaryMetrics: ["val_avg_mae"],
+      errorPreferences: "minimize average validation error while watching long-horizon degradation",
       direction: "minimize",
     },
     budget: {
       maxRuns: input.maxRuns ?? 12,
       maxParallel: 1,
+      latencyBudget: "offline batch scoring unless the user specifies stricter latency",
+      parameterBudget: "prefer lightweight models under 2M parameters when accuracy is close",
       ...(input.maxTrainingSeconds === undefined ? {} : { loop: { timeBudgetSeconds: input.maxTrainingSeconds } }),
     },
   } as Research.CreateTaskInput

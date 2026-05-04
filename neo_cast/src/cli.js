@@ -15,6 +15,7 @@ const {
   printCompanionFinalSummary,
   printCompanionHeader,
   printCompanionResult,
+  startCompanionPulse = () => ({ stop: () => {}, onOutput: () => {} }),
   watchForStop,
 } = require("./modes/companion");
 const { printFinalSummary, printRequirementSummary } = require("./output");
@@ -182,6 +183,9 @@ async function runPythonScript(args, options = {}) {
       signal: options.signal,
       timeoutMs: options.timeoutMs,
       killAfterMs: options.killAfterMs,
+      onStdout: options.onStdout,
+      onStderr: options.onStderr,
+      capture: options.capture,
     });
     if (typeof result.status === "number") {
       return result.status;
@@ -235,7 +239,7 @@ function handleValidate(positionals, rawFlags) {
   return runPythonScript(args, { projectRoot });
 }
 
-function handleRunner(positionals, rawFlags) {
+async function handleRunner(positionals, rawFlags) {
   const [, subcommand] = positionals;
   const runnerScriptPath = path.join(__dirname, "..", PY_DIR, "runner.py");
   const projectRoot = process.cwd();
@@ -258,6 +262,30 @@ function handleRunner(positionals, rawFlags) {
     if (rawFlags["skip-smoke"]) {
       args.push("--skip-smoke");
     }
+
+    const statusPrefix = "RUN";
+    const completeLabel = " done";
+    const abortedLabel = " failed";
+    const trainLabel = "TRN";
+    const startText = `${statusPrefix}:${trainLabel}`;
+    const pulse = startCompanionPulse(startText, { frames: ["|", "/", "-", "\\"] });
+    let exitCode = 1;
+    try {
+      exitCode = await runPythonScript(args, {
+        projectRoot,
+        onStdout: () => {
+          pulse.onOutput();
+        },
+        onStderr: () => {
+          pulse.onOutput();
+        },
+      });
+    } finally {
+      pulse.stop(exitCode === 0
+        ? `${statusPrefix}:${trainLabel}${completeLabel}`
+        : `${statusPrefix}:${trainLabel}${abortedLabel}`);
+    }
+    return exitCode;
   }
   if ((subcommand === "ref-test" || subcommand === "blind-test") && rawFlags["run-id"] && rawFlags["run-id"] !== true) {
     args.push("--run-id", rawFlags["run-id"]);
@@ -414,7 +442,7 @@ async function handleDesign(positionals, rawFlags) {
       useReflection: Boolean(rawFlags["use-reflection"]),
       useMutation: Boolean(rawFlags["use-mutation"]),
       skipSmoke: Boolean(rawFlags["skip-smoke"]),
-      onRoundComplete: mode === "companion" ? (_attempt, row) => printCompanionResult(row) : null,
+      onRoundComplete: mode === "companion" ? (_attempt, row) => printCompanionResult(row, _attempt) : null,
     });
     const paths = getProjectPaths(projectRoot);
     if (mode === "companion") {
@@ -439,73 +467,95 @@ async function handleDesign(positionals, rawFlags) {
   for (let attempt = 1; attempt <= maxCandidates; attempt += 1) {
     if (stopRequested) break;
 
+    const labels = {
+      roundPrefix: "R",
+      generating: "GEN",
+      reflection: "REF",
+      mutation: "MUT",
+      training: "TRN",
+      complete: " done",
+      aborted: " failed",
+    };
+
     let result;
-    if (attempt > 1 && rawFlags["use-reflection"]) {
-      const { reflectAndPropose } = require("./reflect");
-      const reflected = await reflectAndPropose(
+    const roundLabelPrefix = `${labels.roundPrefix}${attempt}`;
+    const formatPulseLabel = (label) => `${roundLabelPrefix}:${label}`;
+    const runWithPulse = async (label, factory) => {
+      const pulse = startCompanionPulse(formatPulseLabel(label), { frames: ["|", "/", "-", "\\"] });
+      let hasFailed = false;
+      try {
+        return await factory();
+      } catch (error) {
+        hasFailed = true;
+        throw error;
+      } finally {
+        pulse.stop(`${formatPulseLabel(label)}${hasFailed ? labels.aborted : labels.complete}`);
+      }
+    };
+
+    const runCandidateGeneration = async () => runWithPulse(
+      labels.generating,
+      () => generateCandidate(
         requirementBundle.requirementText,
         history,
-        previousRow,
         configResult.resolved,
-        {
-          projectRoot,
-          mockLlm: Boolean(rawFlags["mock-llm"]),
-          taskContext,
-          attempt,
-        }
-      );
+        { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
+      )
+    );
 
-      if (reflected) {
-        result = reflected;
-      } else if (rawFlags["use-mutation"]) {
+    if (attempt > 1 && rawFlags["use-reflection"]) {
+      const { reflectAndPropose } = require("./reflect");
+      result = await runWithPulse(labels.reflection, async () => {
+        const reflected = await reflectAndPropose(
+          requirementBundle.requirementText,
+          history,
+          previousRow,
+          configResult.resolved,
+          {
+            projectRoot,
+            mockLlm: Boolean(rawFlags["mock-llm"]),
+            taskContext,
+            attempt,
+          }
+        );
+
+        if (reflected) {
+          return reflected;
+        }
+        if (!rawFlags["use-mutation"]) {
+          return runCandidateGeneration();
+        }
+
+        return await runWithPulse(labels.mutation, async () => {
+          try {
+            const candidate = await mutateCandidate(projectRoot, {
+              metricsPath: latestValMetricsPath(projectRoot, previousRow),
+              index: attempt - 1,
+              statePath: getProjectPaths(projectRoot).runnerStatePath,
+            });
+            return { candidate, source: "mutation_policy" };
+          } catch (error) {
+            console.error(`[neo-cast] mutation also failed: ${error.message}`);
+            return runCandidateGeneration();
+          }
+        });
+      });
+    } else if (attempt > 1 && rawFlags["use-mutation"]) {
+      result = await runWithPulse(labels.mutation, async () => {
         try {
           const candidate = await mutateCandidate(projectRoot, {
             metricsPath: latestValMetricsPath(projectRoot, previousRow),
             index: attempt - 1,
             statePath: getProjectPaths(projectRoot).runnerStatePath,
           });
-          result = { candidate, source: "mutation_policy" };
+          return { candidate, source: "mutation_policy" };
         } catch (error) {
-          console.error(`[neo-cast] mutation also failed: ${error.message}`);
-          result = await generateCandidate(
-            requirementBundle.requirementText,
-            history,
-            configResult.resolved,
-            { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
-          );
+          console.error(`[neo-cast] mutation failed: ${error.message}`);
+          return runCandidateGeneration();
         }
-      } else {
-        result = await generateCandidate(
-          requirementBundle.requirementText,
-          history,
-          configResult.resolved,
-          { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
-        );
-      }
-    } else if (attempt > 1 && rawFlags["use-mutation"]) {
-      try {
-        const candidate = await mutateCandidate(projectRoot, {
-          metricsPath: latestValMetricsPath(projectRoot, previousRow),
-          index: attempt - 1,
-          statePath: getProjectPaths(projectRoot).runnerStatePath,
-        });
-        result = { candidate, source: "mutation_policy" };
-      } catch (error) {
-        console.error(`[neo-cast] mutation failed: ${error.message}`);
-        result = await generateCandidate(
-          requirementBundle.requirementText,
-          history,
-          configResult.resolved,
-          { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
-        );
-      }
+      });
     } else {
-      result = await generateCandidate(
-        requirementBundle.requirementText,
-        history,
-        configResult.resolved,
-        { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
-      );
+      result = await runCandidateGeneration();
     }
 
     const candidate = result.candidate;
@@ -514,21 +564,39 @@ async function handleDesign(positionals, rawFlags) {
     }
 
     const candidatePath = writeCurrentCandidate(projectRoot, candidate);
-    console.log(`design_attempt=${attempt}`);
-    console.log(`candidate_source=${result.source}`);
-    console.log(`candidate_path=${candidatePath}`);
-    console.log(`candidate_family=${describeCandidateFamily(candidate)}`);
-    console.log(`candidate_id=${describeCandidateId(candidate)}`);
+    console.log(`${roundLabelPrefix}:CAN=ready`);
+    console.log(`${roundLabelPrefix}:SRC=${result.source}`);
+    console.log(`${roundLabelPrefix}:PATH=${candidatePath}`);
+    console.log(`${roundLabelPrefix}:FAM=${describeCandidateFamily(candidate)}`);
+    console.log(`${roundLabelPrefix}:ID=${describeCandidateId(candidate)}`);
 
     const description = candidate.hypothesis || `${candidate.model_family} attempt ${attempt}`;
-    lastExitCode = await runRunner(projectRoot, description, {
-      skipSmoke: Boolean(rawFlags["skip-smoke"]),
-    });
+    const pulse = startCompanionPulse(formatPulseLabel(labels.training), { frames: ["|", "/", "-", "\\"] });
+
+    let roundExitCode = 0;
+    try {
+      roundExitCode = await runRunner(projectRoot, description, {
+        skipSmoke: Boolean(rawFlags["skip-smoke"]),
+        onStdout: () => {
+          if (pulse) pulse.onOutput();
+        },
+        onStderr: () => {
+          if (pulse) pulse.onOutput();
+        },
+      });
+      lastExitCode = roundExitCode;
+    } finally {
+      if (pulse) {
+        pulse.stop(roundExitCode === 0
+          ? `${formatPulseLabel(labels.training)}${labels.complete}`
+          : `${formatPulseLabel(labels.training)}${labels.aborted}`);
+      }
+    }
     history = loadResults(projectRoot);
     previousRow = getLatestSessionRow(projectRoot);
 
     if (mode === "companion") {
-      printCompanionResult(previousRow);
+      printCompanionResult(previousRow, attempt);
     }
 
     if (lastExitCode > 1) {

@@ -12,6 +12,7 @@ export type DialogPromptProps = {
   value?: string
   busy?: boolean
   busyText?: string
+  onChange?: (value: string) => void
   onConfirm?: (value: string) => void
   onCancel?: () => void
 }
@@ -77,6 +78,10 @@ export function DialogPrompt(props: DialogPromptProps) {
             props.onConfirm?.(textarea.plainText)
           }}
           height={3}
+          onContentChange={() => {
+            if (props.busy) return
+            props.onChange?.(textarea.plainText)
+          }}
           keyBindings={props.busy ? [] : [{ name: "return", action: "submit" }]}
           ref={(val: TextareaRenderable) => {
             textarea = val

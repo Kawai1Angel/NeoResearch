@@ -78,6 +78,11 @@ export const ResearchMode = Schema.Literals(["review", "autonomous"])
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type ResearchMode = Schema.Schema.Type<typeof ResearchMode>
 
+export const ResearchInteractionMode = Schema.Literals(["socratic", "companion"])
+  .annotate({ identifier: "ResearchInteractionMode" })
+  .pipe(withStatics((s) => ({ zod: zod(s) })))
+export type ResearchInteractionMode = Schema.Schema.Type<typeof ResearchInteractionMode>
+
 export const ResearchTaskStatus = Schema.Literals([
   "idle",
   "created",
@@ -167,6 +172,7 @@ export class ResearchTask extends Schema.Class<ResearchTask>("ResearchTask")({
   title: Schema.String,
   domainID: Schema.String,
   mode: ResearchMode,
+  interactionMode: Schema.optional(ResearchInteractionMode),
   status: ResearchTaskStatus,
   taskSpec: JsonRecord,
   objective: JsonRecord,
@@ -263,6 +269,7 @@ export class CreateTaskInput extends Schema.Class<CreateTaskInput>("ResearchCrea
   title: Schema.String,
   domainID: Schema.String,
   mode: ResearchMode,
+  interactionMode: Schema.optional(ResearchInteractionMode),
   taskSpec: JsonRecord,
   objective: JsonRecord,
   budget: JsonRecord,
@@ -288,7 +295,15 @@ export class UpdateTaskStatusInput extends Schema.Class<UpdateTaskStatusInput>("
 
 export class UpdateTaskSpecInput extends Schema.Class<UpdateTaskSpecInput>("ResearchUpdateTaskSpecInput")({
   taskID: ResearchTaskID,
+  interactionMode: Schema.optional(ResearchInteractionMode),
   taskSpec: JsonRecord,
+}) {
+  static readonly zod = zod(this)
+}
+
+export class AnswerIntentInput extends Schema.Class<AnswerIntentInput>("ResearchAnswerIntentInput")({
+  taskID: ResearchTaskID,
+  slots: JsonRecord,
 }) {
   static readonly zod = zod(this)
 }
@@ -501,6 +516,22 @@ export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("Rese
   maxNoImprove: Schema.optional(Schema.Number),
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
+}) {
+  static readonly zod = zod(this)
+}
+
+export class VerifierAgentRunInput extends Schema.Class<VerifierAgentRunInput>("ResearchVerifierAgentRunInput")({
+  taskID: ResearchTaskID,
+  runID: ResearchRunID,
+  outputDir: Schema.optional(Schema.String),
+}) {
+  static readonly zod = zod(this)
+}
+
+export class ReflectionAgentInput extends Schema.Class<ReflectionAgentInput>("ResearchReflectionAgentInput")({
+  taskID: ResearchTaskID,
+  outputDir: Schema.optional(Schema.String),
+  stoppedReason: Schema.optional(Schema.String),
 }) {
   static readonly zod = zod(this)
 }

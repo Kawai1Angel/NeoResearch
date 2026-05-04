@@ -1,40 +1,46 @@
 "use strict";
 
 function printRequirementSummary(mode, summary) {
-  console.log(`design_mode=${mode}`);
-  console.log("requirement_summary_start");
-  console.log(summary);
-  console.log("requirement_summary_end");
+  console.log(`REQ:MODE=${mode}`);
+  console.log(`REQ:SUMMARY=${summary}`);
+}
+
+function describeCandidateId(candidate) {
+  return candidate.candidate_id || candidate.recipe_id || "NA";
 }
 
 function printCompanionAttempt(attempt, candidate, source) {
-  console.log(`companion_attempt=${attempt}`);
-  console.log(`companion_source=${source}`);
-  console.log(`companion_candidate_id=${candidate.candidate_id || "NA"}`);
-  console.log(`companion_model_family=${candidate.model_family}`);
-  console.log(`companion_hypothesis=${candidate.hypothesis}`);
+  const roundPrefix = `R${attempt}`;
+  const modelFamily = candidate.model_family || "NA";
+
+  console.log(`${roundPrefix}:CAN=trying ${modelFamily}`);
+  console.log(`${roundPrefix}:HYP=${candidate.hypothesis}`);
+  console.log(`${roundPrefix}:SRC=${source}`);
+  console.log(`${roundPrefix}:ID=${describeCandidateId(candidate)}`);
 }
 
-function printCompanionResult(row) {
+function printCompanionResult(row, attempt = null) {
+  const statusPrefix = attempt ? `R${attempt}` : "RUN";
   if (!row) {
-    console.log("companion_result=unavailable");
+    console.log(`${statusPrefix}:RES=unavailable`);
     return;
   }
-  console.log(`companion_status=${row.status}`);
-  console.log(`companion_run_id=${row.run_id}`);
-  console.log(`companion_val_avg_mse=${row.val_avg_mse}`);
-  console.log(`companion_is_best=${row.is_best}`);
+
+  console.log(`${statusPrefix}:STATUS=${row.status}`);
+  console.log(`${statusPrefix}:RUN=${row.run_id}`);
+  console.log(`${statusPrefix}:VAL=${row.val_avg_mse}`);
+  console.log(`${statusPrefix}:BEST=${row.is_best}`);
 }
 
 function printFinalSummary(bestRow) {
   if (!bestRow) {
-    console.log("design_best=unavailable");
+    console.log("BEST:UNAVAILABLE=1");
     return;
   }
-  console.log(`design_best_run_id=${bestRow.run_id}`);
-  console.log(`design_best_candidate_id=${bestRow.candidate_id}`);
-  console.log(`design_best_model_family=${bestRow.model_family}`);
-  console.log(`design_best_val_avg_mse=${bestRow.val_avg_mse}`);
+  console.log(`BEST:RUN=${bestRow.run_id}`);
+  console.log(`BEST:ID=${bestRow.candidate_id || "NA"}`);
+  console.log(`BEST:FAM=${bestRow.model_family || "NA"}`);
+  console.log(`BEST:VAL=${bestRow.val_avg_mse}`);
 }
 
 module.exports = {

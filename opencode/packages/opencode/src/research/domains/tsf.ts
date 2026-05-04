@@ -143,6 +143,7 @@ export const TSFTaskSpec = z
         currentCandidatePath: z.string().min(1).default(".neo-cast/current_candidate.json"),
         resolvedCandidatePath: z.string().min(1).default(".neo-cast/resolved_candidate.json"),
         artifactsDir: z.string().min(1).default(".neo-cast/artifacts"),
+        deploymentTarget: z.string().min(1).optional(),
       })
       .strict()
       .default({
@@ -1361,13 +1362,16 @@ export function summarizeTSFTask(taskSpec: unknown): JsonRecord {
   const maxPredictionLength = Math.max(...task.predictionLengths)
   const horizonContextRatio = Number((maxPredictionLength / task.contextLength).toFixed(6))
   const datasetProfileResult = profileTSFDataset(task)
-  const datasetProfile = datasetProfileResult.profile
+  const metadataProfile = datasetProfileFromFingerprint(task.metadata as JsonRecord)
+  const datasetProfile = datasetProfileResult.profile ?? metadataProfile
+  const metadataBiases = searchBiasList(task.metadata as JsonRecord)
   const searchBiases = [
     task.seriesType === "multivariate" ? "multivariate" : "univariate",
     horizonContextRatio >= 1 ? "long_horizon" : "short_horizon",
     task.runtime.bridgeOnly ? "bridge_safe" : "full_recipe_space",
     task.forecastMode === "probabilistic" ? "probabilistic" : "point_forecast",
     ...datasetProfileBiases(datasetProfile),
+    ...metadataBiases,
   ]
 
   return {
@@ -1423,6 +1427,9 @@ function withOptimizer(
 
 export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] {
   const task = TSFTaskSpec.parse(taskSpec)
+  const taskFingerprint = summarizeTSFTask(task)
+  const datasetProfile = datasetProfileFromFingerprint(taskFingerprint)
+  const biases = searchBiasSet(taskFingerprint)
   const patchLen = Math.min(16, task.contextLength)
   const stride = Math.max(1, Math.floor(patchLen / 2))
   const dModel = 64
@@ -1457,9 +1464,24 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
     }),
   ]
 
-  const datasetProfile = profileTSFDataset(task).profile
-  if (datasetProfile !== undefined && !task.runtime.bridgeOnly) {
-    if (datasetProfile.crossVarCorrelation >= 0.5) {
+  if (!task.runtime.bridgeOnly) {
+    if ((datasetProfile?.seasonalityStrength ?? 0) >= 0.4 || biases.has("seasonal")) {
+      const period = datasetProfile?.acfMainPeriod
+      const kernelSize = Math.max(3, Math.min(255, Math.floor((period && period > 1 ? period : 25) / 2) * 2 + 1))
+      candidates.push(
+        recipe(task, {
+          recipeID: "tsf_profile_seasonal_decomposition_baseline",
+          hypothesis:
+            "Dataset profile or search bias shows seasonality, so decomposition should separate seasonal and residual structure before forecasting.",
+          preprocessing: { actions: [{ type: "series_decomposition", kernelSize }] },
+          embedding: { type: "none" },
+          backbone: { type: "dlinear", kernelSize, bias: true },
+          fusion: { type: "temporal", channelMode: "independent" },
+          predictionHead: { type: "linear", outputDistribution: "point" },
+        }),
+      )
+    }
+    if ((datasetProfile?.crossVarCorrelation ?? 0) >= 0.5 || biases.has("cross_var_correlated")) {
       candidates.push(
         recipe(task, {
           recipeID: "tsf_profile_feature_fusion_baseline",
@@ -1468,17 +1490,33 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
           preprocessing: { actions: [{ type: "none" }] },
           embedding: { type: "invert", dModel },
           backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
-          fusion: { type: "feature", variateToken: true, crossAttention: datasetProfile.crossVarCorrelation >= 0.7 },
+          fusion: {
+            type: "feature",
+            variateToken: true,
+            crossAttention: (datasetProfile?.crossVarCorrelation ?? 0) >= 0.7 || biases.has("cross_var_correlated"),
+          },
           predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
         }),
       )
     }
-    if (datasetProfile.distributionShift >= 0.5 || datasetProfile.missingRate > 0) {
+    if (
+      (datasetProfile?.distributionShift ?? 0) >= 0.5 ||
+      (datasetProfile?.missingRate ?? 0) > 0 ||
+      biases.has("distribution_shift") ||
+      biases.has("missing_values")
+    ) {
       const robust = recipe(task, {
         recipeID: "tsf_profile_shift_robust_baseline",
         hypothesis:
           "Dataset profile shows shift or missingness, so instance normalization and robust loss should be tested.",
-        preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
+        preprocessing: {
+          actions: [
+            ...(biases.has("missing_values") || (datasetProfile?.missingRate ?? 0) > 0
+              ? ([{ type: "missing_mask", maskChannel: true, fillPolicy: "mean" }] as TSFPreprocessingAction[])
+              : []),
+            { type: "instance_norm", affine: true, eps: 1e-5 },
+          ],
+        },
         embedding: { type: "patch", patchLen, stride, dModel },
         backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 2, dropout: 0.15, ffnMult: 4 },
         fusion: { type: "temporal", channelMode: "independent" },
@@ -1740,12 +1778,12 @@ function candidateActionVector(candidate: TSFCandidateRecipe, historyContext?: R
   } as unknown as JsonRecord
 }
 
-function rankedPreprocessingActions(profile: DatasetProfile | undefined): TSFPreprocessingAction[] {
+function rankedPreprocessingActions(profile: DatasetProfile | undefined, biases: Set<string>): TSFPreprocessingAction[] {
   const actions: TSFPreprocessingAction[] = []
-  if ((profile?.missingRate ?? 0) > 0) {
+  if ((profile?.missingRate ?? 0) > 0 || biases.has("missing_values")) {
     actions.push({ type: "missing_mask", maskChannel: true, fillPolicy: "mean" })
   }
-  if ((profile?.distributionShift ?? 0) >= 0.5) {
+  if ((profile?.distributionShift ?? 0) >= 0.5 || biases.has("distribution_shift")) {
     actions.push({ type: "sample_reweighting", scheme: "outlier_robust" })
   }
   return actions.length > 0 ? actions : [{ type: "none" }]
@@ -1754,10 +1792,11 @@ function rankedPreprocessingActions(profile: DatasetProfile | undefined): TSFPre
 function profiledStrategy(
   task: TSFTaskSpec,
   profile: DatasetProfile | undefined,
+  biases: Set<string>,
   overrides: Partial<TSFCandidateRecipe["trainingStrategy"]> = {},
 ): TSFCandidateRecipe["trainingStrategy"] {
   const base = baseStrategy(task)
-  const shifted = (profile?.distributionShift ?? 0) >= 0.5
+  const shifted = (profile?.distributionShift ?? 0) >= 0.5 || biases.has("distribution_shift")
   return {
     ...base,
     loss: {
@@ -1795,12 +1834,13 @@ function profiledStrategy(
 
 function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): TSFCandidateRecipe[] {
   const profile = datasetProfileFromFingerprint(taskFingerprint)
+  const biases = searchBiasSet(taskFingerprint)
   const frequencyCount = Math.max(1, Math.min(8, Math.floor(task.contextLength / 2)))
   const probabilistic = task.forecastMode === "probabilistic"
   const predictionHead: TSFPredictionHead = probabilistic
     ? { type: "quantile", outputDistribution: "quantile", quantiles: [0.1, 0.5, 0.9] }
     : { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true }
-  const trainingStrategy = profiledStrategy(task, profile, {
+  const trainingStrategy = profiledStrategy(task, profile, biases, {
     ...(probabilistic
       ? {
           loss: {
@@ -1818,7 +1858,7 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
       recipeID: "tsf_ranked_frequency_mixer_profiled",
       hypothesis:
         "Profile-ranked frequency embedding plus a mixer backbone targets seasonal structure, missing values, and distribution shift.",
-      preprocessing: { actions: rankedPreprocessingActions(profile) },
+      preprocessing: { actions: rankedPreprocessingActions(profile, biases) },
       embedding: { type: "frequency", nFreq: frequencyCount, complexMode: "magnitude", dModel: 32 },
       backbone: {
         type: "mixer",
@@ -1838,12 +1878,12 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
       recipeID: "tsf_ranked_invert_rnn_feature_profiled",
       hypothesis:
         "Profile-ranked inverted embedding with feature fusion tests whether cross-variate dependence improves forecasts.",
-      preprocessing: { actions: rankedPreprocessingActions(profile) },
+      preprocessing: { actions: rankedPreprocessingActions(profile, biases) },
       embedding: { type: "invert", dModel: 64 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
       fusion: { type: "feature", variateToken: true, crossAttention: (profile?.crossVarCorrelation ?? 0) >= 0.5 },
       predictionHead,
-      trainingStrategy: profiledStrategy(task, profile),
+      trainingStrategy: profiledStrategy(task, profile, biases),
       notes: "Ranked native TimeRecipe candidate: cross-variate recurrent exploration.",
     },
     {
@@ -1851,12 +1891,12 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
       recipeID: "tsf_ranked_ssm_graph_profiled",
       hypothesis:
         "Profile-ranked SSM with correlation graph fusion tests long-range temporal state and multivariate structure.",
-      preprocessing: { actions: rankedPreprocessingActions(profile) },
+      preprocessing: { actions: rankedPreprocessingActions(profile, biases) },
       embedding: { type: "none" },
       backbone: { type: "ssm", stateDim: 64, depth: 2, dropout: 0.1 },
       fusion: { type: "graph", adjacencySource: "correlation", sparsity: 0.2 },
       predictionHead,
-      trainingStrategy: profiledStrategy(task, profile),
+      trainingStrategy: profiledStrategy(task, profile, biases),
       notes: "Ranked native TimeRecipe candidate: state-space and correlation-graph exploration.",
     },
   ]
@@ -2260,11 +2300,17 @@ function scoreNativeRecipe(
     score += 2
     reasons.push("strong cross-var correlation favors graph fusion")
   }
-  if ((profile?.missingRate ?? 0) > 0 && candidate.preprocessing.actions.some((action) => action.type === "missing_mask")) {
+  if (
+    ((profile?.missingRate ?? 0) > 0 || biases.has("missing_values")) &&
+    candidate.preprocessing.actions.some((action) => action.type === "missing_mask")
+  ) {
     score += 1
     reasons.push("missing values require mask-aware preprocessing")
   }
-  if ((profile?.distributionShift ?? 0) >= 0.5 && candidate.trainingStrategy.loss.base === "huber") {
+  if (
+    ((profile?.distributionShift ?? 0) >= 0.5 || biases.has("distribution_shift")) &&
+    candidate.trainingStrategy.loss.base === "huber"
+  ) {
     score += 1
     reasons.push("distribution shift favors robust loss")
   }
@@ -2312,8 +2358,104 @@ function patchEmbedding(task: TSFTaskSpec, base?: TSFEmbedding): Extract<TSFEmbe
   }
 }
 
-function mutateTSFRecipe(task: TSFTaskSpec, base: TSFCandidateRecipe, ordinal: number): TSFCandidateRecipe {
-  const recipeID = mutationRecipeID(base.recipeID, ordinal)
+type ProfileMutationFactory = (base: TSFCandidateRecipe, recipeID: string) => TSFCandidateRecipe | undefined
+
+function profileMutationSequence(task: TSFTaskSpec, taskFingerprint: JsonRecord): ProfileMutationFactory[] {
+  const profile = datasetProfileFromFingerprint(taskFingerprint)
+  const biases = searchBiasSet(taskFingerprint)
+  const factories: ProfileMutationFactory[] = []
+
+  // 1. Seasonal signal: switch patch embedding to frequency
+  if (biases.has("seasonal") || (profile && profile.seasonalityStrength >= 0.4)) {
+    const seasonality = profile ? Number(profile.seasonalityStrength.toFixed(3)) : "unknown"
+    factories.push((base, recipeID) => {
+      if (base.embedding.type !== "patch") return undefined
+      const nFreq = Math.min(base.embedding.dModel, 256)
+      const dModel = base.embedding.dModel
+      return recipe(task, {
+        recipeID,
+        hypothesis: `Profile-guided mutation: seasonal signal (strength=${seasonality}), switching to frequency embedding to capture periodic structure.`,
+        preprocessing: base.preprocessing,
+        embedding: { type: "frequency", nFreq, complexMode: "real_imag", dModel },
+        backbone: base.backbone,
+        fusion: base.fusion,
+        predictionHead: base.predictionHead,
+        notes: `Profile-directed seasonal mutation from ${base.recipeID ?? "candidate"}.`,
+      })
+    })
+  }
+
+  // 2. Cross-var correlated: switch temporal fusion to gated_hybrid
+  if (biases.has("cross_var_correlated") || (profile && profile.crossVarCorrelation >= 0.5)) {
+    const crossVarCorrelation = profile ? Number(profile.crossVarCorrelation.toFixed(3)) : "unknown"
+    factories.push((base, recipeID) => {
+      if (base.fusion.type !== "temporal") return undefined
+      return recipe(task, {
+        recipeID,
+        hypothesis: `Profile-guided mutation: correlated targets (corr=${crossVarCorrelation}), testing gated cross-variate fusion.`,
+        preprocessing: base.preprocessing,
+        embedding: base.embedding,
+        backbone: base.backbone,
+        fusion: { type: "gated_hybrid", gateType: "channel" },
+        predictionHead: base.predictionHead,
+        notes: `Profile-directed cross-var mutation from ${base.recipeID ?? "candidate"}.`,
+      })
+    })
+  }
+
+  // 3. Distribution shift: add instance_norm + huber loss
+  if (biases.has("distribution_shift") || (profile && profile.distributionShift >= 0.5)) {
+    const distributionShift = profile ? Number(profile.distributionShift.toFixed(3)) : "unknown"
+    factories.push((base, recipeID) => {
+      const alreadyHasInstanceNorm = base.preprocessing.actions.some((a) => a.type === "instance_norm")
+      const alreadyHuber = base.trainingStrategy.loss.base === "huber"
+      if (alreadyHasInstanceNorm && alreadyHuber) return undefined
+      const newActions = alreadyHasInstanceNorm
+        ? base.preprocessing.actions
+        : [...base.preprocessing.actions.filter((a) => a.type !== "none"), { type: "instance_norm" as const, affine: false, eps: 1e-5 }]
+      return {
+        ...recipe(task, {
+          recipeID,
+          hypothesis: `Profile-guided mutation: distribution shift (strength=${distributionShift}), adding instance norm and robust huber loss.`,
+          preprocessing: { actions: newActions.length > 0 ? newActions : [{ type: "none" }] },
+          embedding: base.embedding,
+          backbone: base.backbone,
+          fusion: base.fusion,
+          predictionHead: base.predictionHead,
+          notes: `Profile-directed distribution shift mutation from ${base.recipeID ?? "candidate"}.`,
+        }),
+        trainingStrategy: {
+          ...base.trainingStrategy,
+          loss: { ...base.trainingStrategy.loss, base: "huber" as const },
+        },
+      }
+    })
+  }
+
+  // 4. Missing values: add missing_mask preprocessing
+  if (biases.has("missing_values") || (profile && profile.missingRate > 0)) {
+    const missingRate = profile ? Number(profile.missingRate.toFixed(4)) : "unknown"
+    factories.push((base, recipeID) => {
+      const alreadyHasMask = base.preprocessing.actions.some((a) => a.type === "missing_mask")
+      if (alreadyHasMask) return undefined
+      const newActions = [...base.preprocessing.actions.filter((a) => a.type !== "none"), { type: "missing_mask" as const, maskChannel: true, fillPolicy: "zero" as const }]
+      return recipe(task, {
+        recipeID,
+        hypothesis: `Profile-guided mutation: missing values (rate=${missingRate}), adding missing mask preprocessing.`,
+        preprocessing: { actions: newActions },
+        embedding: base.embedding,
+        backbone: base.backbone,
+        fusion: base.fusion,
+        predictionHead: base.predictionHead,
+        notes: `Profile-directed missing values mutation from ${base.recipeID ?? "candidate"}.`,
+      })
+    })
+  }
+
+  return factories
+}
+
+function mutateTSFRecipeGeneric(task: TSFTaskSpec, base: TSFCandidateRecipe, recipeID: string): TSFCandidateRecipe {
   const hypothesis = `Mutation of ${base.recipeID ?? "champion"} tests a small bridge-safe capacity change.`
 
   if (base.backbone.type === "transformer") {
@@ -2357,6 +2499,31 @@ function mutateTSFRecipe(task: TSFTaskSpec, base: TSFCandidateRecipe, ordinal: n
     predictionHead: { type: "linear", outputDistribution: "point" },
     notes: `Autonomous mutation from ${base.recipeID ?? "candidate"} after seeded candidates were exhausted.`,
   })
+}
+
+function mutateTSFRecipe(
+  task: TSFTaskSpec,
+  base: TSFCandidateRecipe,
+  ordinal: number,
+  taskFingerprint?: JsonRecord,
+): TSFCandidateRecipe {
+  const recipeID = mutationRecipeID(base.recipeID, ordinal)
+
+  if (taskFingerprint) {
+    const profileFactories = profileMutationSequence(task, taskFingerprint)
+    // Try profile mutations in priority order using the ordinal to pick different ones
+    const factoryIndex = (ordinal - 1) % Math.max(profileFactories.length, 1)
+    if (profileFactories.length > 0) {
+      // Try from the factoryIndex, wrapping around, to find one that returns a result
+      for (let i = 0; i < profileFactories.length; i++) {
+        const idx = (factoryIndex + i) % profileFactories.length
+        const result = profileFactories[idx]!(base, recipeID)
+        if (result !== undefined) return result
+      }
+    }
+  }
+
+  return mutateTSFRecipeGeneric(task, base, recipeID)
 }
 
 function taskPriorText(taskFingerprint: JsonRecord) {
@@ -2456,7 +2623,7 @@ export function proposeTSFCandidate(input: DomainProposalContext): DomainCandida
   }
 
   for (let offset = 0; offset < 10; offset++) {
-    const candidate = mutateTSFRecipe(task, base, input.candidates.length + offset + 1)
+    const candidate = mutateTSFRecipe(task, base, input.candidates.length + offset + 1, taskFingerprint)
     if (candidate.recipeID && existingRecipeIDs.has(candidate.recipeID)) continue
     const latestLesson = input.memory[0]?.lesson
     return {
@@ -2537,7 +2704,8 @@ function isDataAnalysisArtifact(kind: string) {
     kind === "dataset_analysis_report" ||
     kind === "dataset_quantitative_analysis_markdown" ||
     kind === "dataset_qualitative_analysis_markdown" ||
-    kind === "dataset_main_analysis_markdown"
+    kind === "dataset_main_analysis_markdown" ||
+    kind === "dataset_analysis_plot_png"
   )
 }
 
