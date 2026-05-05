@@ -17,6 +17,7 @@ import {
   buildDefaultTsfResearchTask,
   buildDefaultTsfResearchTaskFromGoal,
   buildSocraticClarificationState,
+  buildResearchCockpitAgentWorkflow,
   buildResearchCockpitRecommendation,
   canExecuteResearchCockpitTask,
   canRunResearchCockpitCandidate,
@@ -37,7 +38,6 @@ import {
   researchInteractionModeLabel,
   researchCockpitCandidateTitle,
   resolveResearchCockpitProjectRunnerRoot,
-  resolveNeoCastSubdirectory,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
   taskModeForInteractionMode,
@@ -71,6 +71,12 @@ import {
 import packageJson from "../../../../../package.json"
 
 type CandidateRunStage = Extract<NonNullable<ResearchCockpitRun["stage"]>, "smoke" | "ref_test" | "blind_test">
+type ResearchCockpitDatasetPreparationResult = {
+  artifact: ResearchCockpitArtifact
+  path: string
+  datasetSpec: JsonRecord
+  command: JsonRecord
+}
 
 const chatRequestTimeoutMs = 90_000
 
@@ -215,6 +221,50 @@ function runSummaryText(run: ResearchCockpitRun) {
   return `${run.id} ${run.stage ?? "run"} ${run.status} / ${metricText(run.metrics)}${runDurationText(run)}`
 }
 
+function parseRunnerProgressRecord(line: string) {
+  try {
+    const parsed = JSON.parse(line)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as JsonRecord) : {}
+  } catch {
+    return {}
+  }
+}
+
+function progressRecordString(record: JsonRecord, key: string) {
+  const value = record[key]
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function progressRecordNumber(record: JsonRecord, key: string) {
+  const value = record[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function formatRunnerProgressLine(data: RunnerProgressLineEvent) {
+  if (data.event === "epoch_end") {
+    return `epoch ${data.epoch ?? "?"} | h${data.horizon ?? "?"} | val_loss ${data.valLoss?.toFixed(4) ?? "?"}`
+  }
+  if (data.event === "timeout") {
+    return `timeout after ${data.elapsedS === undefined ? "?" : Math.round(data.elapsedS)}s`
+  }
+
+  const record = parseRunnerProgressRecord(data.line)
+  if (data.event === "stage_start") {
+    const stage = progressRecordString(record, "stage") ?? "?"
+    const candidate = progressRecordString(record, "candidate_id")
+    return candidate ? `stage ${stage} | candidate ${candidate}` : `stage ${stage}`
+  }
+  if (data.event === "smoke_eval_done") {
+    const mse = progressRecordNumber(record, "val_avg_mse")
+    return mse === undefined ? "smoke_eval_done" : `smoke_eval_done | val_avg_mse ${mse.toFixed(4)}`
+  }
+  if (data.event === "artifact_ready") {
+    const runID = progressRecordString(record, "run_id")
+    return runID ? `artifact_ready | run ${runID}` : "artifact_ready"
+  }
+  return data.line
+}
+
 function assistantTextFromResponse(result: unknown) {
   const parts = Array.isArray((result as { parts?: unknown[] })?.parts) ? (result as { parts: unknown[] }).parts : []
   const text = parts
@@ -245,6 +295,7 @@ const cockpitColors = {
 
 const promptEventHistoryLimit = 20
 const errorEventHistoryLimit = 10
+const runnerOutputBufferSize = 30
 const neoResearchVersion = InstallationVersion === "local" ? packageJson.version : InstallationVersion
 const interactionModeOptions: Array<{
   key: string
@@ -271,6 +322,17 @@ type StreamLine = {
   text: string
   tone?: "text" | "muted" | "primary" | "success" | "warning" | "error"
   spinner?: boolean
+}
+
+type RunnerProgressLineEvent = {
+  taskID?: string
+  runID: string
+  line: string
+  event?: string
+  epoch?: number
+  horizon?: number
+  valLoss?: number
+  elapsedS?: number
 }
 
 type ChatProviderList = {
@@ -499,10 +561,14 @@ function runnerIssueDetailLines(status: ResearchCockpitRunnerStatus) {
   if (status.reason === "missing_python") return ["Initialize Neo-Cast runtime Python."]
   if (status.reason === "python_unavailable") return [`Python unavailable: ${compactTailPath(status.pythonExecutable ?? "")}`]
   if (status.reason === "unsupported_python") return ["Python must be >= 3.10."]
-  if (status.reason === "dataset_spec_mismatch") return ["Prepared dataset does not match task."]
+  if (status.reason === "dataset_spec_mismatch") return ["Prepared dataset does not match task.", "Prepare the task dataset again."]
   if (status.reason === "missing_dataset_spec") return ["Prepare Neo-Cast dataset_spec.json."]
   if (status.reason === "missing_task") return ["No task selected."]
   return [status.detail]
+}
+
+function isDatasetRepairRunnerStatus(status: ResearchCockpitRunnerStatus) {
+  return status.reason === "dataset_spec_mismatch" || status.reason === "missing_dataset_spec"
 }
 
 function formatTaskRequirementSummaryLines(task?: ResearchCockpitTask) {
@@ -558,7 +624,6 @@ function InteractionModeDialog(props: {
       setSelected("companion")
       evt.preventDefault()
       evt.stopPropagation()
-      return
     }
     if (evt.name === "2") {
       setSelected("socratic")
@@ -647,6 +712,9 @@ export function ResearchCockpit() {
   const [error, setError] = createSignal<string>()
   const [errorEvents, setErrorEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
   const [actionEvents, setActionEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
+  const [runnerOutputLines, setRunnerOutputLines] = createSignal<
+    Array<{ id: number; taskID?: string; runID: string; text: string; tone: StreamLine["tone"] }>
+  >([])
   const [promptValue, setPromptValue] = createSignal("")
   const [csvInputErrors, setCsvInputErrors] = createSignal<string[]>([])
   const [promptEvents, setPromptEvents] = createSignal<Array<{ id: number; text: string; taskID?: string; detail?: string }>>(
@@ -788,7 +856,29 @@ export function ResearchCockpit() {
 
   const unsubscribeResearchEvents = event.subscribe((payload) => {
     handleStreamingChatEvent(payload)
-    if (!shouldRefreshResearchCockpitOnEvent(payload)) return
+    const researchPayload = payload as { type: string; properties?: unknown }
+    if (researchPayload.type === "research.runner.progress.line") {
+      const data = researchPayload.properties as Partial<RunnerProgressLineEvent> | undefined
+      if (!data || typeof data.runID !== "string" || typeof data.line !== "string") return
+      const runID = data.runID
+      const taskID = typeof data.taskID === "string" ? data.taskID : undefined
+      const eventName = data.event
+      const task = selectedTask()
+      if (task && typeof taskID === "string" && taskID !== task.id) return
+      const text = formatRunnerProgressLine(data as RunnerProgressLineEvent)
+      setRunnerOutputLines((lines) => [
+        ...lines.slice(-(runnerOutputBufferSize - 1)),
+        {
+          id: ++streamEventID,
+          taskID,
+          runID,
+          text,
+          tone: eventName === "timeout" ? "warning" : "muted",
+        },
+      ])
+      return
+    }
+    if (!shouldRefreshResearchCockpitOnEvent(researchPayload)) return
     setRefresh((value) => value + 1)
   })
   onCleanup(unsubscribeResearchEvents)
@@ -881,6 +971,11 @@ export function ResearchCockpit() {
   })
   const runnerStatus = createMemo(() => getResearchCockpitRunnerStatus(selectedTask(), { validateRuntime: true }))
   const runnerReady = createMemo(() => runnerStatus().ready)
+  const canStartAutonomousLoop = createMemo(
+    () =>
+      selectedTask()?.mode === "autonomous" &&
+      (runnerReady() || isDatasetRepairRunnerStatus(runnerStatus())),
+  )
   const taskCandidates = createMemo(() => candidates() ?? [])
   const taskRuns = createMemo(() => runs() ?? [])
   const taskArtifacts = createMemo(() => artifacts() ?? [])
@@ -927,6 +1022,7 @@ export function ResearchCockpit() {
       champion: validChampion() ?? null,
       fingerprint: taskFingerprint() ?? {},
       runnerReady: runnerReady(),
+      runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
     }),
   )
   async function runAction(name: string, fn: (signal: AbortSignal) => Promise<string>) {
@@ -1056,7 +1152,7 @@ export function ResearchCockpit() {
     await runAction(`create-${resolvedMode}`, async () => {
       const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask(
         resolvedMode,
-        resolveNeoCastSubdirectory(sdk.directory ?? process.cwd()),
+        resolveResearchCockpitProjectRunnerRoot(sdk.directory ?? process.cwd()),
         {
           ...defaults,
           ...(interactionMode === undefined ? {} : { interactionMode }),
@@ -1305,12 +1401,17 @@ export function ResearchCockpit() {
   async function runAutonomousLoop() {
     const task = selectedTask()
     if (!task || task.mode !== "autonomous") return
-    await runAction("autonomous-loop", async () => {
+    await runAction("autonomous-loop", async (signal) => {
+      let preparedDataset: ResearchCockpitDatasetPreparationResult | undefined
       if (!runnerReady()) {
         const status = runnerStatus()
-        throw new Error(
-          `Runner not ready: ${status.detail ?? status.reason}. Configure taskSpec.runtime.neoCastProjectRoot and ensure py/validate.py exists.`,
-        )
+        if (isDatasetRepairRunnerStatus(status)) {
+          preparedDataset = await requestTaskDatasetPreparation(task, signal)
+        } else {
+          throw new Error(
+            `Runner not ready: ${status.detail ?? status.reason}. Configure taskSpec.runtime.neoCastProjectRoot and ensure py/validate.py exists.`,
+          )
+        }
       }
       const result = await researchRequest<ResearchCockpitLoopResult>(
         sdk,
@@ -1318,10 +1419,26 @@ export function ResearchCockpit() {
         {
           method: "POST",
           body: JSON.stringify({ stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" }),
+          signal,
         },
       )
-      return formatResearchCockpitLoop(result)
+      const loopMessage = formatResearchCockpitLoop(result)
+      if (preparedDataset) return `dataset prepared ${shortID(preparedDataset.artifact.id)} / ${loopMessage}`
+      return loopMessage
     })
+  }
+
+  async function requestTaskDatasetPreparation(task: ResearchCockpitTask, signal?: AbortSignal) {
+    return await researchRequest<ResearchCockpitDatasetPreparationResult>(
+      sdk,
+      `/research/tasks/${encodeURIComponent(task.id)}/prepare-dataset`,
+      {
+        method: "POST",
+        body: JSON.stringify({ force: true }),
+        signal,
+      },
+      300_000,
+    )
   }
 
   async function requestRefTestGate(candidate: ResearchCockpitCandidate) {
@@ -1438,6 +1555,15 @@ export function ResearchCockpit() {
     })
   }
 
+  async function prepareTaskDataset() {
+    const task = selectedTask()
+    if (!task) return
+    await runAction("prepare-dataset", async (signal) => {
+      const result = await requestTaskDatasetPreparation(task, signal)
+      return `dataset prepared ${shortID(result.artifact.id)}`
+    })
+  }
+
   function selectTaskOffset(offset: number) {
     const count = sortedTasks().length
     if (count < 2) return
@@ -1548,6 +1674,10 @@ export function ResearchCockpit() {
     }
     if (next === "configure_runner") {
       await useProjectRunnerRoot()
+      return
+    }
+    if (next === "prepare_dataset") {
+      await prepareTaskDataset()
       return
     }
     const candidate = taskCandidates().find(canRunResearchCockpitCandidate)
@@ -1718,7 +1848,7 @@ export function ResearchCockpit() {
       const payload: CreateResearchTaskInput = buildDefaultTsfResearchTaskFromGoal(
         value,
         mode,
-        resolveNeoCastSubdirectory(sdk.directory ?? process.cwd()),
+        resolveResearchCockpitProjectRunnerRoot(sdk.directory ?? process.cwd()),
         { interactionMode },
       )
       const metadata = payload.taskSpec.metadata
@@ -1995,6 +2125,14 @@ export function ResearchCockpit() {
       onSelect: () => void profileTask(),
     },
     {
+      title: "Prepare selected task dataset",
+      value: "research.dataset.prepare",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "prepare-dataset", aliases: ["dataset-prepare"] },
+      onSelect: () => void prepareTaskDataset(),
+    },
+    {
       title: "Approve pending research candidate",
       value: "research.approve.pending",
       category: "Research",
@@ -2022,7 +2160,7 @@ export function ResearchCockpit() {
       title: "Run autonomous research loop",
       value: "research.autonomous.loop",
       category: "Research",
-      enabled: selectedTask()?.mode === "autonomous" && runnerReady(),
+      enabled: canStartAutonomousLoop(),
       keybind: "ctrl+l",
       slash: { name: "agent-loop", aliases: ["loop"] },
       onSelect: () => void runAutonomousLoop(),
@@ -2165,6 +2303,17 @@ export function ResearchCockpit() {
   const streamLines = createMemo<StreamLine[]>(() => {
     const lines: StreamLine[] = []
     const run = latestRun()
+    const task = selectedTask()
+    const liveRunnerLines = runnerOutputLines().filter((item) => {
+      if (task && item.taskID && item.taskID !== task.id) return false
+      if (run && item.runID !== run.id) return false
+      return true
+    })
+    if (run?.status === "running") {
+      for (const item of liveRunnerLines) {
+        lines.push({ id: `runner-${item.id}`, text: item.text, tone: item.tone })
+      }
+    }
     if (run) {
       const tone = run.status === "succeeded" ? "success" : run.status === "failed" ? "error" : "warning"
       lines.push({
@@ -2216,7 +2365,6 @@ export function ResearchCockpit() {
             },
           )
         } else {
-          const task = selectedTask()
           if (task) {
             const mode = taskInteractionMode()
             if (mode === "socratic") {
@@ -2391,15 +2539,37 @@ export function ResearchCockpit() {
   const bestMetricSummary = createMemo(() =>
     findBestResearchCockpitMetric(selectedTask()?.objective ?? {}, taskRuns(), validChampion() ?? null),
   )
-  const hasExplorationProgress = createMemo(() => taskCandidates().length > 0 || succeededRuns() > 0)
+  const agentWorkflowProgress = createMemo(() =>
+    buildResearchCockpitAgentWorkflow({
+      task: selectedTask(),
+      candidates: taskCandidates(),
+      runs: taskRuns(),
+      artifacts: taskArtifacts(),
+      approvals: taskApprovals(),
+      champion: validChampion() ?? null,
+      fingerprint: taskFingerprint() ?? {},
+      runnerReady: runnerReady(),
+      runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
+    }),
+  )
+  const activeResearchAgent = createMemo(() => agentWorkflowProgress().find((item) => item.status === "active"))
+  const trainEvalDone = createMemo(() =>
+    agentWorkflowProgress().some((item) => item.label === "TrainEval Agent" && item.status === "done"),
+  )
+  const hasCandidateDesignProgress = createMemo(() => taskCandidates().length > 0)
+  const hasSuccessfulExperimentProgress = createMemo(() => succeededRuns() > 0)
   const hasProfileProgress = createMemo(() =>
     taskRuns().some((run) => run.stage === "profile" && run.status === "succeeded") ||
-    taskArtifacts().some((artifact) => artifact.kind === "task_profile_json" || artifact.kind === "dataset_analysis_report"),
+    taskArtifacts().some((artifact) => artifact.kind === "task_profile_json" || artifact.kind === "dataset_analysis_report") ||
+    (hasCandidateDesignProgress() && profileSummary() !== "-"),
   )
+  const hasExplorationProgress = createMemo(() => hasCandidateDesignProgress() || hasSuccessfulExperimentProgress())
   const hasInputProgress = createMemo(() => hasProfileProgress() || hasExplorationProgress() || hasResultArtifact())
   const promptAgentLabel = createMemo(() => {
     if (validChampion() || hasResultArtifact()) return "Publish Agent"
-    if (hasExplorationProgress()) return "NAS Agent"
+    const active = activeResearchAgent()
+    if (active) return active.label
+    if (hasExplorationProgress()) return "ModelDesigner Agent"
     if (hasProfileProgress()) return "Data Analysis Agent"
     return "Intent Agent"
   })
@@ -2421,12 +2591,11 @@ export function ResearchCockpit() {
   const sidebarVisible = createMemo(() => dimensions().width >= 100)
   const sidebarWidth = createMemo(() => {
     const width = dimensions().width
-    if (width >= 170) return 44
-    if (width >= 140) return 40
+    if (width >= 170) return 48
+    if (width >= 160) return 46
+    if (width >= 140) return 42
     return 34
   })
-  const maxRuns = createMemo(() => Number(selectedTask()?.budget.maxRuns ?? 0))
-  const remainingRuns = createMemo(() => Math.max(0, maxRuns() - succeededRuns()))
   const taskLabel = createMemo(() => selectedTask()?.title ?? "No research task selected")
   const selectedTaskPosition = createMemo(() => {
     const count = sortedTasks().length
@@ -2439,14 +2608,12 @@ export function ResearchCockpit() {
     return `Candidate ${selectedCandidateIndex() + 1}/${count}`
   })
   const taskSummary = createMemo(() => `${selectedTaskPosition()} · ${candidatePosition()}`)
-  const hasResultsProgress = createMemo(() => Boolean(validChampion()) || hasResultArtifact())
   const progressState = (done: boolean, active: boolean) => (done ? "done" : active ? "active" : "todo")
   const intentProgress = createMemo(() => progressState(Boolean(selectedTask()), !selectedTask()))
   const dataProgress = createMemo(() => progressState(hasProfileProgress(), Boolean(selectedTask()) && !hasProfileProgress()))
-  const nasProgress = createMemo(() =>
-    progressState(hasExplorationProgress(), hasProfileProgress() && !hasExplorationProgress() && runnerReady()),
+  const publishProgress = createMemo(() =>
+    progressState(hasResultArtifact(), (Boolean(validChampion()) || trainEvalDone()) && !hasResultArtifact()),
   )
-  const publishProgress = createMemo(() => progressState(hasResultsProgress(), hasExplorationProgress() && !hasResultsProgress()))
   const taskPath = createMemo(() => sdk.directory ?? process.cwd())
   const compactTaskPath = createMemo(() => compactTailPath(taskPath()))
   const runnerIssueTitle = createMemo(() => {
@@ -2466,6 +2633,8 @@ export function ResearchCockpit() {
     return item.detail
   })
   const statusMark = (status: "done" | "active" | "todo") => (status === "done" ? "✓" : status === "active" ? "→" : "•")
+  const statusColor = (status: "done" | "active" | "todo") =>
+    status === "done" ? cockpitColors.success : status === "active" ? cockpitColors.primary : cockpitColors.textMuted
   return (
     <box flexGrow={1} height="100%" flexDirection="row" backgroundColor={cockpitColors.background}>
       <box
@@ -2511,12 +2680,12 @@ export function ResearchCockpit() {
             </text>
             <text
               fg={
-                selectedTask()?.mode !== "autonomous" || !runnerReady() || busy()
+                !canStartAutonomousLoop() || busy()
                   ? cockpitColors.textMuted
                   : cockpitColors.primary
               }
               onMouseUp={() => {
-                if (selectedTask()?.mode !== "autonomous" || !runnerReady() || busy()) return
+                if (!canStartAutonomousLoop() || busy()) return
                 void runAutonomousLoop()
               }}
             >
@@ -2729,10 +2898,14 @@ export function ResearchCockpit() {
                     fg={busy() ? cockpitColors.textMuted : cockpitColors.primary}
                     onMouseUp={() => {
                       if (busy()) return
+                      if (isDatasetRepairRunnerStatus(runnerStatus())) {
+                        void prepareTaskDataset()
+                        return
+                      }
                       void useProjectRunnerRoot()
                     }}
                   >
-                    Use Project Runner
+                    {isDatasetRepairRunnerStatus(runnerStatus()) ? "Prepare Dataset" : "Use Project Runner"}
                   </text>
                 </Show>
               </box>
@@ -2741,7 +2914,7 @@ export function ResearchCockpit() {
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
                   ▾ AutoResearch进展
                 </text>
-                <text fg={intentProgress() === "done" ? cockpitColors.success : intentProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                <text fg={statusColor(intentProgress())}>
                   {statusMark(intentProgress())} Intent Agent
                 </text>
                 <For each={taskRequirementSummary()}>
@@ -2751,7 +2924,7 @@ export function ResearchCockpit() {
                     </text>
                   )}
                 </For>
-                <text fg={dataProgress() === "done" ? cockpitColors.success : dataProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                <text fg={statusColor(dataProgress())}>
                   {statusMark(dataProgress())} Data Analysis Agent
                 </text>
                 <For each={profileSummary() === "-" ? [] : profileSummaryLines()}>
@@ -2761,9 +2934,13 @@ export function ResearchCockpit() {
                     </text>
                   )}
                 </For>
-                <text fg={nasProgress() === "done" ? cockpitColors.success : nasProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
-                  {statusMark(nasProgress())} NAS Agent {succeededRuns()}/{maxRuns()} runs
-                </text>
+                <For each={agentWorkflowProgress()}>
+                  {(item) => (
+                    <text fg={statusColor(item.status)} width="100%" overflow="hidden" wrapMode="none">
+                      {statusMark(item.status)} {item.displayLabel ?? item.label}
+                    </text>
+                  )}
+                </For>
                 <Show when={bestMetricSummary()}>
                   {(summary) => (
                     <text fg={cockpitColors.success} width="100%" overflow="hidden" wrapMode="none">
@@ -2771,7 +2948,7 @@ export function ResearchCockpit() {
                     </text>
                   )}
                 </Show>
-                <text fg={publishProgress() === "done" ? cockpitColors.success : publishProgress() === "active" ? cockpitColors.primary : cockpitColors.textMuted}>
+                <text fg={statusColor(publishProgress())}>
                   {statusMark(publishProgress())} Publish Agent
                 </text>
               </box>

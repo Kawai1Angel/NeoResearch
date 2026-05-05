@@ -20,6 +20,7 @@ from export import (  # noqa: E402
     render_tool_schema,
     validate_metadata_payload,
 )
+from research_trace import build_research_trace  # noqa: E402
 
 
 class ExportContractTest(unittest.TestCase):
@@ -116,6 +117,35 @@ class ExportContractTest(unittest.TestCase):
         self.assertIn("| split | mse | mae | pinball | crps_approx | interval_80_coverage | interval_80_width |", report)
         self.assertIn("| avg | 0.500000 | 0.400000 | 0.070000 | 0.140000 | 0.880000 | 1.250000 |", report)
         self.assertIn("| h96 | 0.500000 | 0.400000 | 0.070000 | 0.140000 | 0.880000 | 1.250000 |", report)
+
+    def test_eval_report_surfaces_research_trace(self) -> None:
+        metadata = build_metadata(
+            run_id="run_trace_report_001",
+            model_family="recipe_factory",
+            model_impl_entry="model_impl.py:build_model",
+            state_dict_layout="per_horizon",
+            val_metrics={"val_avg_mse": 0.5, "val_h96_mse": 0.5},
+            horizons=[96],
+        )
+        candidate = {
+            "candidate_id": "cand_trace_report_001",
+            "model_family": "recipe_factory",
+            "hypothesis": "Patch MLP should capture local temporal motifs.",
+            "recipe": {
+                "recipe_id": "recipe_trace_report_001",
+                "embedding": {"type": "patch"},
+                "backbone": {"type": "mlp"},
+                "fusion": {"type": "temporal"},
+                "prediction_head": {"type": "linear"},
+            },
+        }
+        trace = build_research_trace(metadata, candidate, created_at="2026-05-05T00:00:00Z")
+
+        report = render_eval_report(metadata, research_trace=trace)
+
+        self.assertIn("## Research Trace", report)
+        self.assertIn("use recipe modules", report)
+        self.assertIn("Patch MLP should capture local temporal motifs.", report)
 
     def test_model_spec_and_patch_bundle_capture_compiled_recipe_artifacts(self) -> None:
         candidate = {

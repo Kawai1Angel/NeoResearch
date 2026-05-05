@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import secrets
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from prepare_tsf import DATASET, PROMOTION_TOKEN_ENV, query_blind_test, query_ref_test
+from research_trace import append_trace_jsonl
 
 
 PY_ROOT = Path(__file__).resolve().parent
@@ -35,6 +37,8 @@ STATE_PATH = STATE_DIR / "runner_state.json"
 CURRENT_CANDIDATE_PATH = STATE_DIR / "current_candidate.json"
 RESOLVED_CANDIDATE_PATH = STATE_DIR / "resolved_candidate.json"
 ARTIFACTS_DIR = STATE_DIR / "artifacts"
+TRACE_PATH = STATE_DIR / "research_trace.jsonl"
+APPROVAL_STATE_PATH = STATE_DIR / "approval_state.json"
 
 RESULTS_HEADER = [
     "session_id",
@@ -171,6 +175,74 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{json.dumps(payload, indent=2, sort_keys=True)}\n", encoding="utf-8")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_approval_state() -> dict[str, Any] | None:
+    if not APPROVAL_STATE_PATH.exists():
+        return None
+    try:
+        payload = read_json(APPROVAL_STATE_PATH)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return payload if payload.get("schema_version") == "approval_state.v1" else None
+
+
+def _save_approval_state(payload: dict[str, Any]) -> None:
+    write_json(APPROVAL_STATE_PATH, payload)
+
+
+def _approval_block_reason() -> dict[str, str] | None:
+    payload = _load_approval_state()
+    if payload is None:
+        return None
+    checkpoint = (payload.get("checkpoints") or {}).get("model_design")
+    if not isinstance(checkpoint, dict):
+        return None
+    expected_hash = checkpoint.get("subject_hash")
+    if not expected_hash:
+        return None
+    status = str(checkpoint.get("status") or "pending")
+    try:
+        current_hash = _file_sha256(CURRENT_CANDIDATE_PATH)
+    except OSError:
+        return {
+            "status": str(checkpoint.get("status") or "unknown"),
+            "reason": "candidate_missing",
+        }
+    if current_hash != expected_hash:
+        if status == "approved":
+            return None
+        return {
+            "status": status,
+            "reason": "checkpoint_subject_mismatch",
+        }
+    if status != "approved":
+        return {
+            "status": status,
+            "reason": "checkpoint_not_approved",
+        }
+    return None
+
+
+def _set_approval_stage(stage: str) -> None:
+    payload = _load_approval_state()
+    if payload is None:
+        return
+    payload["current_stage"] = stage
+    _save_approval_state(payload)
+
+
 def format_metric(value: float | None, decimals: int = 6) -> str:
     if value is None:
         return "NA"
@@ -286,6 +358,15 @@ def _export_artifact(
     return export_exit
 
 
+def _append_artifact_trace(artifact_dir: Path) -> None:
+    trace_json_path = artifact_dir / "research_trace.json"
+    try:
+        trace = read_json(trace_json_path)
+        append_trace_jsonl(TRACE_PATH, trace)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return
+
+
 def _candidate_context() -> tuple[str, str]:
     resolved = read_json(RESOLVED_CANDIDATE_PATH)
     return str(resolved["candidate_id"]), str(resolved["model_family"])
@@ -343,9 +424,17 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         raise FileNotFoundError(
             f"{CURRENT_CANDIDATE_PATH} not found. Write a candidate JSON there or pass --candidate-path in a later CLI layer."
         )
+    block_reason = _approval_block_reason()
+    if block_reason is not None:
+        print("runner_status=pending_approval")
+        print("runner_checkpoint_stage=model_design")
+        print(f"runner_checkpoint_status={block_reason['status']}")
+        print(f"runner_checkpoint_reason={block_reason['reason']}")
+        return 5
 
     state.candidate_counter += 1
     save_state(state)
+    _set_approval_stage("train_eval_running")
 
     if skip_smoke:
         renderer_exit = _resolve_candidate()
@@ -438,6 +527,7 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
             is_best=False,
         )
         return export_exit
+    _append_artifact_trace(artifact_dir)
 
     improved = state.best_val_avg_mse is None or val_avg_mse < state.best_val_avg_mse
     status = "keep" if improved else "discard"
@@ -453,6 +543,7 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         state.crash_streak = 0
         state.no_improve_streak += 1
     save_state(state)
+    _set_approval_stage("train_eval_completed")
 
     _write_result_row(
         state=state,

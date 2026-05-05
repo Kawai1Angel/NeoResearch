@@ -75,6 +75,19 @@ test("design mock mode runs one candidate and updates results", () => {
   const after = fs.readFileSync(path.join(REPO_ROOT, ".neo-cast", "results.tsv"), "utf8");
   assert.notEqual(after, before);
   assert.match(result.stdout, /design_best_run_id=/);
+  const runId = /runner_run_id=([^\s]+)/.exec(result.stdout)?.[1];
+  assert.ok(runId, "design output should expose current runner run id");
+  const artifactDir = path.join(REPO_ROOT, ".neo-cast", "artifacts", `run_${runId}`);
+  const tracePath = path.join(artifactDir, "research_trace.json");
+  assert.ok(fs.existsSync(tracePath), "artifact should include research_trace.json");
+  const trace = JSON.parse(fs.readFileSync(tracePath, "utf8"));
+  assert.equal(trace.schema_version, "research_trace.v1");
+  assert.ok(trace.entries.some((entry) => entry.made_by === "ModelDesigner Agent"));
+  const validateTrace = runNode(["validate", "research-trace", tracePath], { cwd: REPO_ROOT });
+  assert.equal(validateTrace.status, 0, validateTrace.stderr || validateTrace.stdout);
+  const globalTracePath = path.join(REPO_ROOT, ".neo-cast", "research_trace.jsonl");
+  assert.ok(fs.existsSync(globalTracePath), "runner should append global research_trace.jsonl");
+  assert.match(fs.readFileSync(globalTracePath, "utf8"), new RegExp(runId));
 });
 
 test("mutation policy writes a schema-valid next recipe", () => {

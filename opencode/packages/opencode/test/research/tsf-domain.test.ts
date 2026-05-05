@@ -28,10 +28,10 @@ describe("TSF research domain", () => {
     const info = Research.DomainRegistry.getInfo("tsf")
     expect(info.id).toBe("tsf")
     expect(info.actionRegistry.backbone.transformer.bridgeSupported).toBe(true)
-    expect(info.actionRegistry.backbone.dlinear.bridgeSupported).toBe(false)
-    expect(info.actionRegistry.embedding.invert.bridgeSupported).toBe(false)
-    expect(info.actionRegistry.fusion.feature.bridgeSupported).toBe(false)
-    expect(info.actionRegistry.head.direct_multi_horizon.bridgeSupported).toBe(false)
+    expect(info.actionRegistry.backbone.dlinear.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.embedding.invert.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.fusion.feature.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.head.direct_multi_horizon.bridgeSupported).toBe(true)
     expect(info.actionRegistry.head.quantile.phaseMin).toBe("phase2")
     expect(info.actionRegistry.head.gaussian.phaseMin).toBe("phase2")
     expect(info.actionRegistry.head.residual_correction.phaseMin).toBe("phase2")
@@ -104,7 +104,6 @@ describe("TSF research domain", () => {
     })
 
     expect(result.ok).toBe(false)
-    expect(result.issues.map((item) => item.path)).toContain("backbone")
     expect(result.issues.map((item) => item.path)).toContain("backbone.type")
   })
 

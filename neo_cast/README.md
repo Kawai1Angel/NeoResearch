@@ -11,10 +11,14 @@ The default task is **ETTh1 multivariate forecasting**, but dataset loading now 
 Current capabilities:
 
 - Prepare standardized `train + val` and runner-only `ref_test` splits from a numeric CSV.
+- Create a structured `task_spec.v1` Task DSL contract from the prepared dataset contract.
 - Generate module-level CandidateRecipe specs from a natural-language requirement.
+- Persist user corrections as Human Feedback Memory and inject them into later design prompts.
+- Pause model-design execution behind a persisted human checkpoint when `--require-approval` is used.
 - Support both mock design and Anthropic-backed design.
 - Validate candidates with JSON Schema and a smoke run.
 - Train native recipe-factory models or legacy model-family candidates on the prepared dataset.
+- Record `research_trace.v1` decision evidence so exported reports can explain why a model was tried.
 - Track session results under `.neo-cast/results.tsv`.
 - Export a self-contained artifact directory with weights, metadata, inference code, MCP server code, and reports.
 - Run final `ref_test` evaluation on the best frozen artifact.
@@ -62,7 +66,7 @@ neo_cast/
     families/                # supported model families
     registry/                # recipe action registry and compatibility checks
     search/                  # bounded recipe mutation policy
-    schemas/                 # candidate, recipe, dataset, and metadata schemas
+    schemas/                 # candidate, recipe, dataset, task spec, research trace, and metadata schemas
   test/
     e2e.test.js              # CLI-level end-to-end tests
     python-unit.test.js      # Node wrapper for Python unit tests
@@ -150,9 +154,18 @@ node ./bin/neo-cast.js config init
 node ./bin/neo-cast.js config show
 node ./bin/neo-cast.js init-runtime
 node ./bin/neo-cast.js prepare-data --source /path/to/data.csv
+node ./bin/neo-cast.js task-spec init --from-dataset .neo-cast/dataset_spec.json
+node ./bin/neo-cast.js task-spec validate .neo-cast/task_spec.json
+node ./bin/neo-cast.js checkpoint status
+node ./bin/neo-cast.js checkpoint approve model_design --note "approved for training"
+node ./bin/neo-cast.js correction add --scope data_schema --field temperature_forecast --correction "available only at prediction time"
+node ./bin/neo-cast.js correction list
 node ./bin/neo-cast.js validate candidate /path/to/candidate.json
 node ./bin/neo-cast.js validate recipe /path/to/recipe.json
 node ./bin/neo-cast.js validate dataset /path/to/dataset_spec.json
+node ./bin/neo-cast.js validate task-spec /path/to/task_spec.json
+node ./bin/neo-cast.js validate research-trace /path/to/research_trace.json
+node ./bin/neo-cast.js validate user-corrections .neo-cast/user_corrections.json
 node ./bin/neo-cast.js validate metadata /path/to/metadata.json
 node ./bin/neo-cast.js validate smoke
 node ./bin/neo-cast.js runner init --force
@@ -162,6 +175,40 @@ node ./bin/neo-cast.js runner status
 node ./bin/neo-cast.js design --requirement "..." --mode socratic
 node ./bin/neo-cast.js design --requirement "..." --mode companion
 ```
+
+Human checkpoint flow:
+
+```bash
+node ./bin/neo-cast.js design \
+  --requirement "compact ETTh1 baseline" \
+  --mode companion \
+  --max-candidates 1 \
+  --mock-llm \
+  --require-approval
+
+node ./bin/neo-cast.js checkpoint status
+node ./bin/neo-cast.js checkpoint approve model_design --note "model plan accepted"
+node ./bin/neo-cast.js runner run --description "approved model design"
+```
+
+The checkpoint state is persisted in `.neo-cast/approval_state.json`. Runner execution checks the current candidate hash before training, so a stale approval does not silently approve a different model design.
+
+Human Feedback Memory:
+
+```bash
+node ./bin/neo-cast.js correction add \
+  --scope split_policy \
+  --correction "data must be split in chronological order only"
+
+node ./bin/neo-cast.js correction add \
+  --scope data_schema \
+  --field holiday_flag \
+  --correction "should be treated as known future covariate"
+
+node ./bin/neo-cast.js correction list
+```
+
+Corrections are persisted in `.neo-cast/user_corrections.json`. Active corrections are added to model-design and reflection task context as authoritative user constraints.
 
 Generate a bounded next recipe from a previous recipe and validation metrics:
 

@@ -4,6 +4,9 @@ Validate neo-cast payloads and run the smoke gate.
 Usage:
     python validate.py candidate /path/to/candidate.json
     python validate.py recipe /path/to/recipe.json
+    python validate.py task-spec /path/to/task_spec.json
+    python validate.py research-trace /path/to/research_trace.json
+    python validate.py user-corrections /path/to/user_corrections.json
     python validate.py metadata /path/to/metadata.json
     python validate.py smoke --candidate-path .neo-cast/current_candidate.json
 """
@@ -33,6 +36,9 @@ DEFAULT_SCHEMAS = {
     "dataset": SCHEMA_DIR / "dataset_schema.json",
     "metadata": SCHEMA_DIR / "metadata_schema.json",
     "recipe": SCHEMA_DIR / "recipe_schema.json",
+    "research-trace": SCHEMA_DIR / "research_trace_schema.json",
+    "task-spec": SCHEMA_DIR / "task_spec_schema.json",
+    "user-corrections": SCHEMA_DIR / "user_correction_memory_schema.json",
 }
 
 

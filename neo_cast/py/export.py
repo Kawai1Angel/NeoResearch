@@ -15,6 +15,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from prepare_tsf import DATASET, FEATURE_COLUMNS, HORIZONS, INPUT_LEN, NUM_CHANNELS, build_preprocess_spec
+from research_trace import build_research_trace
 
 
 PY_ROOT = Path(__file__).resolve().parent
@@ -28,6 +29,7 @@ DEFAULT_FILES = {
     "eval_report_md": "eval_report.md",
     "model_spec_json": "model_spec.json",
     "patch_bundle_json": "patch_bundle.json",
+    "research_trace_json": "research_trace.json",
 }
 DEFAULT_REQUIREMENTS = [
     "mcp>=1.0",
@@ -318,7 +320,7 @@ def format_metric(value: Any) -> str:
     return str(value)
 
 
-def render_eval_report(metadata: dict[str, Any]) -> str:
+def render_eval_report(metadata: dict[str, Any], research_trace: dict[str, Any] | None = None) -> str:
     val_metrics = metadata["val_metrics"]
     ref_test_metrics = metadata.get("ref_test_metrics")
     training_summary = metadata.get("training_summary", {})
@@ -354,6 +356,20 @@ def render_eval_report(metadata: dict[str, Any]) -> str:
     if ref_test_metrics:
         lines.extend(["", "## Reference Test Metrics", ""])
         lines.extend(render_metrics_table(ref_test_metrics, prefix="ref_test", horizons=metadata["horizons"]))
+    trace_entries = research_trace.get("entries", []) if isinstance(research_trace, dict) else []
+    if trace_entries:
+        lines.extend(["", "## Research Trace", ""])
+        for entry in trace_entries:
+            if not isinstance(entry, dict):
+                continue
+            lines.append(f"- decision: `{entry.get('decision', 'NA')}`")
+            lines.append(f"  - made_by: `{entry.get('made_by', 'NA')}`")
+            evidence = entry.get("evidence", [])
+            if isinstance(evidence, list):
+                for item in evidence:
+                    lines.append(f"  - evidence: {item}")
+            lines.append(f"  - expected_effect: {entry.get('expected_effect', 'NA')}")
+            lines.append(f"  - verification_plan: {entry.get('verification_plan', 'NA')}")
     lines.extend(["", "## Files"])
     for key, value in metadata["files"].items():
         lines.append(f"- {key}: `{value}`")
@@ -662,13 +678,17 @@ def write_export_files(
     tool_schema_path = artifact_dir / "tool_schema.json"
     model_spec_path = artifact_dir / metadata["files"]["model_spec_json"]
     patch_bundle_path = artifact_dir / metadata["files"]["patch_bundle_json"]
+    research_trace_path = artifact_dir / metadata["files"]["research_trace_json"]
     mcp_server_path = artifact_dir / "mcp_server.py"
     readme_path = artifact_dir / "README.md"
     example_path = artifact_dir / "example.py"
     requirements_path = artifact_dir / "requirements.txt"
 
+    research_trace = build_research_trace(metadata, candidate)
+
     metadata_path.write_text(f"{json.dumps(metadata, indent=2, sort_keys=True)}\n", encoding="utf-8")
-    report_path.write_text(render_eval_report(metadata), encoding="utf-8")
+    write_json(research_trace_path, research_trace)
+    report_path.write_text(render_eval_report(metadata, research_trace=research_trace), encoding="utf-8")
     write_json(preprocess_path, build_preprocess_spec())
     family_module_path = (
         PY_ROOT / "factory" / "build_model.py"

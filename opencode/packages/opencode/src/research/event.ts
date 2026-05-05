@@ -48,6 +48,17 @@ export class ResearchAgentStageChanged extends Schema.Class<ResearchAgentStageCh
   metadata: Schema.optional(JsonRecord),
 }) {}
 
+export class ResearchRunnerProgressLine extends Schema.Class<ResearchRunnerProgressLine>("ResearchRunnerProgressLine")({
+  taskID: ResearchTaskID,
+  runID: Schema.String,
+  line: Schema.String,
+  event: Schema.optional(Schema.String),
+  epoch: Schema.optional(Schema.Number),
+  horizon: Schema.optional(Schema.Number),
+  valLoss: Schema.optional(Schema.Number),
+  elapsedS: Schema.optional(Schema.Number),
+}) {}
+
 export const Event = {
   TaskCreated: BusEvent.define("research.task.created", ResearchTaskChanged),
   TaskUpdated: BusEvent.define("research.task.updated", ResearchTaskChanged),
@@ -60,12 +71,16 @@ export const Event = {
   ChampionUpdated: BusEvent.define("research.champion.updated", ResearchChampionChanged),
   ApprovalCreated: BusEvent.define("research.approval.created", ResearchApprovalChanged),
   ApprovalUpdated: BusEvent.define("research.approval.updated", ResearchApprovalChanged),
+  RunnerProgressLine: BusEvent.define("research.runner.progress.line", ResearchRunnerProgressLine),
   IntentAgentStarted: BusEvent.define("research.agent.intent.started", ResearchAgentStageChanged),
   IntentAgentCompleted: BusEvent.define("research.agent.intent.completed", ResearchAgentStageChanged),
   IntentAgentFailed: BusEvent.define("research.agent.intent.failed", ResearchAgentStageChanged),
   DataAnalysisAgentStarted: BusEvent.define("research.agent.dataAnalysis.started", ResearchAgentStageChanged),
   DataAnalysisAgentCompleted: BusEvent.define("research.agent.dataAnalysis.completed", ResearchAgentStageChanged),
   DataAnalysisAgentFailed: BusEvent.define("research.agent.dataAnalysis.failed", ResearchAgentStageChanged),
+  HypoPlannerAgentStarted: BusEvent.define("research.agent.hypoPlanner.started", ResearchAgentStageChanged),
+  HypoPlannerAgentCompleted: BusEvent.define("research.agent.hypoPlanner.completed", ResearchAgentStageChanged),
+  HypoPlannerAgentFailed: BusEvent.define("research.agent.hypoPlanner.failed", ResearchAgentStageChanged),
   NASAgentStarted: BusEvent.define("research.agent.nas.started", ResearchAgentStageChanged),
   NASIterationCompleted: BusEvent.define("research.agent.nas.iteration.completed", ResearchAgentStageChanged),
   NASAgentCompleted: BusEvent.define("research.agent.nas.completed", ResearchAgentStageChanged),

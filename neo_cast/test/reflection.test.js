@@ -78,6 +78,24 @@ test("reflection system prompt exposes long-horizon diagnosis protocol and full 
   }
 });
 
+test("reflection system prompt includes active user correction memory", () => {
+  const prompt = _buildReflectionSystemPrompt({
+    task_id: "energy_hourly",
+    user_corrections: [
+      {
+        schema_version: "user_correction.v1",
+        scope: "split_policy",
+        correction: "data must be split in chronological order only",
+        status: "active",
+      },
+    ],
+  });
+
+  assert.match(prompt, /Human Feedback Memory/);
+  assert.match(prompt, /split_policy/);
+  assert.match(prompt, /chronological order only/);
+});
+
 test("reflectAndPropose mock mode returns a schema candidate without calling artifact APIs", async () => {
   const projectRoot = tempProject("neo-cast-reflect-mock-");
   writeCurrentCandidate(projectRoot, {

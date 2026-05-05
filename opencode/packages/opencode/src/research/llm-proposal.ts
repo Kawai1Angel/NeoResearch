@@ -198,15 +198,43 @@ function pruneCandidateSpec(value: unknown): JsonRecord {
   return spec as JsonRecord
 }
 
+const EXAMPLE_CANDIDATE = {
+  recipe_version: "recipe_schema_v1",
+  recipe_id: "recipe_dlinear_decomp_example",
+  hypothesis: "DLinear 通过趋势-残差分解直接预测，参数量少，适合具有明显趋势的序列。",
+  preprocessing: { actions: [{ type: "series_decomposition", kernel_size: 25 }] },
+  embedding: { type: "none" },
+  backbone: { type: "dlinear", individual: false },
+  fusion: { type: "temporal", channel_mode: "independent" },
+  prediction_head: { type: "linear", output_distribution: "point", share_across_horizons: false },
+  post_processing: { type: "auto" },
+  training_strategy: {
+    loss: { base: "mse", horizon_weighting: "uniform" },
+    optimizer: { type: "adam", lr: 0.001, weight_decay: 0.0 },
+    scheduler: { type: "none", warmup_steps: 0 },
+    regularization: { dropout: 0.0, grad_clip: 1.0 },
+    budget: { max_epochs: 5, time_budget_s: 600, batch_size: 32, patience: 3, seed: 42 },
+  },
+  constraints: { max_params: 500000, max_latency_ms: 30 },
+  notes: "轻量基线，用于趋势主导场景。",
+}
+
 function buildSystemPrompt() {
   return [
     "You are the NeoResearch TSF model-design planner.",
     "Language policy: 尽量用中文表达 hypothesis、rationale、notes 等自然语言内容；保留 JSON 字段名、schema 名称、模块名、指标名、命令和文件路径的英文原文。",
     "Return exactly one JSON object using Neo-Cast recipe_schema_v1 snake_case field names.",
-    "Do not return markdown or prose outside JSON.",
-    "Use only these modules: preprocessing none, instance_norm, series_decomposition, seasonal_differencing, missing_mask, sample_reweighting; embedding none, patch, multiscale_patch, invert, frequency, calendar; backbone linear, mlp, transformer, dlinear, tcn, nbeats, timesnet, rnn, ssm, mixer; fusion temporal, feature, temporal_then_feature, feature_then_temporal, graph, gated_hybrid; prediction_head linear, direct_multi_horizon, quantile, gaussian, residual_correction.",
-    "Treat profileDerivedSearchDirectives as high-priority search priors unless they conflict with runtime constraints or validation rules.",
-    "Include training_strategy.loss, optimizer, scheduler, regularization, and budget.",
+    "Each field must have a single concrete value — NOT a list of alternatives.",
+    "Do not return markdown fences or any prose outside JSON.",
+    "Available module options (choose one value per field):",
+    "  preprocessing.actions[].type: none | instance_norm | series_decomposition | seasonal_differencing | missing_mask | sample_reweighting",
+    "  embedding.type: none | patch | multiscale_patch | invert | frequency | calendar",
+    "  backbone.type: linear | mlp | transformer | dlinear | tcn | nbeats | timesnet | rnn | ssm | mixer",
+    "  fusion.type: temporal | feature | temporal_then_feature | feature_then_temporal | graph | gated_hybrid",
+    "  prediction_head.type: linear | direct_multi_horizon | quantile | gaussian | residual_correction",
+    "Treat profileDerivedSearchDirectives as high-priority search priors unless they conflict with runtime constraints.",
+    "Include training_strategy with loss, optimizer, scheduler, regularization, and budget sub-objects.",
+    `\nEXAMPLE (follow this exact structure):\n${JSON.stringify(EXAMPLE_CANDIDATE, null, 2)}`,
   ].join("\n")
 }
 
@@ -368,6 +396,8 @@ export async function proposeLLMCandidate(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
   readonly workspaceRoot: string
+  /** Fallback key+baseURL resolved from the opencode auth.json when env vars are absent. */
+  readonly authJsonKey?: { readonly key: string; readonly baseURL: string; readonly model: string }
 }): Promise<LLMProposalResult> {
   const runtime = isRecord(input.task.taskSpec.runtime) ? input.task.taskSpec.runtime : {}
   const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -375,14 +405,24 @@ export async function proposeLLMCandidate(input: {
     workspaceRoot: input.workspaceRoot,
     neoCastProjectRoot,
   })
-  const apiKey = apiKeyFor(config)
+  let apiKey = apiKeyFor(config)
+  let effectiveConfig = config
+  if (!apiKey && input.authJsonKey) {
+    apiKey = input.authJsonKey.key
+    effectiveConfig = {
+      ...config,
+      provider: "openai-compatible",
+      model: input.authJsonKey.model,
+      ...(input.authJsonKey.baseURL ? { baseURL: input.authJsonKey.baseURL } : {}),
+    }
+  }
   if (!apiKey) {
     return {
       metadata: llmMetadata(config, "not_configured", {
         llmError:
           config.provider === "anthropic"
             ? "ANTHROPIC_API_KEY is not set"
-            : "NEO_CAST_LLM_API_KEY, OPENAI_API_KEY, or AIGCBEST_API_KEY is not set",
+            : "NEO_CAST_LLM_API_KEY, OPENAI_API_KEY, or AIGCBEST_API_KEY is not set. Configure via TUI → Configure API Key.",
       }),
     }
   }
@@ -390,7 +430,7 @@ export async function proposeLLMCandidate(input: {
   try {
     const system = buildSystemPrompt()
     const user = buildUserPrompt(input)
-    const text = await requestNeoCastLLM(config, apiKey, system, user)
+    const text = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
     const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
     const bridgeOnly = runtime.bridgeOnly !== false
     const governance = bridgeOnly
@@ -406,11 +446,11 @@ export async function proposeLLMCandidate(input: {
         ...governance,
         generatedBy: "llm",
       },
-      metadata: llmMetadata(config, "used"),
+      metadata: llmMetadata(effectiveConfig, "used"),
     }
   } catch (error) {
     return {
-      metadata: llmMetadata(config, "failed", {
+      metadata: llmMetadata(effectiveConfig, "failed", {
         llmError: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
       }),
     }

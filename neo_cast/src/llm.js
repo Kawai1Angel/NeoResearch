@@ -1,5 +1,7 @@
 "use strict";
 
+const { formatUserCorrections } = require("./corrections");
+
 // ---------------------------------------------------------------------------
 // Heuristic fallback (used when LLM is mocked or API fails)
 // ---------------------------------------------------------------------------
@@ -176,8 +178,9 @@ function _formatTaskContext(taskContext = {}) {
   const valRows = taskContext.splits?.val || [8640, 11520];
   const missingStrategy = taskContext.missing?.strategy || "forward_fill";
   const frequency = taskContext.time?.frequency || "auto";
+  const correctionContext = formatUserCorrections(taskContext.user_corrections || []);
 
-  return [
+  const lines = [
     `- Dataset/task: ${taskId}`,
     `- Channels: ${featureColumns.length} (${featureColumns.join(", ")})`,
     `- Input window: ${inputLen} time steps`,
@@ -189,7 +192,11 @@ function _formatTaskContext(taskContext = {}) {
     "- Primary metric: val_avg_mse (lower is better, StandardScaler-normalised space)",
     "- Parameter budget: soft limit 1M params total across all horizon models",
     "- Training budget: 10 minutes wall-clock per run",
-  ].join("\n");
+  ];
+  if (correctionContext) {
+    lines.push(correctionContext);
+  }
+  return lines.join("\n");
 }
 
 function _buildSystemPrompt(taskContext = {}) {

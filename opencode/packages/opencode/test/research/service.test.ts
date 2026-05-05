@@ -167,6 +167,47 @@ printf '{"event":"done","status":"success"}\\n'
   )
 }
 
+async function writeTrainingFakeNeoCastRunner(root: string) {
+  await mkdir(path.join(root, "py"), { recursive: true })
+  await writeFakeNeoCastRunner(root)
+  await writeFile(
+    path.join(root, "py", "runner.py"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p .neo-cast/artifacts/run_train
+cat > .neo-cast/artifacts/run_train/val_metrics.json <<'JSON'
+{"val_avg_mse":0.101,"val_avg_mae":0.303}
+JSON
+printf '{"event":"candidate_resolved"}\\n'
+printf '{"event":"eval_done","val_avg_mse":0.101,"val_avg_mae":0.303}\\n'
+printf '{"event":"artifact_ready","run_id":"train","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_train"
+printf '{"event":"done","status":"success"}\\n'
+`,
+    "utf8",
+  )
+}
+
+async function writeStreamingFakeNeoCastRunner(root: string) {
+  await mkdir(path.join(root, "py"), { recursive: true })
+  await writeFile(
+    path.join(root, "py", "validate.py"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p .neo-cast/artifacts/run_streaming
+cat > .neo-cast/artifacts/run_streaming/val_metrics.json <<'JSON'
+{"val_avg_mse":0.321,"val_avg_mae":0.654}
+JSON
+printf '{"event":"stage_start","stage":"smoke","candidate_id":"recipe_progress"}\\n'
+printf '{"event":"epoch_end","horizon":24,"epoch":1,"val_loss":0.719233}\\n'
+printf '{"event":"timeout","elapsed_s":61.4,"budget_s":60}\\n'
+printf '{"event":"smoke_eval_done","val_avg_mse":0.321,"val_avg_mae":0.654}\\n'
+printf '{"event":"artifact_ready","run_id":"streaming","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_streaming"
+printf '{"event":"done","status":"success"}\\n'
+`,
+    "utf8",
+  )
+}
+
 async function writeFailingNeoCastRunner(root: string) {
   await mkdir(path.join(root, "py"), { recursive: true })
   await writeFile(
@@ -308,7 +349,7 @@ afterEach(async () => {
 
 describe("Research service", () => {
   test("exposes multi-agent task statuses and export artifact kinds", () => {
-    for (const status of ["idle", "intent_gathering", "analyzing", "data_analysis", "searching", "publishing"]) {
+    for (const status of ["idle", "intent_gathering", "analyzing", "data_analysis", "hypo_planning", "searching", "publishing"]) {
       expect(Research.ResearchTaskStatus.zod.safeParse(status).success).toBe(true)
     }
     expect(Research.ExportArtifactKind.zod.safeParse("dataset_analysis_report").success).toBe(true)
@@ -612,6 +653,8 @@ describe("Research service", () => {
         expect(result.intent.taskID).toBe(task.id)
         expect(result.intent.missingFields).toEqual([])
         expect(result.dataAnalysis.artifact.kind).toBe("dataset_analysis_report")
+        expect(result.hypoPlanning.agent).toBe("HypoPlannerAgent")
+        expect(result.hypoPlanning.plan.hypotheses.length).toBeGreaterThan(0)
         expect(result.nas.loop.stoppedReason).toBe("max_iterations")
         expect(result.nas.loop.iterations).toHaveLength(1)
         expect(result.publish.artifact.kind).toBe("model_export_package")
@@ -634,8 +677,15 @@ describe("Research service", () => {
         expect(finalTask.status).toBe("completed")
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         expect(artifacts.map((artifact) => artifact.kind)).toEqual(
-          expect.arrayContaining(["dataset_analysis_report", "research_autonomous_loop_json", "model_export_package"]),
+          expect.arrayContaining([
+            "dataset_analysis_report",
+            "hypo_plan_md",
+            "hypotheses_yaml",
+            "research_autonomous_loop_json",
+            "model_export_package",
+          ]),
         )
+        expect((finalTask.taskSpec.metadata as Record<string, unknown>).hypothesisPlan).toBeDefined()
       },
     })
   })
@@ -674,8 +724,10 @@ describe("Research service", () => {
 
         const firstArtifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         const firstDataReport = firstArtifacts.find((artifact) => artifact.kind === "dataset_analysis_report")
+        const firstHypoPlan = firstArtifacts.find((artifact) => artifact.kind === "hypo_plan_md")
         expect(firstDataReport).toBeDefined()
-        if (firstDataReport === undefined) {
+        expect(firstHypoPlan).toBeDefined()
+        if (firstDataReport === undefined || firstHypoPlan === undefined) {
           return
         }
         const firstPublishedPath = firstRun.publish.artifact.uri
@@ -687,12 +739,16 @@ describe("Research service", () => {
             const svc = yield* Research.Service
             const events = {
               dataAnalysisStarted: 0,
+              hypoPlannerStarted: 0,
               nasStarted: 0,
               reflectionStarted: 0,
               publishStarted: 0,
             }
             const unsubscribeData = yield* bus.subscribeCallback(Research.Event.DataAnalysisAgentStarted, (event) => {
               if (event.properties.taskID === task.id) events.dataAnalysisStarted += 1
+            })
+            const unsubscribeHypo = yield* bus.subscribeCallback(Research.Event.HypoPlannerAgentStarted, (event) => {
+              if (event.properties.taskID === task.id) events.hypoPlannerStarted += 1
             })
             const unsubscribeNAS = yield* bus.subscribeCallback(Research.Event.NASAgentStarted, (event) => {
               if (event.properties.taskID === task.id) events.nasStarted += 1
@@ -713,6 +769,7 @@ describe("Research service", () => {
             })
 
             unsubscribeData()
+            unsubscribeHypo()
             unsubscribeNAS()
             unsubscribeReflection()
             unsubscribePublish()
@@ -721,10 +778,12 @@ describe("Research service", () => {
         )
 
         expect(secondRun.events.dataAnalysisStarted).toBe(0)
+        expect(secondRun.events.hypoPlannerStarted).toBe(0)
         expect(secondRun.events.nasStarted).toBe(0)
         expect(secondRun.events.reflectionStarted).toBe(0)
         expect(secondRun.events.publishStarted).toBe(0)
         expect(secondRun.result.dataAnalysis.artifact.id).toBe(firstDataReport.id)
+        expect(secondRun.result.hypoPlanning.planMarkdown).toContain("# Hypothesis Plan")
         expect(secondRun.result.publish.artifact.uri).toBe(firstPublishedPath)
         const runsAfterReplay = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
         expect(runsAfterReplay.length).toBe(runsBeforeReplay.length)
@@ -2062,6 +2121,74 @@ describe("Research service", () => {
     })
   })
 
+  test("publishes parsed runner progress events while executing a run", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "streaming-neo-cast")
+        await writeStreamingFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await createTSFTask("execute streaming runner", {
+          bridgeOnly: true,
+          neoCastProjectRoot: fakeNeoCastRoot,
+          pythonExecutable: "bash",
+        })
+        const candidate = await createCandidate({ taskID: task.id })
+
+        const progress = await runResearchWithBus(
+          Effect.gen(function* () {
+            const bus = yield* Bus.Service
+            const svc = yield* Research.Service
+            const received: Array<{
+              readonly taskID: Research.ResearchTaskID
+              readonly runID: string
+              readonly line: string
+              readonly event?: string
+              readonly epoch?: number
+              readonly horizon?: number
+              readonly valLoss?: number
+              readonly elapsedS?: number
+            }> = []
+            const unsubscribe = yield* bus.subscribeCallback(Research.Event.RunnerProgressLine, (event) => {
+              if (event.properties.taskID === task.id) received.push(event.properties)
+            })
+            const executed = yield* svc.executeRun({
+              taskID: task.id,
+              candidateID: candidate.id,
+              stage: "smoke",
+              description: "streaming runner smoke",
+            })
+            yield* Effect.promise(() => Bun.sleep(50))
+            unsubscribe()
+            expect(executed.run.status).toBe("succeeded")
+            return received
+          }),
+        )
+
+        expect(progress.map((item) => item.event)).toEqual([
+          "stage_start",
+          "epoch_end",
+          "timeout",
+          "smoke_eval_done",
+          "artifact_ready",
+          "done",
+        ])
+        expect(progress.every((item) => item.runID.length > 0)).toBe(true)
+        expect(progress.find((item) => item.event === "epoch_end")).toMatchObject({
+          taskID: task.id,
+          epoch: 1,
+          horizon: 24,
+          valLoss: 0.719233,
+        })
+        expect(progress.find((item) => item.event === "timeout")).toMatchObject({
+          elapsedS: 61.4,
+        })
+      },
+    })
+  })
+
   test("persists runner execution logs for failed runs", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
@@ -2775,6 +2902,23 @@ describe("Research service", () => {
           "librarian",
         ])
         expect(iteration.managerTrace[0]!.metadata).toMatchObject({ bridgeOnly: true, targetCount: 1 })
+        expect(iteration.managerTrace.find((step) => step.role === "design")?.metadata).toMatchObject({
+          agent: "ModelDesignerAgent",
+          modelDesignerResult: {
+            agent: "ModelDesignerAgent",
+            candidateID: iteration.candidate.id,
+            llmStatus: "disabled",
+            selectionSource: "existing_frontier",
+          },
+        })
+        expect(iteration.managerTrace.find((step) => step.role === "runner")?.metadata).toMatchObject({
+          modelCompilerResult: {
+            agent: "ModelCompilerAgent",
+            candidateID: iteration.candidate.id,
+            runID: iteration.run.id,
+            status: "passed",
+          },
+        })
         expect(iteration.managerTrace[4]!.metadata).toMatchObject({ stage: "smoke", status: "succeeded" })
 
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
@@ -2801,6 +2945,55 @@ describe("Research service", () => {
 
         const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))
         expect(champion?.candidateID).toBe(iteration.candidate.id)
+      },
+    })
+  })
+
+  test("autonomous low-fidelity iteration compiles with smoke before TrainEval", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast-train")
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "autonomous compile then train",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+
+        const iteration = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousIteration({
+              taskID: task.id,
+              stage: "low_fidelity",
+              description: "compile then low fidelity",
+            }),
+          ),
+        )
+
+        expect(iteration.run.stage).toBe("low_fidelity")
+        expect(iteration.run.status).toBe("succeeded")
+        const runs = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+        expect(runs.map((run) => run.stage).sort()).toEqual(["low_fidelity", "smoke"])
+        expect(iteration.managerTrace.find((step) => step.role === "runner")?.metadata).toMatchObject({
+          modelCompilerResult: {
+            agent: "ModelCompilerAgent",
+            status: "passed",
+          },
+          trainEvalResult: {
+            agent: "TrainEvalAgent",
+            runID: iteration.run.id,
+            stage: "low_fidelity",
+            status: "succeeded",
+            verifierDecision: "accepted",
+          },
+        })
       },
     })
   })

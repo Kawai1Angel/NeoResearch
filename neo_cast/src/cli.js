@@ -21,6 +21,23 @@ const {
 const { printFinalSummary, printRequirementSummary } = require("./output");
 const { getBestSessionRow, getLatestSessionRow } = require("./session");
 const {
+  buildTaskSpecFromDatasetSpec,
+  defaultTaskSpecPath,
+  loadJsonFile,
+  normalizeTaskSpec,
+  writeTaskSpec,
+} = require("./task-spec");
+const {
+  loadApprovalState,
+  requestCheckpoint,
+  updateCheckpointStatus,
+} = require("./checkpoint");
+const {
+  addUserCorrection,
+  defaultCorrectionMemoryPath,
+  loadUserCorrections,
+} = require("./corrections");
+const {
   ensureRunnerInitialized,
   getProjectPaths,
   loadResults,
@@ -30,6 +47,7 @@ const {
   writeCurrentCandidate,
 } = require("./python-bridge");
 const { getRuntimePaths, initRuntime, runtimeReady } = require("./runtime");
+const { getLatestVersionRef, registerVersion } = require("./versioning");
 const fs = require("fs");
 const path = require("path");
 const PY_DIR = "py";
@@ -55,11 +73,15 @@ Usage:
   neo-cast --version
   neo-cast help
   neo-cast doctor
-  neo-cast validate <candidate|recipe|dataset|metadata> <payload.json> [--schema /path/to/schema.json]
+  neo-cast validate <candidate|recipe|dataset|metadata|task-spec|research-trace|user-corrections> <payload.json> [--schema /path/to/schema.json]
   neo-cast validate smoke [--candidate-path /path/to/candidate.json]
   neo-cast config init
   neo-cast config show
   neo-cast init-runtime [--skip-install]
+  neo-cast task-spec init [--from-dataset .neo-cast/dataset_spec.json] [--output .neo-cast/task_spec.json]
+  neo-cast task-spec validate [.neo-cast/task_spec.json]
+  neo-cast checkpoint <status|request|approve|reject> [stage]
+  neo-cast correction <add|list> [--scope data_schema] [--field column] [--correction "..."]
   neo-cast prepare-data --source /path/to/data.csv [--task-id etth1] [--feature-cols a,b,c]
   neo-cast runner init [--force]
   neo-cast runner run --description "baseline"
@@ -67,7 +89,7 @@ Usage:
   neo-cast runner blind-test [--run-id 20260424-...]
   neo-cast runner status
   neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3]
-                  [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep]
+                  [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep] [--require-approval]
   neo-cast design --requirement "small transformer for ETTh1" --autonomous [--time-budget 2h]
                   [--max-no-improve 8] [--mock-llm] [--use-reflection] [--use-mutation]
 
@@ -77,6 +99,9 @@ Commands:
   config init    Create the default user config file if missing
   config show    Print the resolved config with secrets masked
   init-runtime   Create the project-local Python runtime under .neo-cast/runtime/.venv
+  task-spec      Create or validate the task_spec.v1 research task contract
+  checkpoint     Manage runtime human approval checkpoints
+  correction     Persist and inspect Human Feedback Memory / User Correction Memory
   prepare-data   Materialize ETTh1 visible/ref-test splits into the dataset cache
   runner         Run the project-local smoke/full/ref-test experiment loop
   design         Generate candidates and run the local design loop
@@ -85,6 +110,7 @@ Design flags:
   --use-reflection   After each run, ask the reflection agent to analyze results and propose the next candidate
                      (takes priority over --use-mutation; falls back to mutation on reflection failure)
   --autonomous       Continue iterating until budget, plateau, or crash stopping conditions are met
+  --require-approval Pause after model design and require: neo-cast checkpoint approve model_design
   --time-budget      Autonomous wall-clock budget, e.g. 2h, 90m, 3600s
   --max-no-improve   Autonomous plateau limit; defaults to 8 consecutive non-improving runs
 `.trim();
@@ -165,12 +191,109 @@ function loadPreparedDatasetSpec(projectRoot = process.cwd()) {
   }
 }
 
+function loadDesignTaskContext(projectRoot = process.cwd()) {
+  const datasetSpec = loadPreparedDatasetSpec(projectRoot);
+  const userCorrections = loadUserCorrections(projectRoot);
+  if (userCorrections.length === 0) {
+    return datasetSpec;
+  }
+  return {
+    ...(datasetSpec || {}),
+    user_corrections: userCorrections,
+  };
+}
+
 function latestValMetricsPath(projectRoot, row) {
   if (!row || !row.run_id || row.run_id.startsWith("crash_") || row.run_id.startsWith("smoke_")) {
     return null;
   }
   const metricsPath = path.join(projectRoot, ".neo-cast", "artifacts", `run_${row.run_id}`, "val_metrics.json");
   return fs.existsSync(metricsPath) ? metricsPath : null;
+}
+
+function taskIdFromContext(taskContext) {
+  return taskContext && taskContext.task_id ? String(taskContext.task_id) : null;
+}
+
+function latestResearchParentRefs(projectRoot, taskId) {
+  return ["task", "data"]
+    .map((kind) => getLatestVersionRef(projectRoot, kind, taskId || undefined))
+    .filter(Boolean);
+}
+
+function candidateVersionId(candidate, attempt) {
+  return String(
+    candidate.recipe_id
+    || candidate.candidate_id
+    || candidate.id
+    || `candidate_${attempt || 1}`
+  );
+}
+
+function artifactPathForRun(projectRoot, runId, fileName) {
+  return path.join(projectRoot, ".neo-cast", "artifacts", `run_${runId}`, fileName);
+}
+
+function registerRecipeLineage(projectRoot, candidate, candidatePath, options = {}) {
+  const taskId = taskIdFromContext(options.taskContext);
+  return registerVersion(projectRoot, {
+    kind: "recipe",
+    logicalId: candidateVersionId(candidate, options.attempt),
+    artifactPath: candidatePath,
+    payload: candidate,
+    parentRefs: latestResearchParentRefs(projectRoot, taskId),
+    metadata: {
+      attempt: options.attempt || null,
+      candidate_source: options.source || null,
+      candidate_id: candidate.candidate_id || null,
+      recipe_id: candidate.recipe_id || null,
+      model_family: candidate.model_family || describeCandidateFamily(candidate),
+      user_correction_count: Array.isArray(options.taskContext?.user_corrections)
+        ? options.taskContext.user_corrections.length
+        : 0,
+    },
+  });
+}
+
+function registerExperimentLineage(projectRoot, row, options = {}) {
+  if (!row || !row.run_id) {
+    return null;
+  }
+  return registerVersion(projectRoot, {
+    kind: "experiment",
+    logicalId: row.run_id,
+    artifactPath: artifactPathForRun(projectRoot, row.run_id, "metadata.json"),
+    parentRefs: options.parentRefs || [],
+    metadata: {
+      session_id: row.session_id || null,
+      candidate_id: row.candidate_id || null,
+      model_family: row.model_family || null,
+      status: row.status || null,
+      is_best: row.is_best || null,
+      val_avg_mse: row.val_avg_mse || null,
+      val_h96_mse: row.val_h96_mse || null,
+      val_h720_mse: row.val_h720_mse || null,
+    },
+  });
+}
+
+function registerReleaseLineage(projectRoot, row, options = {}) {
+  if (!row || !row.run_id) {
+    return null;
+  }
+  return registerVersion(projectRoot, {
+    kind: "release",
+    logicalId: row.run_id,
+    artifactPath: artifactPathForRun(projectRoot, row.run_id, "eval_report.md"),
+    parentRefs: options.parentRefs || [],
+    metadata: {
+      release_type: options.releaseType || "eval_report",
+      session_id: row.session_id || null,
+      candidate_id: row.candidate_id || null,
+      status: row.status || null,
+      is_best: row.is_best || null,
+    },
+  });
 }
 
 async function runPythonScript(args, options = {}) {
@@ -228,7 +351,7 @@ function handleValidate(positionals, rawFlags) {
   }
 
   if (!kind || !payloadPath) {
-    console.error("Usage: neo-cast validate <candidate|recipe|dataset|metadata> <payload.json> [--schema /path/to/schema.json]");
+    console.error("Usage: neo-cast validate <candidate|recipe|dataset|metadata|task-spec|research-trace|user-corrections> <payload.json> [--schema /path/to/schema.json]");
     return 1;
   }
 
@@ -269,6 +392,20 @@ async function handleRunner(positionals, rawFlags) {
     const trainLabel = "TRN";
     const startText = `${statusPrefix}:${trainLabel}`;
     const pulse = startCompanionPulse(startText, { frames: ["|", "/", "-", "\\"] });
+    const paths = getProjectPaths(projectRoot);
+    let recipeVersion = null;
+    if (fs.existsSync(paths.currentCandidatePath)) {
+      try {
+        const candidate = loadJsonFile(paths.currentCandidatePath);
+        recipeVersion = registerRecipeLineage(projectRoot, candidate, paths.currentCandidatePath, {
+          source: "runner",
+          taskContext: loadDesignTaskContext(projectRoot),
+        });
+        console.log(`recipe_version=${recipeVersion.version_id}`);
+      } catch (error) {
+        console.error(`[neo-cast] failed to register recipe version: ${error.message}`);
+      }
+    }
     let exitCode = 1;
     try {
       exitCode = await runPythonScript(args, {
@@ -285,13 +422,40 @@ async function handleRunner(positionals, rawFlags) {
         ? `${statusPrefix}:${trainLabel}${completeLabel}`
         : `${statusPrefix}:${trainLabel}${abortedLabel}`);
     }
+    if (exitCode <= 1) {
+      const latestRow = getLatestSessionRow(projectRoot);
+      if (latestRow && latestRow.run_id) {
+        const experimentVersion = registerExperimentLineage(projectRoot, latestRow, {
+          parentRefs: [recipeVersion].filter(Boolean),
+        });
+        const releaseVersion = registerReleaseLineage(projectRoot, latestRow, {
+          parentRefs: [experimentVersion].filter(Boolean),
+        });
+        console.log(`experiment_version=${experimentVersion.version_id}`);
+        console.log(`release_version=${releaseVersion.version_id}`);
+      }
+    }
     return exitCode;
   }
   if ((subcommand === "ref-test" || subcommand === "blind-test") && rawFlags["run-id"] && rawFlags["run-id"] !== true) {
     args.push("--run-id", rawFlags["run-id"]);
   }
 
-  return runPythonScript(args, { projectRoot });
+  const exitCode = await runPythonScript(args, { projectRoot });
+  if (exitCode === 0 && (subcommand === "ref-test" || subcommand === "blind-test")) {
+    const targetRunId = rawFlags["run-id"] && rawFlags["run-id"] !== true
+      ? String(rawFlags["run-id"])
+      : getBestSessionRow(projectRoot)?.run_id;
+    if (targetRunId) {
+      const experimentRef = getLatestVersionRef(projectRoot, "experiment", targetRunId);
+      const releaseVersion = registerReleaseLineage(projectRoot, { run_id: targetRunId }, {
+        releaseType: subcommand,
+        parentRefs: [experimentRef].filter(Boolean),
+      });
+      console.log(`release_version=${releaseVersion.version_id}`);
+    }
+  }
+  return exitCode;
 }
 
 function handleConfigInit() {
@@ -327,7 +491,7 @@ function handleInitRuntime(rawFlags) {
   return exitCode;
 }
 
-function handlePrepareData(rawFlags) {
+async function handlePrepareData(rawFlags) {
   const projectRoot = process.cwd();
   const source = rawFlags.source || rawFlags["source-csv"];
   if (!source || source === true) {
@@ -366,7 +530,287 @@ function handlePrepareData(rawFlags) {
   if (rawFlags["reject-irregular"]) {
     args.push("--reject-irregular");
   }
-  return runPythonScript(args, { projectRoot });
+  const exitCode = await runPythonScript(args, { projectRoot });
+  if (exitCode === 0) {
+    const datasetPath = path.join(projectRoot, ".neo-cast", "dataset_spec.json");
+    if (fs.existsSync(datasetPath)) {
+      const datasetSpec = loadJsonFile(datasetPath);
+      const dataVersion = registerVersion(projectRoot, {
+        kind: "data",
+        logicalId: datasetSpec.task_id || rawFlags["task-id"] || "dataset",
+        artifactPath: datasetPath,
+        payload: datasetSpec,
+        parentRefs: [getLatestVersionRef(projectRoot, "task", datasetSpec.task_id)].filter(Boolean),
+        metadata: {
+          schema_version: datasetSpec.schema_version,
+          source_csv: path.resolve(String(source)),
+          split_strategy: datasetSpec.split_strategy || null,
+          horizons: datasetSpec.horizons || null,
+          input_len: datasetSpec.input_len || null,
+        },
+      });
+      console.log(`data_version=${dataVersion.version_id}`);
+    }
+  }
+  return exitCode;
+}
+
+function parseCsvList(raw, name) {
+  if (raw === undefined || raw === null || raw === true) {
+    return undefined;
+  }
+  const items = String(raw).split(",").map((item) => item.trim()).filter(Boolean);
+  if (items.length === 0) {
+    throw new Error(`${name} must contain at least one value`);
+  }
+  return items;
+}
+
+function buildTaskSpecOverrides(rawFlags) {
+  const overrides = {};
+  const scalarFlags = [
+    ["task-id", "task_id"],
+    ["task-type", "task_type"],
+    ["domain", "domain"],
+    ["target-column", "target_column"],
+    ["time-column", "time_column"],
+    ["frequency", "frequency"],
+    ["history-window", "history_window"],
+    ["prediction-horizon", "prediction_horizon"],
+    ["interaction-mode", "interaction_mode"],
+  ];
+  for (const [flagName, fieldName] of scalarFlags) {
+    if (rawFlags[flagName] && rawFlags[flagName] !== true) {
+      overrides[fieldName] = rawFlags[flagName];
+    }
+  }
+  const metrics = parseCsvList(rawFlags.metrics, "metrics");
+  if (metrics) {
+    overrides.metrics = metrics;
+  }
+  const predictionHorizons = parseCsvList(rawFlags["prediction-horizons"], "prediction-horizons");
+  if (predictionHorizons) {
+    overrides.prediction_horizons = predictionHorizons.map((item) => Number(item));
+  }
+
+  const constraints = {};
+  if (rawFlags["max-model-params"] && rawFlags["max-model-params"] !== true) {
+    constraints.max_model_params = rawFlags["max-model-params"];
+  }
+  if (rawFlags["max-training-hours"] && rawFlags["max-training-hours"] !== true) {
+    constraints.max_training_hours = Number(rawFlags["max-training-hours"]);
+  }
+  if (rawFlags["prefer-lightweight-model"]) {
+    constraints.prefer_lightweight_model = true;
+  }
+  if (Object.keys(constraints).length > 0) {
+    overrides.constraints = constraints;
+  }
+
+  const output = {};
+  const outputFlags = [
+    ["report", "report"],
+    ["model-code", "model_code"],
+    ["checkpoint", "checkpoint"],
+    ["inference-api", "inference_api"],
+  ];
+  for (const [flagName, fieldName] of outputFlags) {
+    if (rawFlags[flagName]) {
+      output[fieldName] = true;
+    }
+  }
+  if (Object.keys(output).length > 0) {
+    overrides.output = output;
+  }
+  return overrides;
+}
+
+function buildManualTaskSpecPayload(rawFlags, overrides) {
+  return normalizeTaskSpec({
+    schema_version: "task_spec.v1",
+    task_id: overrides.task_id || "tsf_task",
+    task_type: overrides.task_type || "time_series_forecasting",
+    domain: overrides.domain,
+    target_column: overrides.target_column,
+    time_column: overrides.time_column,
+    frequency: overrides.frequency,
+    history_window: overrides.history_window,
+    prediction_horizon: overrides.prediction_horizon,
+    prediction_horizons: overrides.prediction_horizons,
+    metrics: overrides.metrics || parseCsvList(rawFlags.metrics, "metrics"),
+    constraints: overrides.constraints || {},
+    output: overrides.output || {},
+    interaction_mode: overrides.interaction_mode,
+  });
+}
+
+function handleTaskSpec(positionals, rawFlags) {
+  const [, subcommand, payloadPath] = positionals;
+  const projectRoot = process.cwd();
+
+  if (!subcommand || !["init", "validate"].includes(subcommand)) {
+    console.error("Usage: neo-cast task-spec <init|validate> [flags]");
+    return 1;
+  }
+
+  try {
+    if (subcommand === "init") {
+      const overrides = buildTaskSpecOverrides(rawFlags);
+      const explicitDatasetPath = rawFlags["from-dataset"] && rawFlags["from-dataset"] !== true
+        ? path.resolve(rawFlags["from-dataset"])
+        : null;
+      const defaultDatasetPath = path.join(projectRoot, ".neo-cast", "dataset_spec.json");
+      const datasetPath = explicitDatasetPath || (fs.existsSync(defaultDatasetPath) ? defaultDatasetPath : null);
+      const spec = datasetPath
+        ? buildTaskSpecFromDatasetSpec(loadJsonFile(datasetPath), overrides)
+        : buildManualTaskSpecPayload(rawFlags, overrides);
+      const outputPath = rawFlags.output && rawFlags.output !== true
+        ? path.resolve(rawFlags.output)
+        : defaultTaskSpecPath(projectRoot);
+      const writtenPath = writeTaskSpec(spec, outputPath, {
+        projectRoot,
+        force: Boolean(rawFlags.force),
+      });
+      const taskVersion = registerVersion(projectRoot, {
+        kind: "task",
+        logicalId: spec.task_id,
+        artifactPath: writtenPath,
+        payload: spec,
+        metadata: {
+          schema_version: spec.schema_version,
+          task_type: spec.task_type,
+          target_column: spec.target_column,
+          prediction_horizons: spec.prediction_horizons,
+        },
+      });
+      console.log(`task_spec_path=${writtenPath}`);
+      console.log(`task_id=${spec.task_id}`);
+      console.log(`task_version=${taskVersion.version_id}`);
+      return 0;
+    }
+
+    const selectedPath = payloadPath
+      ? path.resolve(payloadPath)
+      : defaultTaskSpecPath(projectRoot);
+    const spec = normalizeTaskSpec(loadJsonFile(selectedPath));
+    console.log("validation_status: valid");
+    console.log("schema_kind: task-spec");
+    console.log(`task_id: ${spec.task_id}`);
+    console.log(`payload_path: ${selectedPath}`);
+    return 0;
+  } catch (error) {
+    console.error(error.message);
+    return 1;
+  }
+}
+
+function printCheckpointStatus(state) {
+  console.log(`approval_schema=${state.schema_version}`);
+  console.log(`current_stage=${state.current_stage}`);
+  for (const [stage, checkpoint] of Object.entries(state.checkpoints || {})) {
+    console.log(`${stage}=${checkpoint.status}`);
+  }
+}
+
+function handleCheckpoint(positionals, rawFlags) {
+  const [, subcommand, stage] = positionals;
+  const projectRoot = process.cwd();
+  try {
+    if (!subcommand || subcommand === "status") {
+      printCheckpointStatus(loadApprovalState(projectRoot));
+      return 0;
+    }
+    if (subcommand === "request") {
+      if (!stage) {
+        console.error("Usage: neo-cast checkpoint request <stage> --subject .neo-cast/current_candidate.json [--summary ...]");
+        return 1;
+      }
+      const checkpoint = requestCheckpoint({
+        projectRoot,
+        stage,
+        subjectPath: rawFlags.subject && rawFlags.subject !== true ? rawFlags.subject : null,
+        summary: rawFlags.summary && rawFlags.summary !== true ? String(rawFlags.summary) : "",
+        requestedBy: rawFlags.by && rawFlags.by !== true ? String(rawFlags.by) : "Runtime",
+      });
+      console.log(`checkpoint_stage=${checkpoint.stage}`);
+      console.log(`checkpoint_status=${checkpoint.status}`);
+      console.log(`checkpoint_id=${checkpoint.checkpoint_id}`);
+      return 0;
+    }
+    if (subcommand === "approve" || subcommand === "reject") {
+      if (!stage) {
+        console.error(`Usage: neo-cast checkpoint ${subcommand} <stage> [--note ...] [--by user]`);
+        return 1;
+      }
+      const checkpoint = updateCheckpointStatus({
+        projectRoot,
+        stage,
+        status: subcommand === "approve" ? "approved" : "rejected",
+        note: rawFlags.note && rawFlags.note !== true ? String(rawFlags.note) : "",
+        by: rawFlags.by && rawFlags.by !== true ? String(rawFlags.by) : "user",
+      });
+      console.log(`checkpoint_stage=${checkpoint.stage}`);
+      console.log(`checkpoint_status=${checkpoint.status}`);
+      console.log(`checkpoint_id=${checkpoint.checkpoint_id}`);
+      return 0;
+    }
+  } catch (error) {
+    console.error(error.message);
+    return 1;
+  }
+  console.error("Usage: neo-cast checkpoint <status|request|approve|reject> [stage]");
+  return 1;
+}
+
+function handleCorrection(positionals, rawFlags) {
+  const [, subcommand] = positionals;
+  const projectRoot = process.cwd();
+
+  try {
+    if (subcommand === "add") {
+      const correctionText = rawFlags.correction && rawFlags.correction !== true
+        ? String(rawFlags.correction)
+        : null;
+      if (!correctionText || correctionText.trim().length === 0) {
+        console.error("--correction is required");
+        return 1;
+      }
+      const { correction, memoryPath } = addUserCorrection(projectRoot, {
+        scope: rawFlags.scope && rawFlags.scope !== true ? String(rawFlags.scope) : "general",
+        field: rawFlags.field && rawFlags.field !== true ? String(rawFlags.field) : null,
+        correction: correctionText,
+        applies_to: rawFlags["applies-to"] && rawFlags["applies-to"] !== true ? String(rawFlags["applies-to"]) : null,
+        created_by: rawFlags.by && rawFlags.by !== true ? String(rawFlags.by) : "user",
+      });
+      console.log(`correction_id=${correction.correction_id}`);
+      console.log(`correction_status=${correction.status}`);
+      console.log(`correction_scope=${correction.scope}`);
+      if (correction.field) {
+        console.log(`correction_field=${correction.field}`);
+      }
+      console.log(`correction_memory_path=${memoryPath}`);
+      return 0;
+    }
+
+    if (!subcommand || subcommand === "list") {
+      const showAll = Boolean(rawFlags.all);
+      const corrections = loadUserCorrections(projectRoot, { status: showAll ? "all" : "active" });
+      console.log(`correction_memory_path=${defaultCorrectionMemoryPath(projectRoot)}`);
+      console.log(`correction_count=${corrections.length}`);
+      for (const item of corrections) {
+        const field = item.field ? ` field=${item.field}` : "";
+        const appliesTo = item.applies_to ? ` applies_to=${item.applies_to}` : "";
+        console.log(`${item.correction_id} [${item.status}] ${item.scope}${field}${appliesTo}: ${item.correction}`);
+      }
+      return 0;
+    }
+  } catch (error) {
+    console.error(error.message);
+    return 1;
+  }
+
+  console.error("Usage: neo-cast correction <add|list> [--correction ...] [--field column] [--scope data_schema]");
+  return 1;
 }
 
 async function handleDesign(positionals, rawFlags) {
@@ -422,7 +866,7 @@ async function handleDesign(positionals, rawFlags) {
   printRequirementSummary(mode, requirementBundle.summary);
 
   let history = loadResults(projectRoot);
-  const taskContext = loadPreparedDatasetSpec(projectRoot);
+  const taskContext = loadDesignTaskContext(projectRoot);
 
   if (isAutonomous) {
     const { parseTimeBudget, runAutonomousLoop } = require("./loop");
@@ -449,6 +893,15 @@ async function handleDesign(positionals, rawFlags) {
       printCompanionFinalSummary(bestRow);
     } else {
       printFinalSummary(bestRow);
+    }
+    if (bestRow && bestRow.run_id) {
+      const experimentRef = getLatestVersionRef(projectRoot, "experiment", bestRow.run_id)
+        || registerExperimentLineage(projectRoot, bestRow);
+      const releaseRef = getLatestVersionRef(projectRoot, "release", bestRow.run_id)
+        || registerReleaseLineage(projectRoot, bestRow, {
+          parentRefs: [experimentRef].filter(Boolean),
+        });
+      console.log(`release_version=${releaseRef.version_id}`);
     }
     console.log(`results_path=${paths.resultsPath}`);
     return 0;
@@ -569,6 +1022,30 @@ async function handleDesign(positionals, rawFlags) {
     console.log(`${roundLabelPrefix}:PATH=${candidatePath}`);
     console.log(`${roundLabelPrefix}:FAM=${describeCandidateFamily(candidate)}`);
     console.log(`${roundLabelPrefix}:ID=${describeCandidateId(candidate)}`);
+    console.log(`design_attempt=${attempt}`);
+    console.log(`candidate_source=${result.source}`);
+    const recipeVersion = registerRecipeLineage(projectRoot, candidate, candidatePath, {
+      attempt,
+      source: result.source,
+      taskContext,
+    });
+    console.log(`recipe_version=${recipeVersion.version_id}`);
+
+    if (rawFlags["require-approval"]) {
+      const checkpoint = requestCheckpoint({
+        projectRoot,
+        stage: "model_design",
+        subjectPath: candidatePath,
+        summary: candidate.hypothesis || describeCandidateFamily(candidate),
+        requestedBy: "ModelDesigner Agent",
+      });
+      console.log(`checkpoint_stage=${checkpoint.stage}`);
+      console.log(`checkpoint_status=${checkpoint.status}`);
+      console.log(`checkpoint_id=${checkpoint.checkpoint_id}`);
+      console.log("checkpoint_approve_command=neo-cast checkpoint approve model_design");
+      console.log(`checkpoint_resume_command=neo-cast runner run --description ${JSON.stringify(candidate.hypothesis || describeCandidateFamily(candidate))}`);
+      return 2;
+    }
 
     const description = candidate.hypothesis || `${candidate.model_family} attempt ${attempt}`;
     const pulse = startCompanionPulse(formatPulseLabel(labels.training), { frames: ["|", "/", "-", "\\"] });
@@ -594,6 +1071,16 @@ async function handleDesign(positionals, rawFlags) {
     }
     history = loadResults(projectRoot);
     previousRow = getLatestSessionRow(projectRoot);
+    if (previousRow && previousRow.run_id) {
+      const experimentVersion = registerExperimentLineage(projectRoot, previousRow, {
+        parentRefs: [recipeVersion],
+      });
+      const releaseVersion = registerReleaseLineage(projectRoot, previousRow, {
+        parentRefs: [experimentVersion],
+      });
+      console.log(`experiment_version=${experimentVersion.version_id}`);
+      console.log(`release_version=${releaseVersion.version_id}`);
+    }
 
     if (mode === "companion") {
       printCompanionResult(previousRow, attempt);
@@ -612,10 +1099,14 @@ async function handleDesign(positionals, rawFlags) {
   stopWatcher(); // close stdin watcher if open
 
   const paths = getProjectPaths(projectRoot);
+  const bestRow = getBestSessionRow(projectRoot);
   if (mode === "companion") {
-    printCompanionFinalSummary(getBestSessionRow(projectRoot));
+    printCompanionFinalSummary(bestRow);
   } else {
-    printFinalSummary(getBestSessionRow(projectRoot));
+    printFinalSummary(bestRow);
+  }
+  if (bestRow && bestRow.run_id) {
+    console.log(`design_best_run_id=${bestRow.run_id}`);
   }
   console.log(`results_path=${paths.resultsPath}`);
   return hadHardFailure ? lastExitCode : 0;
@@ -645,6 +1136,15 @@ async function runCli(argv = process.argv.slice(2)) {
   if (command === "init-runtime") {
     return handleInitRuntime(flags);
   }
+  if (command === "task-spec") {
+    return handleTaskSpec(positionals, flags);
+  }
+  if (command === "checkpoint") {
+    return handleCheckpoint(positionals, flags);
+  }
+  if (command === "correction") {
+    return handleCorrection(positionals, flags);
+  }
   if (command === "prepare-data") {
     return handlePrepareData(flags);
   }
@@ -670,11 +1170,14 @@ module.exports = {
   getPackageVersion,
   handleConfigInit,
   handleConfigShow,
+  handleCheckpoint,
+  handleCorrection,
   handleDesign,
   handleDoctor,
   handleInitRuntime,
   handlePrepareData,
   handleRunner,
+  handleTaskSpec,
   handleValidate,
   parseArgs,
   printHelp,

@@ -12,9 +12,13 @@ function loadCliWithStubs(state = {}) {
   const originalLoad = Module._load;
   const runDescriptions = [];
   const generatedAttempts = [];
+  const generatedTaskContexts = [];
   const reflectedAttempts = [];
+  const reflectedTaskContexts = [];
   const mutationAttempts = [];
   const autonomousOptions = [];
+  const checkpointRequests = [];
+  const versionCalls = [];
   const logs = [];
 
   const stubs = {
@@ -23,6 +27,20 @@ function loadCliWithStubs(state = {}) {
       ensureUserConfigFile: () => "",
       resolveConfig: () => ({ resolved: {}, validationErrors: [] }),
     },
+    "./checkpoint": {
+      requestCheckpoint: (options) => {
+        checkpointRequests.push(options);
+        return {
+          checkpoint_id: "checkpoint_model_design_001",
+          stage: options.stage,
+          status: "pending",
+          subject_hash: "abc123",
+        };
+      },
+    },
+    "./corrections": {
+      loadUserCorrections: () => state.userCorrections || [],
+    },
     "./doctor": {
       formatDoctorReport: () => "",
       runDoctor: () => ({ ok: true }),
@@ -30,6 +48,7 @@ function loadCliWithStubs(state = {}) {
     "./llm": {
       generateCandidate: async (_requirement, _history, _config, options) => {
         generatedAttempts.push(options.attempt);
+        generatedTaskContexts.push(options.taskContext);
         return {
           source: "mock",
           candidate: {
@@ -72,6 +91,21 @@ function loadCliWithStubs(state = {}) {
       getBestSessionRow: () => ({ run_id: "run_1" }),
       getLatestSessionRow: () => ({ run_id: `run_${runDescriptions.length}` }),
     },
+    "./versioning": {
+      getLatestVersionRef: (_projectRoot, kind) => ({
+        kind,
+        logical_id: `latest_${kind}`,
+        version_id: `${kind}_latest_v1`,
+      }),
+      registerVersion: (_projectRoot, options) => {
+        versionCalls.push(options);
+        return {
+          kind: options.kind,
+          logical_id: options.logicalId,
+          version_id: `${options.kind}_${options.logicalId}_v1`,
+        };
+      },
+    },
     "./python-bridge": {
       ensureRunnerInitialized: async () => {},
       getProjectPaths: () => ({ resultsPath: "/tmp/results.tsv" }),
@@ -91,6 +125,7 @@ function loadCliWithStubs(state = {}) {
     "./reflect": {
       reflectAndPropose: async (_requirement, _history, _previousRow, _config, options) => {
         reflectedAttempts.push(options.attempt);
+        reflectedTaskContexts.push(options.taskContext);
         if (Object.prototype.hasOwnProperty.call(state, "reflectionResult")) return state.reflectionResult;
         return {
           source: "llm_reflection",
@@ -127,16 +162,20 @@ function loadCliWithStubs(state = {}) {
   return {
     cli,
     generatedAttempts,
+    generatedTaskContexts,
     autonomousOptions,
+    checkpointRequests,
     logs,
     mutationAttempts,
     reflectedAttempts,
+    reflectedTaskContexts,
     restore() {
       console.log = originalLog;
       Module._load = originalLoad;
       delete require.cache[CLI_PATH];
     },
     runDescriptions,
+    versionCalls,
   };
 }
 
@@ -158,6 +197,47 @@ test("design honors max-candidates by default after a kept candidate", async () 
     assert.equal(exitCode, 0);
     assert.deepEqual(harness.generatedAttempts, [1, 2, 3]);
     assert.equal(harness.logs.filter((line) => line.startsWith("design_attempt=")).length, 3);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("design injects user corrections into model design task context", async () => {
+  const harness = loadCliWithStubs({
+    userCorrections: [
+      {
+        schema_version: "user_correction.v1",
+        scope: "data_schema",
+        field: "temperature_forecast",
+        correction: "available only at prediction time",
+        status: "active",
+      },
+    ],
+  });
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "respect user feedback memory",
+      "--mode",
+      "companion",
+      "--max-candidates",
+      "1",
+      "--mock-llm",
+      "--skip-smoke",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.equal(harness.generatedTaskContexts.length, 1);
+    assert.deepEqual(harness.generatedTaskContexts[0].user_corrections, [
+      {
+        schema_version: "user_correction.v1",
+        scope: "data_schema",
+        field: "temperature_forecast",
+        correction: "available only at prediction time",
+        status: "active",
+      },
+    ]);
   } finally {
     harness.restore();
   }
@@ -247,6 +327,36 @@ test("design uses reflection after the first attempt when requested", async () =
   }
 });
 
+test("design records recipe, experiment, and release versions for lineage", async () => {
+  const harness = loadCliWithStubs();
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "version this candidate",
+      "--mode",
+      "companion",
+      "--max-candidates",
+      "1",
+      "--mock-llm",
+      "--skip-smoke",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(harness.versionCalls.map((call) => call.kind), [
+      "recipe",
+      "experiment",
+      "release",
+    ]);
+    assert.equal(harness.versionCalls[0].logicalId, "candidate_1");
+    assert.equal(harness.versionCalls[1].logicalId, "run_1");
+    assert.equal(harness.versionCalls[2].logicalId, "run_1");
+    assert.match(harness.logs.join("\n"), /recipe_version=recipe_candidate_1_v/);
+  } finally {
+    harness.restore();
+  }
+});
+
 test("design falls back from reflection to mutation when both flags are set", async () => {
   const harness = loadCliWithStubs({
     reflectionResult: null,
@@ -276,6 +386,34 @@ test("design falls back from reflection to mutation when both flags are set", as
     assert.deepEqual(harness.reflectedAttempts, [2]);
     assert.deepEqual(harness.mutationAttempts, [1]);
     assert.match(harness.logs.join("\n"), /candidate_source=mutation_policy/);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("design can pause at a model-design checkpoint before training", async () => {
+  const harness = loadCliWithStubs();
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "approval-gated candidate",
+      "--mode",
+      "companion",
+      "--max-candidates",
+      "1",
+      "--mock-llm",
+      "--skip-smoke",
+      "--require-approval",
+    ]);
+
+    assert.equal(exitCode, 2);
+    assert.deepEqual(harness.generatedAttempts, [1]);
+    assert.equal(harness.runDescriptions.length, 0);
+    assert.equal(harness.checkpointRequests.length, 1);
+    assert.equal(harness.checkpointRequests[0].stage, "model_design");
+    assert.match(harness.logs.join("\n"), /checkpoint_status=pending/);
+    assert.match(harness.logs.join("\n"), /checkpoint_approve_command=neo-cast checkpoint approve model_design/);
   } finally {
     harness.restore();
   }

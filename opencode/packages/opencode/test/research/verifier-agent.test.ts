@@ -214,7 +214,7 @@ test("runVerifiers returns accepted=true when all checks pass", () => {
   }))
   expect(report.accepted).toBe(true)
   expect(report.rejectReason).toBeUndefined()
-  expect(report.results).toHaveLength(5)
+  expect(report.results).toHaveLength(6)
 })
 
 test("buildEvaluationResultMarkdown renders verdict and verifier sections", () => {
@@ -275,4 +275,143 @@ test("buildVerifierDecisionRecord emits a standardized decision artifact", () =>
       }),
     ]),
   )
+})
+
+// --- data_leakage_verifier ---
+
+test("data_leakage_verifier passes a clean run", () => {
+  const report = runVerifiers(ctx({
+    run: run({
+      id: "r_clean",
+      status: "succeeded",
+      metrics: {
+        val_avg_mse: 0.35,
+        val_h96_mse: 0.28,
+        val_h192_mse: 0.33,
+        val_h336_mse: 0.38,
+        val_h720_mse: 0.44,
+        train_avg_mse: 0.22,
+      },
+      resourceUsage: {},
+    }),
+    task: task(),
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(true)
+  expect(result.evidence).toMatchObject({ valAvgMse: 0.35 })
+})
+
+test("data_leakage_verifier skips non-succeeded runs", () => {
+  const report = runVerifiers(ctx({
+    run: run({ id: "r_fail", status: "failed", metrics: {} }),
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(true)
+  expect(result.evidence).toMatchObject({ skipped: true })
+})
+
+test("data_leakage_verifier rejects non-fixed-split protocol", () => {
+  const report = runVerifiers(ctx({
+    task: {
+      ...task(),
+      taskSpec: { evaluation: { protocol: "rolling_window" } },
+    } as unknown as typeof task extends () => infer T ? T : never,
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(false)
+  expect(result.reason).toContain("rolling_window")
+})
+
+test("data_leakage_verifier rejects when max_horizon >= context_length", () => {
+  const report = runVerifiers(ctx({
+    run: run({ id: "r_ctx", status: "succeeded", metrics: { val_avg_mse: 0.4 } }),
+    task: {
+      ...task(),
+      taskSpec: { contextLength: 96, predictionLengths: [96, 192] },
+    } as unknown as typeof task extends () => infer T ? T : never,
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(false)
+  expect(result.reason).toContain("192")
+  expect(result.reason).toContain("96")
+})
+
+test("data_leakage_verifier rejects suspiciously low val/train ratio", () => {
+  const report = runVerifiers(ctx({
+    run: run({
+      id: "r_ratio",
+      status: "succeeded",
+      metrics: {
+        val_avg_mse: 0.05,
+        train_avg_mse: 0.50,
+        val_h96_mse: 0.05,
+        val_h192_mse: 0.06,
+        val_h336_mse: 0.07,
+        val_h720_mse: 0.08,
+      },
+    }),
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(false)
+  expect(result.reason).toContain("Val/train")
+})
+
+test("data_leakage_verifier rejects horizon MSE strong inversion", () => {
+  const report = runVerifiers(ctx({
+    run: run({
+      id: "r_inv",
+      status: "succeeded",
+      metrics: {
+        val_avg_mse: 0.35,
+        val_h96_mse: 0.80,
+        val_h192_mse: 0.60,
+        val_h336_mse: 0.20,
+        val_h720_mse: 0.10,
+      },
+    }),
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(false)
+  expect(result.reason).toContain("inversion")
+})
+
+test("data_leakage_verifier rejects horizon MSE collapse", () => {
+  const val = 0.342_100
+  const report = runVerifiers(ctx({
+    run: run({
+      id: "r_collapse",
+      status: "succeeded",
+      metrics: {
+        val_avg_mse: val,
+        val_h96_mse: val,
+        val_h192_mse: val,
+        val_h336_mse: val,
+        val_h720_mse: val,
+      },
+    }),
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(false)
+  expect(result.reason).toContain("collapse")
+})
+
+test("data_leakage_verifier decision record maps to audit_split_boundaries", () => {
+  const report = runVerifiers(ctx({
+    run: run({
+      id: "r_leak",
+      status: "succeeded",
+      metrics: {
+        val_avg_mse: 0.05,
+        train_avg_mse: 0.50,
+      },
+    }),
+  }))
+  const record = buildVerifierDecisionRecord({
+    task: task(),
+    run: run({ id: "r_leak", status: "succeeded", metrics: { val_avg_mse: 0.05, train_avg_mse: 0.50 } }),
+    candidate: candidate(),
+    report,
+  })
+  expect(record.failure?.category).toBe("data_leakage")
+  expect(record.failure?.recoveryAction.type).toBe("audit_split_boundaries")
 })

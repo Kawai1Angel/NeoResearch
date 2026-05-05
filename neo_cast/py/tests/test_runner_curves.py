@@ -108,6 +108,60 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
         self.assertEqual(rows[-1]["candidate_id"], "smoke_1")
         self.assertEqual(rows[-1]["model_family"], "unknown")
 
+    def test_run_experiment_blocks_when_model_design_checkpoint_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".neo-cast"
+            artifacts_dir = state_dir / "artifacts"
+            state_dir.mkdir(parents=True)
+            current_path = state_dir / "current_candidate.json"
+            state_path = state_dir / "runner_state.json"
+            results_path = state_dir / "results.tsv"
+            approval_path = state_dir / "approval_state.json"
+            current_path.write_text('{"recipe_id":"recipe_gate_001"}\n', encoding="utf-8")
+            approval_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "approval_state.v1",
+                        "current_stage": "model_design_pending_approval",
+                        "checkpoints": {
+                            "model_design": {
+                                "stage": "model_design",
+                                "status": "pending",
+                                "subject_hash": runner._file_sha256(current_path),
+                            }
+                        },
+                        "history": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = runner.RunnerState(
+                session_id="session_test",
+                best_run_id=None,
+                best_val_avg_mse=None,
+                keep_count=0,
+                crash_streak=0,
+                candidate_counter=0,
+                initialized_at="2026-04-29T00:00:00Z",
+                session_started_at="2026-04-29T00:00:00Z",
+            )
+
+            with (
+                patch.object(runner, "STATE_DIR", state_dir),
+                patch.object(runner, "ARTIFACTS_DIR", artifacts_dir),
+                patch.object(runner, "CURRENT_CANDIDATE_PATH", current_path),
+                patch.object(runner, "STATE_PATH", state_path),
+                patch.object(runner, "RESULTS_PATH", results_path),
+                patch.object(runner, "APPROVAL_STATE_PATH", approval_path),
+                patch.object(runner, "_resolve_candidate") as resolve_candidate,
+            ):
+                runner.ensure_results_file(force=True)
+                exit_code = runner.run_experiment(state, description="gated candidate", skip_smoke=True)
+
+        self.assertEqual(exit_code, 5)
+        resolve_candidate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ export type VerifierName =
   | "cost_perf_verifier"
   | "horizon_verifier"
   | "overfitting_verifier"
+  | "data_leakage_verifier"
 
 export interface VerifierResult {
   readonly name: VerifierName

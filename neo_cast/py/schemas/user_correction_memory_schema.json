@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neo-cast.local/schemas/user_correction_memory_schema.json",
+  "title": "UserCorrectionMemory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "user_corrections"],
+  "properties": {
+    "schema_version": {
+      "const": "user_correction_memory.v1"
+    },
+    "user_corrections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/userCorrection"
+      }
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "userCorrection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "correction_id",
+        "scope",
+        "field",
+        "correction",
+        "applies_to",
+        "status",
+        "created_by",
+        "created_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "user_correction.v1"
+        },
+        "correction_id": {
+          "type": "string",
+          "pattern": "^uc_[A-Za-z0-9_]+$"
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "data_schema",
+            "anomaly",
+            "split_policy",
+            "deployment",
+            "metric",
+            "model_constraint",
+            "general"
+          ]
+        },
+        "field": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "correction": {
+          "type": "string",
+          "minLength": 1
+        },
+        "applies_to": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "resolved", "archived"]
+        },
+        "created_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

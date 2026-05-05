@@ -69,6 +69,7 @@ export interface ReflectionAgentResult {
   readonly llm: {
     readonly status: "disabled" | "not_configured" | "used" | "failed"
     readonly model?: string
+    readonly text?: string
     readonly error?: string
   }
 }

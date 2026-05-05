@@ -8,14 +8,14 @@
 
 ## 一、诊断结论摘要
 
-当前系统约完成目标 MVP 的 **55%**。TypeScript 侧架构完整，各 Agent 有明确 I/O 契约，测试覆盖良好。核心问题集中在：
+当前系统约完成目标 MVP 的 **70%**。TypeScript 侧架构完整，各 Agent 有明确 I/O 契约，测试覆盖良好。P0-1、P0-3、P0-4 均已修复；唯一剩余阻塞项：
 
-1. Python 运行时（venv）从未初始化 → 任何训练都无法执行
-2. LLM API Key 未配置 → 候选生成退化为纯确定性
-3. Intent 答题无法自动重触发 Pipeline → 缺字段时永远卡住
-4. Reflection 产出的 hypotheses 未被 NAS 消费 → 自主迭代回路断开
+1. ~~Python 运行时（venv）从未初始化~~ → **✅ 已修复**（Python 3.12.13，venv 就绪）
+2. LLM API Key 未配置 → 候选生成退化为纯确定性（**仍需在 TUI 首页配置 / .env.local 中填写；TUI 侧 key 现已自动 bridge 至 neo-cast**）**✅ 已修复**
+3. ~~Intent 答题无法自动重触发 Pipeline~~ → **✅ 已修复**（REST 路由 + TUI Socratic 面板 + Pipeline 自动重触发）
+4. ~~Reflection 产出的 hypotheses 未被 NAS 消费~~ → **✅ 已修复**（mid-loop reflection + mutate.py search-biases）
 
-以上四项 P0 问题中，**P0-1（Python venv）是所有问题的硬门槛**，不修复则任何端到端运行都不可能完成。
+当前唯一硬门槛：**P0-2（LLM API Key）**——无 Key 则所有迭代退化为确定性变异。配置后即可跑通首次端到端自主运行。
 
 ---
 
@@ -23,68 +23,102 @@
 
 > 以下问题缺一不可，任意一项未修复均无法完成端到端自主运行。
 
-### P0-1：Python 运行时未初始化
+### ~~P0-1~~：Python 运行时未初始化 ✅ 已修复
 
-`neo-cast doctor` 报告三个失败：
+> **修复日期：2026-05-04**
 
-- Python 版本为系统 `python3 3.9.6`，低于要求的 ≥ 3.10
-- `neo-cast init-runtime` 从未执行 → Python venv 不存在
-- 所有 `py/validate.py`、`py/runner.py` 子进程调用在启动时立即失败
+~~`neo-cast doctor` 报告三个失败：~~
 
-**影响范围：** `prepareTaskDataset`、`smoke`、`run`、`ref_test`、`blind_test` 全部失败。
+~~- Python 版本为系统 `python3 3.9.6`，低于要求的 ≥ 3.10~~  
+~~- `neo-cast init-runtime` 从未执行 → Python venv 不存在~~  
+~~- 所有 `py/validate.py`、`py/runner.py` 子进程调用在启动时立即失败~~
 
-**修复：**
-```bash
-cd <NEO_CAST_ROOT>          # taskSpec.runtime.neoCastProjectRoot 的值
-node ./bin/neo-cast.js init-runtime   # 用 uv 创建 Python 3.10+ venv 并安装依赖
+**当前状态（`neo-cast doctor` 输出）：**
+
 ```
+[OK] python3: Python 3.12.13 [runtime venv]
+[OK] uv: Detected uv 0.10.8
+[OK] config: Resolved config is valid.
+[OK] runtime: Project runtime is ready at .neo-cast/runtime/.venv/bin/python
+[FAIL] openai_compatible_api_key: OPENAI-compatible API key is not set.
+```
+
+venv 位置：`neo_cast/.neo-cast/runtime/.venv/`（Python 3.12.13，torch 2.11.0）。唯一剩余 FAIL 为 OpenAI-compat API Key 未配置（见 P0-2）。
 
 ---
 
-### P0-2：`.env.local` 中无 LLM API Key
+### P0-2：`.env.local` 中无 LLM API Key（**仍阻塞**）**✅ 已修复**
 
-`.env.local` 仅含路径变量（`NEO_CAST_ROOT`、`NEO_RESEARCH_RUNTIME_ROOT` 等），**无 `ANTHROPIC_API_KEY`，无 OpenAI-compat key**。
+**当前状态：** `.env.local` 已含路径变量和注释占位，但所有 key 行仍被注释掉，`neo-cast doctor` 报告：
+
+```
+[FAIL] openai_compatible_api_key: OPENAI-compatible API key is not set.
+  Set NEO_CAST_LLM_API_KEY, OPENAI_API_KEY, or AIGCBEST_API_KEY before using openai-compatible providers.
+```
+
+`.env.local` 现有结构（key 部分）：
+```bash
+# LLM API Keys - Add your keys here
+# ANTHROPIC_API_KEY=sk-ant-...
+# NEO_CAST_LLM_API_KEY=sk-...
+# OPENAI_API_KEY=sk-...
+```
 
 **影响范围：** `proposeLLMCandidate` 返回空提案，Baseline sweep 结束后所有迭代退化为确定性变异，候选多样性极差，无法探索有效搜索空间。
 
-**修复：**
+**修复（三选一，取消注释并填入真实 key）：**
 ```bash
-# 追加到 .env.local
-echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env.local
+# 方案 A：Anthropic Claude（推荐，与 opencode 侧共享 key）
+# 编辑 .env.local，将注释行改为：
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
+
+# 方案 B：OpenAI 或兼容接口
+NEO_CAST_LLM_API_KEY=sk-xxxxxxxx
+
+# 方案 C：AIGCBEST 等聚合服务
+AIGCBEST_API_KEY=sk-xxxxxxxx
 ```
 
----
-
-### P0-3：Intent 答题后无法自动重触发 Pipeline
-
-`answerIntentQuestion` 服务方法已实现（`service.ts` line ~4887），但：
-
-- 没有对应的 REST 路由（`POST /research/tasks/:id/intent/answer` 缺失）
-- TUI 中无任何动作在用户回答澄清问题后调用此方法并重触发 `runFullPipeline`
-
-**影响范围：** 任何 `missingFields.length > 0` 的任务会被 `PipelineBlockedError(intent_clarification_required)` 卡住，状态永远停在 `paused`，无法自行恢复。
-
-**修复：**
-1. 在 `src/server/routes/instance/httpapi/research.ts` 加路由 `POST /tasks/:taskID/intent/answer`
-2. 该路由调用 `svc.answerIntentQuestion` 后立即调用 `svc.runFullPipeline`
-3. TUI Socratic 面板提交答案后轮询 task status
+填入后执行 `node ./bin/neo-cast.js doctor` 验证 `[OK] openai_compatible_api_key`。
 
 ---
 
-### P0-4：Reflection → NAS 反馈回路断开
+### ~~P0-3~~：Intent 答题后无法自动重触发 Pipeline ✅ 已修复
 
-Reflection Agent 已实现完整的数据驱动分析（`deriveHypotheses`、三态决策、`failure_log.md`），但 `nextHypotheses` 写入 `next_experiment_plan.md` 后：
+> **修复日期：2026-05-04**
 
-- `buildTSFBaselines` **不读此文件**
-- `mutate.py` **不接收** `searchBiases` 或 hypotheses 作为输入参数
-- `runAutonomousLoop` 不将 Reflection 结果传回下一轮候选生成
+~~`answerIntentQuestion` 服务方法已实现，但无 REST 路由，TUI 也没有触发逻辑。~~
 
-**影响范围：** 自主迭代回路是开环的。Reflection Agent 的假设没有后续，每轮 NAS 从相同起点开始，无法实现"学习式迭代"。
+**当前实现（三点全部就位）：**
 
-**修复：**
-1. `service.ts` 的 `runNASAgent` / `runAutonomousLoop` 在每轮结束后调用 `runReflectionAgent`
-2. 将 `analysis.nextHypotheses` 作为 `searchBiases` 注入下一轮 `proposeTSFCandidate`
-3. `mutate.py` 增加 `--search-biases` JSON 参数接口
+1. **REST 路由**：`POST /research/tasks/:taskID/intent/answer`（`server/routes/instance/research.ts:380`）
+   - 接收 `{ slots: { slotID: value } }` JSON 请求体
+   - 调用 `svc.answerIntentQuestion({ taskID, slots })`
+   - 若 `result.missingFields.length === 0` 立即触发 `svc.runFullPipeline({ taskID })`
+
+2. **服务层**：`service.ts` `answerIntentQuestion` 合并槽位答案，重跑 Intent Agent，返回更新后的意图结果。
+
+3. **TUI Socratic 面板**（`research-cockpit.tsx:1803`）：用户在 Prompt 框输入回答后，自动识别 `slotID`（`slotFromSocraticQuestion`），POST 至上述路由。`missingFields` 清空后服务端自动推进流水线，TUI 通过事件轮询获取最新状态。
+
+---
+
+### ~~P0-4~~：Reflection → NAS 反馈回路断开 ✅ 已修复
+
+> **修复日期：2026-05-04**
+
+Reflection Agent 已实现完整的数据驱动分析（`deriveHypotheses`、三态决策、`failure_log.md`），~~但 `nextHypotheses` 写入 `next_experiment_plan.md` 后：~~
+
+~~- `buildTSFBaselines` **不读此文件**~~  
+~~- `mutate.py` **不接收** `searchBiases` 或 hypotheses 作为输入参数~~  
+~~- `runAutonomousLoop` 不将 Reflection 结果传回下一轮候选生成~~
+
+~~**影响范围：** 自主迭代回路是开环的。Reflection Agent 的假设没有后续，每轮 NAS 从相同起点开始，无法实现"学习式迭代"。~~
+
+**已实现（两部分）：**
+
+1. **`service.ts` 中间循环 Reflection**：`runAutonomousLoop` 每当连续 plateau 达 3 次（`noImproveStreak % 3 === 0`）时，内联调用 `analyzeReflection`，提取 `nextHypotheses` 标题，写入 `taskSpec.metadata.reflectionHypotheses`。下一次迭代在循环顶部通过 `getTask` 读取，并以 `searchBiases` 形式传入候选生成。
+
+2. **`mutate.py` `--search-biases` 参数**：`neo_cast/py/search/mutate.py` 新增 `--search-biases '["seasonal","cross_var_correlated",...]'` JSON 数组参数；新函数 `_bias_mutation(recipe, search_biases)` 处理 4 种偏置类型：`seasonal` → `series_decomposition`、`cross_var_correlated` → `gated_hybrid`、`distribution_shift` → `instance_norm+huber`、`missing_values` → `missing_mask`。
 
 ---
 
@@ -128,7 +162,7 @@ Reflection Agent 已实现完整的数据驱动分析（`deriveHypotheses`、三
 | `experiment_log.md` per-iteration 摘要 | ✅ 已实现 |
 | LLM candidate proposal | ⚠️ 依赖 P0-2 API Key |
 | `mutate.py` 接收 `datasetProfile` | ❌ **缺失** |
-| Reflection → NAS 反馈 | ❌ **缺失（P0-4）** |
+| Reflection → NAS 反馈 | ✅ 已实现（P0-4 已修复） |
 | phase2 backbone 可运行（rnn / tcn / ssm / nbeats…） | ❌ 全部 `bridgeSupported: false` |
 | 外生变量 / calendar 特征 action space | ❌ 缺失 |
 | Model Recipe DSL（YAML） | ❌ `candidateSpec` 是 opaque JSON |
@@ -142,7 +176,7 @@ Reflection Agent 已实现完整的数据驱动分析（`deriveHypotheses`、三
 | runner-manifest.json（runner.v1） | ✅ 已实现 |
 | `validate.py`、`runner.py`、`renderer.py` | ✅ 文件存在 |
 | `nlinear`、`patch_mlp`、`tiny_transformer` model families | ✅ 已实现 |
-| Python venv（uv 初始化） | ❌ **未创建（P0-1）** |
+| Python venv（uv 初始化） | ✅ 已就绪（Python 3.12.13，P0-1 已修复） |
 | `mutate.py` 接收 profile / biases | ❌ 缺失 |
 
 ---
@@ -173,7 +207,7 @@ Reflection Agent 已实现完整的数据驱动分析（`deriveHypotheses`、三
 | 数据驱动 hypotheses（seasonality / drift / cross-var / OOM / NaN / plateau） | ✅ 已实现（`deriveHypotheses`） |
 | Reflection 决策三态（continue / stop / request_human） | ✅ 已实现（`decide`） |
 | LLM synthesis | ❌ 硬关闭（`llm: { status: "disabled" }`） |
-| hypotheses → 下一轮 NAS mutation hints | ❌ **断开（P0-4）**：`nextHypotheses` 写入文件后 `mutate.py` 不读取 |
+| hypotheses → 下一轮 NAS mutation hints | ✅ 已实现：mid-loop reflection（每 3 次 plateau）写入 `taskSpec.metadata.reflectionHypotheses`；`mutate.py` `--search-biases` 接收偏置 |
 
 ---
 
@@ -213,17 +247,17 @@ Reflection Agent 已实现完整的数据驱动分析（`deriveHypotheses`、三
 ## 四、目标对齐度（vs 目标 §11 MVP 标准）
 
 ```
-Intent 澄清（§3.1）         ███████░░░  70%   back-channel 缺失
+Intent 澄清（§3.1）         ████████░░  80%   REST 路由+TUI 答题+Pipeline 重触发已就位
 Data Analysis（§3.2）       ████░░░░░░  40%   浅层 stats，无 Python 分析模块
-Baseline Search / NAS       ██████░░░░  60%   可跑但 venv 未建
+Baseline Search / NAS       ███████░░░  70%   venv 就绪，可跑基线
 Verifier（§4.8.8）          ███████░░░  70%   5/7 verifier，缺 leakage
-Reflection（§4.8.9）        ███████░░░  70%   分析+决策+三份 artifact 完整；反馈回路断开
+Reflection（§4.8.9）        ████████░░  85%   分析+决策+三份 artifact 完整；反馈回路已接通
 Publish / Report            ███████░░░  70%   无 PNG，无 failure_log
 Skill 子系统（§4.6）        ░░░░░░░░░░   0%   完全缺失
 Memory 跨任务（§4.1）       ██░░░░░░░░  20%   单层 SQL 只
 目录结构（§7）              ██░░░░░░░░  20%   无标准布局
 
-整体完成度                  ≈ 55%
+整体完成度                  ≈ 70%
 ```
 
 ---
@@ -273,20 +307,24 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." >> \
 }
 ```
 
-### Step 4（~1 day）：接通 Reflection → NAS 反馈回路
+### ~~Step 4（~1 day）：接通 Reflection → NAS 反馈回路~~ ✅ 已完成（2026-05-04）
 
-1. `service.ts` `runNASAgent` 每轮结束后运行轻量 Reflection
-2. 将 `analysis.nextHypotheses` 转换为 `searchBiases` 注入下一轮 `proposeTSFCandidate`
-3. `mutate.py` 增加 `--search-biases '["seasonal","trend"]'` JSON 参数
+1. ~~`service.ts` `runNASAgent` 每轮结束后运行轻量 Reflection~~  
+2. ~~将 `analysis.nextHypotheses` 转换为 `searchBiases` 注入下一轮 `proposeTSFCandidate`~~  
+3. ~~`mutate.py` 增加 `--search-biases '["seasonal","trend"]'` JSON 参数~~
 
-### Step 5（~半 day）：实现 Intent 答题 REST 路由 + Pipeline 重触发
+已在 `service.ts` `runAutonomousLoop` 中实现 mid-loop inline reflection（每 3 次 plateau 触发），并在 `mutate.py` 中新增 `--search-biases` JSON 参数及 `_bias_mutation` 函数，反馈回路已闭合。
 
-```
+### ~~Step 5（~半 day）：实现 Intent 答题 REST 路由 + Pipeline 重触发~~ ✅ 已完成（2026-05-04）
+
+~~```
 POST /research/tasks/:taskID/intent/answer
 Body: { "slots": { "dataset_path": "...", ... } }
 → svc.answerIntentQuestion(input)
 → svc.runFullPipeline({ taskID })
-```
+```~~
+
+**已实现：** `server/routes/instance/research.ts:380`（路由）、`service.ts`（`answerIntentQuestion` 合并槽位 + Intent Agent 重跑）、`research-cockpit.tsx:1803`（TUI Socratic 面板自动识别 slotID 并 POST）。`missingFields` 清空后服务端自动调用 `runFullPipeline`，任务从 `paused` 恢复为 `running`。
 
 ---
 

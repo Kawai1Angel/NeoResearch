@@ -13,6 +13,7 @@ const {
   runRunner,
   writeCurrentCandidate,
 } = require("./python-bridge");
+const { getLatestVersionRef, registerVersion } = require("./versioning");
 
 function parseTimeBudget(raw) {
   if (!raw || raw === true) return null;
@@ -63,6 +64,86 @@ function latestValMetricsPath(projectRoot, row) {
   }
   const metricsPath = path.join(projectRoot, ".neo-cast", "artifacts", `run_${row.run_id}`, "val_metrics.json");
   return fs.existsSync(metricsPath) ? metricsPath : null;
+}
+
+function taskIdFromContext(taskContext) {
+  return taskContext && taskContext.task_id ? String(taskContext.task_id) : null;
+}
+
+function latestResearchParentRefs(projectRoot, taskId) {
+  return ["task", "data"]
+    .map((kind) => getLatestVersionRef(projectRoot, kind, taskId || undefined))
+    .filter(Boolean);
+}
+
+function candidateVersionId(candidate, attempt) {
+  return String(
+    candidate.recipe_id
+    || candidate.candidate_id
+    || candidate.id
+    || `candidate_${attempt || 1}`
+  );
+}
+
+function artifactPathForRun(projectRoot, runId, fileName) {
+  return path.join(projectRoot, ".neo-cast", "artifacts", `run_${runId}`, fileName);
+}
+
+function registerRecipeLineage(projectRoot, candidate, candidatePath, options = {}) {
+  const taskId = taskIdFromContext(options.taskContext);
+  return registerVersion(projectRoot, {
+    kind: "recipe",
+    logicalId: candidateVersionId(candidate, options.attempt),
+    artifactPath: candidatePath,
+    payload: candidate,
+    parentRefs: latestResearchParentRefs(projectRoot, taskId),
+    metadata: {
+      attempt: options.attempt || null,
+      candidate_source: options.source || null,
+      candidate_id: candidate.candidate_id || null,
+      recipe_id: candidate.recipe_id || null,
+      model_family: candidate.model_family || describeCandidateFamily(candidate),
+    },
+  });
+}
+
+function registerExperimentLineage(projectRoot, row, options = {}) {
+  if (!row || !row.run_id) {
+    return null;
+  }
+  return registerVersion(projectRoot, {
+    kind: "experiment",
+    logicalId: row.run_id,
+    artifactPath: artifactPathForRun(projectRoot, row.run_id, "metadata.json"),
+    parentRefs: options.parentRefs || [],
+    metadata: {
+      session_id: row.session_id || null,
+      candidate_id: row.candidate_id || null,
+      model_family: row.model_family || null,
+      status: row.status || null,
+      is_best: row.is_best || null,
+      val_avg_mse: row.val_avg_mse || null,
+    },
+  });
+}
+
+function registerReleaseLineage(projectRoot, row, options = {}) {
+  if (!row || !row.run_id) {
+    return null;
+  }
+  return registerVersion(projectRoot, {
+    kind: "release",
+    logicalId: row.run_id,
+    artifactPath: artifactPathForRun(projectRoot, row.run_id, "eval_report.md"),
+    parentRefs: options.parentRefs || [],
+    metadata: {
+      release_type: "eval_report",
+      session_id: row.session_id || null,
+      candidate_id: row.candidate_id || null,
+      status: row.status || null,
+      is_best: row.is_best || null,
+    },
+  });
 }
 
 function formatMinutes(timeBudgetMs) {
@@ -170,6 +251,12 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
     console.log(`R${attempt}:PATH=${candidatePath}`);
     console.log(`R${attempt}:FAM=${describeCandidateFamily(candidate)}`);
     console.log(`R${attempt}:ID=${describeCandidateId(candidate)}`);
+    const recipeVersion = registerRecipeLineage(projectRoot, candidate, candidatePath, {
+      attempt,
+      source: result.source,
+      taskContext: options.taskContext,
+    });
+    console.log(`recipe_version=${recipeVersion.version_id}`);
 
     const description = candidate.hypothesis || `${describeCandidateFamily(candidate)} autonomous attempt ${attempt}`;
     const exitCode = await runRunner(projectRoot, description, {
@@ -177,6 +264,16 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
     });
     history = loadResults(projectRoot);
     previousRow = getLatestSessionRow(projectRoot);
+    if (previousRow && previousRow.run_id) {
+      const experimentVersion = registerExperimentLineage(projectRoot, previousRow, {
+        parentRefs: [recipeVersion],
+      });
+      const releaseVersion = registerReleaseLineage(projectRoot, previousRow, {
+        parentRefs: [experimentVersion],
+      });
+      console.log(`experiment_version=${experimentVersion.version_id}`);
+      console.log(`release_version=${releaseVersion.version_id}`);
+    }
     printAttemptResult(attempt, result.source, candidate, previousRow);
 
     if (options.onRoundComplete) {

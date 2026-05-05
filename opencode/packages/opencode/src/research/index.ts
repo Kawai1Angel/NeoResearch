@@ -15,6 +15,35 @@ export type {
 } from "./service"
 export type { IntentAgentResult } from "./agents/intent-agent"
 export type { DataAnalysisAgentResult } from "./agents/data-analysis-agent"
+export {
+  buildExperimentPlan,
+  buildHypoPlanMarkdown,
+  buildHypoPlannerResult,
+  buildHypothesesYaml,
+  extractEvidenceSummary,
+  generateHypotheses,
+  serializeHypothesisPlanMetadata,
+} from "./agents/hypo-planner-agent"
+export type { ExperimentPlan, HypoPlannerInput, HypoPlannerResult, HypothesisObject } from "./agents/hypo-planner-agent"
+export {
+  buildExistingFrontierRankings,
+  buildModelDesignerResult,
+  buildModelDesignerTaskFingerprint,
+  candidateAttemptStateFromRuns,
+  selectHypothesisForDesign,
+  selectModelDesignerCandidate,
+} from "./agents/model-designer-agent"
+export type {
+  CandidateAttemptState,
+  ModelDesignerCandidateSelection,
+  ModelDesignerLLMStatus,
+  ModelDesignerResult,
+  ModelDesignerSelectionSource,
+} from "./agents/model-designer-agent"
+export { buildModelCompilerResult } from "./agents/model-compiler-agent"
+export type { ModelCompilerResult, ModelCompilerStatus } from "./agents/model-compiler-agent"
+export { buildTrainEvalResult } from "./agents/train-eval-agent"
+export type { TrainEvalResult } from "./agents/train-eval-agent"
 export type { NASAgentResult, NASIterationSummary } from "./agents/nas-agent"
 export { buildNASAgentResult } from "./agents/nas-agent"
 export type { VerifierAgentResult } from "./agents/verifier-agent"

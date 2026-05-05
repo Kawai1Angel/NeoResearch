@@ -89,6 +89,26 @@ test("LLM system prompt exposes advanced fusion and probabilistic heads", () => 
   ]);
 });
 
+test("LLM system prompt includes active user correction memory", () => {
+  const prompt = _buildSystemPrompt({
+    task_id: "energy_hourly",
+    user_corrections: [
+      {
+        schema_version: "user_correction.v1",
+        scope: "data_schema",
+        field: "temperature_forecast",
+        correction: "available only at prediction time",
+        status: "active",
+      },
+    ],
+  });
+
+  assert.match(prompt, /Human Feedback Memory/);
+  assert.match(prompt, /temperature_forecast/);
+  assert.match(prompt, /available only at prediction time/);
+  assert.match(prompt, /authoritative constraints/);
+});
+
 test("LLM candidate defaults complete required frequency embedding fields", () => {
   const candidate = _ensureCandidateDefaults(
     {

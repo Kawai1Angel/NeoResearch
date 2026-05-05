@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { formatUserCorrections } = require("./corrections");
 const {
   _buildHeuristicCandidate,
   _ensureCandidateDefaults,
@@ -55,8 +56,9 @@ function formatTaskContext(taskContext = {}) {
   const valRows = taskContext.splits?.val || [8640, 11520];
   const missingStrategy = taskContext.missing?.strategy || "forward_fill";
   const frequency = taskContext.time?.frequency || "auto";
+  const correctionContext = formatUserCorrections(taskContext.user_corrections || []);
 
-  return [
+  const lines = [
     `- Dataset/task: ${taskId}`,
     `- Channels: ${featureColumns.length} (${featureColumns.join(", ")})`,
     `- Input window: ${inputLen} time steps`,
@@ -68,7 +70,11 @@ function formatTaskContext(taskContext = {}) {
     "- Primary metric: val_avg_mse (lower is better, StandardScaler-normalised space)",
     "- Parameter budget: soft limit 1M params total across all horizon models",
     "- Training budget: 10 minutes wall-clock per run",
-  ].join("\n");
+  ];
+  if (correctionContext) {
+    lines.push(correctionContext);
+  }
+  return lines.join("\n");
 }
 
 function _buildReflectionSystemPrompt(taskContext = {}) {

@@ -1848,6 +1848,84 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("creating a task from a nested opencode package resolves the sibling Neo-Cast runner", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const workspace = path.join("/tmp", `neo-research-create-runner-${Date.now()}`)
+    const packageRoot = path.join(workspace, "opencode", "packages", "opencode")
+    const runnerRoot = path.join(workspace, "neo_cast")
+    await mkdir(packageRoot, { recursive: true })
+    await prepareNeoCastRunnerRoot(runnerRoot)
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    const routedFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (init?.method === "POST") {
+        posts.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : undefined })
+      }
+      if (url.pathname === "/research/tasks" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body))
+        return Promise.resolve(
+          response({
+            id: "task_nested_package_runner",
+            title: "Forecast nested package runner",
+            domainID: "tsf",
+            mode: "autonomous",
+            status: "created",
+            taskSpec: body.taskSpec,
+            objective: {},
+            budget: {},
+            time: { created: now, updated: now },
+          }),
+        )
+      }
+      if (url.pathname === "/research/tasks/task_nested_package_runner/pipeline" && init?.method === "POST") {
+        return Promise.resolve(
+          response({
+            nas: { loop: { stoppedReason: "max_iterations", iterations: [] } },
+            publish: {
+              artifact: { id: "artifact_nested_package_export", kind: "model_export_package" },
+              path: "/tmp/neo-research/export/task_nested_package_runner",
+            },
+          }),
+        )
+      }
+      return Promise.resolve(response([]))
+    }) as typeof fetch
+
+    const app = await testRender(
+      () => (
+        <ResearchCockpitHarness
+          fetch={routedFetch}
+          directory={packageRoot}
+          initialRoute={{ type: "cockpit", researchGoal: "Forecast nested package runner" } as Route}
+        />
+      ),
+      { width: 160, height: 48 },
+    )
+
+    try {
+      await waitForFrame(app, "Interaction mode")
+      app.mockInput.pressKey("2")
+      app.mockInput.pressEnter()
+      await waitForFrame(app, "model_export_package exported")
+
+      expect(posts[0]).toMatchObject({
+        path: "/research/tasks",
+        body: {
+          taskSpec: {
+            runtime: {
+              neoCastProjectRoot: runnerRoot,
+            },
+          },
+        },
+      })
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("does not auto-iterate a routed home goal until the runner is ready", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -1935,7 +2013,11 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("AutoResearch进展")
       expect(frame).toContain("Intent Agent")
       expect(frame).toContain("Data Analysis Agent")
-      expect(frame).toContain("NAS Agent")
+      expect(frame).toContain("HypoPlanner Agent")
+      expect(frame).toContain("ModelDesigner Agent")
+      expect(frame).toContain("ModelCompiler Agent")
+      expect(frame).toContain("TrainEval Agent")
+      expect(frame).not.toContain("NAS Agent")
       expect(frame).toContain("Publish Agent")
       expect(frame).toContain("需求摘要")
       expect(frame).toContain("预测=24")
@@ -2305,7 +2387,9 @@ describe("ResearchCockpit render", () => {
         }
         if (path === "/agent") return Promise.resolve(response([agentFixture()]))
         if (path === "/research/tasks") return Promise.resolve(response(phase === "empty" ? [] : [task]))
-        if (path === `/research/tasks/${taskID}/fingerprint`) return Promise.resolve(response(phase === "profile" ? {} : fingerprint))
+        if (path === `/research/tasks/${taskID}/fingerprint`) {
+          return Promise.resolve(response(phase === "empty" || phase === "created" ? {} : fingerprint))
+        }
         if (path === `/research/tasks/${taskID}/champion`) {
           return Promise.resolve(response(phase === "results" ? champion : []))
         }
@@ -2321,8 +2405,8 @@ describe("ResearchCockpit render", () => {
     const cases = [
       ["empty", undefined, "Intent Agent"],
       ["created", "苏格拉底", "Intent Agent"],
-      ["profile", "苏格拉底", "Data Analysis Agent"],
-      ["explore", "苏格拉底", "NAS Agent"],
+      ["profile", "苏格拉底", "HypoPlanner Agent"],
+      ["explore", "苏格拉底", "ModelDesigner Agent"],
       ["results", "苏格拉底", "Publish Agent"],
     ] as const
 
@@ -2360,6 +2444,19 @@ describe("ResearchCockpit render", () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
+    const runnerRoot = "/tmp/neo-cast-progress-profile"
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    await writeFile(
+      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      JSON.stringify({
+        source_csv: "/tmp/ETTh1.csv",
+        input_len: 96,
+        horizons: [24],
+        feature_columns: ["OT"],
+      }),
+      "utf8",
+    )
+
     const task = {
       id: "task_progress_profile",
       title: "Profiled TSF Task",
@@ -2370,7 +2467,15 @@ describe("ResearchCockpit render", () => {
         dataset: { path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
         contextLength: 96,
         predictionLengths: [24],
-        runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast" },
+        runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+        metadata: {
+          hypothesisPlan: {
+            hypotheses: [{ id: "H1" }, { id: "H2" }, { id: "H3" }],
+            baselineStrategy: "domain_baselines_first",
+            searchBiases: ["seasonal"],
+            stopConditions: { maxTrials: 12, noImprovementRounds: 3 },
+          },
+        },
       },
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
       budget: { maxRuns: 12 },
@@ -2417,7 +2522,7 @@ describe("ResearchCockpit render", () => {
           ]),
         )
       }
-      if (path === "/research/tasks/task_progress_profile/candidates") return Promise.resolve(response([]))
+      if (path === "/research/tasks/task_progress_profile/candidates") return Promise.resolve(response([candidateFixture(1)]))
       if (path === "/research/tasks/task_progress_profile/artifacts") return Promise.resolve(response([]))
       if (path === "/research/tasks/task_progress_profile/approvals") return Promise.resolve(response([]))
       if (path === "/research/tasks/task_progress_profile/champion") return Promise.resolve(response(null))
@@ -2431,10 +2536,110 @@ describe("ResearchCockpit render", () => {
 
       expect(frame).toContain("✓ Intent Agent")
       expect(frame).toContain("✓ Data Analysis Agent")
-      expect(frame).toContain("✓ NAS Agent")
-      expect(frame).toContain("→ Publish Agent")
+      expect(frame).toContain("✓ HypoPlanner Agent (3 hypotheses)")
+      expect(frame).toContain("✓ ModelDesigner Agent (iteration 2/12)")
+      expect(frame).toContain("✓ ModelCompiler Agent")
+      expect(frame).toContain("→ TrainEval Agent")
+      expect(frame).toContain("• Publish Agent")
       expect(frame).toContain("Profile rows=1024")
       expect(frame).toContain("missing=0.01")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("marks NAS active while seeded candidates wait for the first run", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const runnerRoot = "/tmp/neo-cast-progress-seeded"
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    await writeFile(
+      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      JSON.stringify({
+        source_csv: "/tmp/ETTh1.csv",
+        input_len: 96,
+        horizons: [24],
+        feature_columns: ["OT"],
+      }),
+      "utf8",
+    )
+
+    const seededTaskID = "task_progress_seeded"
+    const task = {
+      id: seededTaskID,
+      title: "Seeded TSF Task",
+      domainID: "tsf",
+      mode: "autonomous",
+      status: "researching",
+      taskSpec: {
+        dataset: { path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
+        contextLength: 96,
+        predictionLengths: [24],
+        runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+        metadata: {
+          hypothesisPlan: {
+            hypotheses: [{ id: "H1" }, { id: "H2" }, { id: "H3" }],
+            baselineStrategy: "domain_baselines_first",
+            searchBiases: ["seasonal"],
+            stopConditions: { maxTrials: 12, noImprovementRounds: 3 },
+          },
+        },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12 },
+      time: { created: now - 60_000, updated: now },
+    }
+    const candidates = [1, 2, 3].map((index) => ({
+      ...candidateFixture(index),
+      taskID: seededTaskID,
+    }))
+    const progressFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/config/providers") {
+        return Promise.resolve(response({ providers: [providerFixture()], default: { openai: "gpt-test" } }))
+      }
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      if (path === "/research/tasks") return Promise.resolve(response([task]))
+      if (path === `/research/tasks/${seededTaskID}/fingerprint`) {
+        return Promise.resolve(
+          response({
+            datasetProfile: {
+              rowCount: 17420,
+              targetCount: 1,
+              missingRate: 0,
+              trendStrength: 0.623583,
+              seasonalityStrength: 0.154844,
+              crossVarCorrelation: 0,
+              distributionShift: 1.08905,
+            },
+          }),
+        )
+      }
+      if (path === `/research/tasks/${seededTaskID}/candidates`) return Promise.resolve(response(candidates))
+      if (path === `/research/tasks/${seededTaskID}/runs`) return Promise.resolve(response([]))
+      if (path === `/research/tasks/${seededTaskID}/artifacts`) return Promise.resolve(response([]))
+      if (path === `/research/tasks/${seededTaskID}/approvals`) return Promise.resolve(response([]))
+      if (path === `/research/tasks/${seededTaskID}/champion`) return Promise.resolve(response(null))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={progressFetch} />, { width: 160, height: 48 })
+
+    try {
+      const frame = await waitForFrame(app, "Run autonomous loop")
+
+      expect(frame).toContain("Candidate 1/3")
+      expect(frame).toContain("Runner")
+      expect(frame).toContain("ready")
+      expect(frame).toContain("✓ Intent Agent")
+      expect(frame).toContain("✓ Data Analysis Agent")
+      expect(frame).toContain("✓ HypoPlanner Agent (3 hypotheses)")
+      expect(frame).toContain("→ ModelDesigner Agent (iteration 1/12)")
+      expect(frame).toContain("• ModelCompiler Agent")
+      expect(frame).toContain("• TrainEval Agent")
+      expect(frame).not.toContain("NAS Agent")
+      expect(frame).toContain("• Publish Agent")
     } finally {
       app.renderer.destroy()
     }
@@ -3275,8 +3480,269 @@ describe("ResearchCockpit render", () => {
           taskSpec: {
             contextLength: 96,
             predictionLengths: [24],
-            runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast" },
+            runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast-research" },
           },
+        },
+      ])
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("renders live runner progress events for a running run", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const runningRunID = "run_live_progress"
+    const runningFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/runs`) {
+        return Promise.resolve(
+          response([
+            {
+              id: runningRunID,
+              taskID,
+              candidateID,
+              stage: "smoke",
+              status: "running",
+              metrics: {},
+              resourceUsage: {},
+              artifactRefs: [],
+              time: { created: now - 1_000, updated: now - 500 },
+            },
+          ]),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={runningFetch} events={events.source} />, {
+      width: 170,
+      height: 56,
+    })
+
+    try {
+      await waitForFrame(app, `${runningRunID} smoke running`)
+      events.emit({
+        type: "research.runner.progress.line",
+        properties: {
+          taskID,
+          runID: runningRunID,
+          line: '{"event":"epoch_end","horizon":24,"epoch":2,"val_loss":0.12345}',
+          event: "epoch_end",
+          epoch: 2,
+          horizon: 24,
+          valLoss: 0.12345,
+        },
+      })
+
+      const frame = await waitForFrame(app, "epoch 2 | h24 | val_loss 0.1235")
+      expect(frame).toContain(`${runningRunID} smoke running`)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("dataset mismatch can be repaired from the cockpit by preparing the task dataset", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const runnerRoot = path.join("/tmp", `neo-cast-dataset-mismatch-${Date.now()}`)
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    await mkdir(path.join(runnerRoot, ".neo-cast"), { recursive: true })
+    await writeFile(
+      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      `${JSON.stringify(
+        {
+          schema_version: "dataset.v1",
+          source_csv: "/tmp/other.csv",
+          task_id: "etth1",
+          timestamp_col: "date",
+          feature_columns: ["OT"],
+          input_len: 96,
+          horizons: [48],
+          splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
+          normalization: { type: "standard", fit_split: "train" },
+          missing: { strategy: "forward_fill", limit: null },
+          time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    )
+
+    const posts: unknown[] = []
+    const mismatchFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (url.pathname === "/research/tasks" && !init?.method) {
+        return Promise.resolve(
+          response([
+            {
+              id: taskID,
+              projectID: "project_neo_cast",
+              title: "Dataset Mismatch Task",
+              domainID: "tsf",
+              mode: "autonomous",
+              status: "researching",
+              taskSpec: {
+                contextLength: 96,
+                predictionLengths: [24],
+                dataset: { loaderID: "etth1", path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
+                runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+              time: { created: now - 60_000, updated: now },
+            },
+          ]),
+        )
+      }
+      if (url.pathname === `/research/tasks/${taskID}/prepare-dataset` && init?.method === "POST") {
+        posts.push(JSON.parse(String(init.body)))
+        return Promise.resolve(
+          response({
+            artifact: {
+              id: "artifact_dataset_prepared",
+              taskID,
+              kind: "dataset_preparation_json",
+              uri: "file:///tmp/dataset-preparation.json",
+              metadata: {},
+              time: { created: now, updated: now },
+            },
+            path: "/tmp/dataset-preparation.json",
+            datasetSpec: {},
+            command: {},
+          }),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    let command: CommandDialog | undefined
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={mismatchFetch} onCommand={(value) => (command = value)} />,
+      { width: 170, height: 56 },
+    )
+
+    try {
+      const frame = await waitForFrame(app, "Runner dataset mismatch")
+      expect(frame).toContain("Prepared dataset does not match task")
+      expect(frame).toContain("Prepare Dataset")
+      expect(frame).not.toContain("Use Project Runner")
+
+      command?.trigger("research.dataset.prepare")
+      for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts).toEqual([{ force: true }])
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("agent loop repairs a dataset mismatch before starting autonomous loop", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const runnerRoot = path.join("/tmp", `neo-cast-agent-loop-dataset-mismatch-${Date.now()}`)
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    await mkdir(path.join(runnerRoot, ".neo-cast"), { recursive: true })
+    await writeFile(
+      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      `${JSON.stringify(
+        {
+          schema_version: "dataset.v1",
+          source_csv: "/tmp/other.csv",
+          task_id: "etth1",
+          timestamp_col: "date",
+          feature_columns: ["OT"],
+          input_len: 96,
+          horizons: [48],
+          splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
+          normalization: { type: "standard", fit_split: "train" },
+          missing: { strategy: "forward_fill", limit: null },
+          time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    )
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    const mismatchFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (url.pathname === "/research/tasks" && !init?.method) {
+        return Promise.resolve(
+          response([
+            {
+              id: taskID,
+              projectID: "project_neo_cast",
+              title: "Dataset Mismatch Task",
+              domainID: "tsf",
+              mode: "autonomous",
+              status: "researching",
+              taskSpec: {
+                contextLength: 96,
+                predictionLengths: [24],
+                dataset: { loaderID: "etth1", path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
+                runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+              time: { created: now - 60_000, updated: now },
+            },
+          ]),
+        )
+      }
+      if (url.pathname === `/research/tasks/${taskID}/prepare-dataset` && init?.method === "POST") {
+        posts.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+        return Promise.resolve(
+          response({
+            artifact: {
+              id: "artifact_dataset_prepared",
+              taskID,
+              kind: "dataset_preparation_json",
+              uri: "file:///tmp/dataset-preparation.json",
+              metadata: {},
+              time: { created: now, updated: now },
+            },
+            path: "/tmp/dataset-preparation.json",
+            datasetSpec: {},
+            command: {},
+          }),
+        )
+      }
+      if (url.pathname === `/research/tasks/${taskID}/autonomous/loop` && init?.method === "POST") {
+        posts.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+        return Promise.resolve(response({ iterations: [], stoppedReason: "max_iterations" }))
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    let command: CommandDialog | undefined
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={mismatchFetch} onCommand={(value) => (command = value)} />,
+      { width: 170, height: 56 },
+    )
+
+    try {
+      await waitForFrame(app, "Runner dataset mismatch")
+      command?.trigger("research.autonomous.loop")
+      for (let attempt = 0; attempt < 40 && posts.length < 2; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts).toEqual([
+        { path: `/research/tasks/${taskID}/prepare-dataset`, body: { force: true } },
+        {
+          path: `/research/tasks/${taskID}/autonomous/loop`,
+          body: { stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" },
         },
       ])
     } finally {

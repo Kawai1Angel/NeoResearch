@@ -174,7 +174,8 @@
         "inference_py",
         "eval_report_md",
         "model_spec_json",
-        "patch_bundle_json"
+        "patch_bundle_json",
+        "research_trace_json"
       ],
       "properties": {
         "model_pt": {
@@ -202,6 +203,10 @@
           "minLength": 1
         },
         "patch_bundle_json": {
+          "type": "string",
+          "minLength": 1
+        },
+        "research_trace_json": {
           "type": "string",
           "minLength": 1
         }

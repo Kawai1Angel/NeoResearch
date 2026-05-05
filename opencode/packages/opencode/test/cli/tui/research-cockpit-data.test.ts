@@ -5,6 +5,7 @@ import path from "node:path"
 import {
   buildDefaultTsfResearchTaskFromGoal,
   buildDefaultTsfResearchTask,
+  buildResearchCockpitAgentWorkflow,
   buildSocraticClarificationState,
   buildResearchCockpitRecommendation,
   buildResearchCockpitStats,
@@ -22,6 +23,7 @@ import {
   formatResearchCockpitProfile,
   formatResearchCockpitRunResult,
   formatResearchCockpitSeedSweep,
+  getResearchCockpitRunnerStatus,
   hasApprovedResearchCockpitBlindTestGate,
   hasApprovedResearchCockpitRefTestGate,
   interactionModeForTask,
@@ -212,9 +214,11 @@ describe("research cockpit data helpers", () => {
 
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
       "active:Create research task",
-      "todo:Profile dataset",
-      "todo:Design candidates",
-      "todo:Run smoke experiments",
+      "todo:Data Analysis Agent",
+      "todo:HypoPlanner Agent",
+      "todo:ModelDesigner Agent",
+      "todo:ModelCompiler Agent",
+      "todo:TrainEval Agent",
       "todo:Review gates",
       "todo:Export bundle",
     ])
@@ -238,7 +242,17 @@ describe("research cockpit data helpers", () => {
     const currentTask = task({
       id: "task_a",
       mode: "autonomous",
-      taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+      taskSpec: {
+        runtime: { neoCastProjectRoot: "/tmp/neo-cast" },
+        metadata: {
+          hypothesisPlan: {
+            hypotheses: [{ id: "H1" }, { id: "H2" }, { id: "H3" }],
+            baselineStrategy: "domain_baselines_first",
+            searchBiases: ["seasonal"],
+            stopConditions: { maxTrials: 12, noImprovementRounds: 3 },
+          },
+        },
+      },
       budget: { maxRuns: 12 },
     })
     const workflow = buildResearchCockpitWorkflow({
@@ -259,8 +273,18 @@ describe("research cockpit data helpers", () => {
           metrics: { val_avg_mse: 0.12 },
           time: { created: 1, updated: 2 },
         },
+        {
+          id: "train_run",
+          stage: "low_fidelity",
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.1 },
+          time: { created: 1, updated: 3 },
+        },
       ],
-      artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+      artifacts: [
+        artifact({ id: "profile_artifact", kind: "task_profile_json" }),
+        artifact({ id: "compile_artifact", kind: "model_compile_report_md" }),
+      ],
       approvals: [],
       champion: null,
       fingerprint: { datasetProfile: { rowCount: 100 } },
@@ -269,9 +293,11 @@ describe("research cockpit data helpers", () => {
 
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
       "done:Create research task",
-      "done:Profile dataset",
-      "done:Design candidates",
-      "done:Run smoke experiments",
+      "done:Data Analysis Agent",
+      "done:HypoPlanner Agent",
+      "done:ModelDesigner Agent",
+      "done:ModelCompiler Agent",
+      "done:TrainEval Agent",
       "done:Review gates",
       "active:Export bundle",
     ])
@@ -312,11 +338,41 @@ describe("research cockpit data helpers", () => {
 
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
       "done:Create research task",
-      "active:Profile dataset",
-      "done:Design candidates",
-      "todo:Run smoke experiments",
+      "active:Data Analysis Agent",
+      "todo:HypoPlanner Agent",
+      "todo:ModelDesigner Agent",
+      "todo:ModelCompiler Agent",
+      "todo:TrainEval Agent",
       "todo:Review gates",
       "todo:Export bundle",
+    ])
+  })
+
+  test("keeps planning and design agents pending while the runner dataset needs repair", () => {
+    const currentTask = task({
+      id: "task_dataset_repair",
+      mode: "autonomous",
+      taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+      budget: { maxRuns: 12 },
+    })
+
+    const workflow = buildResearchCockpitAgentWorkflow({
+      task: currentTask,
+      candidates: [],
+      runs: [],
+      artifacts: [],
+      approvals: [],
+      champion: null,
+      fingerprint: { datasetProfile: { rowCount: 69680, targetCount: 1 } },
+      runnerReady: false,
+      runnerRepairAction: "prepare_dataset",
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.displayLabel ?? item.label}`)).toEqual([
+      "todo:HypoPlanner Agent",
+      "todo:ModelDesigner Agent",
+      "todo:ModelCompiler Agent",
+      "todo:TrainEval Agent",
     ])
   })
 
@@ -399,6 +455,16 @@ describe("research cockpit data helpers", () => {
     await writeFile(path.join(workspace, "neo_cast", "py", "validate.py"), "# runner\n", "utf8")
 
     expect(resolveResearchCockpitProjectRunnerRoot(opencodeRoot)).toBe(path.join(workspace, "neo_cast"))
+  })
+
+  test("resolves an ancestor neo_cast runner when the selected project is a nested package", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "neo-research-workspace-"))
+    const packageRoot = path.join(workspace, "opencode", "packages", "opencode")
+    await mkdir(packageRoot, { recursive: true })
+    await mkdir(path.join(workspace, "neo_cast", "py"), { recursive: true })
+    await writeFile(path.join(workspace, "neo_cast", "py", "validate.py"), "# runner\n", "utf8")
+
+    expect(resolveResearchCockpitProjectRunnerRoot(packageRoot)).toBe(path.join(workspace, "neo_cast"))
   })
 
   test("saves or updates the Cockpit Neo-Cast runner root on task runtime", () => {
@@ -533,6 +599,59 @@ describe("research cockpit data helpers", () => {
     )
 
     expect(status).toBe(false)
+  })
+
+  test("accepts a matching dataset cache spec when the project root spec is stale", async () => {
+    const root = await createPreparedNeoCastRunnerRoot({
+      schema_version: "dataset.v1",
+      source_csv: "/data/old.csv",
+      task_id: "etth1",
+      timestamp_col: "date",
+      feature_columns: ["OT"],
+      input_len: 512,
+      horizons: [96, 192, 336, 720],
+      splits: { train: [0, 1000], val: [1000, 1200], ref_test: [1200, 1400] },
+      normalization: { type: "standard", fit_split: "train" },
+      missing: { strategy: "forward_fill", limit: null },
+      time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+    })
+    await mkdir(path.join(root, ".neo-cast", "dataset"), { recursive: true })
+    await writeFile(
+      path.join(root, ".neo-cast", "dataset", "dataset_spec.json"),
+      `${JSON.stringify(
+        {
+          schema_version: "dataset.v1",
+          source_csv: "/data/ETTh1.csv",
+          task_id: "etth1",
+          timestamp_col: "date",
+          feature_columns: ["OT"],
+          input_len: 96,
+          horizons: [24],
+          splits: { train: [0, 1000], val: [1000, 1200], ref_test: [1200, 1400] },
+          normalization: { type: "standard", fit_split: "train" },
+          missing: { strategy: "forward_fill", limit: null },
+          time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    )
+
+    const status = getResearchCockpitRunnerStatus(
+      task({
+        id: "dataset_cache_matches",
+        taskSpec: {
+          contextLength: 96,
+          predictionLengths: [24],
+          dataset: { path: "/data/ETTh1.csv", targetCols: ["OT"] },
+          runtime: { neoCastProjectRoot: root },
+        },
+      }),
+      { validateRuntime: true },
+    )
+
+    expect(status.reason).toBe("ready")
   })
 
   test("parses CSV task dialog input with forecasting options", () => {
@@ -975,6 +1094,38 @@ describe("research cockpit data helpers", () => {
     expect(
       formatResearchCockpitArtifactMetadata(
         artifact({
+          id: "hypo_plan",
+          kind: "hypo_plan_md",
+          metadata: { agent: "HypoPlannerAgent", hypothesisCount: 3, baselineStrategy: "domain_baselines_first" },
+        }),
+      ),
+    ).toBe("agent=HypoPlannerAgent / hypotheses=3 / baseline=domain_baselines_first")
+    expect(
+      formatResearchCockpitArtifactMetadata(
+        artifact({
+          id: "hypotheses",
+          kind: "hypotheses_yaml",
+          metadata: { agent: "HypoPlannerAgent", hypothesisCount: 3, baselineStrategy: "domain_baselines_first" },
+        }),
+      ),
+    ).toBe("agent=HypoPlannerAgent / hypotheses=3 / baseline=domain_baselines_first")
+    expect(
+      formatResearchCockpitArtifactMetadata(
+        artifact({
+          id: "compile",
+          kind: "model_compile_report_md",
+          metadata: {
+            agent: "ModelCompilerAgent",
+            candidateID: "candidate_a",
+            status: "passed",
+            smokeMetric: 0.1234,
+          },
+        }),
+      ),
+    ).toBe("agent=ModelCompilerAgent / candidate=candidate_a / status=passed / smoke=0.1234")
+    expect(
+      formatResearchCockpitArtifactMetadata(
+        artifact({
           id: "governance",
           kind: "governance_log_json",
           metadata: { kind: "domain_action", status: "approved", candidateID: "candidate_a" },
@@ -1128,7 +1279,10 @@ describe("research cockpit data helpers", () => {
 
   test("detects research events that should refresh cockpit data", () => {
     expect(shouldRefreshResearchCockpitOnEvent({ type: "research.artifact.created" })).toBe(true)
+    expect(shouldRefreshResearchCockpitOnEvent({ type: "research.runner.progress.line" })).toBe(true)
     expect(shouldRefreshResearchCockpitOnEvent({ type: "research.approval.updated" })).toBe(true)
+    expect(shouldRefreshResearchCockpitOnEvent({ type: "research.agent.hypoPlanner.completed" })).toBe(true)
+    expect(shouldRefreshResearchCockpitOnEvent({ type: "research.runner.progress.line" })).toBe(true)
     expect(shouldRefreshResearchCockpitOnEvent({ type: "message.part.updated" })).toBe(false)
   })
 })

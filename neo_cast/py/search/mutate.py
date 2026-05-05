@@ -250,12 +250,43 @@ def _switch_loss(recipe: dict[str, Any]) -> str | None:
     return "switch_loss_huber"
 
 
+def _bias_mutation(recipe: dict[str, Any], search_biases: list[str]) -> str | None:
+    """Apply the highest-priority bias-directed mutation, return note or None if already applied."""
+    biases = set(search_biases)
+    if "seasonal" in biases or "frequency_embedding" in biases:
+        preprocessing = recipe.setdefault("preprocessing", {"actions": [{"type": "none"}]})
+        actions = preprocessing.get("actions", [{"type": "none"}])
+        if not any(a.get("type") == "series_decomposition" for a in actions):
+            preprocessing["actions"] = [{"type": "series_decomposition", "mode": "additive"}]
+            return "bias_seasonal_decomposition"
+    if "cross_var_correlated" in biases or "cross_var" in biases:
+        fusion = recipe.setdefault("fusion", {})
+        if fusion.get("type") not in {"gated_hybrid", "feature"}:
+            recipe["fusion"] = {"type": "gated_hybrid", "channel_mode": "shared"}
+            return "bias_crossvar_gated_fusion"
+    if "distribution_shift" in biases:
+        preprocessing = recipe.setdefault("preprocessing", {"actions": [{"type": "none"}]})
+        actions = preprocessing.get("actions", [{"type": "none"}])
+        if not any(a.get("type") == "instance_norm" for a in actions):
+            preprocessing["actions"] = [{"type": "instance_norm", "affine": False, "eps": 1e-5}]
+            note = _switch_loss(recipe)
+            return f"bias_shift_instance_norm{'_huber' if note else ''}"
+    if "missing_values" in biases:
+        preprocessing = recipe.setdefault("preprocessing", {"actions": [{"type": "none"}]})
+        actions = preprocessing.get("actions", [{"type": "none"}])
+        if not any(a.get("type") == "missing_mask" for a in actions):
+            preprocessing["actions"] = [{"type": "missing_mask"}]
+            return "bias_missing_mask"
+    return None
+
+
 def _mutation_steps(
     recipe: dict[str, Any],
     metrics: dict[str, Any],
     policy: MutationPolicy,
     *,
     index: int = 1,
+    search_biases: list[str] | None = None,
 ) -> list[str]:
     val_avg_mse = _metric(metrics, "val_avg_mse")
     poor_threshold, good_threshold = _get_thresholds(policy)
@@ -267,6 +298,12 @@ def _mutation_steps(
         if note:
             return [note, _switch_optimizer(recipe, policy, direction="down")]
         return [_switch_optimizer(recipe, policy, direction="down")]
+
+    # Bias-directed mutations from Reflection Agent hypotheses take priority over metric-driven ones
+    if search_biases:
+        note = _bias_mutation(recipe, search_biases)
+        if note:
+            return [note]
 
     if index >= 1 and (val_avg_mse is None or val_avg_mse > good_threshold):
         note = _explore_alternate_raw_backbone(recipe)
@@ -325,6 +362,7 @@ def mutate_recipe(
     policy: MutationPolicy | None = None,
     index: int = 1,
     state_path: str | Path | None = None,
+    search_biases: list[str] | None = None,
 ) -> dict[str, Any]:
     if recipe.get("recipe_version") != "recipe_schema_v1":
         raise ValueError("mutate_recipe expects recipe_version='recipe_schema_v1'")
@@ -335,7 +373,7 @@ def mutate_recipe(
     mutated = copy.deepcopy(recipe)
     _ensure_training_defaults(mutated)
 
-    notes = _mutation_steps(mutated, metrics, policy, index=index)
+    notes = _mutation_steps(mutated, metrics, policy, index=index, search_biases=search_biases)
     mutation_note = "+".join(note for note in notes if note)
     _set_recipe_id(mutated, parent_id, mutation_note or "noop", index)
     mutated["hypothesis"] = (
@@ -353,6 +391,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="Output mutated recipe JSON path.")
     parser.add_argument("--index", type=int, default=1, help="Mutation index suffix.")
     parser.add_argument("--state-path", default=None, help="Optional runner_state.json path for relative thresholds.")
+    parser.add_argument(
+        "--search-biases",
+        default=None,
+        help='JSON array of search bias strings from Reflection Agent, e.g. \'["seasonal","distribution_shift"]\'.',
+    )
     return parser
 
 
@@ -360,7 +403,15 @@ def main() -> None:
     args = build_parser().parse_args()
     recipe = load_json(args.recipe)
     metrics = load_json(args.metrics) if args.metrics else {}
-    mutated = mutate_recipe(recipe, metrics, index=args.index, state_path=args.state_path)
+    search_biases: list[str] | None = None
+    if args.search_biases:
+        try:
+            parsed = json.loads(args.search_biases)
+            if isinstance(parsed, list):
+                search_biases = [b for b in parsed if isinstance(b, str)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    mutated = mutate_recipe(recipe, metrics, index=args.index, state_path=args.state_path, search_biases=search_biases)
     write_json(args.output, mutated)
     print(json.dumps({"event": "recipe_mutated", "recipe_id": mutated["recipe_id"], "output": str(Path(args.output).expanduser())}))
 

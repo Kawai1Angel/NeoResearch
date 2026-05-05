@@ -18,6 +18,7 @@ export type ResearchCockpitTask = {
     | "profiling"
     | "analyzing"
     | "data_analysis"
+    | "hypo_planning"
     | "baselining"
     | "searching"
     | "researching"
@@ -128,7 +129,7 @@ export type ResearchCockpitProfileResult = {
 }
 
 export type ResearchCockpitManagerStep = {
-  role: "diagnostic" | "design" | "coder" | "runner" | "analyst" | "librarian"
+  role: "diagnostic" | "design" | "coder" | "runner" | "verifier" | "analyst" | "librarian"
   status: "completed" | "skipped" | "blocked"
   summary: string
   metadata: JsonRecord
@@ -170,6 +171,7 @@ export type ResearchCockpitWorkflowItem = {
   label: string
   status: ResearchCockpitWorkflowStatus
   detail?: string
+  displayLabel?: string
 }
 
 export type ResearchCockpitRecommendation = {
@@ -177,6 +179,7 @@ export type ResearchCockpitRecommendation = {
     | "create_task"
     | "approve_gate"
     | "configure_runner"
+    | "prepare_dataset"
     | "profile"
     | "seed_baselines"
     | "run_autonomous_loop"
@@ -194,15 +197,19 @@ const researchRefreshEventTypes = new Set([
   "research.candidate.updated",
   "research.run.created",
   "research.run.updated",
+  "research.runner.progress.line",
   "research.artifact.created",
   "research.memory.created",
   "research.champion.updated",
   "research.approval.created",
   "research.approval.updated",
+  "research.agent.hypoPlanner.started",
+  "research.agent.hypoPlanner.completed",
+  "research.agent.hypoPlanner.failed",
 ])
 
 export function shouldRefreshResearchCockpitOnEvent(event: { type: string }) {
-  return researchRefreshEventTypes.has(event.type)
+  return researchRefreshEventTypes.has(event.type) || event.type.startsWith("research.agent.")
 }
 
 export function sortResearchCockpitTasks(tasks: ResearchCockpitTask[]) {
@@ -238,15 +245,17 @@ type ResearchCockpitWorkflowInput = {
   champion?: ResearchCockpitChampion | null
   fingerprint?: JsonRecord
   runnerReady: boolean
+  runnerRepairAction?: "configure_runner" | "prepare_dataset"
 }
 
 export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput): ResearchCockpitWorkflowItem[] {
   const hasTask = Boolean(input.task)
-  const hasProfile = hasCockpitDatasetProfile(input)
-  const hasCandidates = input.candidates.length > 0
-  const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
+  const hasProfile = hasCockpitProfileEvidence(input)
+  const agentWorkflow = buildResearchCockpitAgentWorkflow(input)
+  const hasTrainEval = agentWorkflow.some((item) => item.label === "TrainEval Agent" && item.status === "done")
   const hasPendingApproval = input.approvals.some((approval) => approval.status === "pending")
   const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
+  const canPublish = Boolean(input.champion) || hasTrainEval
 
   return [
     {
@@ -255,36 +264,86 @@ export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput
       detail: hasTask ? input.task?.title : "Bind a goal, dataset, objective, and execution budget.",
     },
     {
-      label: "Profile dataset",
+      label: "Data Analysis Agent",
       status: hasProfile ? "done" : hasTask ? "active" : "todo",
       detail: hasProfile ? "Dataset fingerprint available." : "Inspect horizon, targets, missingness, and seasonality.",
     },
-    {
-      label: "Design candidates",
-      status: hasCandidates ? "done" : hasTask ? "active" : "todo",
-      detail: hasCandidates ? `${input.candidates.length} candidate recipes` : "Seed baselines or let the agent propose recipes.",
-    },
-    {
-      label: "Run smoke experiments",
-      status: hasSucceededRun ? "done" : hasProfile && hasCandidates && input.runnerReady ? "active" : "todo",
-      detail: hasSucceededRun ? "At least one non-profile run succeeded." : "Execute approved candidates against the runner.",
-    },
+    ...agentWorkflow,
     {
       label: "Review gates",
-      status: hasPendingApproval ? "active" : hasSucceededRun ? "done" : "todo",
+      status: hasPendingApproval ? "active" : canPublish ? "done" : "todo",
       detail: hasPendingApproval ? "Approval required before promotion." : "Candidate, ref, and blind gates are clear.",
     },
     {
       label: "Export bundle",
-      status: hasBundle ? "done" : input.champion || hasSucceededRun ? "active" : "todo",
+      status: hasBundle ? "done" : canPublish ? "active" : "todo",
       detail: hasBundle ? "Final bundle available." : "Package report, results, model code, and weights.",
+    },
+  ]
+}
+
+export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflowInput): ResearchCockpitWorkflowItem[] {
+  const hasProfile = hasCockpitProfileEvidence(input)
+  const hasCandidates = input.candidates.length > 0
+  const hypothesisCount = researchCockpitHypothesisCount(input)
+  const hasHypothesisPlan =
+    hypothesisCount !== undefined ||
+    input.artifacts.some((artifact) => artifact.kind === "hypo_plan_md" || artifact.kind === "hypotheses_yaml") ||
+    (hasProfile && (hasCandidates || hasCompletedCompilerRun(input) || hasTrainEvalEvidence(input) || Boolean(input.champion)))
+  const hasCompilerEvidence =
+    input.artifacts.some((artifact) => artifact.kind === "model_compile_report_md") ||
+    hasCompletedCompilerRun(input) ||
+    hasTrainEvalEvidence(input) ||
+    Boolean(input.champion)
+  const hasRunningCompiler = input.runs.some((run) => run.stage === "smoke" && (run.status === "queued" || run.status === "running"))
+  const trainEvalDone = hasTrainEvalEvidence(input) || Boolean(input.champion)
+  const hasRunningTrainEval = input.runs.some(
+    (run) => isTrainEvalRun(run) && (run.status === "queued" || run.status === "running"),
+  )
+  const designerIteration = modelDesignerIteration(input)
+  const planningActive = hasProfile && input.runnerReady
+  const designActive = hasHypothesisPlan && input.runnerReady
+  const designerDisplayLabel =
+    designerIteration && (hasCompilerEvidence || designActive) ? `ModelDesigner Agent (${designerIteration})` : "ModelDesigner Agent"
+
+  return [
+    {
+      label: "HypoPlanner Agent",
+      displayLabel:
+        hypothesisCount === undefined
+          ? "HypoPlanner Agent"
+          : `HypoPlanner Agent (${hypothesisCount} ${hypothesisCount === 1 ? "hypothesis" : "hypotheses"})`,
+      status: hasHypothesisPlan ? "done" : planningActive ? "active" : "todo",
+      detail: hasHypothesisPlan
+        ? hypothesisCount === undefined
+          ? "Hypothesis plan ready."
+          : `${hypothesisCount} hypotheses ready.`
+        : "Turn the data-analysis handoff into testable architecture hypotheses.",
+    },
+    {
+      label: "ModelDesigner Agent",
+      displayLabel: designerDisplayLabel,
+      status: hasCompilerEvidence ? "done" : designActive ? "active" : "todo",
+      detail: hasCandidates
+        ? `${input.candidates.length} candidate recipes available.`
+        : "Select or synthesize the next architecture candidate.",
+    },
+    {
+      label: "ModelCompiler Agent",
+      status: hasCompilerEvidence ? "done" : hasRunningCompiler ? "active" : "todo",
+      detail: hasCompilerEvidence ? "Smoke compile evidence available." : "Run smoke validation before training.",
+    },
+    {
+      label: "TrainEval Agent",
+      status: trainEvalDone ? "done" : hasRunningTrainEval || (hasCompilerEvidence && input.runnerReady) ? "active" : "todo",
+      detail: trainEvalDone ? "Training/evaluation evidence available." : "Promote compiled candidates to training evaluation.",
     },
   ]
 }
 
 export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflowInput): ResearchCockpitRecommendation {
   const pendingApproval = input.approvals.find((approval) => approval.status === "pending")
-  const hasProfile = hasCockpitDatasetProfile(input)
+  const hasProfile = hasCockpitProfileEvidence(input)
   const hasCandidates = input.candidates.length > 0
   const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
   const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
@@ -305,6 +364,13 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
     }
   }
   if (!input.runnerReady) {
+    if (input.runnerRepairAction === "prepare_dataset") {
+      return {
+        action: "prepare_dataset",
+        title: "Prepare Neo-Cast dataset",
+        detail: "Regenerate the runner dataset contract so it matches the selected task.",
+      }
+    }
     return {
       action: "configure_runner",
       title: "Configure Neo-Cast runner",
@@ -357,6 +423,53 @@ function hasCockpitDatasetProfile(input: Pick<ResearchCockpitWorkflowInput, "art
   if (input.artifacts.some((artifact) => artifact.kind === "task_profile_json")) return true
   const fingerprint = input.fingerprint ?? {}
   return Boolean(fingerprint.datasetProfile || fingerprint.datasetProfileWarning)
+}
+
+function hasCockpitProfileEvidence(input: Pick<ResearchCockpitWorkflowInput, "artifacts" | "fingerprint" | "runs">) {
+  return hasCockpitDatasetProfile(input) || input.runs.some((run) => run.stage === "profile" && run.status === "succeeded")
+}
+
+function researchCockpitHypothesisCount(input: ResearchCockpitWorkflowInput) {
+  const metadata = asRecord(asRecord(input.task?.taskSpec).metadata)
+  const plan = asRecord(metadata.hypothesisPlan)
+  const planHypotheses = plan.hypotheses
+  if (Array.isArray(planHypotheses)) return planHypotheses.length
+  for (const artifact of input.artifacts) {
+    if (artifact.kind !== "hypo_plan_md" && artifact.kind !== "hypotheses_yaml") continue
+    const count = artifact.metadata.hypothesisCount
+    if (typeof count === "number" && Number.isFinite(count)) return count
+  }
+  return undefined
+}
+
+function hasCompletedCompilerRun(input: Pick<ResearchCockpitWorkflowInput, "runs">) {
+  return input.runs.some(
+    (run) => run.stage === "smoke" && (run.status === "succeeded" || run.status === "failed" || run.status === "rejected"),
+  )
+}
+
+function isTrainEvalRun(run: ResearchCockpitRun) {
+  return run.stage === "low_fidelity" || run.stage === "full" || run.stage === "ref_test" || run.stage === "blind_test"
+}
+
+function hasTrainEvalEvidence(input: Pick<ResearchCockpitWorkflowInput, "runs">) {
+  return input.runs.some(
+    (run) => isTrainEvalRun(run) && (run.status === "succeeded" || run.status === "failed" || run.status === "rejected"),
+  )
+}
+
+function modelDesignerIteration(input: Pick<ResearchCockpitWorkflowInput, "task" | "runs">) {
+  const maxRuns = typeof input.task?.budget.maxRuns === "number" ? Math.max(1, Math.floor(input.task.budget.maxRuns)) : undefined
+  if (!maxRuns) return undefined
+  const candidateIDs = new Set(
+    input.runs
+      .filter((run) => run.stage !== "profile" && typeof run.candidateID === "string" && run.candidateID.length > 0)
+      .map((run) => run.candidateID as string),
+  )
+  const fallbackAttemptCount = input.runs.filter((run) => run.stage !== "profile").length
+  const completedAttempts = candidateIDs.size > 0 ? candidateIDs.size : fallbackAttemptCount
+  const iteration = Math.min(maxRuns, completedAttempts + 1)
+  return `iteration ${iteration}/${maxRuns}`
 }
 
 export function researchCockpitArtifactTarget(artifact: ResearchCockpitArtifact) {
@@ -443,6 +556,28 @@ export function formatResearchCockpitArtifactMetadata(artifact: ResearchCockpitA
       source ? `source=${source}` : undefined,
       hasDatasetProfile,
       profileWarning ? `warning=${profileWarning}` : undefined,
+    ]
+  } else if (artifact.kind === "hypo_plan_md" || artifact.kind === "hypotheses_yaml") {
+    const agent = metadataString(artifact.metadata, "agent")
+    const hypothesisCount = compactValue(artifact.metadata.hypothesisCount)
+    const baseline = metadataString(artifact.metadata, "baselineStrategy")
+    parts = [
+      agent ? `agent=${agent}` : undefined,
+      hypothesisCount ? `hypotheses=${hypothesisCount}` : undefined,
+      baseline ? `baseline=${baseline}` : undefined,
+    ]
+  } else if (artifact.kind === "model_compile_report_md") {
+    const agent = metadataString(artifact.metadata, "agent")
+    const candidateID = metadataString(artifact.metadata, "candidateID")
+    const status = metadataString(artifact.metadata, "status")
+    const smokeMetric = compactValue(artifact.metadata.smokeMetric)
+    const failureReason = metadataString(artifact.metadata, "failureReason")
+    parts = [
+      agent ? `agent=${agent}` : undefined,
+      candidateID ? `candidate=${candidateID}` : undefined,
+      status ? `status=${status}` : undefined,
+      smokeMetric ? `smoke=${smokeMetric}` : undefined,
+      failureReason ? `failure=${failureReason}` : undefined,
     ]
   } else if (artifact.kind === "governance_log_json") {
     const approvalKind = metadataString(artifact.metadata, "kind")
@@ -632,13 +767,26 @@ export function resolveResearchCockpitProjectRunnerRoot(projectRoot: string) {
   const root = projectRoot.trim()
   if (!root) return root
   const resolved = path.resolve(root)
-  const candidates = [
-    path.join(resolved, "neo_cast"),
-    path.join(resolved, "neo-cast"),
-    path.join(path.dirname(resolved), "neo_cast"),
-    path.join(path.dirname(resolved), "neo-cast"),
-    resolved,
-  ]
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const addCandidate = (candidate: string) => {
+    if (seen.has(candidate)) return
+    seen.add(candidate)
+    candidates.push(candidate)
+  }
+
+  addCandidate(resolved)
+  addCandidate(path.join(resolved, "neo_cast"))
+  addCandidate(path.join(resolved, "neo-cast"))
+
+  if (resolved.split(path.sep).includes("opencode")) {
+    for (let current = path.dirname(resolved); ; current = path.dirname(current)) {
+      addCandidate(path.join(current, "neo_cast"))
+      addCandidate(path.join(current, "neo-cast"))
+      if (current === path.dirname(current)) break
+    }
+  }
+
   return candidates.find((candidate) => existsSync(path.join(candidate, "py", "validate.py"))) ?? resolved
 }
 
@@ -722,42 +870,56 @@ function arrayEquals<T>(left: T[] | undefined, right: T[] | undefined) {
   return left.length === right.length && left.every((item, index) => item === right[index])
 }
 
-function readPreparedDatasetSpec(root: string) {
+function readPreparedDatasetSpecs(root: string) {
   const specPaths = [
     path.join(root, ".neo-cast", "dataset_spec.json"),
     path.join(root, ".neo-cast", "dataset", "dataset_spec.json"),
   ]
-  const specPath = specPaths.find((item) => existsSync(item))
-  if (!specPath) return undefined
+  const specs: JsonRecord[] = []
+  for (const specPath of specPaths) {
+    if (!existsSync(specPath)) continue
+    try {
+      const parsed = JSON.parse(readFileSync(specPath, "utf8"))
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) specs.push(parsed as JsonRecord)
+    } catch {
+      continue
+    }
+  }
+  return specs
+}
+
+function preparedDatasetSpecPayloadMatchesTask(prepared: JsonRecord, task: ResearchCockpitTask) {
   try {
-    const parsed = JSON.parse(readFileSync(specPath, "utf8"))
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as JsonRecord) : undefined
+    const taskSpec = asRecord(task.taskSpec)
+    const dataset = asRecord(taskSpec.dataset)
+    const taskDatasetPath = typeof dataset.path === "string" ? path.resolve(dataset.path) : undefined
+    const sourceCsv = typeof prepared.source_csv === "string" ? path.resolve(prepared.source_csv) : undefined
+    if (sourceCsv && taskDatasetPath && sourceCsv !== taskDatasetPath) return false
+
+    const inputLen = typeof prepared.input_len === "number" ? prepared.input_len : undefined
+    const contextLength = typeof taskSpec.contextLength === "number" ? taskSpec.contextLength : undefined
+    if (inputLen !== undefined && contextLength !== undefined && inputLen !== contextLength) return false
+
+    if (!arrayEquals(optionalNumberArray(taskSpec.predictionLengths), optionalNumberArray(prepared.horizons))) return false
+    const targets = optionalStringArray(dataset.targetCols)
+    const features = optionalStringArray(prepared.feature_columns)
+    if (targets && features) {
+      const featureSet = new Set(features)
+      if (targets.some((target) => !featureSet.has(target))) return false
+    }
+    return true
   } catch {
-    return undefined
+    return false
   }
 }
 
 function preparedDatasetSpecMatchesTask(task: ResearchCockpitTask, root: string) {
-  const prepared = readPreparedDatasetSpec(root)
+  const preparedSpecs = readPreparedDatasetSpecs(root)
   const taskSpec = asRecord(task.taskSpec)
   const dataset = asRecord(taskSpec.dataset)
   const taskDatasetPath = typeof dataset.path === "string" ? path.resolve(dataset.path) : undefined
-  if (!prepared) return taskDatasetPath === undefined
-  const sourceCsv = typeof prepared.source_csv === "string" ? path.resolve(prepared.source_csv) : undefined
-  if (sourceCsv && taskDatasetPath && sourceCsv !== taskDatasetPath) return false
-
-  const inputLen = typeof prepared.input_len === "number" ? prepared.input_len : undefined
-  const contextLength = typeof taskSpec.contextLength === "number" ? taskSpec.contextLength : undefined
-  if (inputLen !== undefined && contextLength !== undefined && inputLen !== contextLength) return false
-
-  if (!arrayEquals(optionalNumberArray(taskSpec.predictionLengths), optionalNumberArray(prepared.horizons))) return false
-  const targets = optionalStringArray(dataset.targetCols)
-  const features = optionalStringArray(prepared.feature_columns)
-  if (targets && features) {
-    const featureSet = new Set(features)
-    if (targets.some((target) => !featureSet.has(target))) return false
-  }
-  return true
+  if (preparedSpecs.length === 0) return taskDatasetPath === undefined
+  return preparedSpecs.some((prepared) => preparedDatasetSpecPayloadMatchesTask(prepared, task))
 }
 
 export function getResearchCockpitRunnerStatus(

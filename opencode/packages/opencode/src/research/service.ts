@@ -2,6 +2,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { cp, mkdir, readFile, writeFile } from "fs/promises"
 import { existsSync } from "fs"
+import os from "os"
 import path from "path"
 import { deflateSync } from "zlib"
 import z from "zod"
@@ -83,19 +84,42 @@ import {
   summarizeDataAnalysisAgent,
   type DataAnalysisAgentResult,
 } from "./agents/data-analysis-agent"
+import {
+  buildModelCompilerResult,
+  type ModelCompilerResult,
+} from "./agents/model-compiler-agent"
+import {
+  buildModelDesignerResult,
+  buildModelDesignerTaskFingerprint,
+  candidateAttemptStateFromRuns as modelDesignerCandidateAttemptStateFromRuns,
+  selectHypothesisForDesign,
+  selectModelDesignerCandidate,
+  type ModelDesignerLLMStatus,
+} from "./agents/model-designer-agent"
+import {
+  buildHypoPlanMarkdown,
+  buildHypoPlannerResult,
+  buildHypothesesYaml,
+  extractEvidenceSummary,
+  type ExperimentPlan,
+  type HypoPlannerResult,
+} from "./agents/hypo-planner-agent"
 import { buildNASAgentResult, summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
 import { summarizePublishAgent, type PublishAgentResult } from "./agents/publish-agent"
+import { buildTrainEvalResult, type TrainEvalResult } from "./agents/train-eval-agent"
 import {
+  analyzeReflection,
   reflectionAgentMetadata,
   summarizeReflectionAgent,
   type ReflectionAgentResult,
+  type ReflectionAnalysis,
 } from "./agents/reflection-agent"
 import {
   evaluateRun as evaluateRunWithVerifiers,
   verifierAgentMetadata,
   type VerifierAgentResult,
 } from "./agents/verifier-agent"
-import { buildEvaluationResultMarkdown, buildVerifierDecisionRecord, runVerifiers } from "./verifiers"
+import { buildEvaluationResultMarkdown, buildVerifierDecisionRecord, runVerifiers, type VerifierReport } from "./verifiers"
 
 type DbClient = Parameters<typeof Database.use>[0] extends (trx: infer D) => unknown ? D : never
 type ResearchTaskRow = typeof ResearchTaskTable.$inferSelect
@@ -160,6 +184,7 @@ export interface RunFullPipelineResult {
   readonly task: ResearchTask
   readonly intent: IntentAgentResult
   readonly dataAnalysis: DataAnalysisAgentResult
+  readonly hypoPlanning: HypoPlannerResult
   readonly nas: NASAgentResult
   readonly reflection: ReflectionAgentResult
   readonly publish: PublishAgentResult
@@ -168,6 +193,7 @@ export interface RunFullPipelineResult {
 const PipelineWorkflowPhases = [
   "intent_gathering",
   "data_analysis",
+  "hypo_planning",
   "searching",
   "reflection",
   "publishing",
@@ -326,6 +352,36 @@ function parseRunnerRecords(stdout: string) {
   return records
 }
 
+interface RunnerProgressFields {
+  readonly event?: string
+  readonly epoch?: number
+  readonly horizon?: number
+  readonly valLoss?: number
+  readonly elapsedS?: number
+}
+
+function parseProgressLine(line: string): RunnerProgressFields {
+  try {
+    const parsed = JSON.parse(line)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {}
+    const record = parsed as Record<string, unknown>
+    const event = typeof record.event === "string" ? record.event : undefined
+    const epoch = finiteNumber(record.epoch)
+    const horizon = finiteNumber(record.horizon)
+    const valLoss = finiteNumber(record.val_loss) ?? finiteNumber(record.valLoss)
+    const elapsedS = finiteNumber(record.elapsed_s) ?? finiteNumber(record.elapsedS)
+    return {
+      ...(event === undefined ? {} : { event }),
+      ...(epoch === undefined ? {} : { epoch }),
+      ...(horizon === undefined ? {} : { horizon }),
+      ...(valLoss === undefined ? {} : { valLoss }),
+      ...(elapsedS === undefined ? {} : { elapsedS }),
+    }
+  } catch {
+    return {}
+  }
+}
+
 function metricsFromRecords(records: Record<string, unknown>[]) {
   const metrics: Record<string, number> = {}
   for (const record of records) {
@@ -481,6 +537,41 @@ function managerStep(
 function recordValue(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
+}
+
+function experimentPlanFromMetadata(value: unknown): ExperimentPlan | undefined {
+  const record = recordValue(value)
+  return Array.isArray(record.hypotheses) ? (value as ExperimentPlan) : undefined
+}
+
+function recoverHypoPlannerResultFromPlan(input: {
+  readonly task: ResearchTask
+  readonly dataAnalysis: DataAnalysisAgentResult
+  readonly plan: ExperimentPlan
+}): HypoPlannerResult {
+  const evidenceSummary = extractEvidenceSummary(input.dataAnalysis)
+  const partial = {
+    agent: "HypoPlannerAgent" as const,
+    taskID: input.task.id,
+    plan: input.plan,
+    hypothesesYaml: buildHypothesesYaml(input.plan),
+    evidenceSummary,
+  }
+  return {
+    ...partial,
+    planMarkdown: buildHypoPlanMarkdown({ ...partial, planMarkdown: "" }),
+  }
+}
+
+function modelDesignerLLMStatusFromMetadata(
+  metadata: JsonRecord,
+  generatedBy: ResearchCandidate["generatedBy"],
+  selectionSource: "existing_frontier" | "domain_proposal",
+): ModelDesignerLLMStatus {
+  const status = metadata.llmStatus
+  if (status === "used" || status === "failed" || status === "disabled" || status === "invalid") return status
+  if (generatedBy === "llm") return "used"
+  return selectionSource === "existing_frontier" ? "disabled" : "disabled"
 }
 
 function asPipelineWorkflowMetadata(input: unknown): PipelineWorkflowMetadata {
@@ -689,65 +780,11 @@ function isMeaningfulMetricImprovement(
   return delta / Math.max(Math.abs(current), 1e-12) >= minRelativeImprovement
 }
 
-function candidateAttemptStateFromRuns(
-  runs: readonly ResearchRun[],
-  maxFailedRetries: number,
-  primaryMetricName?: string,
-) {
-  const retryableCounts = new Map<ResearchCandidateID, number>()
-  const attempted = new Set<ResearchCandidateID>()
-  const inconclusive = new Set<ResearchCandidateID>()
-  for (const run of runs) {
-    if (run.candidateID === undefined) continue
-    if (run.status === "failed") {
-      retryableCounts.set(run.candidateID, (retryableCounts.get(run.candidateID) ?? 0) + 1)
-      continue
-    }
-    if (
-      run.status === "succeeded" &&
-      primaryMetricName !== undefined &&
-      metricValue(run.metrics, primaryMetricName) === undefined
-    ) {
-      inconclusive.add(run.candidateID)
-      retryableCounts.set(run.candidateID, (retryableCounts.get(run.candidateID) ?? 0) + 1)
-      continue
-    }
-    attempted.add(run.candidateID)
-  }
-  for (const [candidateID, count] of retryableCounts) {
-    if (count > maxFailedRetries) attempted.add(candidateID)
-  }
-  return {
-    attemptedCandidateIDs: attempted,
-    inconclusiveCandidateIDs: inconclusive,
-  }
-}
-
 function autonomousLoopMaxIterations(inputValue: unknown, task: ResearchTask) {
   const requested = integerPolicyValue(inputValue)
   if (requested !== undefined) return Math.max(1, Math.min(requested, 50))
   const budgetMaxRuns = maxRunsLimit(task.budget)
   return Math.max(1, Math.min(Math.max(budgetMaxRuns ?? 10, 10), 50))
-}
-
-function rankExistingReadyCandidates(
-  candidates: readonly ResearchCandidate[],
-  readyCandidateIDs: readonly ResearchCandidateID[],
-): DomainCandidateRanking[] {
-  const ready = new Set(readyCandidateIDs)
-  return candidates
-    .filter((candidate) => ready.has(candidate.id))
-    .map((candidate, index) => ({
-      rank: index + 1,
-      score: readyCandidateIDs.length - index,
-      reasons: ["existing approved frontier candidate"],
-      predictorVersion: "existing_frontier_v1",
-      candidateSpec: candidate.candidateSpec,
-      rationale: candidate.rationale,
-      riskLevel: candidate.riskLevel,
-      approvalStatus: candidate.approvalStatus,
-      generatedBy: candidate.generatedBy,
-    }))
 }
 
 function artifactDirsFromRecords(records: Record<string, unknown>[]) {
@@ -2126,6 +2163,59 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
   )
 }
 
+// Known opencode provider → OpenAI-compat base URL mapping for neo-cast LLM bridge.
+const OPENCODE_PROVIDER_BASE_URLS: Record<string, string> = {
+  zhipuai: "https://open.bigmodel.cn/api/paas/v4",
+  "zhipuai-coding-plan": "https://open.bigmodel.cn/api/paas/v4",
+  openai: "https://api.openai.com/v1",
+  anthropic: "", // handled separately via ANTHROPIC_API_KEY env path
+}
+
+// Default model names to use when neo-cast config doesn't specify one and we fall back to auth.json key.
+const OPENCODE_PROVIDER_DEFAULT_MODELS: Record<string, string> = {
+  zhipuai: "glm-4-flash",
+  "zhipuai-coding-plan": "glm-4-flash",
+  openai: "gpt-4o-mini",
+}
+
+interface AuthJsonKeyResult {
+  readonly key: string
+  readonly baseURL: string
+  readonly model: string
+}
+
+// Reads opencode's auth.json and returns the first usable API key with provider metadata.
+// This bridges the gap between "Configure API Key" (opencode provider auth) and neo-cast env vars.
+async function resolveApiKeyFromAuthJson(): Promise<AuthJsonKeyResult | undefined> {
+  if (process.env.OPENCODE_TEST_HOME) return undefined
+  const candidates = [
+    process.env.XDG_DATA_HOME ? path.join(process.env.XDG_DATA_HOME, "neo-research", "auth.json") : undefined,
+    path.join(os.homedir(), ".local", "share", "neo-research", "auth.json"),
+    path.join(os.homedir(), ".local", "share", "opencode", "auth.json"),
+  ].filter((p): p is string => p !== undefined)
+
+  for (const authPath of candidates) {
+    try {
+      const raw = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>
+      // Priority order: anthropic → openai → zhipuai → others
+      const priority = ["anthropic", "openai", ...Object.keys(OPENCODE_PROVIDER_BASE_URLS)]
+      const order = [...new Set(priority)]
+      for (const providerID of order) {
+        const entry = raw[providerID]
+        if (!entry || typeof entry !== "object") continue
+        const rec = entry as Record<string, unknown>
+        if (rec.type !== "api" || typeof rec.key !== "string" || !rec.key) continue
+        const baseURL = OPENCODE_PROVIDER_BASE_URLS[providerID] ?? ""
+        const model = OPENCODE_PROVIDER_DEFAULT_MODELS[providerID] ?? "gpt-4o-mini"
+        return { key: rec.key, baseURL, model }
+      }
+    } catch {
+      // file missing or unreadable — try next candidate
+    }
+  }
+  return undefined
+}
+
 async function generateLLMQualitativeAnalysis(
   task: ResearchTask,
   fingerprint: JsonRecord,
@@ -2136,16 +2226,119 @@ async function generateLLMQualitativeAnalysis(
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
     const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
     const config = await resolveNeoCastLLMConfig({ workspaceRoot, neoCastProjectRoot })
-    const apiKey = apiKeyFor(config)
-    if (!apiKey) return undefined
+    let apiKey = apiKeyFor(config)
+    let effectiveConfig = config
+    if (!apiKey) {
+      // Fallback: read the key configured via the TUI "Configure API Key" dialog (opencode auth.json).
+      const authEntry = await resolveApiKeyFromAuthJson()
+      if (!authEntry) return undefined
+      apiKey = authEntry.key
+      effectiveConfig = { ...config, provider: "openai-compatible", ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}) }
+    }
     const system = buildQualitativeSystemPrompt()
     const user = buildQualitativeUserPrompt(task, fingerprint, context)
     // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
-    const llmPromise = requestNeoCastLLM(config, apiKey, system, user)
+    const llmPromise = requestNeoCastLLM(effectiveConfig, apiKey, system, user)
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
     return await Promise.race([llmPromise, timeoutPromise])
   } catch {
     return undefined
+  }
+}
+
+function buildReflectionLLMSystemPrompt(): string {
+  return [
+    "You are the NeoResearch reflection assistant for time series forecasting (TSF) research.",
+    "Language policy: write in English; keep technical terms, metric names, and module names in English.",
+    "Task: Given a structured analysis of a TSF model-search window, write a concise narrative reflection.",
+    "Output format: Return exactly three paragraphs of plain prose (no headings, no bullet points, no code blocks):",
+    "Paragraph 1: Plain-language summary of what happened in this search window (runs, outcomes, best metric).",
+    "Paragraph 2: What worked and what did not — effective changes, failures, and plateau observations.",
+    "Paragraph 3: What the agent recommends next and why, based on the hypotheses and decision.",
+    "Keep the total length to 150-250 words. Do not add any text outside the three paragraphs.",
+  ].join("\n")
+}
+
+function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis): string {
+  return JSON.stringify(
+    {
+      primaryMetricName: analysis.primaryMetricName,
+      direction: analysis.direction,
+      bestMetric: analysis.bestMetric ?? null,
+      bestRunID: analysis.bestRunID ?? null,
+      latestMetric: analysis.latestMetric ?? null,
+      latestDelta: analysis.latestDelta ?? null,
+      succeededRuns: analysis.succeededRuns,
+      failedRuns: analysis.failedRuns,
+      rejectedRuns: analysis.rejectedRuns,
+      plateauStreak: analysis.plateauStreak,
+      effectiveChanges: analysis.effectiveChanges.map((item) => ({
+        candidateID: item.candidateID,
+        runID: item.runID,
+        metricValue: item.metricValue,
+        delta: item.delta,
+        summary: item.summary,
+      })),
+      ineffectiveChanges: analysis.ineffectiveChanges.map((item) => ({
+        candidateID: item.candidateID,
+        runID: item.runID,
+        metricValue: item.metricValue,
+        delta: item.delta,
+        summary: item.summary,
+      })),
+      failures: analysis.failures.map((item) => ({
+        runID: item.runID,
+        candidateID: item.candidateID ?? null,
+        category: item.category,
+        summary: item.summary,
+      })),
+      nextHypotheses: analysis.nextHypotheses.map((item) => ({
+        title: item.title,
+        rationale: item.rationale,
+        expectedSignal: item.expectedSignal,
+      })),
+      decision: analysis.decision,
+      decisionReason: analysis.decisionReason,
+      instruction:
+        "Write a narrative reflection summary (3 paragraphs) describing what happened, what worked/failed, and what to do next.",
+    },
+    null,
+    2,
+  )
+}
+
+async function generateLLMReflectionSynthesis(
+  task: ResearchTask,
+  result: ReflectionAgentResult,
+): Promise<ReflectionAgentResult> {
+  const runtime = recordValue(recordValue(task.taskSpec).runtime)
+  const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
+  let config
+  try {
+    config = await resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot })
+  } catch {
+    return { ...result, llm: { status: "failed" } }
+  }
+  let apiKey = apiKeyFor(config)
+  let effectiveConfig = config
+  if (!apiKey) {
+    // Fallback: read the key configured via the TUI "Configure API Key" dialog (opencode auth.json).
+    const authEntry = await resolveApiKeyFromAuthJson()
+    if (!authEntry) return { ...result, llm: { status: "not_configured" } }
+    apiKey = authEntry.key
+    effectiveConfig = { ...config, provider: "openai-compatible", ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}) }
+  }
+  try {
+    const system = buildReflectionLLMSystemPrompt()
+    const user = buildReflectionLLMUserPrompt(result.analysis)
+    // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
+    const llmPromise = requestNeoCastLLM(effectiveConfig, apiKey, system, user)
+    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
+    const text = await Promise.race([llmPromise, timeoutPromise])
+    if (text === undefined) return { ...result, llm: { status: "failed" } }
+    return { ...result, llm: { status: "used", model: effectiveConfig.model, text } }
+  } catch {
+    return { ...result, llm: { status: "failed" } }
   }
 }
 
@@ -2256,7 +2449,10 @@ function renderReleasePackageMarkdown(input: {
   ].join("\n")
 }
 
-async function executeRunnerPlan(plan: DomainRunPlan): Promise<RunnerExecution> {
+async function executeRunnerPlan(
+  plan: DomainRunPlan,
+  onProgressLine?: (line: string) => void,
+): Promise<RunnerExecution> {
   const cwd = plan.command.cwd ?? process.cwd()
   for (const item of plan.writes) {
     const file = runnerPath(cwd, item.path)
@@ -2264,11 +2460,12 @@ async function executeRunnerPlan(plan: DomainRunPlan): Promise<RunnerExecution> 
     await writeFile(file, `${JSON.stringify(item.content, null, 2)}\n`, "utf8")
   }
 
-  const result = await Process.run([plan.command.executable, ...plan.command.args], {
+  const result = await Process.runStreaming([plan.command.executable, ...plan.command.args], {
     cwd,
     env: plan.command.env,
     timeout: plan.command.timeoutMs,
     nothrow: true,
+    onStdoutLine: onProgressLine,
   })
   const stdout = result.stdout.toString()
   return {
@@ -2514,6 +2711,11 @@ export interface Interface {
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
   readonly answerIntentQuestion: (input: AnswerIntentInput) => Effect.Effect<IntentAgentResult>
   readonly runDataAnalysisAgent: (input: ProfileTaskInput) => Effect.Effect<DataAnalysisAgentResult>
+  readonly runHypoPlannerAgent: (input: {
+    readonly taskID: ResearchTaskID
+    readonly dataAnalysis: DataAnalysisAgentResult
+    readonly outputDir?: string
+  }) => Effect.Effect<HypoPlannerResult>
   readonly runNASAgent: (input: AutonomousLoopInput) => Effect.Effect<NASAgentResult>
   readonly runVerifierAgent: (input: VerifierAgentRunInput) => Effect.Effect<VerifierAgentResult>
   readonly runReflectionAgent: (input: ReflectionAgentInput) => Effect.Effect<ReflectionAgentResult>
@@ -2674,6 +2876,36 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const nextTaskSpec = {
         ...task.taskSpec,
         metadata: { ...metadata, workflow: next } as unknown as JsonRecord,
+      }
+      const row = yield* db((d) =>
+        d
+          .update(ResearchTaskTable)
+          .set({
+            task_spec: nextTaskSpec,
+            time_updated: Date.now(),
+          })
+          .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
+          .returning()
+          .get(),
+      )
+      if (!row) throw missing("Research task", input.taskID)
+      const updated = mapTask(row)
+      yield* bus.publish(Event.TaskUpdated, { task: updated })
+      return updated
+    })
+
+    const updateTaskHypothesisPlan = Effect.fn("Research.updateTaskHypothesisPlan")(function* (input: {
+      taskID: ResearchTaskID
+      hypothesisPlan: ExperimentPlan
+    }) {
+      const task = yield* getTask(input.taskID)
+      const metadata = recordValue(task.taskSpec.metadata)
+      const nextTaskSpec = {
+        ...task.taskSpec,
+        metadata: {
+          ...metadata,
+          hypothesisPlan: input.hypothesisPlan,
+        } as unknown as JsonRecord,
       }
       const row = yield* db((d) =>
         d
@@ -3302,9 +3534,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       if (!runPlan.validation.ok) {
         throw new Error(`Research candidate failed domain validation: ${runPlan.validation.issues[0]?.message}`)
       }
-      if (runPlan.approvalRequired) {
-        yield* ensureRunApprovalGates(task, candidate, stage)
-      }
+      yield* ensureRunApprovalGates(task, candidate, stage)
 
       const run = yield* createRun({
         taskID: task.id,
@@ -3501,7 +3731,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       }
 
       const running = yield* updateRunStatus({ runID: prepared.run.id, status: "running" })
-      const execution = yield* Effect.promise(() => executeRunnerPlan(prepared.runPlan))
+      let progressPublishQueue = Promise.resolve()
+      const publishProgressLine = Instance.bind((line: string) => {
+        progressPublishQueue = progressPublishQueue
+          .then(() =>
+            Effect.runPromise(
+              bus.publish(Event.RunnerProgressLine, {
+                taskID: running.taskID,
+                runID: running.id,
+                line,
+                ...parseProgressLine(line),
+              }),
+            ),
+          )
+          .catch(() => undefined)
+      })
+      const execution = yield* Effect.promise(async () => {
+        const result = await executeRunnerPlan(prepared.runPlan, publishProgressLine)
+        await progressPublishQueue
+        return result
+      })
       const metrics = metricsFromRecords(execution.records)
       const artifactRefs: ResearchArtifactID[] = [...running.artifactRefs]
 
@@ -3730,6 +3979,33 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       })
     })
 
+    const writeModelCompileArtifact = Effect.fn("Research.writeModelCompileArtifact")(function* (input: {
+      readonly task: ResearchTask
+      readonly run: ResearchRun
+      readonly compilerResult: ModelCompilerResult
+    }) {
+      const dir = path.join(Instance.directory, ".neo-research", "compile-reports", input.task.id)
+      const file = path.join(dir, `${input.run.id}.md`)
+      yield* Effect.promise(async () => {
+        await mkdir(dir, { recursive: true })
+        await writeFile(file, input.compilerResult.compileReportMarkdown, "utf8")
+      })
+      return yield* createArtifact({
+        taskID: input.task.id,
+        runID: input.run.id,
+        kind: "model_compile_report_md",
+        uri: `file://${file}`,
+        metadata: {
+          agent: input.compilerResult.agent,
+          candidateID: input.compilerResult.candidateID,
+          runID: input.compilerResult.runID,
+          status: input.compilerResult.status,
+          smokeMetric: input.compilerResult.smokeMetric ?? null,
+          failureReason: input.compilerResult.failureReason ?? null,
+        },
+      })
+    })
+
     const attachArtifactRefToRun = Effect.fn("Research.attachArtifactRefToRun")(function* (
       run: ResearchRun,
       artifactID: ResearchArtifactID,
@@ -3894,16 +4170,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const reflectionHypotheses = Array.isArray(existingMeta.reflectionHypotheses)
         ? (existingMeta.reflectionHypotheses as string[])
         : []
+      const hypothesisPlan = experimentPlanFromMetadata(existingMeta.hypothesisPlan)
+      const selectedHypothesis = selectHypothesisForDesign(hypothesisPlan)
 
-      const baseSearchBiases = Array.isArray(baseFingerprint.searchBiases)
-        ? (baseFingerprint.searchBiases as unknown[])
+      const taskFingerprint = buildModelDesignerTaskFingerprint({
+        baseFingerprint,
+        hypothesisPlan,
+        selectedHypothesis,
+        reflectionHypotheses,
+      })
+      const mergedSearchBiases = Array.isArray(taskFingerprint.searchBiases)
+        ? (taskFingerprint.searchBiases as unknown[])
         : []
-      const mergedSearchBiases = [...baseSearchBiases, ...reflectionHypotheses]
-
-      const taskFingerprint = {
-        ...baseFingerprint,
-        searchBiases: mergedSearchBiases,
-      } as JsonRecord
 
       const managerTrace: ResearchManagerStep[] = [
         managerStep("diagnostic", "completed", "Built task fingerprint for autonomous planning.", {
@@ -3936,30 +4214,23 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
       const runs = yield* listRuns(task.id)
       const primaryMetricName = objectiveMetricName(task.objective)
-      const attemptState = candidateAttemptStateFromRuns(runs, maxFailedCandidateRetries(task), primaryMetricName)
-      const readyCandidateIDs = candidates
-        .filter(
-          (item) =>
-            (item.approvalStatus === "approved" || item.approvalStatus === "auto_approved") &&
-            !attemptState.attemptedCandidateIDs.has(item.id),
-        )
-        .map((item) => item.id)
-      let candidate = candidates.find(
-        (item) =>
-          (item.approvalStatus === "approved" || item.approvalStatus === "auto_approved") &&
-          attemptState.inconclusiveCandidateIDs.has(item.id) &&
-          !attemptState.attemptedCandidateIDs.has(item.id),
-      )
-      candidate ??= candidates.find(
-        (item) =>
-          (item.approvalStatus === "approved" || item.approvalStatus === "auto_approved") &&
-          !attemptState.attemptedCandidateIDs.has(item.id),
-      )
+      const designerSelection = selectModelDesignerCandidate({
+        candidates,
+        runs,
+        primaryMetricName,
+        maxFailedRetries: maxFailedCandidateRetries(task),
+      })
+      const readyCandidateIDs = [...designerSelection.readyCandidateIDs]
+      const attemptState = {
+        attemptedCandidateIDs: new Set(designerSelection.attemptedCandidateIDs),
+        inconclusiveCandidateIDs: new Set(designerSelection.inconclusiveCandidateIDs),
+      }
+      let candidate = designerSelection.candidate
 
       const proposalApprovals: ResearchApproval[] = []
       let proposalCreated = false
       let selectionSource: "existing_frontier" | "domain_proposal" = "existing_frontier"
-      let rankings: DomainCandidateRanking[] = rankExistingReadyCandidates(candidates, readyCandidateIDs)
+      let rankings: DomainCandidateRanking[] = [...designerSelection.rankings]
       let llmMetadata: JsonRecord = {}
       if (!candidate) {
         const memory = yield* listRelatedMemory(task)
@@ -3997,11 +4268,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                   utility: champion.utility,
                 },
         }
+        const authJsonKey = yield* Effect.promise(() => resolveApiKeyFromAuthJson())
         const llmResult = yield* Effect.promise(() =>
           proposeLLMCandidate({
             task,
             proposalContext,
             workspaceRoot: Instance.directory,
+            ...(authJsonKey ? { authJsonKey } : {}),
           }),
         )
         llmMetadata = llmResult.metadata
@@ -4057,14 +4330,25 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const topRanking = rankings[0]
       const topRankedRecipeID = topRanking === undefined ? undefined : rankingRecipeID(topRanking)
       const selectedRecipeID = candidateRecipeID(candidate.candidateSpec)
+      const designSummary = proposalCreated
+        ? "Designed a new candidate from task fingerprint, run history, champion, and memory."
+        : "Selected an approved candidate already queued in the frontier."
+      const modelDesignerResult = buildModelDesignerResult({
+        taskID: task.id,
+        candidate,
+        selectedHypothesis,
+        rationale: designSummary,
+        llmStatus: modelDesignerLLMStatusFromMetadata(llmMetadata, candidate.generatedBy, selectionSource),
+        selectionSource,
+      })
       managerTrace.push(
         managerStep(
           "design",
           "completed",
-          proposalCreated
-            ? "Designed a new candidate from task fingerprint, run history, champion, and memory."
-            : "Selected an approved candidate already queued in the frontier.",
+          designSummary,
           {
+            agent: modelDesignerResult.agent,
+            modelDesignerResult,
             candidateID: candidate.id,
             selectedCandidateID: candidate.id,
             recipeID: selectedRecipeID,
@@ -4106,18 +4390,65 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         ),
       )
 
+      const requestedStage = input.stage ?? "smoke"
+      if (
+        requestedStage !== "smoke" &&
+        stageRequiresDomainActionApproval(requestedStage) &&
+        candidateUsesNativeDomainAction(candidate.candidateSpec)
+      ) {
+        yield* ensureRunApprovalGates(task, candidate, requestedStage)
+      }
+
       const memoryBeforeRun = yield* listMemory(task.id)
-      const executed = yield* executeRun({
+      let compileRun = yield* executeRun({
         taskID: task.id,
         candidateID: candidate.id,
-        stage: input.stage,
+        stage: "smoke",
         description: input.description,
       })
+      const compilerResult = buildModelCompilerResult({
+        taskID: task.id,
+        candidateID: candidate.id,
+        smokeRun: compileRun.run,
+      })
+      if (compilerResult.status !== "passed" && compileRun.run.status !== "failed") {
+        compileRun = {
+          ...compileRun,
+          run: yield* updateRunStatus({
+            runID: compileRun.run.id,
+            status: "failed",
+            error: compilerResult.failureReason ?? `ModelCompilerAgent marked smoke as ${compilerResult.status}.`,
+          }),
+        }
+      }
+      const compileArtifact = yield* writeModelCompileArtifact({
+        task,
+        run: compileRun.run,
+        compilerResult,
+      })
+      compileRun = {
+        ...compileRun,
+        run: yield* attachArtifactRefToRun(compileRun.run, compileArtifact.id),
+      }
+
+      let executed = compileRun
+      if (requestedStage !== "smoke" && compilerResult.status === "passed") {
+        executed = yield* executeRun({
+          taskID: task.id,
+          candidateID: candidate.id,
+          stage: requestedStage,
+          description: input.description,
+        })
+      }
       // --- Verifier Agent: run post-execution checks only when primary metric is present ---
       let finalRun = executed.run
       const primaryMetric = metricValue(executed.run.metrics, primaryMetricName)
+      let verifierReportForTrainEval: VerifierReport | undefined
       if (executed.run.status === "succeeded" && primaryMetric !== undefined) {
-        const prevRuns = runs.filter((r) => r.id !== executed.run.id)
+        const prevRuns =
+          executed.run.id === compileRun.run.id
+            ? runs.filter((r) => r.id !== executed.run.id)
+            : [...runs, compileRun.run].filter((r) => r.id !== executed.run.id)
         const currentChampion = yield* getChampion(task.id)
         const verReport = runVerifiers({
           task,
@@ -4126,6 +4457,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           previousRuns: prevRuns,
           champion: currentChampion,
         })
+        verifierReportForTrainEval = verReport
         const evalMarkdown = buildEvaluationResultMarkdown({
           task,
           run: executed.run,
@@ -4224,6 +4556,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         )
       }
 
+      const trainEvalResult: TrainEvalResult | undefined =
+        requestedStage === "low_fidelity" || requestedStage === "full"
+          ? buildTrainEvalResult({
+              taskID: task.id,
+              run: finalRun,
+              candidate,
+              stage: requestedStage,
+              primaryMetricName,
+              ...(verifierReportForTrainEval === undefined ? {} : { verifierReport: verifierReportForTrainEval }),
+            })
+          : undefined
+
       const runSucceeded = finalRun.status === "succeeded"
       managerTrace.push(
         managerStep(
@@ -4238,6 +4582,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             stage: finalRun.stage,
             status: finalRun.status,
             metrics: finalRun.metrics,
+            modelCompilerResult: compilerResult,
+            ...(trainEvalResult === undefined ? {} : { trainEvalResult }),
             ...(finalRun.error === undefined ? {} : { error: finalRun.error }),
             rankPredictorVersion: rankPredictor.version,
           },
@@ -4327,11 +4673,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       if (candidates.length === 0) return undefined
 
       const runs = yield* listRuns(task.id)
-      const attemptState = candidateAttemptStateFromRuns(
+      const attemptState = modelDesignerCandidateAttemptStateFromRuns({
         runs,
-        maxFailedCandidateRetries(task),
-        objectiveMetricName(task.objective),
-      )
+        maxFailedRetries: maxFailedCandidateRetries(task),
+        primaryMetricName: objectiveMetricName(task.objective),
+      })
       const hasReadyCandidate = candidates.some(
         (candidate) =>
           (candidate.approvalStatus === "approved" || candidate.approvalStatus === "auto_approved") &&
@@ -4419,6 +4765,32 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             noImproveStreak = 0
           } else {
             noImproveStreak += 1
+            // Mid-loop reflection: after every 3 consecutive no-improve iterations, derive fresh
+            // hypotheses and persist them to taskSpec so the next iteration picks them up.
+            if (noImproveStreak % 3 === 0) {
+              yield* Effect.gen(function* () {
+                const currentTask = yield* getTask(input.taskID)
+                const allRuns = yield* listRuns(input.taskID)
+                const allCandidates = yield* listCandidates(input.taskID)
+                const midAnalysis = analyzeReflection({
+                  task: currentTask,
+                  runs: allRuns,
+                  candidates: allCandidates,
+                  stoppedReason: undefined,
+                })
+                const hypothesisTitles = midAnalysis.nextHypotheses.map((h) => h.title)
+                if (hypothesisTitles.length > 0) {
+                  const existingMeta = recordValue(currentTask.taskSpec.metadata)
+                  yield* updateTaskSpec({
+                    taskID: input.taskID,
+                    taskSpec: {
+                      ...currentTask.taskSpec,
+                      metadata: { ...existingMeta, reflectionHypotheses: hypothesisTitles },
+                    } as JsonRecord,
+                  })
+                }
+              }).pipe(Effect.catchCause(() => Effect.void))
+            }
           }
           const targetReached =
             targetMetricValue !== undefined &&
@@ -5256,6 +5628,97 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	      )
 	    })
 
+	    const runHypoPlannerAgent = Effect.fn("Research.runHypoPlannerAgent")(function* (input: {
+	      readonly taskID: ResearchTaskID
+	      readonly dataAnalysis: DataAnalysisAgentResult
+	      readonly outputDir?: string
+	    }) {
+	      yield* updateTaskStatus({ taskID: input.taskID, status: "hypo_planning" })
+	      yield* bus.publish(Event.HypoPlannerAgentStarted, {
+	        taskID: input.taskID,
+	        agent: "HypoPlannerAgent",
+	        stage: "hypo_planning",
+	        status: "started",
+	      })
+	      return yield* Effect.gen(function* () {
+	        const task = yield* getTask(input.taskID)
+	        const runs = yield* listRuns(input.taskID)
+	        const memory = yield* listMemory(input.taskID)
+	        const result = buildHypoPlannerResult({
+	          task,
+	          dataAnalysis: input.dataAnalysis,
+	          runs,
+	          memory,
+	        })
+	        const outputDir = path.join(
+	          Instance.directory,
+	          input.outputDir ?? path.join(".neo-research", "sessions", input.taskID, "hypotheses"),
+	        )
+	        const planPath = path.join(outputDir, "hypo_plan.md")
+	        const yamlPath = path.join(outputDir, "hypotheses.yaml")
+	        yield* Effect.promise(async () => {
+	          await mkdir(outputDir, { recursive: true })
+	          await writeFile(planPath, result.planMarkdown, "utf8")
+	          await writeFile(yamlPath, result.hypothesesYaml, "utf8")
+	        })
+	        const planArtifact = yield* createArtifact({
+	          taskID: input.taskID,
+	          kind: "hypo_plan_md",
+	          uri: `file://${planPath}`,
+	          metadata: {
+	            format: "markdown",
+	            phase: "hypo_planning",
+	            agent: "HypoPlannerAgent",
+	            hypothesisCount: result.plan.hypotheses.length,
+	            baselineStrategy: result.plan.baselineStrategy,
+	          },
+	        })
+	        const yamlArtifact = yield* createArtifact({
+	          taskID: input.taskID,
+	          kind: "hypotheses_yaml",
+	          uri: `file://${yamlPath}`,
+	          metadata: {
+	            format: "yaml",
+	            phase: "hypo_planning",
+	            agent: "HypoPlannerAgent",
+	            hypothesisCount: result.plan.hypotheses.length,
+	            baselineStrategy: result.plan.baselineStrategy,
+	          },
+	        })
+	        yield* updateTaskHypothesisPlan({
+	          taskID: input.taskID,
+	          hypothesisPlan: result.plan,
+	        })
+	        yield* bus.publish(Event.HypoPlannerAgentCompleted, {
+	          taskID: input.taskID,
+	          agent: "HypoPlannerAgent",
+	          stage: "hypo_planning",
+	          status: "completed",
+	          metadata: {
+	            hypothesisCount: result.plan.hypotheses.length,
+	            planArtifactID: planArtifact.id,
+	            yamlArtifactID: yamlArtifact.id,
+	            baselineStrategy: result.plan.baselineStrategy,
+	          },
+	        })
+	        return result
+	      }).pipe(
+	        Effect.catchCause((cause) =>
+	          Effect.gen(function* () {
+	            const error = Cause.squash(cause)
+	            yield* bus.publish(Event.HypoPlannerAgentFailed, {
+	              taskID: input.taskID,
+	              agent: "HypoPlannerAgent",
+	              stage: "hypo_planning",
+	              status: "failed",
+	              metadata: errorMetadata(error),
+	            })
+	            return yield* Effect.failCause(cause)
+	          }),
+	        ),
+	      )
+	    })
+
 	    const runNASAgent = Effect.fn("Research.runNASAgent")(function* (input: AutonomousLoopInput) {
       yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
       yield* bus.publish(Event.NASAgentStarted, {
@@ -5461,13 +5924,19 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        const runs = yield* listRuns(input.taskID)
 	        const candidates = yield* listCandidates(input.taskID)
 	        const champion = yield* getChampion(input.taskID)
-	        const result = summarizeReflectionAgent({
+	        const baseResult = summarizeReflectionAgent({
 	          task,
 	          runs,
 	          candidates,
 	          champion,
 	          stoppedReason: input.stoppedReason,
 	        })
+	        const result = yield* Effect.promise(() =>
+	          generateLLMReflectionSynthesis(task, baseResult).catch(() => ({
+	            ...baseResult,
+	            llm: { status: 'failed' as const },
+	          })),
+	        )
 	        const directory = path.join(
 	          runnerPath(Instance.directory, input.outputDir ?? ".neo-research/reflection"),
 	          task.id,
@@ -5630,6 +6099,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             searchBiases,
             warningCount: Number.isFinite(warningCount) ? warningCount : 0,
           } satisfies DataAnalysisAgentResult
+        })
+
+      const recoverHypoPlanning = (task: ResearchTask, dataAnalysis: DataAnalysisAgentResult) =>
+        Effect.gen(function* () {
+          const plan = experimentPlanFromMetadata(recordValue(task.taskSpec.metadata).hypothesisPlan)
+          if (plan !== undefined) {
+            return recoverHypoPlannerResultFromPlan({ task, dataAnalysis, plan })
+          }
+          const runs = yield* listRuns(input.taskID)
+          const memory = yield* listMemory(input.taskID)
+          return buildHypoPlannerResult({ task, dataAnalysis, runs, memory })
         })
 
       const recoverNAS = (task: ResearchTask) =>
@@ -5800,6 +6280,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             Effect.tap(() => markWorkflowPhase("data_analysis")),
           )
 
+      const taskAfterDataAnalysis = yield* getTask(input.taskID)
+      const workflowAfterDataAnalysis = workflowMetadataFromTask(taskAfterDataAnalysis)
+      const hypoPlanning = workflowAfterDataAnalysis.completedPhases.includes("hypo_planning")
+        ? yield* recoverHypoPlanning(taskAfterDataAnalysis, dataAnalysis)
+        : yield* runHypoPlannerAgent({
+            taskID: input.taskID,
+            dataAnalysis,
+            outputDir: input.outputDir === undefined ? undefined : path.join(input.outputDir, "hypotheses"),
+          }).pipe(
+            Effect.tap(() => markWorkflowPhase("hypo_planning")),
+          )
+
       if (intent.intentSpec.interaction_mode === "companion") {
         const checkpoint = yield* ensureHumanCheckpoint({
           taskID: input.taskID,
@@ -5807,6 +6299,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           reason: [
             "Companion checkpoint: data analysis finished.",
             `Data analysis artifact: ${dataAnalysis.artifact.id}`,
+            `Hypothesis plan: ${hypoPlanning.plan.hypotheses.length} hypotheses prepared.`,
             "Recommended action: review the data-analysis report, confirm whether the interpretation matches domain knowledge, then approve this protocol checkpoint to continue model search.",
           ].join("\n"),
         })
@@ -5818,10 +6311,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             checkpointPhase: "data_analysis_done",
           })
         }
+        const checkpointTask = yield* getTask(input.taskID)
+        const checkpointWorkflow = workflowMetadataFromTask(checkpointTask)
         yield* updateTaskWorkflow({
           taskID: input.taskID,
           lastCheckpoint: "data_analysis_done",
-          completedPhases: workflow.completedPhases.includes("data_analysis") ? workflow.completedPhases : ["data_analysis"],
+          completedPhases: checkpointWorkflow.completedPhases.includes("data_analysis")
+            ? checkpointWorkflow.completedPhases
+            : [...checkpointWorkflow.completedPhases, "data_analysis"],
         })
       }
 
@@ -5862,7 +6359,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         }
         yield* updateTaskWorkflow({
           taskID: input.taskID,
-          completedPhases: currentWorkflow.completedPhases.includes("searching") ? currentWorkflow.completedPhases : ["searching"],
+          completedPhases: currentWorkflow.completedPhases.includes("searching")
+            ? currentWorkflow.completedPhases
+            : [...currentWorkflow.completedPhases, "searching"],
           lastCheckpoint: "search_space_confirmed",
         })
       }
@@ -6006,7 +6505,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       }
 
       const completed = yield* getTask(input.taskID)
-      return { task: completed, intent, dataAnalysis, nas, reflection, publish }
+      return { task: completed, intent, dataAnalysis, hypoPlanning, nas, reflection, publish }
     })
 
     const createMemory = Effect.fn("Research.createMemory")(function* (input: CreateMemoryInput) {
@@ -6138,6 +6637,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       runIntentAgent,
       answerIntentQuestion,
       runDataAnalysisAgent,
+      runHypoPlannerAgent,
       runNASAgent,
       runVerifierAgent,
       runReflectionAgent,

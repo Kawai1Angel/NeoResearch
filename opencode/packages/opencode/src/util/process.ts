@@ -22,6 +22,11 @@ export interface RunOptions extends Omit<Options, "stdout" | "stderr"> {
   nothrow?: boolean
 }
 
+export interface StreamingRunOptions extends RunOptions {
+  onStdoutLine?: (line: string) => void
+  onStderrLine?: (line: string) => void
+}
+
 export interface Result {
   code: number
   stdout: Buffer
@@ -126,6 +131,79 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<Result>
   if (!proc.stdout || !proc.stderr) throw new Error("Process output not available")
 
   const out = await Promise.all([proc.exited, buffer(proc.stdout), buffer(proc.stderr)])
+    .then(([code, stdout, stderr]) => ({
+      code,
+      stdout,
+      stderr,
+    }))
+    .catch((err: unknown) => {
+      if (!opts.nothrow) throw err
+      return {
+        code: 1,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.from(errorMessage(err)),
+      }
+    })
+  if (out.code === 0 || opts.nothrow) return out
+  throw new RunFailedError(cmd, out.code, out.stdout, out.stderr)
+}
+
+function collectStreamLines(
+  stream: NodeJS.ReadableStream,
+  onLine?: (line: string) => void,
+): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let pending = ""
+
+  const emitLine = (line: string) => {
+    if (!line) return
+    onLine?.(line)
+  }
+
+  return new Promise((resolve, reject) => {
+    stream.on("data", (chunk: Buffer) => {
+      try {
+        chunks.push(chunk)
+        pending += chunk.toString()
+        const lines = pending.split(/\r?\n/)
+        pending = lines.pop() ?? ""
+        for (const line of lines) emitLine(line)
+      } catch (err) {
+        reject(err)
+      }
+    })
+    stream.on("end", () => {
+      try {
+        emitLine(pending)
+        resolve(Buffer.concat(chunks))
+      } catch (err) {
+        reject(err)
+      }
+    })
+    stream.on("error", reject)
+  })
+}
+
+export async function runStreaming(cmd: string[], opts: StreamingRunOptions = {}): Promise<Result> {
+  const proc = spawn(cmd, {
+    cwd: opts.cwd,
+    env: opts.env,
+    stdin: opts.stdin,
+    shell: opts.shell,
+    abort: opts.abort,
+    kill: opts.kill,
+    timeout: opts.timeout,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+
+  if (!proc.stdout || !proc.stderr) throw new Error("Process output not available")
+
+  const out = await Promise.all([
+    proc.exited,
+    collectStreamLines(proc.stdout, opts.onStdoutLine),
+    collectStreamLines(proc.stderr, opts.onStderrLine),
+  ])
     .then(([code, stdout, stderr]) => ({
       code,
       stdout,

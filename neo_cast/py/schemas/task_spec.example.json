@@ -1,0 +1,25 @@
+{
+  "schema_version": "task_spec.v1",
+  "task_id": "tsf_energy_001",
+  "task_type": "time_series_forecasting",
+  "domain": "electric_load_forecasting",
+  "target_column": "load",
+  "time_column": "timestamp",
+  "frequency": "hourly",
+  "history_window": 96,
+  "prediction_horizon": 24,
+  "prediction_horizons": [24],
+  "metrics": ["mse", "mae"],
+  "constraints": {
+    "max_model_params": "5M",
+    "max_training_hours": 3,
+    "prefer_lightweight_model": true
+  },
+  "output": {
+    "report": true,
+    "model_code": true,
+    "checkpoint": true,
+    "inference_api": false
+  },
+  "interaction_mode": "cognitive_copilot"
+}

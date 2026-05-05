@@ -16,6 +16,33 @@ describe("util.process", () => {
     expect(out.stderr.toString()).toBe("err")
   })
 
+  test("streams stdout lines before the process exits while retaining output", async () => {
+    let finished = false
+    let resolveFirstLine: (line: string) => void = () => {}
+    const firstLine = new Promise<string>((resolve) => {
+      resolveFirstLine = resolve
+    })
+
+    const outPromise = Process.runStreaming(
+      node('console.log("epoch 1"); setTimeout(() => console.log("epoch 2"), 150)'),
+      {
+        onStdoutLine: (line) => {
+          if (line === "epoch 1") resolveFirstLine(line)
+        },
+      },
+    ).finally(() => {
+      finished = true
+    })
+
+    expect(await firstLine).toBe("epoch 1")
+    expect(finished).toBe(false)
+
+    const out = await outPromise
+    expect(out.code).toBe(0)
+    expect(out.stdout.toString()).toContain("epoch 1")
+    expect(out.stdout.toString()).toContain("epoch 2")
+  })
+
   test("returns code when nothrow is enabled", async () => {
     const out = await Process.run(node("process.exit(7)"), { nothrow: true })
     expect(out.code).toBe(7)

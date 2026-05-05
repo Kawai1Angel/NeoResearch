@@ -53,7 +53,10 @@
     "preprocess_json": "preprocess.json",
     "model_impl_py": "model_impl.py",
     "inference_py": "inference.py",
-    "eval_report_md": "eval_report.md"
+    "eval_report_md": "eval_report.md",
+    "model_spec_json": "model_spec.json",
+    "patch_bundle_json": "patch_bundle.json",
+    "research_trace_json": "research_trace.json"
   },
   "created_at": "2026-04-24T10:15:30Z"
 }

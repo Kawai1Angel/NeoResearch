@@ -1,6 +1,7 @@
 import type { VerifierContext, VerifierReport, VerifierResult } from "./types"
 import { runBaselineComparisonVerifier } from "./baseline-comparison-verifier"
 import { runCostPerfVerifier } from "./cost-perf-verifier"
+import { runDataLeakageVerifier } from "./data-leakage-verifier"
 import { runHorizonVerifier } from "./horizon-verifier"
 import { runMetricVerifier } from "./metric-verifier"
 import { runOverfittingVerifier } from "./overfitting-verifier"
@@ -13,10 +14,12 @@ export type VerifierFailureCategory =
   | "resource_budget"
   | "horizon_instability"
   | "overfitting"
+  | "data_leakage"
   | "verifier_rejection"
 
 export type VerifierRecoveryActionType =
   | "fix_metric_reporting"
+  | "audit_split_boundaries"
   | "try_safer_candidate"
   | "reduce_resource_usage"
   | "stabilize_long_horizon"
@@ -56,6 +59,7 @@ const VERIFIER_PIPELINE: ReadonlyArray<(ctx: VerifierContext) => VerifierResult>
   runCostPerfVerifier,
   runHorizonVerifier,
   runOverfittingVerifier,
+  runDataLeakageVerifier,
 ]
 
 export function runVerifiers(ctx: VerifierContext): VerifierReport {
@@ -127,6 +131,7 @@ function verifierFailureCategory(result: VerifierResult | undefined): VerifierFa
   if (result.name === "cost_perf_verifier") return "resource_budget"
   if (result.name === "horizon_verifier") return "horizon_instability"
   if (result.name === "overfitting_verifier") return "overfitting"
+  if (result.name === "data_leakage_verifier") return "data_leakage"
   return "verifier_rejection"
 }
 
@@ -162,6 +167,12 @@ function verifierRecoveryAction(category: VerifierFailureCategory): {
     return {
       type: "audit_data_leakage",
       summary: "检查切分、归一化和泄漏风险；必要时提升 ref/blind gate 后再接受该结果。",
+    }
+  }
+  if (category === "data_leakage") {
+    return {
+      type: "audit_split_boundaries",
+      summary: "立即停止该候选的晋升流程。检查 dataset_spec.json 中的 train/val/ref_test 边界、normalization fit_split 是否为 train、val context 窗口是否错误包含 ref_test 行。修复后从 smoke 阶段重新运行。",
     }
   }
   return {

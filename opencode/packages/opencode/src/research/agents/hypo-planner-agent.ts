@@ -1,0 +1,443 @@
+import type { DataAnalysisAgentResult } from "./data-analysis-agent"
+import type { JsonRecord, ResearchMemory, ResearchRun, ResearchTask, ResearchTaskID } from "../schema"
+
+export interface HypothesisObject {
+  readonly id: string
+  readonly statement: string
+  readonly motivation: readonly string[]
+  readonly suggestedBackbones: readonly string[]
+  readonly suggestedPreprocessing: readonly string[]
+  readonly priority: "high" | "medium" | "low"
+  readonly risk: string
+  readonly testable: boolean
+}
+
+export interface ExperimentPlan {
+  readonly hypotheses: readonly HypothesisObject[]
+  readonly baselineStrategy: string
+  readonly searchBiases: readonly string[]
+  readonly stopConditions: {
+    readonly maxTrials: number
+    readonly noImprovementRounds: number
+    readonly targetMetricValue?: number
+  }
+}
+
+export interface HypoPlannerResult {
+  readonly agent: "HypoPlannerAgent"
+  readonly taskID: ResearchTaskID
+  readonly plan: ExperimentPlan
+  readonly planMarkdown: string
+  readonly hypothesesYaml: string
+  readonly evidenceSummary: string
+}
+
+export interface HypoPlannerInput {
+  readonly task: ResearchTask
+  readonly dataAnalysis: DataAnalysisAgentResult
+  readonly runs: readonly ResearchRun[]
+  readonly memory: readonly ResearchMemory[]
+}
+
+interface HypothesisRule {
+  readonly bias: string
+  readonly statement: string
+  readonly metricKeys: readonly string[]
+  readonly suggestedBackbones: readonly string[]
+  readonly suggestedPreprocessing: readonly string[]
+  readonly priority: "high" | "medium" | "low"
+  readonly risk: string
+}
+
+const hypothesisRules: readonly HypothesisRule[] = [
+  {
+    bias: "seasonal",
+    statement: "seasonal structure will benefit from decomposition-aware or frequency-aware backbones.",
+    metricKeys: ["seasonalityStrength", "acfMainPeriodStrength"],
+    suggestedBackbones: ["dlinear", "nbeats", "patch_transformer"],
+    suggestedPreprocessing: ["seasonal_decomposition", "per_series_normalization"],
+    priority: "high",
+    risk: "The detected period may be weak or unstable across the evaluation horizon.",
+  },
+  {
+    bias: "trend",
+    statement: "trend structure will benefit from detrending and low-variance linear or mixer backbones.",
+    metricKeys: ["trendStrength", "adfStatistic"],
+    suggestedBackbones: ["dlinear", "linear", "mixer"],
+    suggestedPreprocessing: ["detrend", "standard_scaling"],
+    priority: "high",
+    risk: "Aggressive detrending can remove useful low-frequency signal.",
+  },
+  {
+    bias: "cross_var_correlated",
+    statement: "cross-variate dependencies will benefit from channel-mixing backbones.",
+    metricKeys: ["crossVarCorrelation"],
+    suggestedBackbones: ["mixer", "patch_transformer", "tcn"],
+    suggestedPreprocessing: ["channel_normalization", "correlation_screening"],
+    priority: "high",
+    risk: "Spurious channel correlations can overfit small validation windows.",
+  },
+  {
+    bias: "missing_values",
+    statement: "missing-value patterns should be handled before testing higher-capacity backbones.",
+    metricKeys: ["missingRate"],
+    suggestedBackbones: ["linear", "dlinear", "mixer"],
+    suggestedPreprocessing: ["forward_fill", "mask_features", "robust_scaling"],
+    priority: "medium",
+    risk: "Imputation can leak future information if it is not restricted to causal context.",
+  },
+  {
+    bias: "distribution_shift",
+    statement: "distribution shift calls for robust preprocessing and lower-variance candidates first.",
+    metricKeys: ["distributionShift", "outlierRate"],
+    suggestedBackbones: ["dlinear", "mixer", "linear"],
+    suggestedPreprocessing: ["robust_scaling", "rolling_normalization", "time_ordered_validation"],
+    priority: "high",
+    risk: "A short validation split may not represent the shifted test regime.",
+  },
+  {
+    bias: "probabilistic",
+    statement: "probabilistic forecasting should compare calibrated distributional heads against point baselines.",
+    metricKeys: [],
+    suggestedBackbones: ["mixer", "patch_transformer", "tcn"],
+    suggestedPreprocessing: ["quantile_targets", "calibration_check"],
+    priority: "medium",
+    risk: "Distributional losses can improve calibration while worsening the primary point metric.",
+  },
+  {
+    bias: "long_horizon",
+    statement: "long-horizon forecasting should prefer stable low-frequency and patch-based candidates.",
+    metricKeys: ["horizonContextRatio"],
+    suggestedBackbones: ["dlinear", "patch_transformer", "nbeats"],
+    suggestedPreprocessing: ["multi_horizon_validation", "context_window_ablation"],
+    priority: "medium",
+    risk: "Long horizons can hide short-term errors behind averaged metrics.",
+  },
+  {
+    bias: "multivariate",
+    statement: "multivariate targets should verify whether channel mixing improves over independent baselines.",
+    metricKeys: ["targetCount"],
+    suggestedBackbones: ["mixer", "patch_transformer", "linear"],
+    suggestedPreprocessing: ["per_channel_scaling", "target_correlation_audit"],
+    priority: "medium",
+    risk: "Extra channel capacity may add noise when targets are weakly related.",
+  },
+]
+
+function recordValue(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return value as Record<string, unknown>
+}
+
+function numberValue(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function stringList(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === "string" && item.length > 0)
+}
+
+function unique(items: readonly string[]) {
+  return [...new Set(items.filter((item) => item.length > 0))]
+}
+
+function taskMetadata(task: ResearchTask) {
+  return recordValue(recordValue(task.taskSpec).metadata)
+}
+
+function taskProfile(task: ResearchTask): Record<string, unknown> {
+  const spec = recordValue(task.taskSpec)
+  const metadata = taskMetadata(task)
+  return {
+    ...recordValue(metadata.datasetProfile),
+    ...recordValue(spec.datasetProfile),
+  }
+}
+
+function taskSearchBiases(task: ResearchTask) {
+  const spec = recordValue(task.taskSpec)
+  const metadata = taskMetadata(task)
+  return unique([...stringList(metadata.searchBiases), ...stringList(spec.searchBiases)])
+}
+
+function profileDerivedBiases(task: ResearchTask) {
+  const profile = taskProfile(task)
+  const biases: string[] = []
+  if ((numberValue(profile.seasonalityStrength) ?? 0) >= 0.35) biases.push("seasonal")
+  if ((numberValue(profile.trendStrength) ?? 0) >= 0.3) biases.push("trend")
+  if ((numberValue(profile.crossVarCorrelation) ?? 0) >= 0.4) biases.push("cross_var_correlated")
+  if ((numberValue(profile.missingRate) ?? 0) > 0) biases.push("missing_values")
+  if ((numberValue(profile.distributionShift) ?? 0) >= 0.2) biases.push("distribution_shift")
+  if ((numberValue(profile.horizonContextRatio) ?? 0) >= 1) biases.push("long_horizon")
+  if ((numberValue(profile.targetCount) ?? 0) > 1) biases.push("multivariate")
+  return unique(biases)
+}
+
+function orderedBiases(task: ResearchTask, dataAnalysis: DataAnalysisAgentResult) {
+  const explicit = unique([...dataAnalysis.searchBiases, ...taskSearchBiases(task)])
+  const source = explicit.length > 0 ? explicit : profileDerivedBiases(task)
+  const known = hypothesisRules.map((rule) => rule.bias)
+  return unique([
+    ...known.filter((bias) => source.includes(bias)),
+    ...source.filter((bias) => !known.includes(bias)),
+  ])
+}
+
+function formatNumber(value: number) {
+  return Number(value.toFixed(6)).toString()
+}
+
+function metricMotivations(rule: HypothesisRule, task: ResearchTask) {
+  const profile = taskProfile(task)
+  return rule.metricKeys.flatMap((key) => {
+    const number = numberValue(profile[key])
+    return number === undefined ? [] : [`Dataset profile ${key}=${formatNumber(number)}.`]
+  })
+}
+
+function historyMotivations(runs: readonly ResearchRun[]) {
+  if (runs.length === 0) return []
+  const succeeded = runs.filter((run) => run.status === "succeeded").length
+  const failed = runs.filter((run) => run.status === "failed").length
+  const rejected = runs.filter((run) => run.status === "rejected").length
+  return [`Run history: ${succeeded} succeeded, ${failed} failed, ${rejected} rejected.`]
+}
+
+function memoryMotivations(memory: readonly ResearchMemory[]) {
+  return memory.slice(0, 2).map((item) => `Memory: ${item.lesson}`)
+}
+
+function fallbackHypothesis(input: HypoPlannerInput): HypothesisObject {
+  return {
+    id: "H1",
+    statement: "baseline controls should establish a reliable metric floor before higher-risk search.",
+    motivation: [
+      "No strong profile-derived search bias was available.",
+      ...historyMotivations(input.runs),
+      ...memoryMotivations(input.memory),
+    ],
+    suggestedBackbones: ["linear", "dlinear"],
+    suggestedPreprocessing: ["standard_scaling"],
+    priority: "medium",
+    risk: "A conservative baseline may underfit complex temporal structure.",
+    testable: true,
+  }
+}
+
+export function extractEvidenceSummary(dataAnalysis: DataAnalysisAgentResult): string {
+  const biasText = dataAnalysis.searchBiases.length > 0 ? dataAnalysis.searchBiases.join(", ") : "none"
+  const warningText = `${dataAnalysis.warningCount} warning${dataAnalysis.warningCount === 1 ? "" : "s"}`
+  const sourceText = `${dataAnalysis.sourceArtifactIDs.length} source artifact${
+    dataAnalysis.sourceArtifactIDs.length === 1 ? "" : "s"
+  }`
+  return [
+    `DataAnalysisAgent artifact ${dataAnalysis.artifact.id} provides the current search handoff.`,
+    `Search biases: ${biasText}.`,
+    `Quality signals: ${warningText}; ${sourceText}.`,
+  ].join(" ")
+}
+
+export function generateHypotheses(input: HypoPlannerInput): HypothesisObject[] {
+  const biases = orderedBiases(input.task, input.dataAnalysis)
+  const rules = biases
+    .map((bias) => hypothesisRules.find((rule) => rule.bias === bias))
+    .filter((rule): rule is HypothesisRule => rule !== undefined)
+
+  if (rules.length === 0) return [fallbackHypothesis(input)]
+
+  return rules.map((rule, index) => ({
+    id: `H${index + 1}`,
+    statement: rule.statement,
+    motivation: unique([
+      `Search bias "${rule.bias}" was present in the data-analysis handoff or task metadata.`,
+      ...metricMotivations(rule, input.task),
+      ...historyMotivations(input.runs),
+      ...memoryMotivations(input.memory),
+    ]),
+    suggestedBackbones: rule.suggestedBackbones,
+    suggestedPreprocessing: rule.suggestedPreprocessing,
+    priority: rule.priority,
+    risk: rule.risk,
+    testable: true,
+  }))
+}
+
+function hypothesisSearchBiases(hypotheses: readonly HypothesisObject[]) {
+  const pairs: readonly [string, string][] = [
+    ["seasonal", "seasonal"],
+    ["trend", "trend"],
+    ["cross-variate", "cross_var_correlated"],
+    ["missing", "missing_values"],
+    ["distribution shift", "distribution_shift"],
+    ["probabilistic", "probabilistic"],
+    ["long-horizon", "long_horizon"],
+    ["multivariate", "multivariate"],
+  ]
+  return hypotheses.flatMap((hypothesis) =>
+    pairs
+      .filter(([needle]) => hypothesis.statement.includes(needle))
+      .map(([, bias]) => bias),
+  )
+}
+
+function budgetNumber(task: ResearchTask, ...keys: readonly string[]) {
+  const budget = recordValue(task.budget)
+  for (const key of keys) {
+    const value = numberValue(budget[key])
+    if (value !== undefined) return value
+  }
+  return undefined
+}
+
+function objectiveNumber(task: ResearchTask, ...keys: readonly string[]) {
+  const objective = recordValue(task.objective)
+  for (const key of keys) {
+    const value = numberValue(objective[key])
+    if (value !== undefined) return value
+  }
+  return undefined
+}
+
+function isBridgeOnly(task: ResearchTask) {
+  const spec = recordValue(task.taskSpec)
+  const metadata = taskMetadata(task)
+  const runtime = {
+    ...recordValue(metadata.runtime),
+    ...recordValue(spec.runtime),
+  }
+  return runtime.bridgeOnly === true
+}
+
+export function buildExperimentPlan(input: {
+  readonly hypotheses: readonly HypothesisObject[]
+  readonly task: ResearchTask
+}): ExperimentPlan {
+  const searchBiases = unique([
+    ...taskSearchBiases(input.task),
+    ...hypothesisSearchBiases(input.hypotheses),
+  ])
+  const maxTrials = Math.max(1, Math.floor(budgetNumber(input.task, "maxTrials", "maxRuns") ?? 12))
+  const noImprovementRounds = Math.max(
+    1,
+    Math.floor(budgetNumber(input.task, "noImprovementRounds", "maxNoImprove") ?? 3),
+  )
+  const targetMetricValue = objectiveNumber(input.task, "targetMetricValue", "targetMetric")
+  return {
+    hypotheses: input.hypotheses,
+    baselineStrategy: searchBiases.includes("bridge_safe") || isBridgeOnly(input.task)
+      ? "bridge_safe_baselines_first"
+      : "domain_baselines_first",
+    searchBiases,
+    stopConditions: {
+      maxTrials,
+      noImprovementRounds,
+      ...(targetMetricValue === undefined ? {} : { targetMetricValue }),
+    },
+  }
+}
+
+function yamlScalar(value: string | number | boolean) {
+  if (typeof value === "number") return Number.isFinite(value) ? value.toString() : "null"
+  if (typeof value === "boolean") return value ? "true" : "false"
+  if (/^[A-Za-z0-9_.-]+$/.test(value)) return value
+  return JSON.stringify(value)
+}
+
+function yamlList(items: readonly string[], indent: string) {
+  return items.length === 0 ? [`${indent}[]`] : items.map((item) => `${indent}- ${yamlScalar(item)}`)
+}
+
+export function buildHypothesesYaml(plan: ExperimentPlan): string {
+  const lines = [
+    `baselineStrategy: ${yamlScalar(plan.baselineStrategy)}`,
+    "searchBiases:",
+    ...yamlList(plan.searchBiases, "  "),
+    "stopConditions:",
+    `  maxTrials: ${plan.stopConditions.maxTrials}`,
+    `  noImprovementRounds: ${plan.stopConditions.noImprovementRounds}`,
+  ]
+  if (plan.stopConditions.targetMetricValue !== undefined) {
+    lines.push(`  targetMetricValue: ${plan.stopConditions.targetMetricValue}`)
+  }
+  lines.push("hypotheses:")
+  for (const hypothesis of plan.hypotheses) {
+    lines.push(
+      `  - id: ${yamlScalar(hypothesis.id)}`,
+      `    statement: ${yamlScalar(hypothesis.statement)}`,
+      "    motivation:",
+      ...yamlList(hypothesis.motivation, "      "),
+      "    suggestedBackbones:",
+      ...yamlList(hypothesis.suggestedBackbones, "      "),
+      "    suggestedPreprocessing:",
+      ...yamlList(hypothesis.suggestedPreprocessing, "      "),
+      `    priority: ${hypothesis.priority}`,
+      `    risk: ${yamlScalar(hypothesis.risk)}`,
+      `    testable: ${hypothesis.testable ? "true" : "false"}`,
+    )
+  }
+  return `${lines.join("\n")}\n`
+}
+
+export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
+  const { plan } = result
+  const lines = [
+    "# Hypothesis Plan",
+    "",
+    `- Agent: ${result.agent}`,
+    `- Task ID: ${result.taskID}`,
+    `- Baseline strategy: ${plan.baselineStrategy}`,
+    `- Search biases: ${plan.searchBiases.length > 0 ? plan.searchBiases.join(", ") : "none"}`,
+    `- Stop conditions: maxTrials=${plan.stopConditions.maxTrials}, noImprovementRounds=${plan.stopConditions.noImprovementRounds}${
+      plan.stopConditions.targetMetricValue === undefined
+        ? ""
+        : `, targetMetricValue=${plan.stopConditions.targetMetricValue}`
+    }`,
+    "",
+    "## Evidence Summary",
+    "",
+    result.evidenceSummary,
+    "",
+    "## Hypotheses",
+    "",
+  ]
+  for (const hypothesis of plan.hypotheses) {
+    lines.push(
+      `### ${hypothesis.id}`,
+      "",
+      hypothesis.statement,
+      "",
+      `- Priority: ${hypothesis.priority}`,
+      `- Testable: ${hypothesis.testable ? "yes" : "no"}`,
+      `- Suggested backbones: ${hypothesis.suggestedBackbones.join(", ")}`,
+      `- Suggested preprocessing: ${hypothesis.suggestedPreprocessing.join(", ")}`,
+      `- Risk: ${hypothesis.risk}`,
+      "",
+      "Motivation:",
+      ...hypothesis.motivation.map((item) => `- ${item}`),
+      "",
+    )
+  }
+  return `${lines.join("\n")}\n`
+}
+
+export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResult {
+  const evidenceSummary = extractEvidenceSummary(input.dataAnalysis)
+  const hypotheses = generateHypotheses(input)
+  const plan = buildExperimentPlan({ hypotheses, task: input.task })
+  const partial = {
+    agent: "HypoPlannerAgent" as const,
+    taskID: input.task.id,
+    plan,
+    hypothesesYaml: buildHypothesesYaml(plan),
+    evidenceSummary,
+  }
+  return {
+    ...partial,
+    planMarkdown: buildHypoPlanMarkdown({ ...partial, planMarkdown: "" }),
+  }
+}
+
+export function serializeHypothesisPlanMetadata(plan: ExperimentPlan): JsonRecord {
+  return plan as unknown as JsonRecord
+}

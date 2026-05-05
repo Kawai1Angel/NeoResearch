@@ -130,11 +130,53 @@ neo-cast init-runtime
 #    下载：https://github.com/thuml/Time-Series-Library → dataset/ETT-small/ETTh1.csv
 neo-cast prepare-data --source /path/to/ETTh1.csv
 
-# 3. 验证环境
+# 3. 生成结构化研究任务合同（Task DSL）
+neo-cast task-spec init --from-dataset .neo-cast/dataset_spec.json
+neo-cast task-spec validate .neo-cast/task_spec.json
+
+# 4. 验证环境
 neo-cast doctor
 ```
 
 完成后，工作目录中会出现 `.neo-cast/` 子目录，后续所有实验产物都存放在这里。
+每次训练导出的 artifact 会包含 `research_trace.json`，同时 `.neo-cast/research_trace.jsonl`
+会追加记录关键研究决策的依据、预期效果和验证计划。
+
+需要把模型方案确认变成 Runtime gate 时，可以启用 human checkpoint：
+
+```bash
+neo-cast design \
+  --requirement "use a compact baseline" \
+  --mode companion \
+  --max-candidates 1 \
+  --mock-llm \
+  --require-approval
+
+neo-cast checkpoint status
+neo-cast checkpoint approve model_design --note "确认该模型方案"
+neo-cast runner run --description "approved model design"
+```
+
+确认状态写入 `.neo-cast/approval_state.json`。如果 `model_design` 仍是 pending/rejected，
+runner 会拒绝进入训练阶段。
+
+需要纠正系统误判时，把反馈写入 Human Feedback Memory，而不是只留在聊天记录里：
+
+```bash
+neo-cast correction add \
+  --scope data_schema \
+  --field temperature_forecast \
+  --correction "available only at prediction time"
+
+neo-cast correction add \
+  --scope split_policy \
+  --correction "data must be split in chronological order only"
+
+neo-cast correction list
+```
+
+这些记录写入 `.neo-cast/user_corrections.json`。后续 `design` 与 reflection 会把 active corrections
+作为用户权威约束注入任务上下文。
 
 ---
 
