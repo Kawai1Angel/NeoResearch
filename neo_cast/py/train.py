@@ -151,15 +151,15 @@ def run_epoch(
 
 
 @torch.no_grad()
-def compute_val_loss(model: nn.Module, loader, device: torch.device) -> float:
+def compute_val_loss(model: nn.Module, loader, device: torch.device, predict_fn=None) -> float:
     model.eval()
     total_loss = 0.0
     total_batches = 0
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
-        pred = model(x)
-        total_loss += F.mse_loss(pred, y).item()
+        pred = predict_fn(model, x) if predict_fn is not None else model(x)
+        total_loss += F.mse_loss(_point_prediction(pred, y), y).item()
         total_batches += 1
     return total_loss / max(total_batches, 1)
 
@@ -336,6 +336,12 @@ def _predict_for_training(model: nn.Module, candidate: dict[str, Any], x: torch.
     if wants_quantiles and hasattr(model, "forward_quantiles"):
         return model.forward_quantiles(x)
     return model(x)
+
+
+def _slice_context_window(x: torch.Tensor, input_len: int) -> torch.Tensor:
+    if x.size(1) > input_len:
+        return x[:, -input_len:, :]
+    return x
 
 
 def _candidate_recipe(candidate: dict[str, Any]) -> dict[str, Any] | None:
@@ -529,7 +535,8 @@ def train_models(
     )
 
     t_start = time.time()
-    models = {h: family_module.build_model(candidate["model_config"], INPUT_LEN, h).to(device) for h in horizons}
+    input_len = int(candidate.get("task", {}).get("input_len", INPUT_LEN))
+    models = {h: family_module.build_model(candidate["model_config"], input_len, h).to(device) for h in horizons}
     num_params = sum(param.numel() for model in models.values() for param in model.parameters())
     num_params_m = num_params / 1e6
     param_budget_m = float(constraints["param_budget_m"])
@@ -546,7 +553,7 @@ def train_models(
         return 3
 
     loss_fn = _build_train_loss(candidate)
-    predict_fn = lambda model, x: _predict_for_training(model, candidate, x)
+    predict_fn = lambda model, x: _predict_for_training(model, candidate, _slice_context_window(x, input_len))
     grad_clip = _grad_clip(candidate)
     optimizers = {
         h: _build_optimizer(models[h], candidate, lr=lr, weight_decay=weight_decay)
@@ -595,7 +602,7 @@ def train_models(
                 grad_clip,
                 predict_fn,
             )
-            val_loss = compute_val_loss(models[horizon], val_loaders[horizon], device)
+            val_loss = compute_val_loss(models[horizon], val_loaders[horizon], device, predict_fn)
             if schedulers[horizon] is not None:
                 _step_scheduler(schedulers[horizon], val_loss)
             emit("epoch_end", horizon=horizon, epoch=epoch, val_loss=round(val_loss, 6))

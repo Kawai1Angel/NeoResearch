@@ -3,10 +3,16 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+PY_ROOT = Path(__file__).resolve().parents[1]
+if str(PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(PY_ROOT))
+
+from model_recipe import is_model_recipe_payload, compile_model_recipe
 
 DEFAULT_SCALES = [
     {"patch_len": 8, "stride": 4},
@@ -364,6 +370,8 @@ def mutate_recipe(
     state_path: str | Path | None = None,
     search_biases: list[str] | None = None,
 ) -> dict[str, Any]:
+    if is_model_recipe_payload(recipe):
+        recipe = compile_model_recipe(recipe)
     if recipe.get("recipe_version") != "recipe_schema_v1":
         raise ValueError("mutate_recipe expects recipe_version='recipe_schema_v1'")
 

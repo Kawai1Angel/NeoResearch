@@ -341,6 +341,7 @@ def _build_materialize_spec(
     irregular_ratio_warn: float | None,
 ) -> DatasetSpec:
     default_payload = dataset_preset_payload(dataset_preset)
+    use_preset_policy = dataset_preset is not None
     default_spec = DatasetSpec.from_payload(
         {
             **DEFAULT_ETTH1_SPEC,
@@ -353,7 +354,7 @@ def _build_materialize_spec(
     preset_feature_columns = default_payload.get("feature_columns")
     selected_feature_columns = feature_columns or (
         list(preset_feature_columns)
-        if isinstance(preset_feature_columns, list)
+        if use_preset_policy and isinstance(preset_feature_columns, list)
         else _infer_feature_columns(df, selected_timestamp_col)
     )
     selected_input_len = input_len or default_spec.input_len
@@ -365,13 +366,13 @@ def _build_materialize_spec(
             "val": val_rows,
             "ref_test": ref_test_rows,
         }
-    elif default_payload.get("split_strategy") == "fixed":
+    elif use_preset_policy and default_payload.get("split_strategy") == "fixed":
         splits = {
             "train": default_spec.train,
             "val": default_spec.val,
             "ref_test": default_spec.ref_test,
         }
-    elif default_payload.get("split_strategy") == "tsl_custom_70_10_20":
+    elif use_preset_policy and default_payload.get("split_strategy") == "tsl_custom_70_10_20":
         splits = infer_tsl_custom_splits(len(df), selected_input_len, max(selected_horizons))
     else:
         splits = infer_contiguous_splits(len(df), selected_input_len, max(selected_horizons))

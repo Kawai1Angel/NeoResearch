@@ -18,6 +18,7 @@ function loadCliWithStubs(state = {}) {
   const mutationAttempts = [];
   const autonomousOptions = [];
   const checkpointRequests = [];
+  const publishedReports = [];
   const versionCalls = [];
   const logs = [];
 
@@ -91,12 +92,23 @@ function loadCliWithStubs(state = {}) {
       getBestSessionRow: () => ({ run_id: "run_1" }),
       getLatestSessionRow: () => ({ run_id: `run_${runDescriptions.length}` }),
     },
+    "./report-output": {
+      publishReleaseReport: (_projectRoot, options) => {
+        publishedReports.push(options);
+        return {
+          copied: true,
+          manifestPath: `/tmp/reports/${options.versionId}/release_manifest.json`,
+          reportPath: `/tmp/reports/${options.versionId}/eval_report.md`,
+        };
+      },
+    },
     "./versioning": {
       getLatestVersionRef: (_projectRoot, kind) => ({
         kind,
         logical_id: `latest_${kind}`,
         version_id: `${kind}_latest_v1`,
       }),
+      getNextVersionId: (_projectRoot, kind, logicalId) => `${kind}_${logicalId}_v1`,
       registerVersion: (_projectRoot, options) => {
         versionCalls.push(options);
         return {
@@ -167,6 +179,7 @@ function loadCliWithStubs(state = {}) {
     checkpointRequests,
     logs,
     mutationAttempts,
+    publishedReports,
     reflectedAttempts,
     reflectedTaskContexts,
     restore() {
@@ -351,6 +364,8 @@ test("design records recipe, experiment, and release versions for lineage", asyn
     assert.equal(harness.versionCalls[0].logicalId, "candidate_1");
     assert.equal(harness.versionCalls[1].logicalId, "run_1");
     assert.equal(harness.versionCalls[2].logicalId, "run_1");
+    assert.equal(harness.publishedReports.length, 1);
+    assert.equal(harness.publishedReports[0].versionId, "release_run_1_v1");
     assert.match(harness.logs.join("\n"), /recipe_version=recipe_candidate_1_v/);
   } finally {
     harness.restore();

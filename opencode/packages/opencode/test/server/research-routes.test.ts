@@ -874,6 +874,45 @@ describe("research routes", () => {
           }),
         )
 
+        const firstResponse = await app().request(pathFor(ResearchPaths.taskPipeline, { taskID: task.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            stage: "smoke",
+            maxIterations: 1,
+            description: "api pipeline smoke",
+            outputDir: ".neo-research/api-pipeline",
+          }),
+        })
+        expect(firstResponse.status).toBe(500)
+        const blocked = await firstResponse.json()
+        expect(blocked).toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "intent_confirmed",
+          },
+        })
+
+        const approvals = await json<Research.ResearchApproval[]>(
+          await app().request(`${pathFor(ResearchPaths.taskApprovals, { taskID: task.id })}?status=pending`, { headers }),
+        )
+        const intentApproval = approvals.find(
+          (approval) =>
+            approval.kind === "protocol" &&
+            approval.status === "pending" &&
+            approval.reason.includes("[checkpoint:intent_confirmed]"),
+        )
+        expect(intentApproval).toBeDefined()
+        await json<Research.ResearchApproval>(
+          await app().request(pathFor(ResearchPaths.approvalReply, { approvalID: intentApproval!.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ status: "approved", replyMessage: "Intent requirements confirmed." }),
+          }),
+        )
+
         const response = await app().request(pathFor(ResearchPaths.taskPipeline, { taskID: task.id }), {
           method: "POST",
           headers,
@@ -896,7 +935,7 @@ describe("research routes", () => {
     })
   })
 
-  test("pipeline API pauses explicit companion tasks at the data analysis checkpoint", async () => {
+  test("pipeline API pauses explicit companion tasks at the intent checkpoint", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
     const datasetPath = await writeProfileDataset()
@@ -964,15 +1003,14 @@ describe("research routes", () => {
           data: {
             taskID: task.id,
             reason: "human_checkpoint_required",
-            checkpointPhase: "data_analysis_done",
+            checkpointPhase: "intent_confirmed",
           },
         })
 
         const runs = await json<Research.ResearchRun[]>(
           await app().request(pathFor(ResearchPaths.taskRuns, { taskID: task.id }), { headers }),
         )
-        expect(runs).toHaveLength(1)
-        expect(runs[0]!.stage).toBe("profile")
+        expect(runs).toHaveLength(0)
       },
     })
   })
@@ -1374,7 +1412,7 @@ describe("research routes", () => {
         expect(memory).toHaveLength(1)
         expect(memory[0]).toMatchObject({
           outcome: "failed",
-          lesson: `Candidate ${candidate.id} failed during smoke: bridge timeout`,
+          lesson: `[dataset:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: bridge timeout`,
         })
         expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, status: "failed" })
       },
@@ -1440,7 +1478,7 @@ describe("research routes", () => {
         expect(memory).toHaveLength(1)
         expect(memory[0]).toMatchObject({
           outcome: "failed",
-          lesson: `Candidate ${candidate.id} failed during smoke: failed`,
+          lesson: `[dataset:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: failed`,
         })
         expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, status: "failed" })
       },

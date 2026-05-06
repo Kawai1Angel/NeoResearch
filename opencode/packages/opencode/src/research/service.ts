@@ -327,6 +327,55 @@ function taskInteractionMode(task: ResearchTask) {
   return task.mode === "autonomous" ? "socratic" : undefined
 }
 
+function compactIntentValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map(compactIntentValue).join(",")
+  if (typeof value === "string") return value.trim() || "-"
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  return "-"
+}
+
+function intentCheckpointSignature(task: ResearchTask) {
+  const spec = recordValue(task.taskSpec)
+  const dataset = recordValue(spec.dataset)
+  const objective = recordValue(task.objective)
+  const budget = recordValue(task.budget)
+  return [
+    `mode=${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
+    `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
+    `targets=${compactIntentValue(dataset.targetCols)}`,
+    `context=${compactIntentValue(spec.contextLength)}`,
+    `horizons=${compactIntentValue(spec.predictionLengths)}`,
+    `metric=${compactIntentValue(objective.primaryMetric)}`,
+    `direction=${compactIntentValue(objective.direction)}`,
+    `maxRuns=${compactIntentValue(budget.maxRuns)}`,
+  ].join("|")
+}
+
+function buildIntentCheckpointReason(task: ResearchTask) {
+  const spec = recordValue(task.taskSpec)
+  const dataset = recordValue(spec.dataset)
+  const objective = recordValue(task.objective)
+  const budget = recordValue(task.budget)
+  const metadata = recordValue(spec.metadata)
+  return [
+    "## 需求交流确认完成后，才能结束 Intent Agent",
+    "",
+    "请确认 Intent Agent 已完成需求交流，下面这些研究意图可以作为后续 Data Analysis、HypoPlanner 和实验循环的输入。",
+    `Intent signature: ${intentCheckpointSignature(task)}`,
+    `Interaction mode: ${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
+    `Task: ${task.title}`,
+    `Dataset: ${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
+    `Targets: ${compactIntentValue(dataset.targetCols)}`,
+    `Context length: ${compactIntentValue(spec.contextLength)}`,
+    `Prediction lengths: ${compactIntentValue(spec.predictionLengths)}`,
+    `Primary metric: ${compactIntentValue(objective.primaryMetric)}`,
+    `Budget max runs: ${compactIntentValue(budget.maxRuns)}`,
+    `Business context: ${compactIntentValue(metadata.businessContext ?? metadata.business_context)}`,
+    "",
+    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并更新 taskSpec/intent slots 后重新运行。",
+  ].join("\n")
+}
+
 function taskInteractionModeFromFields(mode: string, taskSpec: JsonRecord) {
   const metadata =
     taskSpec.metadata && typeof taskSpec.metadata === "object" && !Array.isArray(taskSpec.metadata)
@@ -3239,6 +3288,42 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       })
     })
 
+    const ensureIntentCheckpoint = Effect.fn("Research.ensureIntentCheckpoint")(function* (input: {
+      readonly task: ResearchTask
+      readonly reason: string
+    }) {
+      const phase = "intent_confirmed"
+      const checkpointTag = `[checkpoint:${phase}]`
+      const signature = `Intent signature: ${intentCheckpointSignature(input.task)}`
+      const checkpointReason = `${checkpointTag}\n${input.reason}`
+      const rows = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchApprovalTable)
+          .where(
+            and(
+              eq(ResearchApprovalTable.task_id, input.task.id),
+              isNull(ResearchApprovalTable.candidate_id),
+              eq(ResearchApprovalTable.kind, "protocol"),
+            ),
+          )
+          .all(),
+      )
+      const approved = rows.find(
+        (row) => row.status === "approved" && row.reason.includes(checkpointTag) && row.reason.includes(signature),
+      )
+      if (approved) return mapApproval(approved)
+      const pending = rows.find(
+        (row) => row.status === "pending" && row.reason.includes(checkpointTag) && row.reason.includes(signature),
+      )
+      if (pending) return mapApproval(pending)
+      return yield* createApproval({
+        taskID: input.task.id,
+        kind: "protocol",
+        reason: checkpointReason,
+      })
+    })
+
     const ensureRunBudget = Effect.fn("Research.ensureRunBudget")(function* (
       task: ResearchTask,
       status: ResearchRun["status"],
@@ -3671,6 +3756,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         })
       }
 
+      const evalDataset = recordValue(recordValue(task.taskSpec).dataset)
+      const evalSourceCsv = typeof evalDataset.path === "string" ? path.basename(evalDataset.path) : (typeof evalDataset.loaderID === "string" ? evalDataset.loaderID : "unknown")
       yield* createMemory({
         taskID: task.id,
         domainID: task.domainID,
@@ -3680,6 +3767,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           domainID: task.domainID,
           primaryMetricName: metricName,
           direction,
+          sourceCsv: evalSourceCsv,
         },
         candidateSummary: runCandidateMemorySummary(candidate, run, {
           primaryMetric,
@@ -3687,8 +3775,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         }),
         outcome: championUpdated ? "accepted" : "rejected",
         lesson: championUpdated
-          ? `Candidate ${run.candidateID} became champion on ${metricName}=${primaryMetric}.`
-          : `Candidate ${run.candidateID} did not improve champion on ${metricName}=${primaryMetric}.`,
+          ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} became champion on ${metricName}=${primaryMetric}.`
+          : `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} did not improve champion on ${metricName}=${primaryMetric}.`,
       })
     })
 
@@ -3696,6 +3784,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const task = yield* getTask(run.taskID)
       const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
       const candidate = run.candidateID === undefined ? undefined : yield* getCandidateForTask(task.id, run.candidateID)
+      const failedDataset = recordValue(recordValue(task.taskSpec).dataset)
+      const failedSourceCsv = typeof failedDataset.path === "string" ? path.basename(failedDataset.path) : (typeof failedDataset.loaderID === "string" ? failedDataset.loaderID : "unknown")
       yield* createMemory({
         taskID: task.id,
         domainID: task.domainID,
@@ -3704,12 +3794,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           taskID: task.id,
           domainID: task.domainID,
           status: run.status,
+          sourceCsv: failedSourceCsv,
         },
         candidateSummary: runCandidateMemorySummary(candidate, run, {
           status: run.status,
         }),
         outcome: "failed",
-        lesson: `Candidate ${run.candidateID} failed during ${run.stage}: ${run.error ?? run.status}`,
+        lesson: `[dataset:${failedSourceCsv}] Candidate ${run.candidateID} failed during ${run.stage}: ${run.error ?? run.status}`,
       })
     })
 
@@ -6258,8 +6349,35 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         })
       }
 
-      const task = yield* getTask(input.taskID)
-      const workflow = workflowMetadataFromTask(task)
+      let task = yield* getTask(input.taskID)
+      let workflow = workflowMetadataFromTask(task)
+      const intentAlreadyConfirmed =
+        workflow.lastCheckpoint === "intent_confirmed" ||
+        workflow.lastCheckpoint === "requirements_confirmed" ||
+        workflow.completedPhases.some((phase) => phase !== "intent_gathering")
+      if (!intentAlreadyConfirmed && !workflow.completedPhases.includes("intent_gathering")) {
+        const intentCheckpoint = yield* ensureIntentCheckpoint({
+          task,
+          reason: buildIntentCheckpointReason(task),
+        })
+        if (intentCheckpoint.status === "pending") {
+          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: input.taskID,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "intent_confirmed",
+          })
+        }
+        yield* updateTaskWorkflow({
+          taskID: input.taskID,
+          lastCheckpoint: "intent_confirmed",
+          completedPhases: workflow.completedPhases.includes("intent_gathering")
+            ? workflow.completedPhases
+            : [...workflow.completedPhases, "intent_gathering"],
+        })
+        task = yield* getTask(input.taskID)
+        workflow = workflowMetadataFromTask(task)
+      }
       const datasetPreparation = tsfDatasetPreparationConfig(task)
       if (
         datasetPreparation !== undefined &&
@@ -6291,36 +6409,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           }).pipe(
             Effect.tap(() => markWorkflowPhase("hypo_planning")),
           )
-
-      if (intent.intentSpec.interaction_mode === "companion") {
-        const checkpoint = yield* ensureHumanCheckpoint({
-          taskID: input.taskID,
-          phase: "data_analysis_done",
-          reason: [
-            "Companion checkpoint: data analysis finished.",
-            `Data analysis artifact: ${dataAnalysis.artifact.id}`,
-            `Hypothesis plan: ${hypoPlanning.plan.hypotheses.length} hypotheses prepared.`,
-            "Recommended action: review the data-analysis report, confirm whether the interpretation matches domain knowledge, then approve this protocol checkpoint to continue model search.",
-          ].join("\n"),
-        })
-        if (checkpoint.status === "pending") {
-          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
-          throw new PipelineBlockedError({
-            taskID: input.taskID,
-            reason: "human_checkpoint_required",
-            checkpointPhase: "data_analysis_done",
-          })
-        }
-        const checkpointTask = yield* getTask(input.taskID)
-        const checkpointWorkflow = workflowMetadataFromTask(checkpointTask)
-        yield* updateTaskWorkflow({
-          taskID: input.taskID,
-          lastCheckpoint: "data_analysis_done",
-          completedPhases: checkpointWorkflow.completedPhases.includes("data_analysis")
-            ? checkpointWorkflow.completedPhases
-            : [...checkpointWorkflow.completedPhases, "data_analysis"],
-        })
-      }
 
       const currentTask = yield* getTask(input.taskID)
       const currentWorkflow = workflowMetadataFromTask(currentTask)

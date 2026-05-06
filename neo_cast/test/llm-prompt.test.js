@@ -54,8 +54,8 @@ test("LLM system prompt lists the full factory backbone action space", () => {
     "linear",
     "mlp",
     "transformer",
+    "temporal_conv",
     "dlinear",
-    "tcn",
     "nbeats",
     "timesnet",
     "rnn",
@@ -89,6 +89,18 @@ test("LLM system prompt exposes advanced fusion and probabilistic heads", () => 
   ]);
 });
 
+test("LLM system prompt requires the high-level model_recipe.v1 DSL", () => {
+  const prompt = _buildSystemPrompt({ input_len: 96, horizons: [24] });
+
+  assert.match(prompt, /ModelRecipe DSL/);
+  assert.match(prompt, /schema_version: "model_recipe\.v1"/);
+  assert.match(prompt, /model_name/);
+  assert.match(prompt, /input/);
+  assert.match(prompt, /architecture/);
+  assert.match(prompt, /training/);
+  assert.match(prompt, /latency_sensitive/);
+});
+
 test("LLM system prompt includes active user correction memory", () => {
   const prompt = _buildSystemPrompt({
     task_id: "energy_hourly",
@@ -107,6 +119,23 @@ test("LLM system prompt includes active user correction memory", () => {
   assert.match(prompt, /temperature_forecast/);
   assert.match(prompt, /available only at prediction time/);
   assert.match(prompt, /authoritative constraints/);
+});
+
+test("heuristic mock candidate emits a high-level model recipe", () => {
+  const { _buildHeuristicCandidate } = require("../src/llm");
+
+  const candidate = _buildHeuristicCandidate(
+    "MultiScale tiny temporal conv model with deployment latency sensitivity",
+    1,
+    { input_len: 96, horizons: [24] },
+  );
+
+  assert.equal(candidate.schema_version, "model_recipe.v1");
+  assert.equal(candidate.input.history_window, 96);
+  assert.equal(candidate.input.prediction_horizon, 24);
+  assert.equal(candidate.architecture.backbone, "temporal_conv");
+  assert.equal(candidate.architecture.multiscale_blocks, 3);
+  assert.equal(candidate.constraints.latency_sensitive, true);
 });
 
 test("LLM candidate defaults complete required frequency embedding fields", () => {

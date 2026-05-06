@@ -177,6 +177,7 @@ export type ResearchCockpitWorkflowItem = {
 export type ResearchCockpitRecommendation = {
   action:
     | "create_task"
+    | "confirm_intent"
     | "approve_gate"
     | "configure_runner"
     | "prepare_dataset"
@@ -251,6 +252,7 @@ type ResearchCockpitWorkflowInput = {
 export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput): ResearchCockpitWorkflowItem[] {
   const hasTask = Boolean(input.task)
   const hasProfile = hasCockpitProfileEvidence(input)
+  const intentConfirmed = hasIntentConfirmation(input) || hasProfile
   const agentWorkflow = buildResearchCockpitAgentWorkflow(input)
   const hasTrainEval = agentWorkflow.some((item) => item.label === "TrainEval Agent" && item.status === "done")
   const hasPendingApproval = input.approvals.some((approval) => approval.status === "pending")
@@ -265,7 +267,7 @@ export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput
     },
     {
       label: "Data Analysis Agent",
-      status: hasProfile ? "done" : hasTask ? "active" : "todo",
+      status: hasProfile ? "done" : hasTask && intentConfirmed ? "active" : "todo",
       detail: hasProfile ? "Dataset fingerprint available." : "Inspect horizon, targets, missingness, and seasonality.",
     },
     ...agentWorkflow,
@@ -290,6 +292,7 @@ export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflow
     hypothesisCount !== undefined ||
     input.artifacts.some((artifact) => artifact.kind === "hypo_plan_md" || artifact.kind === "hypotheses_yaml") ||
     (hasProfile && (hasCandidates || hasCompletedCompilerRun(input) || hasTrainEvalEvidence(input) || Boolean(input.champion)))
+  const requirementsConfirmed = hasRequirementsConfirmation(input) || hasHypothesisPlan
   const hasCompilerEvidence =
     input.artifacts.some((artifact) => artifact.kind === "model_compile_report_md") ||
     hasCompletedCompilerRun(input) ||
@@ -300,8 +303,10 @@ export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflow
   const hasRunningTrainEval = input.runs.some(
     (run) => isTrainEvalRun(run) && (run.status === "queued" || run.status === "running"),
   )
+  const reflectionDone = hasReflectionEvidence(input)
+  const reflectionActive = (trainEvalDone || Boolean(input.champion)) && !reflectionDone
   const designerIteration = modelDesignerIteration(input)
-  const planningActive = hasProfile && input.runnerReady
+  const planningActive = hasProfile && input.runnerReady && requirementsConfirmed
   const designActive = hasHypothesisPlan && input.runnerReady
   const designerDisplayLabel =
     designerIteration && (hasCompilerEvidence || designActive) ? `ModelDesigner Agent (${designerIteration})` : "ModelDesigner Agent"
@@ -338,12 +343,20 @@ export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflow
       status: trainEvalDone ? "done" : hasRunningTrainEval || (hasCompilerEvidence && input.runnerReady) ? "active" : "todo",
       detail: trainEvalDone ? "Training/evaluation evidence available." : "Promote compiled candidates to training evaluation.",
     },
+    {
+      label: "Reflection Agent",
+      status: reflectionDone ? "done" : reflectionActive ? "active" : "todo",
+      detail: reflectionDone
+        ? "Reflection notes available."
+        : "Summarize what worked, what failed, and the next hypotheses.",
+    },
   ]
 }
 
 export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflowInput): ResearchCockpitRecommendation {
   const pendingApproval = input.approvals.find((approval) => approval.status === "pending")
   const hasProfile = hasCockpitProfileEvidence(input)
+  const intentConfirmed = hasIntentConfirmation(input) || hasProfile
   const hasCandidates = input.candidates.length > 0
   const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
   const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
@@ -375,6 +388,13 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
       action: "configure_runner",
       title: "Configure Neo-Cast runner",
       detail: "Set taskSpec.runtime.neoCastProjectRoot before executing candidate runs.",
+    }
+  }
+  if (!intentConfirmed) {
+    return {
+      action: "confirm_intent",
+      title: "Confirm requirements",
+      detail: "Review the Intent Agent slots and confirm before Data Analysis, baselines, or autonomous loop can start.",
     }
   }
   if (!hasProfile) {
@@ -455,6 +475,70 @@ function isTrainEvalRun(run: ResearchCockpitRun) {
 function hasTrainEvalEvidence(input: Pick<ResearchCockpitWorkflowInput, "runs">) {
   return input.runs.some(
     (run) => isTrainEvalRun(run) && (run.status === "succeeded" || run.status === "failed" || run.status === "rejected"),
+  )
+}
+
+function hasReflectionEvidence(input: Pick<ResearchCockpitWorkflowInput, "artifacts">) {
+  return input.artifacts.some(
+    (artifact) =>
+      artifact.kind === "reflection_notes_md" ||
+      artifact.kind === "nas_reflection_notes_md" ||
+      artifact.kind === "next_experiment_plan_md" ||
+      artifact.kind === "failure_log_md",
+  )
+}
+
+export function hasIntentConfirmation(
+  input: Pick<ResearchCockpitWorkflowInput, "task" | "approvals" | "artifacts" | "runs"> &
+    Partial<Pick<ResearchCockpitWorkflowInput, "candidates" | "champion">>,
+) {
+  const workflow = asRecord(asRecord(asRecord(input.task?.taskSpec).metadata).workflow)
+  const lastCheckpoint = workflow.lastCheckpoint
+  if (lastCheckpoint === "intent_confirmed" || lastCheckpoint === "requirements_confirmed") return true
+  const completedPhases = workflow.completedPhases
+  if (
+    Array.isArray(completedPhases) &&
+    completedPhases.some(
+      (phase) =>
+        phase === "intent_gathering" ||
+        phase === "data_analysis" ||
+        phase === "hypo_planning" ||
+        phase === "searching" ||
+        phase === "reflection" ||
+        phase === "publishing",
+    )
+  ) {
+    return true
+  }
+  if (
+    input.artifacts.some((artifact) => artifact.kind === "dataset_analysis_report" || artifact.kind === "task_profile_json") ||
+    input.runs.some((run) => run.stage === "profile") ||
+    (input.candidates?.length ?? 0) > 0 ||
+    Boolean(input.champion) ||
+    input.approvals.some((approval) => approval.kind !== "protocol" || Boolean(approval.candidateID))
+  ) {
+    return true
+  }
+  return input.approvals.some(
+    (approval) =>
+      approval.kind === "protocol" &&
+      approval.status === "approved" &&
+      (approval.reason.includes("[checkpoint:intent_confirmed]") ||
+        approval.reason.includes("[checkpoint:requirements_confirmed]")),
+  )
+}
+
+function hasRequirementsConfirmation(input: Pick<ResearchCockpitWorkflowInput, "task" | "approvals">) {
+  const workflow = asRecord(asRecord(asRecord(input.task?.taskSpec).metadata).workflow)
+  const lastCheckpoint = workflow.lastCheckpoint
+  if (lastCheckpoint === "requirements_confirmed") return true
+  const completedPhases = workflow.completedPhases
+  if (Array.isArray(completedPhases) && completedPhases.includes("hypo_planning")) return true
+  return input.approvals.some(
+    (approval) =>
+      approval.kind === "protocol" &&
+      approval.status === "approved" &&
+      approval.reason.includes("[checkpoint:requirements_confirmed]"),
   )
 }
 
@@ -703,6 +787,56 @@ export function findBestResearchCockpitMetric(
 function asRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
+}
+
+function compactIntentValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map(compactIntentValue).join(",")
+  if (typeof value === "string") return value.trim() || "-"
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  return "-"
+}
+
+export function researchCockpitIntentCheckpointSignature(task: ResearchCockpitTask) {
+  const spec = asRecord(task.taskSpec)
+  const dataset = asRecord(spec.dataset)
+  const objective = asRecord(task.objective)
+  const budget = asRecord(task.budget)
+  return [
+    `mode=${compactIntentValue(interactionModeForTask(task) ?? task.mode)}`,
+    `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
+    `targets=${compactIntentValue(dataset.targetCols)}`,
+    `context=${compactIntentValue(spec.contextLength)}`,
+    `horizons=${compactIntentValue(spec.predictionLengths)}`,
+    `metric=${compactIntentValue(objective.primaryMetric)}`,
+    `direction=${compactIntentValue(objective.direction)}`,
+    `maxRuns=${compactIntentValue(budget.maxRuns)}`,
+  ].join("|")
+}
+
+export function formatResearchCockpitIntentCheckpointReason(task: ResearchCockpitTask) {
+  const spec = asRecord(task.taskSpec)
+  const dataset = asRecord(spec.dataset)
+  const objective = asRecord(task.objective)
+  const budget = asRecord(task.budget)
+  const metadata = asRecord(spec.metadata)
+  return [
+    "[checkpoint:intent_confirmed]",
+    "## 需求交流确认完成后，才能结束 Intent Agent",
+    "",
+    "请确认 Intent Agent 已完成需求交流，下面这些研究意图可以作为后续 Data Analysis、HypoPlanner 和实验循环的输入。",
+    `Intent signature: ${researchCockpitIntentCheckpointSignature(task)}`,
+    `Interaction mode: ${compactIntentValue(interactionModeForTask(task) ?? task.mode)}`,
+    `Task: ${task.title}`,
+    `Dataset: ${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
+    `Targets: ${compactIntentValue(dataset.targetCols)}`,
+    `Context length: ${compactIntentValue(spec.contextLength)}`,
+    `Prediction lengths: ${compactIntentValue(spec.predictionLengths)}`,
+    `Primary metric: ${compactIntentValue(objective.primaryMetric)}`,
+    `Budget max runs: ${compactIntentValue(budget.maxRuns)}`,
+    `Business context: ${compactIntentValue(metadata.businessContext ?? metadata.business_context)}`,
+    "",
+    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并更新 taskSpec/intent slots 后重新运行。",
+  ].join("\n")
 }
 
 export function researchCockpitCandidateTitle(candidate: ResearchCockpitCandidate) {
@@ -1467,14 +1601,20 @@ const socraticIntentSlotDefinitions: Array<Omit<SocraticIntentSlot, "status" | "
 export function buildSocraticClarificationState(
   task: ResearchCockpitTask | undefined,
   approvals: ResearchCockpitApproval[],
+  options: { includeCompanion?: boolean } = {},
 ): SocraticClarificationState {
-  if (interactionModeForTask(task) !== "socratic") return { active: false, missingSlots: [], questionCount: 0, slots: [] }
-  const approval = approvals.find(
-    (item) =>
-      item.status === "pending" &&
-      item.kind === "protocol" &&
-      (/Intent clarification required/i.test(item.reason) || /澄清研究意图/.test(item.reason)),
-  )
+  const interactionMode = interactionModeForTask(task)
+  const includeSlotOverview = interactionMode === "socratic" || (options.includeCompanion === true && interactionMode === "companion")
+  if (!includeSlotOverview) return { active: false, missingSlots: [], questionCount: 0, slots: [] }
+  const approval =
+    interactionMode === "socratic"
+      ? approvals.find(
+        (item) =>
+          item.status === "pending" &&
+          item.kind === "protocol" &&
+          (/Intent clarification required/i.test(item.reason) || /澄清研究意图/.test(item.reason)),
+      )
+      : undefined
   const questions = approval
     ? approval.reason
     .split(/\r?\n/)
@@ -1541,7 +1681,10 @@ function socraticSlotsForTask(task: ResearchCockpitTask | undefined, forcedMissi
     const answeredValue = intentSlots[slot.id] !== undefined
       ? String(intentSlots[slot.id])
       : undefined
-    const value = answeredValue ?? socraticSlotValue(slot.id, dataset, taskSpec, objective, budget, metadata)
+    const value =
+      answeredValue ??
+      socraticSlotValue(slot.id, dataset, taskSpec, objective, budget, metadata) ??
+      (slot.id === "interaction_mode" ? interactionModeForTask(task) : undefined)
     const isRequired = slot.required !== false
     const missing = forcedMissing.has(slot.id) || (value === undefined && isRequired)
     return {
@@ -1678,7 +1821,7 @@ export function buildDefaultTsfResearchTask(
       predictionLengths:
         defaults.predictionLengths && defaults.predictionLengths.length > 0 ? defaults.predictionLengths : [24],
       dataset: {
-        loaderID: nonEmpty(defaults.datasetPreset) ?? "etth1_tslib_v1",
+        loaderID: nonEmpty(defaults.datasetPreset) ?? (datasetPath ? "local_csv" : "etth1_tslib_v1"),
         ...(datasetPath ? { path: datasetPath } : {}),
         targetCols: defaults.targetCols && defaults.targetCols.length > 0 ? defaults.targetCols : ["OT"],
         knownFutureCovariates: [],

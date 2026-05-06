@@ -114,8 +114,8 @@ test("reflectAndPropose mock mode returns a schema candidate without calling art
   );
 
   assert.equal(result.source, "heuristic_mock");
-  assert.equal(result.candidate.recipe_version, "recipe_schema_v1");
-  assert.match(result.candidate.recipe_id, /reflect_mock/);
+  assert.equal(result.candidate.schema_version, "model_recipe.v1");
+  assert.match(result.candidate.model_name, /Forecaster/);
 });
 
 test("reflectAndPropose real LLM path tags candidates as llm_reflection", async () => {

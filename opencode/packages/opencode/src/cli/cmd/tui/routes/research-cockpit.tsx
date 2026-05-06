@@ -28,9 +28,11 @@ import {
   formatResearchCockpitLoop,
   formatResearchCockpitRunResult,
   formatResearchCockpitSeedSweep,
+  formatResearchCockpitIntentCheckpointReason,
   getResearchCockpitRunnerStatus,
   hasApprovedResearchCockpitBlindTestGate,
   hasApprovedResearchCockpitRefTestGate,
+  hasIntentConfirmation,
   interactionModeForTask,
   parseTsfCsvTaskInput,
   slotFromSocraticQuestion,
@@ -71,6 +73,13 @@ import {
 import packageJson from "../../../../../package.json"
 
 type CandidateRunStage = Extract<NonNullable<ResearchCockpitRun["stage"]>, "smoke" | "ref_test" | "blind_test">
+type ResearchAgentStageStatus = "done" | "active" | "todo"
+type ResearchAgentStage = {
+  key: string
+  label: string
+  displayLabel?: string
+  status: ResearchAgentStageStatus
+}
 type ResearchCockpitDatasetPreparationResult = {
   artifact: ResearchCockpitArtifact
   path: string
@@ -163,11 +172,64 @@ function shortID(value: string | undefined) {
 }
 
 function formatError(error: unknown) {
-  const text = error instanceof Error ? error.message : String(error)
+  const text = normalizeErrorMessage(error instanceof Error ? error.message : String(error))
   return text.length > 180 ? text.slice(0, 177) + "..." : text
 }
 
-const busySpinnerFrames = ["-", "\\", "|", "/"]
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function normalizeErrorMessage(value: string) {
+  const parsed = parseErrorPayload(value)
+  const text = parsed ?? value
+  const decoded = text.includes("\\n") && !text.includes("\n") ? text.replace(/\\n/g, "\n") : text
+  const lines = decoded
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const tracebackLine = lines.findIndex((line) => line.includes("Traceback (most recent call last)"))
+  if (tracebackLine !== -1) {
+    const actionable = [...lines]
+      .reverse()
+      .find(
+        (line) =>
+          !line.includes("Traceback (most recent call last)") &&
+          !line.startsWith("File ") &&
+          !line.startsWith("at ") &&
+          line !== "main()",
+      )
+    if (actionable) return actionable.replace(/^Error:\s+/, "").replace(/\s+/g, " ").trim()
+  }
+  return decoded.replace(/^Error:\s+/, "").replace(/\s+/g, " ").trim()
+}
+
+function parseErrorPayload(value: string): string | undefined {
+  try {
+    const payload = JSON.parse(value) as unknown
+    if (!isJsonRecord(payload)) return undefined
+    const data = payload.data
+    if (isJsonRecord(data) && typeof data.message === "string" && data.message.trim()) return data.message
+    if (typeof payload.message === "string" && payload.message.trim()) return payload.message
+    if (isJsonRecord(data) && typeof data.error === "string" && data.error.trim()) return data.error
+    if (typeof payload.error === "string" && payload.error.trim()) return payload.error
+    if (typeof payload.name === "string" && payload.name.trim() && payload.name !== "UnknownError") return payload.name
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+const workingBarFrames = [
+  "[>       ]",
+  "[=>      ]",
+  "[==>     ]",
+  "[===>    ]",
+  "[ ===>   ]",
+  "[  ===>  ]",
+  "[   ===> ]",
+  "[    ===>]",
+]
 
 function formatBusyElapsed(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000))
@@ -177,13 +239,14 @@ function formatBusyElapsed(ms: number) {
   return `${minutes}:${String(rest).padStart(2, "0")}`
 }
 
-function busyActionText(action: string, activity?: string) {
-  const prefix = activity ? `${activity} ` : ""
-  if (action.startsWith("chat:")) {
-    return `${prefix}Waiting for ${action.slice("chat:".length)} response... Press Esc to cancel.`
-  }
-  if (action === "chat") return `${prefix}Waiting for model response... Press Esc to cancel.`
-  return `${prefix}Running ${action}...`
+function workingActionLabel(action: string) {
+  if (action.startsWith("chat:")) return `chat ${action.slice("chat:".length)}`
+  return action
+}
+
+function workingActionText(action: string, elapsed: string, tick: number) {
+  const frame = workingBarFrames[tick % workingBarFrames.length]
+  return `Working / ${workingActionLabel(action)} / ${elapsed} ${frame}`
 }
 
 function localResearchChatReply(value: string) {
@@ -265,6 +328,33 @@ function formatRunnerProgressLine(data: RunnerProgressLineEvent) {
   return data.line
 }
 
+function isRunRecommendedPrompt(value: string) {
+  const normalized = value.trim().toLowerCase()
+  const compact = normalized.replace(/\s+/g, "")
+  if (
+    [
+      "开始",
+      "开始预测",
+      "开始运行",
+      "开始实验",
+      "继续",
+      "执行",
+      "执行下一步",
+      "运行",
+      "下一步",
+      "start",
+      "run",
+      "continue",
+      "execute",
+      "next",
+      "go",
+    ].includes(compact)
+  ) {
+    return true
+  }
+  return /^(run|start|continue|execute|next)\b/.test(normalized)
+}
+
 function assistantTextFromResponse(result: unknown) {
   const parts = Array.isArray((result as { parts?: unknown[] })?.parts) ? (result as { parts: unknown[] }).parts : []
   const text = parts
@@ -333,6 +423,21 @@ type RunnerProgressLineEvent = {
   horizon?: number
   valLoss?: number
   elapsedS?: number
+}
+
+type StreamingChatTextPart = {
+  id: string
+  text: string
+}
+
+type StreamingChatTurn = {
+  id: number
+  sessionID: string
+  messageID?: string
+  partID?: string
+  text: string
+  parts: StreamingChatTextPart[]
+  modelLabel?: string
 }
 
 type ChatProviderList = {
@@ -510,6 +615,25 @@ function compactStreamTextParts(value: string) {
     .split(/\r?\n/)
     .map((part) => part.trimEnd())
     .filter((part) => part.trim().length > 0)
+}
+
+function streamingChatTextFromParts(parts: StreamingChatTextPart[]) {
+  return parts
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join("\n\n")
+}
+
+function setStreamingChatPartText(parts: StreamingChatTextPart[], id: string, text: string) {
+  const existing = parts.findIndex((part) => part.id === id)
+  if (existing === -1) return [...parts, { id, text }]
+  return parts.map((part, index) => (index === existing ? { ...part, text } : part))
+}
+
+function appendStreamingChatPartText(parts: StreamingChatTextPart[], id: string, delta: string) {
+  const existing = parts.findIndex((part) => part.id === id)
+  if (existing === -1) return [...parts, { id, text: delta }]
+  return parts.map((part, index) => (index === existing ? { ...part, text: part.text + delta } : part))
 }
 
 function promptTaskTitle(value: string) {
@@ -707,6 +831,7 @@ export function ResearchCockpit() {
   const [refresh, setRefresh] = createSignal(0)
   const [selectedIndex, setSelectedIndex] = createSignal(0)
   const [selectedCandidateIndex, setSelectedCandidateIndex] = createSignal(0)
+  const [selectedAgentStageIndex, setSelectedAgentStageIndex] = createSignal<number>()
   const [busy, setBusy] = createSignal<string>()
   const [chatBusy, setChatBusy] = createSignal<string>()
   const [error, setError] = createSignal<string>()
@@ -720,14 +845,7 @@ export function ResearchCockpit() {
   const [promptEvents, setPromptEvents] = createSignal<Array<{ id: number; text: string; taskID?: string; detail?: string }>>(
     [],
   )
-  const [streamingChat, setStreamingChat] = createSignal<{
-    id: number
-    sessionID: string
-    messageID?: string
-    partID?: string
-    text: string
-    modelLabel?: string
-  }>()
+  const [streamingChat, setStreamingChat] = createSignal<StreamingChatTurn>()
   const [chatSessionID, setChatSessionID] = createSignal<string>()
   const [chatUsageByMessage, setChatUsageByMessage] = createSignal<Record<string, ChatUsageEntry>>({})
   const [interactionModeByTask, setInteractionModeByTask] = createSignal<Record<string, ResearchInteractionMode>>({})
@@ -780,30 +898,46 @@ export function ResearchCockpit() {
     }
     if (payload.type === "message.part.updated") {
       const part = properties.part
-      if (!current.messageID || part?.sessionID !== current.sessionID || part.messageID !== current.messageID) return
+      if (part?.sessionID !== current.sessionID || typeof part.messageID !== "string") return
+      if (current.messageID && part.messageID !== current.messageID) return
       if (part.type !== "text") return
       setStreamingChat((draft) =>
         draft
-          ? {
-              ...draft,
-              partID: part.id,
-              text: typeof part.text === "string" ? part.text : draft.text,
-            }
+          ? (() => {
+              const parts = setStreamingChatPartText(
+                draft.parts,
+                part.id,
+                typeof part.text === "string" ? part.text : "",
+              )
+              return {
+                ...draft,
+                messageID: draft.messageID ?? part.messageID,
+                partID: part.id,
+                parts,
+                text: streamingChatTextFromParts(parts),
+              }
+            })()
           : draft,
       )
       return
     }
     if (payload.type === "message.part.delta") {
-      if (!current.messageID || properties.sessionID !== current.sessionID || properties.messageID !== current.messageID) return
-      if (current.partID && properties.partID !== current.partID) return
+      if (properties.sessionID !== current.sessionID || typeof properties.messageID !== "string") return
+      if (current.messageID && properties.messageID !== current.messageID) return
       if (properties.field !== "text" || typeof properties.delta !== "string") return
+      const partID = typeof properties.partID === "string" && properties.partID.length > 0 ? properties.partID : "text"
       setStreamingChat((draft) =>
         draft
-          ? {
-              ...draft,
-              partID: draft.partID ?? properties.partID,
-              text: draft.text + properties.delta,
-            }
+          ? (() => {
+              const parts = appendStreamingChatPartText(draft.parts, partID, properties.delta)
+              return {
+                ...draft,
+                messageID: draft.messageID ?? properties.messageID,
+                partID,
+                parts,
+                text: streamingChatTextFromParts(parts),
+              }
+            })()
           : draft,
       )
     }
@@ -842,6 +976,7 @@ export function ResearchCockpit() {
       refresh: refresh(),
     }
   })
+  let selectedAgentStageTaskID: string | undefined
 
   createEffect(() => {
     const count = sortedTasks().length
@@ -852,6 +987,13 @@ export function ResearchCockpit() {
     if (count > 0 && selectedIndex() >= count) {
       setSelectedIndex(count - 1)
     }
+  })
+
+  createEffect(() => {
+    const taskID = selectedTask()?.id
+    if (selectedAgentStageTaskID === taskID) return
+    selectedAgentStageTaskID = taskID
+    setSelectedAgentStageIndex(undefined)
   })
 
   const unsubscribeResearchEvents = event.subscribe((payload) => {
@@ -958,34 +1100,47 @@ export function ResearchCockpit() {
       activeApiTimer = setInterval(() => setActiveApiTick((value) => value + 1), 250)
     }
   })
-  const activeApiActivity = createMemo(() => {
+  const activeApiElapsed = createMemo(() => {
     const startedAt = activeApiStartedAt()
     if (startedAt === undefined) return undefined
-    const tick = activeApiTick()
-    const frame = busySpinnerFrames[tick % busySpinnerFrames.length]
-    return `${frame} ${formatBusyElapsed(Date.now() - startedAt)}`
+    activeApiTick()
+    return formatBusyElapsed(Date.now() - startedAt)
   })
-  const interruptHint = createMemo(() => {
-    const activity = activeApiActivity()
-    return activity ? `${activity} esc interrupt` : "esc interrupt"
+  const workingStatusLine = createMemo(() => {
+    const active = activeApiAction()
+    const elapsed = activeApiElapsed()
+    if (!active || !elapsed) return undefined
+    return workingActionText(active, elapsed, activeApiTick())
   })
   const runnerStatus = createMemo(() => getResearchCockpitRunnerStatus(selectedTask(), { validateRuntime: true }))
   const runnerReady = createMemo(() => runnerStatus().ready)
-  const canStartAutonomousLoop = createMemo(
-    () =>
-      selectedTask()?.mode === "autonomous" &&
-      (runnerReady() || isDatasetRepairRunnerStatus(runnerStatus())),
-  )
   const taskCandidates = createMemo(() => candidates() ?? [])
   const taskRuns = createMemo(() => runs() ?? [])
   const taskArtifacts = createMemo(() => artifacts() ?? [])
   const taskApprovals = createMemo(() => approvals() ?? [])
+  const intentConfirmed = createMemo(() =>
+    hasIntentConfirmation({
+      task: selectedTask(),
+      approvals: taskApprovals(),
+      artifacts: taskArtifacts(),
+      runs: taskRuns(),
+      candidates: taskCandidates(),
+    }),
+  )
+  const canStartAutonomousLoop = createMemo(
+    () =>
+      selectedTask()?.mode === "autonomous" &&
+      intentConfirmed() &&
+      (runnerReady() || isDatasetRepairRunnerStatus(runnerStatus())),
+  )
   const taskInteractionMode = createMemo(() => {
     const task = selectedTask()
     if (!task) return undefined
     return interactionModeByTask()[task.id] ?? interactionModeForTask(task)
   })
-  const socraticClarification = createMemo(() => buildSocraticClarificationState(selectedTask(), taskApprovals()))
+  const socraticClarification = createMemo(() =>
+    buildSocraticClarificationState(selectedTask(), taskApprovals(), { includeCompanion: true }),
+  )
   const validChampion = createMemo(() => {
     const item = champion()
     if (
@@ -1206,7 +1361,6 @@ export function ResearchCockpit() {
     }
     setCsvInputErrors([])
     await createTask(resolvedMode, {
-      datasetPreset: "etth1_tslib_v1",
       targetCols: ["OT"],
       ...defaults,
       ...parsed,
@@ -1218,6 +1372,10 @@ export function ResearchCockpit() {
   async function seedBaselines() {
     const task = selectedTask()
     if (!task) return
+    if (!intentConfirmed()) {
+      await confirmIntentCheckpoint()
+      return
+    }
     await runAction("seed-baselines", async () => {
       const seeded = await researchRequest<{ candidates: unknown[]; approvals: unknown[] }>(
         sdk,
@@ -1246,6 +1404,34 @@ export function ResearchCockpit() {
 
   async function approvePending() {
     await replyPendingApproval("approved")
+  }
+
+  async function confirmIntentCheckpoint() {
+    const task = selectedTask()
+    if (!task) return
+    await runAction("confirm-intent", async () => {
+      const approval = await researchRequest<ResearchCockpitApproval>(
+        sdk,
+        "/research/approvals",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            taskID: task.id,
+            kind: "protocol",
+            reason: formatResearchCockpitIntentCheckpointReason(task),
+          }),
+        },
+      )
+      const updated = await researchRequest<ResearchCockpitApproval>(
+        sdk,
+        `/research/approvals/${encodeURIComponent(approval.id)}/reply`,
+        {
+          method: "POST",
+          body: JSON.stringify({ status: "approved", replyMessage: "Intent requirements confirmed." }),
+        },
+      )
+      return `${shortID(updated.id)} intent confirmed`
+    })
   }
 
   async function rejectPending() {
@@ -1366,7 +1552,7 @@ export function ResearchCockpit() {
         resolvedDefaults ? Promise.resolve(resolvedDefaults) : resolveChatDefaults(),
       ])
       persistStreamingChat()
-      setStreamingChat({ id: ++streamEventID, sessionID, text: "", modelLabel: defaults.modelLabel })
+      setStreamingChat({ id: ++streamEventID, sessionID, text: "", parts: [], modelLabel: defaults.modelLabel })
       setChatBusy(`chat:${defaults.modelLabel}`)
       try {
         await researchRequestNoContent(
@@ -1401,6 +1587,10 @@ export function ResearchCockpit() {
   async function runAutonomousLoop() {
     const task = selectedTask()
     if (!task || task.mode !== "autonomous") return
+    if (!intentConfirmed()) {
+      await confirmIntentCheckpoint()
+      return
+    }
     await runAction("autonomous-loop", async (signal) => {
       let preparedDataset: ResearchCockpitDatasetPreparationResult | undefined
       if (!runnerReady()) {
@@ -1542,6 +1732,10 @@ export function ResearchCockpit() {
   async function profileTask() {
     const task = selectedTask()
     if (!task) return
+    if (!intentConfirmed()) {
+      await confirmIntentCheckpoint()
+      return
+    }
     await runAction("profile-task", async () => {
       const result = await researchRequest<ResearchCockpitProfileResult>(
         sdk,
@@ -1658,6 +1852,10 @@ export function ResearchCockpit() {
     }
     if (pendingApproval()) {
       await approvePending()
+      return
+    }
+    if (next === "confirm_intent") {
+      await confirmIntentCheckpoint()
       return
     }
     if (next === "profile") {
@@ -1929,6 +2127,11 @@ export function ResearchCockpit() {
         taskID: task?.id,
       },
     ])
+    if (isRunRecommendedPrompt(value)) {
+      await runRecommendedAction()
+      promptInput?.focus()
+      return
+    }
     const clarification = socraticClarification()
     if (clarification.active && task.status === "paused" && clarification.nextQuestion) {
       const slotID = slotFromSocraticQuestion(clarification.nextQuestion)
@@ -1975,24 +2178,32 @@ export function ResearchCockpit() {
   function handleSlashKeyDown(evt: KeyEvent) {
     const value = promptInput?.plainText ?? promptValue()
     const options = command.slashes()
-    if (!slashMenuHasOptions(value, options)) return
     const name = evt.name?.toLowerCase()
     const ctrlOnly = evt.ctrl && !evt.meta && !evt.shift
-    if (name === "down" || (ctrlOnly && name === "n")) {
-      evt.preventDefault()
-      moveSlashSelection(value, options, 1, slashSelection)
+
+    if (slashMenuHasOptions(value, options)) {
+      if (name === "down" || (ctrlOnly && name === "n")) {
+        evt.preventDefault()
+        moveSlashSelection(value, options, 1, slashSelection)
+        return
+      }
+      if (name === "up" || (ctrlOnly && name === "p")) {
+        evt.preventDefault()
+        moveSlashSelection(value, options, -1, slashSelection)
+        return
+      }
+      if (name === "return" || name === "tab") {
+        const option = resolveSlashOption(value, options, slashSelection)
+        if (!option) return
+        evt.preventDefault()
+        selectSlashOption(option)
+      }
       return
     }
-    if (name === "up" || (ctrlOnly && name === "p")) {
+
+    if (name === "tab" && cycleAgentStage(evt.shift ? -1 : 1)) {
       evt.preventDefault()
-      moveSlashSelection(value, options, -1, slashSelection)
-      return
-    }
-    if (name === "return" || name === "tab") {
-      const option = resolveSlashOption(value, options, slashSelection)
-      if (!option) return
-      evt.preventDefault()
-      selectSlashOption(option)
+      evt.stopPropagation()
     }
   }
 
@@ -2367,32 +2578,27 @@ export function ResearchCockpit() {
         } else {
           if (task) {
             const mode = taskInteractionMode()
-            if (mode === "socratic") {
+            if (mode === "socratic" || mode === "companion") {
+              const title = mode === "socratic" ? "Socratic" : "Companion"
               lines.push(
                 {
-                  id: "idle-task-socratic",
-                  text: "Socratic onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。",
+                  id: `idle-task-${mode}`,
+                  text: `${title} onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。`,
                   tone: "primary",
                 },
                 ...clarification.slots.map((slot) => ({
-                  id: `idle-socratic-slot-${slot.id}`,
+                  id: `idle-${mode}-slot-${slot.id}`,
                   text: socraticSlotLine(slot),
                   tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
                 })),
               )
               if (clarification.nextQuestion) {
                 lines.push({
-                  id: "idle-task-socratic-next",
+                  id: `idle-task-${mode}-next`,
                   text: `Next question: ${clarification.nextQuestion}`,
                   tone: "primary",
                 })
               }
-            } else if (mode === "companion") {
-              lines.push({
-                id: "idle-task-companion",
-                text: "Companion checkpoint: review the proposed next step, approve gates, or ask for a recommendation.",
-                tone: "primary",
-              })
             } else {
               lines.push({ id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" })
             }
@@ -2455,19 +2661,12 @@ export function ResearchCockpit() {
       }
       lines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
-    const active = activeApiAction()
-    if (active) {
-      lines.push({
-        id: "busy",
-        text: busyActionText(active, activeApiActivity()),
-        tone: "warning",
-      })
-    }
     return lines
   })
   const promptPlaceholder = createMemo(() => {
     if (!selectedTask()) return "询问 Research Agent，或使用 New CSV Task 创建带数据集的任务..."
     if (socraticClarification().active) return "回答当前 Socratic 问题..."
+    if (!intentConfirmed()) return "确认需求后进入 Data Analysis，或继续补充需求..."
     if (taskInteractionMode() === "companion") return "请求建议、批准 checkpoint，或导出 bundle..."
     if (taskInteractionMode() === "socratic") return "回答下一个澄清问题、请求实验或导出..."
     return "请求下一个实验、批准 gate，或导出报告..."
@@ -2556,6 +2755,9 @@ export function ResearchCockpit() {
   const trainEvalDone = createMemo(() =>
     agentWorkflowProgress().some((item) => item.label === "TrainEval Agent" && item.status === "done"),
   )
+  const reflectionDone = createMemo(() =>
+    agentWorkflowProgress().some((item) => item.label === "Reflection Agent" && item.status === "done"),
+  )
   const hasCandidateDesignProgress = createMemo(() => taskCandidates().length > 0)
   const hasSuccessfulExperimentProgress = createMemo(() => succeededRuns() > 0)
   const hasProfileProgress = createMemo(() =>
@@ -2565,10 +2767,11 @@ export function ResearchCockpit() {
   )
   const hasExplorationProgress = createMemo(() => hasCandidateDesignProgress() || hasSuccessfulExperimentProgress())
   const hasInputProgress = createMemo(() => hasProfileProgress() || hasExplorationProgress() || hasResultArtifact())
-  const promptAgentLabel = createMemo(() => {
-    if (validChampion() || hasResultArtifact()) return "Publish Agent"
+  const automaticPromptAgentLabel = createMemo(() => {
+    if (hasResultArtifact()) return "Publish Agent"
     const active = activeResearchAgent()
     if (active) return active.label
+    if (validChampion()) return "Publish Agent"
     if (hasExplorationProgress()) return "ModelDesigner Agent"
     if (hasProfileProgress()) return "Data Analysis Agent"
     return "Intent Agent"
@@ -2609,11 +2812,56 @@ export function ResearchCockpit() {
   })
   const taskSummary = createMemo(() => `${selectedTaskPosition()} · ${candidatePosition()}`)
   const progressState = (done: boolean, active: boolean) => (done ? "done" : active ? "active" : "todo")
-  const intentProgress = createMemo(() => progressState(Boolean(selectedTask()), !selectedTask()))
-  const dataProgress = createMemo(() => progressState(hasProfileProgress(), Boolean(selectedTask()) && !hasProfileProgress()))
-  const publishProgress = createMemo(() =>
-    progressState(hasResultArtifact(), (Boolean(validChampion()) || trainEvalDone()) && !hasResultArtifact()),
+  const intentProgress = createMemo(() => progressState(intentConfirmed(), Boolean(selectedTask()) && !intentConfirmed()))
+  const dataProgress = createMemo(() =>
+    progressState(hasProfileProgress(), Boolean(selectedTask()) && intentConfirmed() && !hasProfileProgress()),
   )
+  const publishProgress = createMemo(() =>
+    progressState(hasResultArtifact(), (Boolean(validChampion()) || reflectionDone()) && !hasResultArtifact()),
+  )
+  const researchAgentStages = createMemo<ResearchAgentStage[]>(() => [
+    { key: "intent", label: "Intent Agent", status: intentProgress() },
+    { key: "data", label: "Data Analysis Agent", status: dataProgress() },
+    ...agentWorkflowProgress().map((item) => ({
+      key: item.label,
+      label: item.label,
+      displayLabel: item.displayLabel,
+      status: item.status,
+    })),
+    { key: "publish", label: "Publish Agent", status: publishProgress() },
+  ])
+  const automaticAgentStageIndex = createMemo(() => {
+    const stages = researchAgentStages()
+    if (stages.length === 0) return -1
+    const label = automaticPromptAgentLabel()
+    const labelIndex = stages.findIndex((item) => item.label === label || item.displayLabel === label)
+    if (labelIndex >= 0) return labelIndex
+    const activeIndex = stages.findIndex((item) => item.status === "active")
+    return activeIndex >= 0 ? activeIndex : 0
+  })
+  const effectiveAgentStageIndex = createMemo(() => {
+    const stages = researchAgentStages()
+    if (stages.length === 0) return -1
+    const selected = selectedAgentStageIndex()
+    if (selected === undefined) return automaticAgentStageIndex()
+    return Math.max(0, Math.min(selected, stages.length - 1))
+  })
+  const selectedAgentStage = createMemo(() => {
+    const index = effectiveAgentStageIndex()
+    return index < 0 ? undefined : researchAgentStages()[index]
+  })
+  const promptAgentLabel = createMemo(() => selectedAgentStage()?.label ?? automaticPromptAgentLabel())
+
+  function cycleAgentStage(offset: number) {
+    const stages = researchAgentStages()
+    if (!selectedTask() || stages.length === 0) return false
+    const current = effectiveAgentStageIndex()
+    const next = ((current + offset) % stages.length + stages.length) % stages.length
+    setSelectedAgentStageIndex(next)
+    promptInput?.focus()
+    return true
+  }
+
   const taskPath = createMemo(() => sdk.directory ?? process.cwd())
   const compactTaskPath = createMemo(() => compactTailPath(taskPath()))
   const runnerIssueTitle = createMemo(() => {
@@ -2635,6 +2883,10 @@ export function ResearchCockpit() {
   const statusMark = (status: "done" | "active" | "todo") => (status === "done" ? "✓" : status === "active" ? "→" : "•")
   const statusColor = (status: "done" | "active" | "todo") =>
     status === "done" ? cockpitColors.success : status === "active" ? cockpitColors.primary : cockpitColors.textMuted
+  const agentStageSelected = (key: string) => selectedAgentStage()?.key === key
+  const agentStageColor = (stage: Pick<ResearchAgentStage, "key" | "status">) =>
+    agentStageSelected(stage.key) ? cockpitColors.primary : statusColor(stage.status)
+  const agentStageText = (stage: ResearchAgentStage) => `${statusMark(stage.status)} ${stage.displayLabel ?? stage.label}`
   return (
     <box flexGrow={1} height="100%" flexDirection="row" backgroundColor={cockpitColors.background}>
       <box
@@ -2670,9 +2922,9 @@ export function ResearchCockpit() {
               New CSV Task
             </text>
             <text
-              fg={!selectedTask() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
+              fg={!selectedTask() || !intentConfirmed() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
               onMouseUp={() => {
-                if (!selectedTask() || busy()) return
+                if (!selectedTask() || !intentConfirmed() || busy()) return
                 void seedBaselines()
               }}
             >
@@ -2761,7 +3013,7 @@ export function ResearchCockpit() {
 
         <box
           flexShrink={0}
-          height={5}
+          height={workingStatusLine() ? 6 : 5}
           backgroundColor={cockpitColors.panel}
           border={["left"]}
           borderColor={cockpitColors.primary}
@@ -2769,6 +3021,19 @@ export function ResearchCockpit() {
           paddingRight={2}
           paddingTop={1}
         >
+          <Show when={workingStatusLine()}>
+            {(line) => (
+              <text
+                fg={cockpitColors.warning}
+                attributes={TextAttributes.BOLD}
+                flexShrink={0}
+                overflow="hidden"
+                wrapMode="none"
+              >
+                {line()}
+              </text>
+            )}
+          </Show>
           <box flexGrow={1} minHeight={0}>
             <textarea
               ref={(value: TextareaRenderable) => {
@@ -2817,7 +3082,7 @@ export function ResearchCockpit() {
 
         <box flexShrink={0} flexDirection="row" justifyContent="space-between">
           <text fg={busy() || chatAwaitingFirstToken() ? cockpitColors.primary : cockpitColors.textMuted}>
-            {interruptHint()}
+            esc interrupt
           </text>
           <box flexDirection="row" gap={2}>
             <text fg={cockpitColors.textMuted}>tab agents</text>
@@ -2914,8 +3179,8 @@ export function ResearchCockpit() {
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
                   ▾ AutoResearch进展
                 </text>
-                <text fg={statusColor(intentProgress())}>
-                  {statusMark(intentProgress())} Intent Agent
+                <text fg={agentStageColor(researchAgentStages()[0]!)}>
+                  {agentStageText(researchAgentStages()[0]!)}
                 </text>
                 <For each={taskRequirementSummary()}>
                   {(summary) => (
@@ -2924,8 +3189,8 @@ export function ResearchCockpit() {
                     </text>
                   )}
                 </For>
-                <text fg={statusColor(dataProgress())}>
-                  {statusMark(dataProgress())} Data Analysis Agent
+                <text fg={agentStageColor(researchAgentStages()[1]!)}>
+                  {agentStageText(researchAgentStages()[1]!)}
                 </text>
                 <For each={profileSummary() === "-" ? [] : profileSummaryLines()}>
                   {(summary) => (
@@ -2936,8 +3201,21 @@ export function ResearchCockpit() {
                 </For>
                 <For each={agentWorkflowProgress()}>
                   {(item) => (
-                    <text fg={statusColor(item.status)} width="100%" overflow="hidden" wrapMode="none">
-                      {statusMark(item.status)} {item.displayLabel ?? item.label}
+                    <text
+                      fg={agentStageColor({
+                        key: item.label,
+                        status: item.status,
+                      })}
+                      width="100%"
+                      overflow="hidden"
+                      wrapMode="none"
+                    >
+                      {agentStageText({
+                        key: item.label,
+                        label: item.label,
+                        displayLabel: item.displayLabel,
+                        status: item.status,
+                      })}
                     </text>
                   )}
                 </For>
@@ -2948,8 +3226,8 @@ export function ResearchCockpit() {
                     </text>
                   )}
                 </Show>
-                <text fg={statusColor(publishProgress())}>
-                  {statusMark(publishProgress())} Publish Agent
+                <text fg={agentStageColor(researchAgentStages().at(-1)!)}>
+                  {agentStageText(researchAgentStages().at(-1)!)}
                 </text>
               </box>
 

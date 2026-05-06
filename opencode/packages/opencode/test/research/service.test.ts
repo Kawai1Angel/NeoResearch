@@ -343,6 +343,50 @@ function createRun(input: {
   )
 }
 
+async function approveIntentCheckpoint(taskID: Research.ResearchTaskID, replyMessage = "Intent requirements confirmed.") {
+  const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID })))
+  const approval = approvals.find(
+    (item) =>
+      item.kind === "protocol" &&
+      item.status === "pending" &&
+      item.reason.includes("[checkpoint:intent_confirmed]"),
+  )
+  expect(approval).toBeDefined()
+  if (!approval) throw new Error(`Missing intent confirmation approval for task: ${taskID}`)
+  await runResearch(
+    Research.Service.use((svc) =>
+      svc.replyApproval({
+        approvalID: approval.id,
+        status: "approved",
+        replyMessage,
+      }),
+    ),
+  )
+}
+
+async function runFullPipelineAfterIntentConfirmation(input: {
+  taskID: Research.ResearchTaskID
+  stage?: Research.ExecutableRunStage
+  description?: string
+  maxIterations?: number
+  outputDir?: string
+}) {
+  try {
+    return await runResearch(Research.Service.use((svc) => svc.runFullPipeline(input)))
+  } catch (error) {
+    expect(error).toMatchObject({
+      name: "ResearchPipelineBlockedError",
+      data: {
+        taskID: input.taskID,
+        reason: "human_checkpoint_required",
+        checkpointPhase: "intent_confirmed",
+      },
+    })
+    await approveIntentCheckpoint(input.taskID)
+    return await runResearch(Research.Service.use((svc) => svc.runFullPipeline(input)))
+  }
+}
+
 afterEach(async () => {
   await resetDatabase()
 })
@@ -638,17 +682,13 @@ describe("Research service", () => {
           "autonomous",
         )
 
-        const result = await runResearch(
-          Research.Service.use((svc) =>
-            svc.runFullPipeline({
-              taskID: task.id,
-              stage: "smoke",
-              description: "pipeline smoke",
-              maxIterations: 1,
-              outputDir: ".neo-research/pipeline",
-            }),
-          ),
-        )
+        const result = await runFullPipelineAfterIntentConfirmation({
+          taskID: task.id,
+          stage: "smoke",
+          description: "pipeline smoke",
+          maxIterations: 1,
+          outputDir: ".neo-research/pipeline",
+        })
 
         expect(result.intent.taskID).toBe(task.id)
         expect(result.intent.missingFields).toEqual([])
@@ -710,17 +750,13 @@ describe("Research service", () => {
           "autonomous",
         )
 
-        const firstRun = await runResearch(
-          Research.Service.use((svc) =>
-            svc.runFullPipeline({
-              taskID: task.id,
-              stage: "smoke",
-              description: "pipeline smoke",
-              maxIterations: 1,
-              outputDir: ".neo-research/pipeline",
-            }),
-          ),
-        )
+        const firstRun = await runFullPipelineAfterIntentConfirmation({
+          taskID: task.id,
+          stage: "smoke",
+          description: "pipeline smoke",
+          maxIterations: 1,
+          outputDir: ".neo-research/pipeline",
+        })
 
         const firstArtifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         const firstDataReport = firstArtifacts.find((artifact) => artifact.kind === "dataset_analysis_report")
@@ -811,17 +847,13 @@ describe("Research service", () => {
           "autonomous",
         )
 
-        await runResearch(
-          Research.Service.use((svc) =>
-            svc.runFullPipeline({
-              taskID: task.id,
-              stage: "smoke",
-              description: "pipeline smoke",
-              maxIterations: 1,
-              outputDir: ".neo-research/pipeline",
-            }),
-          ),
-        )
+        await runFullPipelineAfterIntentConfirmation({
+          taskID: task.id,
+          stage: "smoke",
+          description: "pipeline smoke",
+          maxIterations: 1,
+          outputDir: ".neo-research/pipeline",
+        })
 
         await runResearch(
           Research.Service.use((svc) =>
@@ -834,6 +866,7 @@ describe("Research service", () => {
                   pythonExecutable: "bash",
                   datasetPath,
                 }),
+                predictionLengths: [48],
                 metadata: {
                   ...(validTsfTaskSpec({
                     bridgeOnly: true,
@@ -853,6 +886,56 @@ describe("Research service", () => {
         expect(clearedTaskMetadata.workflow).toBeUndefined()
 
         const runsBeforeUpdate = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+
+        const blockedReplay = await runResearchWithBus(
+          Effect.gen(function* () {
+            const bus = yield* Bus.Service
+            const svc = yield* Research.Service
+            let dataAnalysisStarted = 0
+            let nasStarted = 0
+            let reflectionStarted = 0
+            let publishStarted = 0
+            const unsubscribeData = yield* bus.subscribeCallback(Research.Event.DataAnalysisAgentStarted, () => dataAnalysisStarted += 1)
+            const unsubscribeNAS = yield* bus.subscribeCallback(Research.Event.NASAgentStarted, () => nasStarted += 1)
+            const unsubscribeReflection = yield* bus.subscribeCallback(Research.Event.ReflectionAgentStarted, () => reflectionStarted += 1)
+            const unsubscribePublish = yield* bus.subscribeCallback(Research.Event.PublishAgentStarted, () => publishStarted += 1)
+            const error = yield* svc
+              .runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                description: "pipeline smoke",
+                maxIterations: 1,
+                outputDir: ".neo-research/pipeline",
+              })
+              .pipe(
+                Effect.as(undefined),
+                Effect.catchCause((cause) => Effect.succeed(Cause.squash(cause))),
+              )
+            unsubscribeData()
+            unsubscribeNAS()
+            unsubscribeReflection()
+            unsubscribePublish()
+            return {
+              error,
+              events: { dataAnalysisStarted, nasStarted, reflectionStarted, publishStarted },
+            }
+          }),
+        )
+
+        expect(blockedReplay.error).toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "intent_confirmed",
+          },
+        })
+        expect(blockedReplay.events.dataAnalysisStarted).toBe(0)
+        expect(blockedReplay.events.nasStarted).toBe(0)
+        expect(blockedReplay.events.reflectionStarted).toBe(0)
+        expect(blockedReplay.events.publishStarted).toBe(0)
+
+        await approveIntentCheckpoint(task.id, "Updated intent requirements confirmed.")
 
         const replayResult = await runResearchWithBus(
           Effect.gen(function* () {
@@ -939,6 +1022,267 @@ describe("Research service", () => {
           reason: expect.stringContaining("CSV 数据集路径"),
         })
         expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toHaveLength(0)
+      },
+    })
+  })
+
+  test("pauses the pipeline before Data Analysis until the intent checkpoint is confirmed", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "intent confirmation gate task",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+            datasetPath,
+          },
+          "autonomous",
+        )
+
+        const blocked = await runResearchWithBus(
+          Effect.gen(function* () {
+            const bus = yield* Bus.Service
+            const svc = yield* Research.Service
+            let dataAnalysisStarted = 0
+            let hypoPlannerStarted = 0
+            const unsubscribeData = yield* bus.subscribeCallback(Research.Event.DataAnalysisAgentStarted, (event) => {
+              if (event.properties.taskID === task.id) dataAnalysisStarted += 1
+            })
+            const unsubscribeHypo = yield* bus.subscribeCallback(Research.Event.HypoPlannerAgentStarted, (event) => {
+              if (event.properties.taskID === task.id) hypoPlannerStarted += 1
+            })
+            const error = yield* svc
+              .runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+                outputDir: ".neo-research/pipeline",
+              })
+              .pipe(
+                Effect.as(undefined),
+                Effect.catchCause((cause) => Effect.succeed(Cause.squash(cause))),
+              )
+            unsubscribeData()
+            unsubscribeHypo()
+            return { error, dataAnalysisStarted, hypoPlannerStarted }
+          }),
+        )
+
+        expect(blocked.error).toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "intent_confirmed",
+          },
+        })
+        expect(blocked.dataAnalysisStarted).toBe(0)
+        expect(blocked.hypoPlannerStarted).toBe(0)
+
+        const artifactsBeforeApproval = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        expect(artifactsBeforeApproval.find((artifact) => artifact.kind === "dataset_analysis_report")).toBeUndefined()
+        expect(artifactsBeforeApproval.find((artifact) => artifact.kind === "hypo_plan_md")).toBeUndefined()
+
+        const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
+        expect(approvals.find((approval) => approval.kind === "protocol")).toMatchObject({
+          status: "pending",
+          reason: expect.stringContaining("[checkpoint:intent_confirmed]"),
+        })
+      },
+    })
+  })
+
+  test("pauses Socratic pipeline in Intent until requirements are confirmed", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "socratic requirements gate task",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+            datasetPath,
+          },
+          "autonomous",
+        )
+
+        const blocked = await runResearchWithBus(
+          Effect.gen(function* () {
+            const bus = yield* Bus.Service
+            const svc = yield* Research.Service
+            let hypoPlannerStarted = 0
+            const unsubscribeHypo = yield* bus.subscribeCallback(Research.Event.HypoPlannerAgentStarted, (event) => {
+              if (event.properties.taskID === task.id) hypoPlannerStarted += 1
+            })
+            const error = yield* svc
+              .runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+                outputDir: ".neo-research/pipeline",
+              })
+              .pipe(
+                Effect.as(undefined),
+                Effect.catchCause((cause) => Effect.succeed(Cause.squash(cause))),
+              )
+            unsubscribeHypo()
+            return { error, hypoPlannerStarted }
+          }),
+        )
+
+        expect(blocked.error).toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "intent_confirmed",
+          },
+        })
+        expect(blocked.hypoPlannerStarted).toBe(0)
+
+        const artifactsBeforeApproval = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        expect(artifactsBeforeApproval.find((artifact) => artifact.kind === "dataset_analysis_report")).toBeUndefined()
+        expect(artifactsBeforeApproval.find((artifact) => artifact.kind === "hypo_plan_md")).toBeUndefined()
+
+        const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
+        const intentApproval = approvals.find((approval) => approval.kind === "protocol")
+        expect(intentApproval).toMatchObject({
+          status: "pending",
+          reason: expect.stringContaining("[checkpoint:intent_confirmed]"),
+        })
+        if (!intentApproval) return
+
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.replyApproval({
+              approvalID: intentApproval.id,
+              status: "approved",
+              replyMessage: "需求交流已确认完成，可以进入 HypoPlanner。",
+            }),
+          ),
+        )
+
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.runFullPipeline({
+              taskID: task.id,
+              stage: "smoke",
+              maxIterations: 1,
+              outputDir: ".neo-research/pipeline",
+            }),
+          ),
+        )
+
+        const artifactsAfterApproval = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        expect(artifactsAfterApproval.find((artifact) => artifact.kind === "hypo_plan_md")).toBeDefined()
+      },
+    })
+  })
+
+  test("pauses companion pipeline in Intent until requirements are confirmed", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "companion requirements gate task",
+              domainID: "tsf",
+              mode: "review",
+              interactionMode: "companion",
+              taskSpec: validTsfTaskSpec({
+                bridgeOnly: true,
+                neoCastProjectRoot: fakeNeoCastRoot,
+                pythonExecutable: "bash",
+                datasetPath,
+              }),
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize", errorPreferences: "balanced" },
+              budget: { maxRuns: 12, latencyBudget: "no_constraint", parameterBudget: "no_constraint" },
+            }),
+          ),
+        )
+
+        await expect(
+          runResearch(
+            Research.Service.use((svc) =>
+              svc.runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+                outputDir: ".neo-research/pipeline",
+              }),
+            ),
+          ),
+        ).rejects.toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "intent_confirmed",
+          },
+        })
+
+        const artifactsBeforeApproval = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        expect(artifactsBeforeApproval.find((artifact) => artifact.kind === "dataset_analysis_report")).toBeUndefined()
+        expect(artifactsBeforeApproval.find((artifact) => artifact.kind === "hypo_plan_md")).toBeUndefined()
+
+        const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
+        const intentApproval = approvals.find((approval) =>
+          approval.kind === "protocol" && approval.reason.includes("[checkpoint:intent_confirmed]"),
+        )
+        expect(intentApproval?.status).toBe("pending")
+        if (!intentApproval) return
+
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.replyApproval({
+              approvalID: intentApproval.id,
+              status: "approved",
+              replyMessage: "Companion requirements confirmed.",
+            }),
+          ),
+        )
+
+        await expect(
+          runResearch(
+            Research.Service.use((svc) =>
+              svc.runFullPipeline({
+                taskID: task.id,
+                stage: "smoke",
+                maxIterations: 1,
+                outputDir: ".neo-research/pipeline",
+              }),
+            ),
+          ),
+        ).rejects.toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: {
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "search_space_confirmed",
+          },
+        })
+
+        const artifactsAfterApproval = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        expect(artifactsAfterApproval.find((artifact) => artifact.kind === "hypo_plan_md")).toBeDefined()
       },
     })
   })

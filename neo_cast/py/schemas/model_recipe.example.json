@@ -1,0 +1,33 @@
+{
+  "schema_version": "model_recipe.v1",
+  "model_name": "MultiScaleTinyForecaster",
+  "hypothesis": "A compact temporal convolution with decomposition should capture local multiscale dynamics under deployment constraints.",
+  "input": {
+    "history_window": 96,
+    "prediction_horizon": 24,
+    "covariates": true
+  },
+  "architecture": {
+    "backbone": "temporal_conv",
+    "decomposition": true,
+    "multiscale_blocks": 3,
+    "attention": "lightweight",
+    "hidden_dim": 32,
+    "kernel_size": 3,
+    "dropout": 0.1
+  },
+  "training": {
+    "loss": "mse",
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "max_epochs": 8,
+    "time_budget_s": 600,
+    "patience": 4,
+    "seed": 42
+  },
+  "constraints": {
+    "max_params": "5M",
+    "latency_sensitive": true
+  }
+}

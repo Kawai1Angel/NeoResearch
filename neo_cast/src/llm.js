@@ -6,7 +6,107 @@ const { formatUserCorrections } = require("./corrections");
 // Heuristic fallback (used when LLM is mocked or API fails)
 // ---------------------------------------------------------------------------
 
-function _buildHeuristicCandidate(requirement, attempt = 1) {
+function _modelNameForFamily(modelFamily, useMultiscale) {
+  const names = {
+    tiny_transformer: useMultiscale ? "MultiScaleTinyTransformer" : "TinyTransformerForecaster",
+    patch_mlp: useMultiscale ? "MultiScalePatchMLPForecaster" : "PatchMLPForecaster",
+    dlinear: "DLinearTinyForecaster",
+    tcn: useMultiscale ? "MultiScaleTemporalConvForecaster" : "TemporalConvForecaster",
+    nbeats: "NBeatsLiteForecaster",
+    timesnet: "TimesNetLiteForecaster",
+    nlinear: "LinearTinyForecaster",
+  };
+  return names[modelFamily] || "TinyForecaster";
+}
+
+function _architectureBackboneForFamily(modelFamily) {
+  if (modelFamily === "tiny_transformer") return "transformer";
+  if (modelFamily === "patch_mlp") return "mlp";
+  if (modelFamily === "tcn") return "temporal_conv";
+  if (modelFamily === "nlinear") return "linear";
+  return modelFamily;
+}
+
+function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
+  const modelFamily = options.modelFamily || "model";
+  const text = String(options.requirement || "").toLowerCase();
+  const architecture = recipe.backbone || {};
+  const embedding = recipe.embedding || {};
+  const strategy = recipe.training_strategy || {};
+  const budget = strategy.budget || {};
+  const optimizer = strategy.optimizer || {};
+  const wantsDecomposition = (
+    text.includes("decomposition") ||
+    text.includes("decompose") ||
+    text.includes("trend") ||
+    text.includes("seasonal") ||
+    text.includes("seasonality") ||
+    text.includes("分解") ||
+    text.includes("趋势") ||
+    text.includes("季节")
+  );
+  const latencySensitive = (
+    text.includes("latency") ||
+    text.includes("deployment") ||
+    text.includes("deploy") ||
+    text.includes("inference") ||
+    text.includes("部署") ||
+    text.includes("推理")
+  );
+  const horizons = Array.isArray(taskContext.horizons) && taskContext.horizons.length > 0
+    ? taskContext.horizons
+    : [96, 192, 336, 720];
+  const multiscaleBlocks = embedding.type === "multiscale_patch"
+    ? embedding.scales?.length || 3
+    : Math.max(Number(architecture.n_layers || architecture.n_blocks || architecture.depth || 1), options.useMultiscale ? 3 : 0);
+
+  return {
+    schema_version: "model_recipe.v1",
+    model_name: _modelNameForFamily(modelFamily, Boolean(options.useMultiscale)),
+    hypothesis: recipe.hypothesis,
+    input: {
+      history_window: Number(taskContext.input_len || 512),
+      prediction_horizon: Number(horizons[0] || 96),
+      covariates: recipe.fusion?.channel_mode === "shared",
+    },
+    architecture: {
+      backbone: _architectureBackboneForFamily(modelFamily),
+      decomposition: wantsDecomposition || modelFamily === "dlinear",
+      multiscale_blocks: multiscaleBlocks,
+      attention: modelFamily === "tiny_transformer" || text.includes("attention") ? "lightweight" : "none",
+      channel_fusion: recipe.fusion?.channel_mode || "independent",
+      hidden_dim: Number(architecture.hidden_dim || architecture.d_model || embedding.d_model || 64),
+      d_model: Number(architecture.d_model || embedding.d_model || architecture.hidden_dim || 64),
+      layers: Number(architecture.n_layers || architecture.n_blocks || architecture.depth || 1),
+      heads: Number(architecture.n_heads || 4),
+      kernel_size: Number(architecture.kernel_size || 3),
+      patch_len: Number(embedding.patch_len || 16),
+      stride: Number(embedding.stride || 8),
+      dropout: Number(architecture.dropout || 0.1),
+      output_distribution: recipe.prediction_head?.output_distribution || "point",
+    },
+    training: {
+      loss: strategy.loss?.base || "mse",
+      optimizer: optimizer.type || "adam",
+      learning_rate: Number(optimizer.lr || 0.001),
+      weight_decay: Number(optimizer.weight_decay || 0.0),
+      batch_size: Number(budget.batch_size || 32),
+      max_epochs: Number(budget.max_epochs || 8),
+      time_budget_s: Number(budget.time_budget_s || 600),
+      patience: Number(budget.patience || 4),
+      seed: Number(budget.seed || 42),
+      grad_clip: Number(strategy.regularization?.grad_clip || 1.0),
+    },
+    constraints: {
+      max_params: `${Math.max(1, Math.round(Number(recipe.constraints?.max_params || 1_000_000) / 1_000_000))}M`,
+      latency_sensitive: latencySensitive || recipe.constraints?.latency_priority === "high",
+      max_latency_ms: Number(recipe.constraints?.max_latency_ms || 50),
+    },
+    notes: recipe.notes,
+  };
+}
+
+function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   const text = String(requirement || "").toLowerCase();
   const fastMode = Boolean(process.env.NEO_CAST_FAST_E2E);
   const channelMode = (
@@ -93,7 +193,7 @@ function _buildHeuristicCandidate(requirement, attempt = 1) {
 
   if (modelFamily === "tiny_transformer") {
     const dModel = attempt >= 3 ? 128 : 64;
-    return {
+    return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: useMultiscale
         ? {
@@ -107,11 +207,11 @@ function _buildHeuristicCandidate(requirement, attempt = 1) {
           }
         : { type: "patch", patch_len: 16, stride: 16, d_model: dModel },
       backbone: { type: "transformer", d_model: dModel, n_heads: 4, n_layers: attempt >= 2 ? 2 : 1, dropout: 0.1, ffn_mult: 4.0 },
-    };
+    }, taskContext, { modelFamily, requirement, useMultiscale });
   }
   if (modelFamily === "patch_mlp") {
     const dModel = attempt >= 3 ? 256 : 128;
-    return {
+    return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: useMultiscale
         ? {
@@ -125,42 +225,42 @@ function _buildHeuristicCandidate(requirement, attempt = 1) {
           }
         : { type: "patch", patch_len: 16, stride: 8, d_model: dModel },
       backbone: { type: "mlp", depth: 2, hidden_dim: dModel, activation: "gelu", dropout: 0.1 },
-    };
+    }, taskContext, { modelFamily, requirement, useMultiscale });
   }
   if (modelFamily === "dlinear") {
-    return {
+    return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: { type: "none" },
       backbone: { type: "dlinear", kernel_size: 25, bias: true },
-    };
+    }, taskContext, { modelFamily, requirement, useMultiscale });
   }
   if (modelFamily === "tcn") {
-    return {
+    return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: { type: "none" },
-      backbone: { type: "tcn", hidden_dim: 16, n_layers: 1, kernel_size: 3, activation: "gelu", dropout: 0.1 },
-    };
+      backbone: { type: "tcn", hidden_dim: 16, n_layers: useMultiscale ? 3 : 1, kernel_size: 3, activation: "gelu", dropout: 0.1 },
+    }, taskContext, { modelFamily, requirement, useMultiscale });
   }
   if (modelFamily === "nbeats") {
-    return {
+    return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: { type: "none" },
       backbone: { type: "nbeats", hidden_dim: 128, n_blocks: 3, n_layers: 2, activation: "gelu", dropout: 0.1 },
-    };
+    }, taskContext, { modelFamily, requirement, useMultiscale });
   }
   if (modelFamily === "timesnet") {
-    return {
+    return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: { type: "none" },
       backbone: { type: "timesnet", hidden_dim: 16, n_layers: 1, top_k: 1, kernel_size: 3, dropout: 0.1 },
-    };
+    }, taskContext, { modelFamily, requirement, useMultiscale });
   }
 
-  return {
+  return _candidateRecipeToModelRecipe({
     ...baseRecipe,
     embedding: { type: "none" },
     backbone: { type: "linear", shared: false, bias: true },
-  };
+  }, taskContext, { modelFamily, requirement, useMultiscale });
 }
 
 // ---------------------------------------------------------------------------
@@ -207,13 +307,14 @@ Your job is to propose one concrete model candidate for the prepared multivariat
 ## Task context
 ${_formatTaskContext(taskContext)}
 
-## Supported CandidateRecipe actions
+## Supported ModelRecipe DSL controlled design space
 
-You must output a module-level CandidateRecipe, not Python code.
+You must output a high-level ModelRecipe DSL object, not natural language and not Python code.
+The runtime will compile model_recipe.v1 into the executable recipe_schema_v1 factory format.
 
 - preprocessing: none, instance_norm, series_decomposition, seasonal_differencing, missing_mask, sample_reweighting
 - embedding: none, patch, multiscale_patch, invert, frequency, calendar
-- backbone: linear, mlp, transformer, dlinear, tcn, nbeats, timesnet, rnn, ssm, mixer
+- backbone: linear, mlp, transformer, temporal_conv, dlinear, nbeats, timesnet, rnn, ssm, mixer
 - fusion: temporal, feature, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
 - prediction_head: linear, direct_multi_horizon, quantile, gaussian, residual_correction
 - output_distribution: point, quantile, gaussian
@@ -259,18 +360,17 @@ Action parameters:
 Return a single JSON object and nothing else. No markdown, no explanation outside the JSON.
 
 Required fields:
-  recipe_version: "recipe_schema_v1"
-  recipe_id: unique string like "recipe_<embedding>_<backbone>_<short_reason>"
+  schema_version: "model_recipe.v1"
+  model_name: PascalCase model name, e.g. "MultiScaleTinyForecaster"
   hypothesis: 1-2 sentence rationale for why this candidate may improve val_avg_mse
-  preprocessing, embedding, backbone, fusion, prediction_head, post_processing, training_strategy, constraints
+  input: { history_window, prediction_horizon, covariates }
+  architecture: { backbone, decomposition, multiscale_blocks, attention, channel_fusion, hidden_dim, d_model, layers, heads, kernel_size, patch_len, stride, dropout, output_distribution }
+  training: { loss, optimizer, learning_rate, batch_size, max_epochs, time_budget_s, patience, seed, weight_decay, grad_clip }
+  constraints: { max_params, latency_sensitive, max_latency_ms }
 
-training_strategy.budget: { max_epochs, time_budget_s, batch_size, patience, seed: 42 }
-    lr: 0.0001–0.01
-    batch_size: 16, 32, or 64
-    max_epochs: 10–100
-    patience: 3–10
-    time_budget_s: <= 600
-constraints: { max_params: 1000000, max_latency_ms: 50, latency_priority: "medium" }
+Use history_window and prediction_horizon from the task context.
+constraints.max_params may be an integer or a human-readable string like "5M".
+constraints.latency_sensitive should be true when deployment, inference speed, or compact serving is important.
 
 ## Design principles
 - Avoid repeating module combinations that already appeared in recent history
@@ -300,7 +400,7 @@ function _buildUserMessage(requirement, history, attempt, taskContext = {}) {
     attempt,
     task_context: taskContext,
     recent_experiment_history: recentHistory,
-    instruction: "Propose the next candidate. Return JSON only.",
+    instruction: "Propose the next model_recipe.v1 candidate. Return JSON only.",
   }, null, 2);
 }
 
@@ -319,7 +419,67 @@ function _extractJsonObject(text) {
   return JSON.parse(stripped.slice(start, end + 1));
 }
 
+function _looksLikeModelRecipe(candidate) {
+  return candidate?.schema_version === "model_recipe.v1"
+    || candidate?.model_name
+    || candidate?.architecture
+    || candidate?.training
+    || candidate?.input;
+}
+
 function _ensureCandidateDefaults(candidate, prefix, attempt) {
+  if (_looksLikeModelRecipe(candidate) && !candidate.recipe_version) {
+    if (!candidate.schema_version) candidate.schema_version = "model_recipe.v1";
+    if (!candidate.model_name) candidate.model_name = `TinyForecaster${attempt}`;
+    if (!candidate.hypothesis) candidate.hypothesis = "Structured model recipe generated for the prepared forecasting task.";
+    if (!candidate.input) {
+      candidate.input = { history_window: 512, prediction_horizon: 96, covariates: true };
+    }
+    if (candidate.input.history_window === undefined) candidate.input.history_window = 512;
+    if (candidate.input.prediction_horizon === undefined) candidate.input.prediction_horizon = 96;
+    if (candidate.input.covariates === undefined) candidate.input.covariates = true;
+    if (!candidate.architecture) candidate.architecture = { backbone: "linear" };
+    if (!candidate.architecture.backbone) candidate.architecture.backbone = "linear";
+    if (candidate.architecture.decomposition === undefined) candidate.architecture.decomposition = false;
+    if (candidate.architecture.multiscale_blocks === undefined) candidate.architecture.multiscale_blocks = 0;
+    if (!candidate.architecture.attention) candidate.architecture.attention = "none";
+    if (!candidate.training) {
+      candidate.training = {
+        loss: "mse",
+        optimizer: "adam",
+        learning_rate: 0.001,
+        batch_size: 32,
+        max_epochs: 50,
+        time_budget_s: 600,
+        patience: 5,
+        seed: 42,
+      };
+    }
+    if (!candidate.training.loss) candidate.training.loss = "mse";
+    if (!candidate.training.optimizer) candidate.training.optimizer = "adam";
+    if (candidate.training.learning_rate === undefined) candidate.training.learning_rate = 0.001;
+    if (candidate.training.batch_size === undefined) candidate.training.batch_size = 32;
+    if (candidate.training.max_epochs === undefined) candidate.training.max_epochs = 50;
+    if (candidate.training.time_budget_s === undefined) candidate.training.time_budget_s = 600;
+    if (candidate.training.patience === undefined) candidate.training.patience = 5;
+    if (candidate.training.seed === undefined) candidate.training.seed = 42;
+    if (!candidate.constraints) {
+      candidate.constraints = { max_params: "1M", latency_sensitive: false, max_latency_ms: 50 };
+    }
+    if (candidate.constraints.max_params === undefined) candidate.constraints.max_params = "1M";
+    if (candidate.constraints.latency_sensitive === undefined) candidate.constraints.latency_sensitive = false;
+
+    if (process.env.NEO_CAST_FAST_E2E) {
+      candidate.training = {
+        ...candidate.training,
+        batch_size: Math.min(Number(candidate.training.batch_size || 32), 16),
+        max_epochs: Math.min(Number(candidate.training.max_epochs || 50), 2),
+        patience: Math.min(Number(candidate.training.patience || 5), 2),
+      };
+    }
+    return candidate;
+  }
+
   if (!candidate.recipe_version) candidate.recipe_version = "recipe_schema_v1";
   if (!candidate.recipe_id) candidate.recipe_id = `recipe_${prefix}_${Date.now()}_${attempt}`;
   if (!candidate.post_processing) candidate.post_processing = { type: "auto" };
@@ -493,7 +653,7 @@ async function generateCandidate(requirement, history, resolvedConfig, options =
   const taskContext = options.taskContext || {};
 
   if (useMock) {
-    return { candidate: _buildHeuristicCandidate(requirement, attempt), source: "heuristic_mock" };
+    return { candidate: _buildHeuristicCandidate(requirement, attempt, taskContext), source: "heuristic_mock" };
   }
 
   const provider = resolvedConfig?.llm?.provider || "anthropic";
@@ -502,7 +662,7 @@ async function generateCandidate(requirement, history, resolvedConfig, options =
     && !process.env.ANTHROPIC_API_KEY
   ) {
     console.error("[neo-cast] ANTHROPIC_API_KEY not set — falling back to heuristic candidate.");
-    return { candidate: _buildHeuristicCandidate(requirement, attempt), source: "heuristic_fallback:no_api_key" };
+    return { candidate: _buildHeuristicCandidate(requirement, attempt, taskContext), source: "heuristic_fallback:no_api_key" };
   }
 
   try {
@@ -518,7 +678,7 @@ async function generateCandidate(requirement, history, resolvedConfig, options =
   } catch (err) {
     console.error(`[neo-cast] LLM call failed (attempt ${attempt}): ${err.message}`);
     console.error("[neo-cast] Falling back to heuristic candidate.");
-    return { candidate: _buildHeuristicCandidate(requirement, attempt), source: `heuristic_fallback:${err.message.slice(0, 80)}` };
+    return { candidate: _buildHeuristicCandidate(requirement, attempt, taskContext), source: `heuristic_fallback:${err.message.slice(0, 80)}` };
   }
 }
 

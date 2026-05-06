@@ -1000,6 +1000,80 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("stitches multiple assistant text parts into one visible chat turn", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const chatFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      if (url.pathname !== "/session/session_research_chat/prompt_async") {
+        const handled = await mockChatResponse(input, init, [], "unused")
+        if (handled) return handled
+      }
+      if (url.pathname === "/session/session_research_chat/prompt_async") {
+        setTimeout(() => {
+          events.emit({
+            type: "message.updated",
+            properties: {
+              info: {
+                id: "msg_multi_part_reply",
+                sessionID: "session_research_chat",
+                role: "assistant",
+                mode: "build",
+                agent: "Research Agent",
+                time: { created: now },
+              },
+            },
+          })
+          events.emit({
+            type: "message.part.updated",
+            properties: {
+              sessionID: "session_research_chat",
+              part: {
+                id: "part_intro",
+                sessionID: "session_research_chat",
+                messageID: "msg_multi_part_reply",
+                type: "text",
+                text: "第一段",
+              },
+            },
+          })
+          events.emit({
+            type: "message.part.delta",
+            properties: {
+              sessionID: "session_research_chat",
+              messageID: "msg_multi_part_reply",
+              partID: "part_body",
+              field: "text",
+              delta: "第二段",
+            },
+          })
+        }, 0)
+        return new Response(null, { status: 204 })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} events={events.source} />, {
+      width: 170,
+      height: 48,
+    })
+
+    try {
+      await waitForFrame(app, "run_smoke")
+      await app.mockInput.typeText("请拼接多段回复")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      const frame = await waitForFrame(app, "第二段")
+      expect(frame).toContain("Research Agent: 第一段")
+      expect(frame).toContain("  第二段")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("submitting a prompt starts the chat asynchronously and renders streamed events without waiting for final JSON", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -1198,10 +1272,11 @@ describe("ResearchCockpit render", () => {
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const waitingFrame = await waitForFrame(app, "Waiting for GPT Test response")
+      const waitingFrame = await waitForFrame(app, "Working / chat GPT Test")
       expect(waitingFrame).toContain("Research Agent 正在生成回复")
-      expect(waitingFrame).toMatch(/[-\\|/] 0s Waiting for GPT Test response/)
-      expect(waitingFrame).toContain("0s esc interrupt")
+      expect(waitingFrame).toMatch(/Working \/ chat GPT Test \/ 0s \[[=> ]+\]/)
+      expect(waitingFrame).not.toContain("Waiting for GPT Test response")
+      expect(waitingFrame).not.toContain("0s esc interrupt")
       expect(waitingFrame).toContain("esc interrupt")
       app.mockInput.pressKey("ESCAPE")
       const frame = await waitForFrame(app, "chat: Chat request canceled.")
@@ -2008,7 +2083,7 @@ describe("ResearchCockpit render", () => {
       expect(
         frame
           .split("\n")
-          .some((line) => line.includes("苏格拉底") && line.includes("Publish Agent") && line.includes("Research Agent")),
+          .some((line) => line.includes("苏格拉底") && line.includes("Reflection Agent") && line.includes("Research Agent")),
       ).toBe(true)
       expect(frame).toContain("AutoResearch进展")
       expect(frame).toContain("Intent Agent")
@@ -2017,6 +2092,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("ModelDesigner Agent")
       expect(frame).toContain("ModelCompiler Agent")
       expect(frame).toContain("TrainEval Agent")
+      expect(frame).toContain("Reflection Agent")
       expect(frame).not.toContain("NAS Agent")
       expect(frame).toContain("Publish Agent")
       expect(frame).toContain("需求摘要")
@@ -2103,10 +2179,61 @@ describe("ResearchCockpit render", () => {
       const frame = await waitForFrame(app, "Socratic onboarding")
 
       expect(frame).toContain("Socratic onboarding")
-      expect(frame).toContain("回答下一个澄清问题")
-      expect(frame).toContain("✓ Intent Agent")
-      expect(frame).toContain("→ Data Analysis Agent")
+      expect(frame).toContain("Confirm requirements")
+      expect(frame).toContain("确认需求后进入 Data Analysis")
+      expect(frame).toContain("→ Intent Agent")
+      expect(frame).toContain("• Data Analysis Agent")
       expect(frame).not.toContain("研究输出会在 agent 运行时显示在这里。")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("onboards a newly created Companion task with the same slot overview", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const onboardingFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/config/providers") {
+        return Promise.resolve(response({ providers: [providerFixture()], default: { openai: "gpt-test" } }))
+      }
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      if (path === "/research/tasks" && !init?.method) {
+        return Promise.resolve(
+          response([
+            {
+              id: "task_new_companion",
+              title: "Review new dataset",
+              domainID: "tsf",
+              mode: "review",
+              status: "idle",
+              taskSpec: { metadata: { interactionMode: "companion" }, runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 8 },
+              time: { created: now, updated: now },
+            },
+          ]),
+        )
+      }
+      if (path.startsWith("/research/tasks/task_new_companion/")) return Promise.resolve(response([]))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={onboardingFetch} />, { width: 160, height: 48 })
+
+    try {
+      const frame = await waitForFrame(app, "Companion onboarding")
+
+      expect(frame).toContain("Companion onboarding")
+      expect(frame).toContain("交互模式: companion")
+      expect(frame).toContain("→ 预测对象")
+      expect(frame).toContain("Next question")
+      expect(frame).toContain("→ Intent Agent")
+      expect(frame).toContain("• Data Analysis Agent")
+      expect(frame).toContain("Confirm requirements")
+      expect(frame).toContain("确认需求后进入 Data Analysis")
+      expect(frame).not.toContain("Companion checkpoint: review the proposed next step")
     } finally {
       app.renderer.destroy()
     }
@@ -2324,7 +2451,7 @@ describe("ResearchCockpit render", () => {
       const roleLine = lines.findIndex(
         (line) =>
           line.includes("苏格拉底") &&
-          line.includes("Publish Agent") &&
+          line.includes("Reflection Agent") &&
           (line.includes("GPT Test") || line.includes("Research Agent")),
       )
       const footerLine = frameLine(frame, "tab agents")
@@ -2379,7 +2506,14 @@ describe("ResearchCockpit render", () => {
       artifactRefs: [],
       time: { created: now - 12_000, updated: now - 8_000 },
     }
-    const phaseFetch = (phase: "empty" | "created" | "profile" | "explore" | "results") =>
+    const requirementsApproval = {
+      id: "approval_requirements_01",
+      kind: "protocol",
+      status: "approved",
+      reason: "[checkpoint:requirements_confirmed]\nRequirements confirmed.",
+      time: { created: now - 7_000, updated: now - 7_000 },
+    }
+    const phaseFetch = (phase: "empty" | "created" | "profile" | "profile_confirmed" | "explore" | "results") =>
       ((input: RequestInfo | URL, _init?: RequestInit) => {
         const path = requestURL(input).pathname
         if (path === "/config/providers") {
@@ -2396,18 +2530,21 @@ describe("ResearchCockpit render", () => {
         if (path === `/research/tasks/${taskID}/artifacts`) return Promise.resolve(response([]))
         if (path === `/research/tasks/${taskID}/candidates`) return Promise.resolve(response(phase === "explore" ? [candidate] : []))
         if (path === `/research/tasks/${taskID}/runs`) {
-          return Promise.resolve(response(phase === "profile" ? [profileRun] : []))
+          return Promise.resolve(response(phase === "profile" || phase === "profile_confirmed" ? [profileRun] : []))
         }
-        if (path === `/research/tasks/${taskID}/approvals`) return Promise.resolve(response([]))
+        if (path === `/research/tasks/${taskID}/approvals`) {
+          return Promise.resolve(response(phase === "profile_confirmed" ? [requirementsApproval] : []))
+        }
         return Promise.resolve(response([]))
       }) as typeof fetch
 
     const cases = [
       ["empty", undefined, "Intent Agent"],
       ["created", "苏格拉底", "Intent Agent"],
-      ["profile", "苏格拉底", "HypoPlanner Agent"],
+      ["profile", "苏格拉底", "Data Analysis Agent"],
+      ["profile_confirmed", "苏格拉底", "HypoPlanner Agent"],
       ["explore", "苏格拉底", "ModelDesigner Agent"],
-      ["results", "苏格拉底", "Publish Agent"],
+      ["results", "苏格拉底", "Reflection Agent"],
     ] as const
 
     for (const [phase, modeLabel, agentLabel] of cases) {
@@ -2437,6 +2574,82 @@ describe("ResearchCockpit render", () => {
       } finally {
         app.renderer.destroy()
       }
+    }
+  })
+
+  test("tab cycles the selected research stage agent in the cockpit footer", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const task = {
+      id: taskID,
+      projectID: "project_neo_cast",
+      title: "Tab Agent Task",
+      domainID: "tsf",
+      mode: "autonomous",
+      status: "researching",
+      taskSpec: { runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast" } },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12, maxParallel: 1 },
+      time: { created: now - 60_000, updated: now },
+    }
+    const profileRun = {
+      id: "run_profile_01",
+      taskID,
+      stage: "profile",
+      status: "succeeded",
+      metrics: { profile_missing_rate: 0 },
+      artifactRefs: [],
+      time: { created: now - 12_000, updated: now - 8_000 },
+    }
+    const intentApproval = {
+      id: "approval_intent_01",
+      kind: "protocol",
+      status: "approved",
+      reason: "[checkpoint:intent_confirmed]\nIntent requirements confirmed.",
+      time: { created: now - 7_000, updated: now - 7_000 },
+    }
+    const tabFetch = ((input: RequestInfo | URL, _init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/config/providers") {
+        return Promise.resolve(response({ providers: [providerFixture()], default: { openai: "gpt-test" } }))
+      }
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      if (path === "/research/tasks") return Promise.resolve(response([task]))
+      if (path === `/research/tasks/${taskID}/fingerprint`) {
+        return Promise.resolve(response({ datasetProfile: { rowCount: 1024, targetCount: 1 } }))
+      }
+      if (path === `/research/tasks/${taskID}/runs`) return Promise.resolve(response([profileRun]))
+      if (path === `/research/tasks/${taskID}/approvals`) return Promise.resolve(response([intentApproval]))
+      if (path === `/research/tasks/${taskID}/champion`) return Promise.resolve(response([]))
+      return Promise.resolve(response([]))
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={tabFetch} />, { width: 160, height: 48 })
+
+    try {
+      let frame = await waitForFrame(app, "Data Analysis Agent")
+      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("Data Analysis Agent"))).toBe(true)
+
+      app.mockInput.pressKey("TAB")
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await app.renderOnce()
+        frame = app.captureCharFrame()
+        if (frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("HypoPlanner Agent"))) break
+        await Bun.sleep(25)
+      }
+      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("HypoPlanner Agent"))).toBe(true)
+
+      app.mockInput.pressKey("TAB", { shift: true })
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await app.renderOnce()
+        frame = app.captureCharFrame()
+        if (frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("Data Analysis Agent"))) break
+        await Bun.sleep(25)
+      }
+      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("Data Analysis Agent"))).toBe(true)
+    } finally {
+      app.renderer.destroy()
     }
   })
 
@@ -2540,6 +2753,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("✓ ModelDesigner Agent (iteration 2/12)")
       expect(frame).toContain("✓ ModelCompiler Agent")
       expect(frame).toContain("→ TrainEval Agent")
+      expect(frame).toContain("• Reflection Agent")
       expect(frame).toContain("• Publish Agent")
       expect(frame).toContain("Profile rows=1024")
       expect(frame).toContain("missing=0.01")
@@ -2638,6 +2852,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("→ ModelDesigner Agent (iteration 1/12)")
       expect(frame).toContain("• ModelCompiler Agent")
       expect(frame).toContain("• TrainEval Agent")
+      expect(frame).toContain("• Reflection Agent")
       expect(frame).not.toContain("NAS Agent")
       expect(frame).toContain("• Publish Agent")
     } finally {
@@ -3120,7 +3335,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-            await waitForFrame(app, "Companion checkpoint")
+      await waitForFrame(app, "Companion onboarding")
       command?.trigger("research.task.next")
       await app.renderOnce()
       const frame = app.captureCharFrame()
@@ -3644,6 +3859,187 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("prepare dataset failures render a concise error instead of raw server JSON", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const runnerRoot = path.join("/tmp", `neo-cast-prepare-error-${Date.now()}`)
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    await mkdir(path.join(runnerRoot, ".neo-cast"), { recursive: true })
+    await writeFile(
+      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      `${JSON.stringify(
+        {
+          schema_version: "dataset.v1",
+          source_csv: "/tmp/old.csv",
+          feature_columns: ["OT"],
+          input_len: 512,
+          horizons: [96],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    )
+
+    const traceback = [
+      "Error: Traceback (most recent call last):",
+      '  File "/Users/chengmingyue/project/neo_cast/py/prepare_tsf_dataset.py", line 44, in <module>',
+      "    main()",
+      "ValueError: target column OT not found in exchange_rate.csv",
+    ].join("\n")
+    const failureFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      if (url.pathname === "/research/tasks" && !init?.method) {
+        return Promise.resolve(
+          response([
+            {
+              id: taskID,
+              projectID: "project_neo_cast",
+              title: "Dataset Prepare Failure",
+              domainID: "tsf",
+              mode: "autonomous",
+              status: "researching",
+              taskSpec: {
+                contextLength: 96,
+                predictionLengths: [24],
+                dataset: { loaderID: "exchange_rate", path: "/tmp/exchange_rate.csv", targetCols: ["OT"] },
+                runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+              time: { created: now - 60_000, updated: now },
+            },
+          ]),
+        )
+      }
+      if (url.pathname === `/research/tasks/${taskID}/prepare-dataset` && init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              name: "UnknownError",
+              data: {
+                message: traceback,
+              },
+            }),
+            { status: 500, headers: { "content-type": "application/json" } },
+          ),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    let command: CommandDialog | undefined
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={failureFetch} onCommand={(value) => (command = value)} />,
+      { width: 170, height: 56 },
+    )
+
+    try {
+      await waitForFrame(app, "Runner dataset mismatch")
+      command?.trigger("research.dataset.prepare")
+      const frame = await waitForFrame(app, "prepare-dataset: ValueError: target column OT not found in exchange_rate.csv")
+
+      expect(frame).not.toContain('{"name":"UnknownError"')
+      expect(frame).not.toContain("Traceback (most recent call last)")
+      expect(frame).not.toContain("prepare_tsf_dataset.py")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("start forecast prompt runs the recommended dataset preparation", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const runnerRoot = path.join("/tmp", `neo-cast-start-prepare-${Date.now()}`)
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    await mkdir(path.join(runnerRoot, ".neo-cast"), { recursive: true })
+    await writeFile(
+      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      `${JSON.stringify(
+        {
+          schema_version: "dataset.v1",
+          source_csv: "/tmp/old.csv",
+          feature_columns: ["OT"],
+          input_len: 512,
+          horizons: [96, 192, 336, 720],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    )
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    const mismatchFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (init?.method === "POST") {
+        posts.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : undefined })
+      }
+      if (url.pathname === "/research/tasks" && !init?.method) {
+        return Promise.resolve(
+          response([
+            {
+              id: taskID,
+              projectID: "project_neo_cast",
+              title: "Dataset Mismatch Task",
+              domainID: "tsf",
+              mode: "autonomous",
+              status: "researching",
+              taskSpec: {
+                contextLength: 96,
+                predictionLengths: [24],
+                dataset: { loaderID: "etth1", path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
+                runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12, maxParallel: 1 },
+              time: { created: now - 60_000, updated: now },
+            },
+          ]),
+        )
+      }
+      if (url.pathname === `/research/tasks/${taskID}/prepare-dataset` && init?.method === "POST") {
+        return Promise.resolve(
+          response({
+            artifact: {
+              id: "artifact_dataset_prepared",
+              taskID,
+              kind: "dataset_preparation_json",
+              uri: "file:///tmp/dataset-preparation.json",
+              metadata: {},
+              time: { created: now, updated: now },
+            },
+            path: "/tmp/dataset-preparation.json",
+            datasetSpec: {},
+            command: {},
+          }),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={mismatchFetch} />, {
+      width: 170,
+      height: 56,
+    })
+
+    try {
+      await waitForFrame(app, "Runner dataset mismatch")
+      await app.mockInput.typeText("开始预测")
+      app.mockInput.pressEnter()
+      for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts).toEqual([{ path: `/research/tasks/${taskID}/prepare-dataset`, body: { force: true } }])
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("agent loop repairs a dataset mismatch before starting autonomous loop", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -4015,10 +4411,12 @@ describe("ResearchCockpit render", () => {
     try {
       await waitForFrame(app, "run_smoke")
       command?.trigger("research.seed.baselines")
-      const frame = await waitForFrame(app, "Running seed-baselines")
+      const frame = await waitForFrame(app, "Working / seed-baselines")
 
       expect(frame).not.toContain("Active Action")
-      expect(frame).toContain("Running seed-baselines")
+      expect(frame).not.toContain("Running seed-baselines")
+      expect(frame).toMatch(/Working \/ seed-baselines \/ 0s \[[=> ]+\]/)
+      expect(frameLine(frame, "Working / seed-baselines")).toBeLessThan(frameLine(frame, "esc interrupt"))
       resolveBaselines?.(response({ candidates: [], approvals: [] }))
     } finally {
       app.renderer.destroy()

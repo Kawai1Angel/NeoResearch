@@ -152,13 +152,14 @@ ${formatTaskContext(taskContext)}
 ## Output format
 Return a single JSON object. No markdown, no explanation outside the JSON.
 
-Required fields: recipe_version, recipe_id, hypothesis, preprocessing, embedding,
-backbone, fusion, prediction_head, post_processing, training_strategy, constraints
+Return the high-level ModelRecipe DSL shape:
+schema_version: "model_recipe.v1"
+model_name, hypothesis, input, architecture, training, constraints
 
 The hypothesis field MUST follow this format, max 1200 chars:
 "Previous [backbone+embedding]: [observed metric pattern]. Diagnosis: [root cause]. Proposed change: [what changed] because [why this addresses the bottleneck]."
 
-constraints: { "max_params": 1000000, "max_latency_ms": 50, "latency_priority": "medium" }`;
+constraints: { "max_params": "1M", "latency_sensitive": true|false, "max_latency_ms": 50 }`;
 }
 
 function _buildReflectionUserMessage(requirement, attempt, context) {
@@ -167,7 +168,7 @@ function _buildReflectionUserMessage(requirement, attempt, context) {
       user_requirement: requirement,
       attempt,
       reflection_context: context,
-      instruction: "Analyze the previous result and propose an improved recipe. Return JSON only.",
+      instruction: "Analyze the previous result and propose an improved model_recipe.v1. Return JSON only.",
     },
     null,
     2,

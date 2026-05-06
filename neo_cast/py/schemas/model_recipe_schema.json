@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/model_recipe_schema.json",
+  "title": "neo-cast ModelRecipe DSL Schema",
+  "description": "High-level, user-facing model recipe compiled into recipe_schema_v1 for the native model factory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "model_name",
+    "hypothesis",
+    "input",
+    "architecture",
+    "training",
+    "constraints"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "model_recipe.v1"
+    },
+    "model_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{2,63}$"
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 1200
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["history_window", "prediction_horizon", "covariates"],
+      "properties": {
+        "history_window": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "prediction_horizon": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "covariates": {
+          "type": "boolean"
+        },
+        "known_future_covariates": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "architecture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backbone"],
+      "properties": {
+        "backbone": {
+          "type": "string",
+          "enum": [
+            "linear",
+            "mlp",
+            "transformer",
+            "temporal_conv",
+            "dlinear",
+            "nbeats",
+            "timesnet",
+            "rnn",
+            "ssm",
+            "mixer"
+          ]
+        },
+        "decomposition": {
+          "type": "boolean"
+        },
+        "decomposition_kernel": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 255
+        },
+        "multiscale_blocks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "attention": {
+          "type": "string",
+          "enum": ["none", "lightweight", "full"]
+        },
+        "embedding": {
+          "type": "string",
+          "enum": ["auto", "none", "patch", "multiscale_patch", "invert", "frequency", "calendar"]
+        },
+        "channel_fusion": {
+          "type": "string",
+          "enum": ["independent", "shared", "feature", "gated_hybrid"]
+        },
+        "hidden_dim": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 4096
+        },
+        "d_model": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 1024
+        },
+        "layers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 24
+        },
+        "heads": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "kernel_size": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 255
+        },
+        "patch_len": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 512
+        },
+        "stride": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "dropout": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 0.9
+        },
+        "output_distribution": {
+          "type": "string",
+          "enum": ["point", "quantile", "gaussian"]
+        }
+      }
+    },
+    "training": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loss", "optimizer", "learning_rate", "batch_size"],
+      "properties": {
+        "loss": {
+          "type": "string",
+          "enum": ["mse", "mae", "huber", "quantile", "distillation"]
+        },
+        "optimizer": {
+          "type": "string",
+          "enum": ["adam", "adamw", "sgd"]
+        },
+        "learning_rate": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0
+        },
+        "weight_decay": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "max_epochs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "time_budget_s": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "patience": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "grad_clip": {
+          "type": "number",
+          "exclusiveMinimum": 0.0
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_params", "latency_sensitive"],
+      "properties": {
+        "max_params": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)?[KkMmBb]?$"
+            }
+          ]
+        },
+        "latency_sensitive": {
+          "type": "boolean"
+        },
+        "max_latency_ms": {
+          "type": "number",
+          "exclusiveMinimum": 0.0
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 2000
+    }
+  }
+}

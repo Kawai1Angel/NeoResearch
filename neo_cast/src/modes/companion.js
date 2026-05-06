@@ -99,11 +99,16 @@ function startCompanionPulse(label, options = {}) {
 }
 
 function _candidateId(candidate) {
-  return candidate.candidate_id || candidate.recipe_id || "NA";
+  return candidate.candidate_id || candidate.recipe_id || candidate.model_name || "NA";
 }
 
 function _candidateFamily(candidate) {
   if (candidate.model_family) return candidate.model_family;
+  if (candidate.schema_version === "model_recipe.v1") {
+    const backbone = candidate.architecture?.backbone || "unknown_backbone";
+    const multiscale = Number(candidate.architecture?.multiscale_blocks || 0) > 1 ? "+multiscale" : "";
+    return `model_recipe:${backbone}${multiscale}`;
+  }
   if (candidate.recipe_version === "recipe_schema_v1") {
     const embedding = candidate.embedding?.type || "unknown_embedding";
     const backbone = candidate.backbone?.type || "unknown_backbone";
@@ -120,6 +125,12 @@ function _candidateTrainInfo(candidate) {
     };
   }
   const strategy = candidate.training_strategy || {};
+  if (candidate.training) {
+    return {
+      lr: candidate.training.learning_rate,
+      batchSize: candidate.training.batch_size,
+    };
+  }
   return {
     lr: strategy.optimizer?.lr,
     batchSize: strategy.budget?.batch_size,

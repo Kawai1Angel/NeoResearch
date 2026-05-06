@@ -152,6 +152,14 @@ function nextVersionNumber(index, kind, logicalId) {
     .reduce((maxVersion, record) => Math.max(maxVersion, Number(record.version) || 0), 0) + 1;
 }
 
+function getNextVersionId(projectRoot, kind, logicalId) {
+  assertKind(kind);
+  const safeId = safeLogicalId(logicalId);
+  const index = readIndex(projectRoot);
+  const version = nextVersionNumber(index, kind, safeId);
+  return `${kind}_${safeId}_v${version}`;
+}
+
 function registerVersion(projectRoot, options = {}) {
   const kind = options.kind;
   assertKind(kind);
@@ -227,6 +235,7 @@ module.exports = {
   VERSION_RECORD_SCHEMA_VERSION,
   getLatestVersionRef,
   getLineageDir,
+  getNextVersionId,
   getVersionRecord,
   readIndex,
   registerVersion,

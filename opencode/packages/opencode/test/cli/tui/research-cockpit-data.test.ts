@@ -219,6 +219,7 @@ describe("research cockpit data helpers", () => {
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
       "todo:TrainEval Agent",
+      "todo:Reflection Agent",
       "todo:Review gates",
       "todo:Export bundle",
     ])
@@ -298,6 +299,7 @@ describe("research cockpit data helpers", () => {
       "done:ModelDesigner Agent",
       "done:ModelCompiler Agent",
       "done:TrainEval Agent",
+      "active:Reflection Agent",
       "done:Review gates",
       "active:Export bundle",
     ])
@@ -343,9 +345,96 @@ describe("research cockpit data helpers", () => {
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
       "todo:TrainEval Agent",
+      "todo:Reflection Agent",
       "todo:Review gates",
       "todo:Export bundle",
     ])
+  })
+
+  test("keeps Data Analysis pending until the intent checkpoint is approved", () => {
+    const currentTask = task({
+      id: "task_intent_pending",
+      mode: "autonomous",
+      interactionMode: "companion",
+      taskSpec: {
+        dataset: { path: "/tmp/electricity.csv", targetCols: ["OT"] },
+        contextLength: 96,
+        predictionLengths: [24],
+        metadata: { interactionMode: "companion" },
+        runtime: { neoCastProjectRoot: "/tmp/neo-cast" },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12 },
+    })
+    const input = {
+      task: currentTask,
+      candidates: [],
+      runs: [],
+      artifacts: [],
+      approvals: [],
+      champion: null,
+      fingerprint: {},
+      runnerReady: true,
+    }
+
+    expect(buildResearchCockpitWorkflow(input).map((item) => `${item.status}:${item.label}`)).toEqual([
+      "done:Create research task",
+      "todo:Data Analysis Agent",
+      "todo:HypoPlanner Agent",
+      "todo:ModelDesigner Agent",
+      "todo:ModelCompiler Agent",
+      "todo:TrainEval Agent",
+      "todo:Reflection Agent",
+      "todo:Review gates",
+      "todo:Export bundle",
+    ])
+    expect(buildResearchCockpitRecommendation(input)).toMatchObject({
+      action: "confirm_intent",
+      title: "Confirm requirements",
+    })
+  })
+
+  test("activates Data Analysis after the intent checkpoint is approved", () => {
+    const currentTask = task({
+      id: "task_intent_approved",
+      mode: "autonomous",
+      interactionMode: "companion",
+      taskSpec: {
+        dataset: { path: "/tmp/electricity.csv", targetCols: ["OT"] },
+        contextLength: 96,
+        predictionLengths: [24],
+        metadata: { interactionMode: "companion" },
+        runtime: { neoCastProjectRoot: "/tmp/neo-cast" },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12 },
+    })
+    const input = {
+      task: currentTask,
+      candidates: [],
+      runs: [],
+      artifacts: [],
+      approvals: [
+        {
+          id: "approval_intent",
+          kind: "protocol" as const,
+          status: "approved" as const,
+          reason: "[checkpoint:intent_confirmed]\n需求交流已确认。",
+          time: { created: 1, updated: 1 },
+        },
+      ],
+      champion: null,
+      fingerprint: {},
+      runnerReady: true,
+    }
+
+    expect(buildResearchCockpitWorkflow(input).map((item) => `${item.status}:${item.label}`)).toContain(
+      "active:Data Analysis Agent",
+    )
+    expect(buildResearchCockpitRecommendation(input)).toMatchObject({
+      action: "profile",
+      title: "Profile dataset",
+    })
   })
 
   test("keeps planning and design agents pending while the runner dataset needs repair", () => {
@@ -373,7 +462,96 @@ describe("research cockpit data helpers", () => {
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
       "todo:TrainEval Agent",
+      "todo:Reflection Agent",
     ])
+  })
+
+  test("keeps HypoPlanner pending while requirements confirmation is pending", () => {
+    const workflow = buildResearchCockpitAgentWorkflow({
+      task: task({
+        id: "task_requirements_pending",
+        mode: "autonomous",
+        taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+        budget: { maxRuns: 12 },
+      }),
+      candidates: [],
+      runs: [{ id: "profile_run", stage: "profile", status: "succeeded", metrics: {}, time: { created: 1, updated: 1 } }],
+      artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+      approvals: [
+        {
+          id: "approval_requirements",
+          kind: "protocol",
+          status: "pending",
+          reason: "[checkpoint:requirements_confirmed]\n确认需求后再进入 HypoPlanner。",
+          time: { created: 1, updated: 1 },
+        },
+      ],
+      champion: null,
+      fingerprint: { datasetProfile: { rowCount: 100 } },
+      runnerReady: true,
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toContain("todo:HypoPlanner Agent")
+  })
+
+  test("activates HypoPlanner after requirements confirmation is approved", () => {
+    const workflow = buildResearchCockpitAgentWorkflow({
+      task: task({
+        id: "task_requirements_approved",
+        mode: "autonomous",
+        taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+        budget: { maxRuns: 12 },
+      }),
+      candidates: [],
+      runs: [{ id: "profile_run", stage: "profile", status: "succeeded", metrics: {}, time: { created: 1, updated: 1 } }],
+      artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+      approvals: [
+        {
+          id: "approval_requirements",
+          kind: "protocol",
+          status: "approved",
+          reason: "[checkpoint:requirements_confirmed]\n确认需求后再进入 HypoPlanner。",
+          time: { created: 1, updated: 1 },
+        },
+      ],
+      champion: null,
+      fingerprint: { datasetProfile: { rowCount: 100 } },
+      runnerReady: true,
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toContain("active:HypoPlanner Agent")
+  })
+
+  test("marks Reflection Agent done when reflection notes are available", () => {
+    const workflow = buildResearchCockpitAgentWorkflow({
+      task: task({
+        id: "task_reflection_done",
+        mode: "autonomous",
+        taskSpec: { runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+        budget: { maxRuns: 12 },
+      }),
+      candidates: [candidate({ id: "candidate_a" })],
+      runs: [
+        { id: "profile_run", stage: "profile", status: "succeeded", metrics: {}, time: { created: 1, updated: 1 } },
+        {
+          id: "train_run",
+          stage: "low_fidelity",
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.1 },
+          time: { created: 1, updated: 2 },
+        },
+      ],
+      artifacts: [
+        artifact({ id: "profile_artifact", kind: "task_profile_json" }),
+        artifact({ id: "reflection_artifact", kind: "reflection_notes_md" }),
+      ],
+      approvals: [],
+      champion: null,
+      fingerprint: { datasetProfile: { rowCount: 100 } },
+      runnerReady: true,
+    })
+
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toContain("done:Reflection Agent")
   })
 
 

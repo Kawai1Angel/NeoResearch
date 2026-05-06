@@ -23,17 +23,20 @@ Current capabilities:
 - Export a self-contained artifact directory with weights, metadata, inference code, MCP server code, and reports.
 - Run final `ref_test` evaluation on the best frozen artifact.
 
-Current native recipe factory action space:
+Current Model Recipe DSL and native factory action space:
+
+- ModelDesigner emits `model_recipe.v1`, a high-level DSL with `model_name`, `input`, `architecture`, `training`, and `constraints`.
+- The runtime compiles `model_recipe.v1` into executable `recipe_schema_v1` before validation, smoke testing, training, mutation, and export.
 
 - Preprocessing: `none`, `instance_norm`, `series_decomposition`.
 - Embedding: `none`, `patch`, `multiscale_patch`.
-- Backbone: `linear`, `mlp`, `transformer`, `dlinear`, `tcn`, `nbeats`, `timesnet`.
+- Backbone: `linear`, `mlp`, `transformer`, `temporal_conv` (compiled to TCN), `dlinear`, `nbeats`, `timesnet`.
 - Fusion/head: temporal fusion with `independent` or residual `shared` channel mixing, plus linear point forecast head.
 - Training: `mse` / `mae` / `huber`, `adam` / `adamw` / `sgd`, optional cosine scheduler.
 
 The new raw-sequence backbones (`dlinear`, `tcn`, `nbeats`, `timesnet`) currently require `embedding.type="none"`. Patch and multiscale patch embeddings remain paired with `mlp` or `transformer`.
 
-Legacy `candidate.v1` with `model_family` is still accepted for compatibility. New design proposals should prefer `recipe_schema_v1`.
+Legacy `recipe_schema_v1` is still accepted as the executable factory format. New design proposals should prefer `model_recipe.v1`.
 
 The main optimization signal is `val_avg_mse`. `ref_test` is reserved for final reporting and is not used as the normal search signal.
 
@@ -162,6 +165,7 @@ node ./bin/neo-cast.js correction add --scope data_schema --field temperature_fo
 node ./bin/neo-cast.js correction list
 node ./bin/neo-cast.js validate candidate /path/to/candidate.json
 node ./bin/neo-cast.js validate recipe /path/to/recipe.json
+node ./bin/neo-cast.js validate model-recipe /path/to/model_recipe.json
 node ./bin/neo-cast.js validate dataset /path/to/dataset_spec.json
 node ./bin/neo-cast.js validate task-spec /path/to/task_spec.json
 node ./bin/neo-cast.js validate research-trace /path/to/research_trace.json

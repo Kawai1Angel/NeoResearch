@@ -47,7 +47,8 @@ const {
   writeCurrentCandidate,
 } = require("./python-bridge");
 const { getRuntimePaths, initRuntime, runtimeReady } = require("./runtime");
-const { getLatestVersionRef, registerVersion } = require("./versioning");
+const { publishReleaseReport } = require("./report-output");
+const { getLatestVersionRef, getNextVersionId, registerVersion } = require("./versioning");
 const fs = require("fs");
 const path = require("path");
 const PY_DIR = "py";
@@ -73,7 +74,7 @@ Usage:
   neo-cast --version
   neo-cast help
   neo-cast doctor
-  neo-cast validate <candidate|recipe|dataset|metadata|task-spec|research-trace|user-corrections> <payload.json> [--schema /path/to/schema.json]
+  neo-cast validate <candidate|recipe|model-recipe|dataset|metadata|task-spec|research-trace|user-corrections> <payload.json> [--schema /path/to/schema.json]
   neo-cast validate smoke [--candidate-path /path/to/candidate.json]
   neo-cast config init
   neo-cast config show
@@ -180,15 +181,21 @@ function mapCliFlags(rawFlags) {
 }
 
 function loadPreparedDatasetSpec(projectRoot = process.cwd()) {
-  const specPath = path.join(projectRoot, ".neo-cast", "dataset_spec.json");
-  if (!fs.existsSync(specPath)) {
-    return null;
+  const specPaths = [
+    path.join(projectRoot, ".neo-cast", "dataset", "dataset_spec.json"),
+    path.join(projectRoot, ".neo-cast", "dataset_spec.json"),
+  ];
+  for (const specPath of specPaths) {
+    if (!fs.existsSync(specPath)) {
+      continue;
+    }
+    try {
+      return JSON.parse(fs.readFileSync(specPath, "utf8"));
+    } catch (_error) {
+      return null;
+    }
   }
-  try {
-    return JSON.parse(fs.readFileSync(specPath, "utf8"));
-  } catch (_error) {
-    return null;
-  }
+  return null;
 }
 
 function loadDesignTaskContext(projectRoot = process.cwd()) {
@@ -225,6 +232,7 @@ function candidateVersionId(candidate, attempt) {
   return String(
     candidate.recipe_id
     || candidate.candidate_id
+    || candidate.model_name
     || candidate.id
     || `candidate_${attempt || 1}`
   );
@@ -247,6 +255,7 @@ function registerRecipeLineage(projectRoot, candidate, candidatePath, options = 
       candidate_source: options.source || null,
       candidate_id: candidate.candidate_id || null,
       recipe_id: candidate.recipe_id || null,
+      model_name: candidate.model_name || null,
       model_family: candidate.model_family || describeCandidateFamily(candidate),
       user_correction_count: Array.isArray(options.taskContext?.user_corrections)
         ? options.taskContext.user_corrections.length
@@ -281,10 +290,25 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
   if (!row || !row.run_id) {
     return null;
   }
+  const logicalId = row.run_id;
+  const versionId = getNextVersionId(projectRoot, "release", logicalId);
+  const sourceReportPath = artifactPathForRun(projectRoot, logicalId, "eval_report.md");
+  const published = publishReleaseReport(projectRoot, {
+    versionId,
+    sourceReportPath,
+    manifest: {
+      run_id: logicalId,
+      release_type: options.releaseType || "eval_report",
+      session_id: row.session_id || null,
+      candidate_id: row.candidate_id || null,
+      status: row.status || null,
+      is_best: row.is_best || null,
+    },
+  });
   return registerVersion(projectRoot, {
     kind: "release",
-    logicalId: row.run_id,
-    artifactPath: artifactPathForRun(projectRoot, row.run_id, "eval_report.md"),
+    logicalId,
+    artifactPath: published.reportPath,
     parentRefs: options.parentRefs || [],
     metadata: {
       release_type: options.releaseType || "eval_report",
@@ -292,6 +316,10 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
       candidate_id: row.candidate_id || null,
       status: row.status || null,
       is_best: row.is_best || null,
+      report_path: published.reportPath,
+      report_manifest_path: published.manifestPath,
+      report_copied: published.copied,
+      source_report_path: sourceReportPath,
     },
   });
 }
@@ -351,7 +379,7 @@ function handleValidate(positionals, rawFlags) {
   }
 
   if (!kind || !payloadPath) {
-    console.error("Usage: neo-cast validate <candidate|recipe|dataset|metadata|task-spec|research-trace|user-corrections> <payload.json> [--schema /path/to/schema.json]");
+    console.error("Usage: neo-cast validate <candidate|recipe|model-recipe|dataset|metadata|task-spec|research-trace|user-corrections> <payload.json> [--schema /path/to/schema.json]");
     return 1;
   }
 

@@ -13,7 +13,8 @@ const {
   runRunner,
   writeCurrentCandidate,
 } = require("./python-bridge");
-const { getLatestVersionRef, registerVersion } = require("./versioning");
+const { publishReleaseReport } = require("./report-output");
+const { getLatestVersionRef, getNextVersionId, registerVersion } = require("./versioning");
 
 function parseTimeBudget(raw) {
   if (!raw || raw === true) return null;
@@ -80,6 +81,7 @@ function candidateVersionId(candidate, attempt) {
   return String(
     candidate.recipe_id
     || candidate.candidate_id
+    || candidate.model_name
     || candidate.id
     || `candidate_${attempt || 1}`
   );
@@ -102,6 +104,7 @@ function registerRecipeLineage(projectRoot, candidate, candidatePath, options = 
       candidate_source: options.source || null,
       candidate_id: candidate.candidate_id || null,
       recipe_id: candidate.recipe_id || null,
+      model_name: candidate.model_name || null,
       model_family: candidate.model_family || describeCandidateFamily(candidate),
     },
   });
@@ -131,10 +134,25 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
   if (!row || !row.run_id) {
     return null;
   }
+  const logicalId = row.run_id;
+  const versionId = getNextVersionId(projectRoot, "release", logicalId);
+  const sourceReportPath = artifactPathForRun(projectRoot, logicalId, "eval_report.md");
+  const published = publishReleaseReport(projectRoot, {
+    versionId,
+    sourceReportPath,
+    manifest: {
+      run_id: logicalId,
+      release_type: "eval_report",
+      session_id: row.session_id || null,
+      candidate_id: row.candidate_id || null,
+      status: row.status || null,
+      is_best: row.is_best || null,
+    },
+  });
   return registerVersion(projectRoot, {
     kind: "release",
-    logicalId: row.run_id,
-    artifactPath: artifactPathForRun(projectRoot, row.run_id, "eval_report.md"),
+    logicalId,
+    artifactPath: published.reportPath,
     parentRefs: options.parentRefs || [],
     metadata: {
       release_type: "eval_report",
@@ -142,6 +160,10 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
       candidate_id: row.candidate_id || null,
       status: row.status || null,
       is_best: row.is_best || null,
+      report_path: published.reportPath,
+      report_manifest_path: published.manifestPath,
+      report_copied: published.copied,
+      source_report_path: sourceReportPath,
     },
   });
 }

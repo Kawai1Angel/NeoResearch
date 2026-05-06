@@ -142,6 +142,9 @@ neo-cast doctor
 每次训练导出的 artifact 会包含 `research_trace.json`，同时 `.neo-cast/research_trace.jsonl`
 会追加记录关键研究决策的依据、预期效果和验证计划。
 
+ModelDesigner 会生成 `model_recipe.v1` 高层模型配方，包含 `model_name / input / architecture / training / constraints`。
+Runtime 会把它编译成可执行的 `recipe_schema_v1`，再进入 smoke、训练、评估和导出流程。
+
 需要把模型方案确认变成 Runtime gate 时，可以启用 human checkpoint：
 
 ```bash

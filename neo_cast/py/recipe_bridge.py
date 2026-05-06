@@ -4,6 +4,7 @@ import random
 import string
 from typing import Any
 
+from model_recipe import compile_model_recipe, is_model_recipe_payload
 from prepare_tsf import INPUT_LEN
 from registry.action_specs import validate_recipe_against_registry
 
@@ -15,6 +16,14 @@ def _random_suffix(length: int = 6) -> str:
 
 def is_recipe_payload(payload: dict[str, Any]) -> bool:
     return payload.get("recipe_version") == "recipe_schema_v1"
+
+
+def to_candidate_recipe(payload: dict[str, Any]) -> dict[str, Any]:
+    if is_recipe_payload(payload):
+        return payload
+    if is_model_recipe_payload(payload):
+        return compile_model_recipe(payload)
+    raise ValueError("Expected recipe_schema_v1 or model_recipe.v1 payload")
 
 
 def normalize_recipe_id(recipe: dict[str, Any]) -> str:
@@ -61,5 +70,4 @@ def _recipe_constraints(recipe: dict[str, Any]) -> dict[str, Any]:
         "time_budget_seconds": int(strategy_budget["time_budget_s"]),
         "latency_priority": constraints.get("latency_priority", "medium"),
     }
-
 

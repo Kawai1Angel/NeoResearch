@@ -87,6 +87,37 @@ class DatasetPresetTest(unittest.TestCase):
         self.assertEqual(spec.val, (700, 800))
         self.assertEqual(spec.ref_test, (800, 1_000))
 
+    def test_custom_task_id_without_preset_uses_contiguous_splits(self) -> None:
+        df = pd.DataFrame(
+            {
+                "date": pd.date_range("2021-01-01", periods=7_588, freq="D"),
+                "OT": range(7_588),
+            }
+        )
+
+        spec = prepare_tsf._build_materialize_spec(
+            df=df,
+            dataset_preset=None,
+            task_id="exchange_rate",
+            timestamp_col=None,
+            feature_columns=["OT"],
+            input_len=96,
+            horizons=[24],
+            train_rows=None,
+            val_rows=None,
+            ref_test_rows=None,
+            missing_strategy=None,
+            missing_limit=None,
+            frequency=None,
+            allow_irregular=None,
+            irregular_ratio_warn=None,
+        )
+
+        self.assertEqual(spec.task_id, "exchange_rate")
+        self.assertEqual(spec.train, (0, 4_552))
+        self.assertEqual(spec.val, (4_552, 6_070))
+        self.assertEqual(spec.ref_test, (6_070, 7_588))
+
 
 if __name__ == "__main__":
     unittest.main()

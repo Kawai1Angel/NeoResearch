@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from model_recipe import compile_model_recipe, is_model_recipe_payload
 from prepare_tsf import DATASET, HORIZONS, INPUT_LEN, NUM_CHANNELS, PARAM_BUDGET, SEED, TIME_BUDGET
 from recipe_bridge import is_recipe_payload, normalize_recipe_id
 from validate import detect_payload_kind, validate_payload
@@ -35,7 +36,7 @@ def load_json(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def resolve_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
+def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | None = None) -> dict[str, Any]:
     recipe_id = normalize_recipe_id(recipe)
     normalized_recipe = {
         **recipe,
@@ -46,7 +47,12 @@ def resolve_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
     budget = strategy["budget"]
     constraints = normalized_recipe.get("constraints") or {}
     max_params = constraints.get("max_params")
-    return {
+    task_input_len = int(model_recipe.get("input", {}).get("history_window", INPUT_LEN)) if model_recipe else INPUT_LEN
+    task_horizon = int(model_recipe.get("input", {}).get("prediction_horizon", HORIZONS[0])) if model_recipe else None
+    smoke_config = SMOKE_CONFIG.copy()
+    if task_horizon:
+        smoke_config["horizon"] = task_horizon
+    resolved = {
         "schema_version": "resolved_candidate.v1",
         "candidate_id": recipe_id,
         "hypothesis": normalized_recipe["hypothesis"],
@@ -67,25 +73,30 @@ def resolve_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
             "time_budget_s": min(int(budget["time_budget_s"]), DEFAULT_TIME_BUDGET_S),
             "latency_priority": constraints.get("latency_priority", "medium"),
         },
-        "smoke_config": SMOKE_CONFIG.copy(),
+        "smoke_config": smoke_config,
         "task": {
             "task_id": DATASET,
-            "input_len": INPUT_LEN,
-            "horizons": list(HORIZONS),
+            "input_len": task_input_len,
+            "horizons": [task_horizon] if task_horizon else list(HORIZONS),
             "num_channels": NUM_CHANNELS,
         },
         "notes": normalized_recipe.get("notes"),
         "recipe": normalized_recipe,
     }
+    if model_recipe:
+        resolved["model_recipe"] = model_recipe
+    return resolved
 
 
 def resolve_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    if not is_recipe_payload(payload):
-        raise ValueError(
-            "Expected recipe_version='recipe_schema_v1'. "
-            "The legacy candidate.v1 format is no longer supported as pipeline input."
-        )
-    return resolve_recipe(payload)
+    if is_recipe_payload(payload):
+        return resolve_recipe(payload)
+    if is_model_recipe_payload(payload):
+        return resolve_recipe(compile_model_recipe(payload), model_recipe=payload)
+    raise ValueError(
+        "Expected recipe_version='recipe_schema_v1' or schema_version='model_recipe.v1'. "
+        "The legacy candidate.v1 format is no longer supported as pipeline input."
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

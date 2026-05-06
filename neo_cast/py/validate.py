@@ -4,6 +4,7 @@ Validate neo-cast payloads and run the smoke gate.
 Usage:
     python validate.py candidate /path/to/candidate.json
     python validate.py recipe /path/to/recipe.json
+    python validate.py model-recipe /path/to/model_recipe.json
     python validate.py task-spec /path/to/task_spec.json
     python validate.py research-trace /path/to/research_trace.json
     python validate.py user-corrections /path/to/user_corrections.json
@@ -35,6 +36,7 @@ DEFAULT_SCHEMAS = {
     "candidate": SCHEMA_DIR / "candidate_schema.json",
     "dataset": SCHEMA_DIR / "dataset_schema.json",
     "metadata": SCHEMA_DIR / "metadata_schema.json",
+    "model-recipe": SCHEMA_DIR / "model_recipe_schema.json",
     "recipe": SCHEMA_DIR / "recipe_schema.json",
     "research-trace": SCHEMA_DIR / "research_trace_schema.json",
     "task-spec": SCHEMA_DIR / "task_spec_schema.json",
@@ -68,6 +70,22 @@ def validate_payload(kind: str, payload_path: str | Path, schema_path: str | Pat
 
         if isinstance(payload, dict):
             errors.extend(validate_recipe_against_registry(payload))
+    if kind == "model-recipe" and not errors:
+        from model_recipe import compile_model_recipe
+        from registry.action_specs import validate_recipe_against_registry
+
+        if isinstance(payload, dict):
+            try:
+                compiled = compile_model_recipe(payload)
+                errors.extend(
+                    f"compiled_recipe.{item}"
+                    for item in validate_recipe_against_registry(
+                        compiled,
+                        input_len=int(payload.get("input", {}).get("history_window", 0)) or None,
+                    )
+                )
+            except Exception as exc:
+                errors.append(str(exc))
     return errors
 
 
@@ -77,8 +95,10 @@ def detect_payload_kind(payload_path: str | Path) -> str:
         raise ValueError(f"Expected JSON object at {payload_path}")
     if payload.get("recipe_version") == "recipe_schema_v1":
         return "recipe"
+    if payload.get("schema_version") == "model_recipe.v1":
+        return "model-recipe"
     raise ValueError(
-        "Unknown payload kind. Expected recipe_version='recipe_schema_v1'."
+        "Unknown payload kind. Expected recipe_version='recipe_schema_v1' or schema_version='model_recipe.v1'."
     )
 
 

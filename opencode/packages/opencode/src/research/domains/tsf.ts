@@ -2002,6 +2002,13 @@ function profileSimilarity(taskFingerprint: JsonRecord, memoryFingerprint: unkno
   const previous = datasetProfileFromFingerprint(asRecord(memoryFingerprint))
   if (!current || !previous) return 0.75
 
+  // Different source CSV → cross-dataset memory, cap similarity so it doesn't dominate ranking.
+  const currentCsv = typeof taskFingerprint.sourceCsv === "string" ? taskFingerprint.sourceCsv : undefined
+  const previousCsv = typeof (memoryFingerprint as Record<string, unknown>).sourceCsv === "string"
+    ? (memoryFingerprint as Record<string, unknown>).sourceCsv
+    : undefined
+  if (currentCsv && previousCsv && currentCsv !== previousCsv) return 0.1
+
   const diffs = [
     Math.abs(current.missingRate - previous.missingRate),
     Math.abs(current.trendStrength - previous.trendStrength),
