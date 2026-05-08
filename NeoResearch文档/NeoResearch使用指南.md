@@ -1,6 +1,7 @@
-# NeoResearch 使用指南
+# NeoResearch 新版交互用户指南（Case 版）
 
-> 适用版本：v0.1.0-alpha.0
+> 适用版本：v0.2.0-alpha 交互改造版
+> 本文不是功能清单，而是一份可以照着走的新版 cockpit 使用 Case。
 
 ---
 
@@ -34,157 +35,304 @@ Task（研究任务）
 
 ---
 
-## 三、交互模式 vs 任务模式
+## 三、新版交互原则
 
-这是理解"自动"与"按钮"并存的关键。系统有**两个独立维度**：
+v0.2.0-alpha 的驾驶舱不再要求用户记一堆按钮。现在的核心模型是：
 
-### 3.1 交互模式（和 LLM 的对话风格）
+```
+一个输入框 + 一个 Next Best Action + 一组斜杠命令
+```
 
-| 模式 | 说明 | 适合场景 |
+用户有两种输入方式：
+
+| 输入方式 | 用法 | 适合场景 |
 |---|---|---|
-| **Socratic（苏格拉底）** | LLM 主动追问缺失信息，逐个确认 slot | 需求不明确时 |
-| **Companion（认知伴随）** | LLM 先汇总理解，一次性确认后直接推进 | 需求已明确，求效率 |
+| 自然语言 | 直接描述你想做什么 | 提需求、问原因、让 Agent 解释状态 |
+| 斜杠命令 | 输入 `/new csv`、`/dataset prepare` 等 | 明确要执行某个动作 |
 
-切换命令：`/mode-socratic` 或 `/mode-companion`
+驾驶舱会根据当前状态推导一条 **Next Best Action（NBA）**。当输入框为空时，按 `Enter` 会执行这条推荐动作。
 
-### 3.2 任务模式（NAS 搜索的自动化程度）
+### 3.1 保留的核心快捷键
 
-| 模式 | 说明 | 何时执行下一轮 |
-|---|---|---|
-| **Review（评审模式）** | 每轮训练后等待人工审阅，按需手动触发下一个候选 | 人工按键 |
-| **Autonomous（自主模式）** | 按下 `Agent Loop` 后，循环自动生成候选 → 训练 → 选优 | 自动，直到预算耗尽 |
+| 键 | 行为 |
+|---|---|
+| `Enter` | 输入框为空时执行 NBA；有文字时发送消息或执行 slash |
+| `Esc` | 取消当前 action proposal / 中断当前操作 |
+| `Ctrl+J` / `Ctrl+K` | 切换任务 |
+| `Ctrl+L` | 清空当前对话流显示，不删除研究数据 |
+| `Ctrl+C` | abort 当前 chat / run / loop |
+
+旧快捷键如 `Ctrl+N`、`Ctrl+B`、`Ctrl+E`、`Alt+H`、`Alt+Left/Right` 已迁移到斜杠命令。首次按下会显示迁移提示。
+
+### 3.2 常用斜杠命令
+
+| 命令 | 作用 |
+|---|---|
+| `/new csv` | 创建本地 CSV 预测任务 |
+| `/dataset prepare` | 准备 Neo-Cast 数据集缓存 |
+| `/dataset profile` | 生成数据诊断 profile |
+| `/seed` | 生成基线候选 |
+| `/run smoke` | 对当前候选做 smoke run |
+| `/loop start` | 启动 autonomous loop |
+| `/candidate approve` | 批准当前 pending candidate / gate |
+| `/export bundle` | 导出完整研究交付包 |
+| `/runner check` | 检查 Neo-Cast runner 配置 |
+| `/mode companion` / `/mode socratic` | 切换对话风格 |
+| `/abort` | 中断当前操作 |
+| `/help` | 查看命令提示 |
 
 ---
 
-## 四、为什么"自动"还需要"按按钮"？
+## 四、Case：用本地 CSV 完成一次自动 TSF 研究
 
-这**不是矛盾**，而是有意设计的**人类监督门控**（Human Checkpoint）。
+下面这个 Case 展示新版推荐路径：用户主要跟随 NBA，不需要找按钮。
 
-系统把整个研究分为几个阶段，**阶段内**尽量自动，**阶段之间**必须人工确认：
+### Case 背景
 
-```
-[阶段边界：人工门控]          [阶段内：自动化]
-        │                           │
-配置数据集 ──────────────── 自动计算数据 profile
-        │
-确认意图 ────────────────── LLM 自动填写 task spec
-        │
-启动 Agent Loop ─────────── 自动：提案 → smoke → 训练 → 选优
-（只按一次）                 自动循环直到：预算/no-improve/时间上限
-        │
-（可选）批准预算追加 ─────── 继续自动循环
-        │
-导出 Bundle ─────────────── 自动打包结果
-```
+你有一个本地时序 CSV，希望让 NeoResearch 自动探索小模型。
 
-**门控的意义：**
-- 防止系统拿错数据集就开始烧 GPU
-- 让研究者在搜索前确认目标（horizon、指标、约束）
-- 预算耗尽时给人类一个"要不要继续"的决策机会
+示例目标：
 
----
+- 数据：`/Users/me/data/traffic.csv`
+- 预测列：`speed`
+- 输入窗口：`96`
+- 预测 horizon：`12,24`
+- 指标：`val_avg_mse`
+- 模式：Autonomous，尽量让系统自动跑完
 
-## 五、完整使用流程
-
-### Step 1：启动 TUI
+### Step 1：启动 cockpit
 
 ```bash
 cd opencode
-neo-research
+neo-research cockpit
 ```
 
-### Step 2：创建任务
+首次进入会看到欢迎气泡：
 
-**方式 A — 标准 ETTh1 等内置数据集**
-
-按 `n`（New Task）→ 选择交互模式 → 系统会对话澄清意图
-
-**方式 B — 自定义 CSV 数据集**
-
-按 `c`（New CSV Task），输入格式：
-
-```
-/path/to/your.csv target=OT horizon=24,48 context=96
+```text
+欢迎来到 NeoResearch。
+本系统主要通过对话使用，直接告诉我你想做什么即可。
+常用斜杠命令：/new csv、/dataset prepare、/loop start、/help。
+核心快捷键：Enter、Esc、Ctrl+J/K、Ctrl+L、Ctrl+C。
 ```
 
-可选关键字：
-- `target=列名,列名`  预测目标列
-- `horizon=24,48`    预测步长（可多个）
-- `context=96`       lookback 窗口
-- `preset=etth1`     使用内置数据集分割策略（只对已知标准数据集用）
-- `full` / `bridge`  是否启用完整模型空间
+这个提示只展示一次，状态记录在：
 
-> 注意：自定义 CSV **不要**加 `preset=etth1`，系统会自动做 60/20/20 自适应分割。
-
-### Step 3：完成意图对话
-
-**Socratic 模式**：逐条回答 LLM 的追问，直到所有 slot 确认 ✓
-
-**Companion 模式**：LLM 一次性列出理解摘要，确认后继续
-
-### Step 4：准备数据集
-
-TUI 右侧状态栏显示 `Runner dataset mismatch` 时，按 `Enter` 选择 `Prepare Dataset`（或 `/prepare-dataset`）。
-
-这一步会：
-1. 调用 `neo-cast prepare-data --source ... --input-len ... --horizons ...`
-2. 在 neo_cast 目录下生成 `visible_*.csv`（训练集可见部分）和 `ref_test.csv`（测试集，训练时不可见）
-3. 写入 `dataset_spec.json`
-
-**只需执行一次**（除非更换数据集或修改 horizon）。
-
-### Step 5：（可选）Seed Baselines
-
-按 `s`（Seed Baselines）让 LLM 生成 3 个固定基准候选：nlinear / tiny_transformer / patch_mlp。
-
-用于建立初始 champion，帮助后续的 NAS 反射机制有比较基准。
-
-### Step 6：启动 Agent Loop（核心步骤）
-
-**只按一次**，之后系统完全自动：
-
-```
-按 A → Agent Loop
+```text
+~/.local/share/neo-research/onboarded.json
 ```
 
-每一轮（iteration）自动完成：
-1. 调用 LLM（或 mutation / reflection 策略）生成候选 JSON
-2. 执行 smoke（60 s 冒烟检查，验证代码可运行）
-3. 执行 full run（600 s 完整训练 + 评估）
-4. 与 Champion 比较，决定 keep / discard
-5. 更新 Memory（记录 `[dataset:xxx.csv] candidate X 成为 champion`）
-6. 自动进入下一轮
+### Step 2：创建 CSV 任务
 
-循环停止条件（任一满足即停）：
+如果当前没有任务，NBA 会显示：
 
-| 条件 | 默认值 |
+```text
+▶ Next: Create CSV task (/new csv)
+Enter 执行 · 可直接输入其他问题来追问或跳过
+```
+
+此时直接按 `Enter`，或手动输入：
+
+```text
+/new csv
+```
+
+随后在弹出的 CSV 输入框里填写：
+
+```text
+/Users/me/data/traffic.csv target=speed horizon=12,24 context=96 full
+```
+
+常用字段说明：
+
+| 字段 | 示例 | 说明 |
+|---|---|---|
+| CSV 路径 | `/Users/me/data/traffic.csv` | 本地 CSV 文件路径 |
+| `target=` | `target=speed` | 预测目标列；多个列用逗号分隔 |
+| `horizon=` | `horizon=12,24` | 预测步长 |
+| `context=` | `context=96` | lookback 窗口 |
+| `full` | `full` | 启用完整模型空间 |
+
+> 自定义 CSV 通常不要写 `preset=etth1`。除非你明确要复用标准数据集协议，否则系统会自动使用自适应切分。
+
+### Step 3：选择交互模式
+
+创建任务时系统会询问交互模式：
+
+| 模式 | 适合场景 |
 |---|---|
-| 最大 Run 次数 | `budget.maxRuns`（默认 12） |
-| 连续不改善轮数 | `maxNoImprove`（默认 8） |
-| 时间预算 | `timeBudgetSeconds`（如有） |
-| 连续 crash | 5 次 |
-| 人工 Abort | 按 `Ctrl+C` 或 `/abort` |
+| Companion | 需求已经比较明确，希望系统少打扰、快推进 |
+| Socratic | 需求还不完整，希望系统逐步追问确认 |
 
-### Step 7：查看结果与导出
+本 Case 推荐选择 **Companion**。后续可随时切换：
 
-- 右侧状态栏实时显示 Champion 指标
-- `tab` → Agents 面板：查看各 Agent 进度
-- 按 `e`（Export Bundle）：导出完整实验包（含模型配置、metrics、eval report）
+```text
+/mode companion
+/mode socratic
+```
+
+### Step 4：跟随 NBA 准备数据
+
+任务创建后，如果 runner 数据缓存还没准备好，NBA 通常会变成：
+
+```text
+▶ Next: Prepare dataset (/dataset prepare)
+```
+
+直接按 `Enter`。
+
+这一步会调用 Neo-Cast 准备数据，生成训练可见数据、ref test 数据和 `dataset_spec.json`。如果你修改了 CSV、target、horizon 或 context，需要重新执行：
+
+```text
+/dataset prepare
+```
+
+### Step 5：生成数据 profile
+
+数据准备完成后，NBA 可能会建议：
+
+```text
+▶ Next: Profile dataset (/dataset profile)
+```
+
+继续按 `Enter`。
+
+profile 会让系统了解数据规模、缺失率、周期性、趋势强度、目标列分布等特征。后续 ModelDesigner 会参考这些信息生成候选。
+
+### Step 6：Seed baseline
+
+如果当前还没有候选，NBA 会建议：
+
+```text
+▶ Next: Seed baseline candidates (/seed)
+```
+
+继续按 `Enter`。
+
+这一步会创建若干基线候选，用于建立最初的比较对象。它的意义不是“找到最终模型”，而是给 autonomous loop 一个可靠起点。
+
+### Step 7：启动 autonomous loop
+
+当数据、profile、候选都就绪后，NBA 会建议：
+
+```text
+▶ Next: Run autonomous loop (/loop start)
+```
+
+继续按 `Enter`。
+
+启动后系统会循环执行：
+
+1. 根据数据 profile、历史 memory 和当前 champion 生成候选
+2. 编译候选 recipe
+3. 运行 smoke / full run
+4. 记录指标
+5. 更新 champion
+6. 写入 reflection / memory
+7. 判断是否继续下一轮
+
+运行中 NBA 会隐藏，conversation pane 会显示 runner progress、run summary 和失败原因摘要。
+
+### Step 8：处理中途审批
+
+有些动作需要人工确认，例如候选晋级、ref test gate、预算追加。此时 NBA 可能显示：
+
+```text
+▶ Next: Approve candidate (/candidate approve)
+```
+
+如果你认可系统建议，按 `Enter`。如果不认可，可以输入：
+
+```text
+/candidate reject
+```
+
+如果 Agent 返回 action proposal，界面会显示：
+
+```text
+我建议执行：/dataset prepare
+原因：当前 task 的 dataset_spec 与已准备的不匹配
+[Enter 执行]   [Esc 取消]
+```
+
+规则很简单：
+
+- `Enter`：确认执行
+- `Esc`：取消 proposal
+- 想追问原因：直接输入自然语言，例如“为什么要先执行这一步？”
+
+### Step 9：导出 bundle
+
+当已有成功 run 且研究可以交付时，NBA 会建议：
+
+```text
+▶ Next: Export bundle (/export bundle)
+```
+
+按 `Enter` 或手动输入：
+
+```text
+/export bundle
+```
+
+导出包通常包含：
+
+- task spec
+- candidates
+- runs / metrics
+- champion metadata
+- evaluation report
+- model artifacts
+- memory / reflection trace
 
 ---
 
-## 六、Review 模式 vs Autonomous 模式操作对比
+## 五、Case：用户只用自然语言推进
+
+新版 cockpit 允许你不记命令，直接用自然语言表达意图。涉及副作用动作时，系统会尽量转成 action proposal，让你确认后再执行。
+
+示例对话：
+
+```text
+用户：我想用 traffic.csv 预测 speed，输入 96，预测 12 和 24 步，先自动跑一轮。
+Agent：我需要创建一个 CSV 任务。建议执行：/new csv
+用户：Enter
+```
+
+如果 Agent 发现数据没有准备好：
+
+```text
+Agent：我建议执行：/dataset prepare
+原因：当前任务的数据配置还没有同步到 Neo-Cast runner。
+用户：Enter
+```
+
+如果用户不想执行：
+
+```text
+用户：Esc
+用户：为什么要先 prepare？
+Agent：因为训练 runner 只读取准备后的 dataset_spec.json 和可见训练集...
+```
+
+这个模式适合新用户，但高级用户仍然可以随时用 slash 精确控制。
+
+---
+
+## 六、Review 模式 vs Autonomous 模式
 
 | 操作 | Review 模式 | Autonomous 模式 |
 |---|---|---|
-| 生成一个候选并训练 | 手动按 `r`（Run Candidate） | 由 Agent Loop 自动循环 |
-| 查看结果再决定下一步 | 每轮都等人工 | 自动决策 keep/discard |
-| 什么时候用 | 想精细控制每个候选 | 想"放手"让系统跑 |
-| 何时需要人工介入 | 每一轮 | 预算耗尽 / 报错 |
+| 候选生成 | 人工更频繁确认 | 系统自动生成 |
+| 训练推进 | 常用 `/run smoke`、`/run full` | 常用 `/loop start` |
+| 审批节奏 | 每个关键候选都看一眼 | 只在 gate / 预算 / 异常时介入 |
+| 适合场景 | 新数据集首次验证、想精细控制 | 批量探索、希望系统自主迭代 |
 
-**典型使用场景：**
-- **第一次用新数据集**：先用 Review 模式跑 2-3 个候选，确认 pipeline 正常，再切换到 Autonomous
-- **批量探索**：直接 Autonomous，设置 `maxRuns=20`，去喝咖啡
+推荐做法：
+
+1. 第一次接入新 CSV：用 Companion + `/dataset profile` + `/seed` 先确认 pipeline 正常。
+2. 确认数据和 runner 没问题后：切到 Autonomous，跟随 NBA 执行 `/loop start`。
+3. 如果结果异常：用 `/abort` 停止，再问 Agent “为什么当前 champion 不稳定？”
 
 ---
 
@@ -192,14 +340,14 @@ TUI 右侧状态栏显示 `Runner dataset mismatch` 时，按 `Enter` 选择 `Pr
 
 ### Q：`Runner dataset mismatch` 是什么意思？
 
-数据集文件已变更（换了 CSV 或修改了 horizon），需要重新运行 `prepare-dataset`。
+数据集文件已变更（换了 CSV 或修改了 horizon），需要重新运行 `/dataset prepare`。
 
 ### Q：`Missing py/validate.py` 是什么意思？
 
 Runner root 没有配置，或者配置的路径不包含 `neo_cast` 目录。  
-用 `/edit-runner-root` 命令手动指定：
+用 `/runner edit-root` 命令手动指定：
 ```
-/edit-runner-root
+/runner edit-root
 输入：/path/to/neo-research/neo_cast
 ```
 
@@ -222,12 +370,29 @@ export NEO_CAST_LLM_API_KEY=...          # 通用（OpenAI 兼容）
 
 ### Q：可以中途切换交互模式吗？
 
-可以。`/mode-companion` 或 `/mode-socratic` 随时切换，不影响已有实验。
+可以。`/mode companion` 或 `/mode socratic` 随时切换，不影响已有实验。
+
+### Q：我还需要记 `/prepare-dataset`、`/agent-loop` 这些旧命令吗？
+
+不需要。旧命令保留兼容，但新版推荐使用：
+
+| 旧命令 | 新命令 |
+|---|---|
+| `/prepare-dataset` | `/dataset prepare` |
+| `/profile` | `/dataset profile` |
+| `/agent-loop` | `/loop start` |
+| `/seed-baselines` | `/seed` |
+| `/task-next` | `/task next` |
+| `/candidate-next` | `/candidate next` |
+
+### Q：为什么输入框为空时按 Enter 会执行动作？
+
+这是新版交互的核心：空输入代表“接受系统推荐的下一步”。如果不想执行，可以直接输入其他自然语言问题或 slash 命令。
 
 ---
 
 ## 八、一句话总结
 
-> **NeoResearch 的"自动"是指 NAS 搜索循环（生成候选 → 训练 → 选优）自动；**  
-> **"按按钮"是在几个关键边界点给人类一个确认机会，防止系统拿错数据乱跑。**  
-> 两者不矛盾——这是有意为之的**人类监督 + 机器执行**架构。
+> **新版 NeoResearch 的默认交互不是“找按钮”，而是“看建议、问原因、按 Enter 推进”。**
+> 斜杠命令负责精确控制，Next Best Action 负责告诉你下一步，Action Proposal 负责让 Agent 把动作端到你面前。
+> 用户仍然掌握确认权，但不再需要在按钮森林里找路。

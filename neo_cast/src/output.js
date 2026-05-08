@@ -26,10 +26,14 @@ function printCompanionResult(row, attempt = null) {
     return;
   }
 
+  // BEST tag derives from the session-local `status === "keep"` signal: Python's
+  // runner_state.best_val_avg_mse tracker still flips the row to "keep" when it
+  // improves locally. The TS-driven champion table is the global authority.
+  const sessionLocalBest = row.status === "keep" ? "1" : "0";
   console.log(`${statusPrefix}:STATUS=${row.status}`);
   console.log(`${statusPrefix}:RUN=${row.run_id}`);
   console.log(`${statusPrefix}:VAL=${row.val_avg_mse}`);
-  console.log(`${statusPrefix}:BEST=${row.is_best}`);
+  console.log(`${statusPrefix}:BEST=${sessionLocalBest}`);
 }
 
 function printFinalSummary(bestRow) {

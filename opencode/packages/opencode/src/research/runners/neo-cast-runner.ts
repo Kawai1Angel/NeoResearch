@@ -60,7 +60,7 @@ const DEFAULT_NEO_CAST_MANIFEST: NeoCastRunnerManifest = {
     },
     run: {
       script: "py/runner.py",
-      args: ["run", "--description", "{description}"],
+      args: ["run", "--description", "{description}", "--skip-smoke"],
       timeout_ms: 900000,
     },
     ref_test: {

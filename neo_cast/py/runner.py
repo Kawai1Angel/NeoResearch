@@ -156,17 +156,6 @@ def append_result(row: dict[str, str]) -> None:
     save_results(rows)
 
 
-def clear_best_for_session(session_id: str) -> None:
-    rows = load_results()
-    changed = False
-    for row in rows:
-        if row["session_id"] == session_id and row["is_best"] == "1":
-            row["is_best"] = "0"
-            changed = True
-    if changed:
-        save_results(rows)
-
-
 def read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -335,6 +324,18 @@ def _resolve_candidate() -> int:
     return renderer_exit
 
 
+def _resolved_candidate_is_fresh() -> bool:
+    try:
+        if not CURRENT_CANDIDATE_PATH.exists() or not RESOLVED_CANDIDATE_PATH.exists():
+            return False
+        if RESOLVED_CANDIDATE_PATH.stat().st_mtime < CURRENT_CANDIDATE_PATH.stat().st_mtime:
+            return False
+        resolved = read_json(RESOLVED_CANDIDATE_PATH)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(resolved.get("candidate_id"), str) and isinstance(resolved.get("model_family"), str)
+
+
 def _export_artifact(
     *,
     state: RunnerState,
@@ -389,6 +390,10 @@ def _candidate_context_from_current(fallback_candidate_id: str) -> tuple[str, st
     return str(candidate_id), str(model_family or "unknown")
 
 
+# NOTE: The `is_best` column is preserved in RESULTS_HEADER for backward-compat
+# schema reasons, but it is no longer authoritative. The TS Research Service's
+# `research_champion` table is the single source of truth for champion selection.
+# This writer always emits "0" so the Python runner cannot drift from the TS DB.
 def _write_result_row(
     *,
     state: RunnerState,
@@ -398,10 +403,7 @@ def _write_result_row(
     val_metrics: dict[str, float] | None,
     params_m: float | None,
     status: str,
-    is_best: bool,
 ) -> None:
-    if is_best:
-        clear_best_for_session(state.session_id)
     append_result(
         {
             "session_id": state.session_id,
@@ -413,7 +415,7 @@ def _write_result_row(
             "val_h720_mse": format_metric(val_metrics.get("val_h720_mse") if val_metrics else None),
             "params_M": format_metric(params_m, decimals=2),
             "status": status,
-            "is_best": "1" if is_best else "0",
+            "is_best": "0",
             "timestamp": _now_iso(),
         }
     )
@@ -437,9 +439,10 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
     _set_approval_stage("train_eval_running")
 
     if skip_smoke:
-        renderer_exit = _resolve_candidate()
-        if renderer_exit != 0:
-            return renderer_exit
+        if not _resolved_candidate_is_fresh():
+            renderer_exit = _resolve_candidate()
+            if renderer_exit != 0:
+                return renderer_exit
         candidate_id, model_family = _candidate_context()
     else:
         candidate_id = f"smoke_{state.candidate_counter}"
@@ -473,7 +476,6 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
                 val_metrics=_parse_eval_metrics(smoke_records),
                 params_m=None,
                 status=status,
-                is_best=False,
             )
             return smoke_exit
 
@@ -503,7 +505,6 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
             val_metrics=val_metrics,
             params_m=None,
             status="crash",
-            is_best=False,
         )
         return train_exit if train_exit != 0 else 1
 
@@ -524,7 +525,6 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
             val_metrics=val_metrics,
             params_m=params_m,
             status="crash",
-            is_best=False,
         )
         return export_exit
     _append_artifact_trace(artifact_dir)
@@ -553,7 +553,6 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         val_metrics=val_metrics,
         params_m=params_m,
         status=status,
-        is_best=improved,
     )
 
     print(f"runner_status={status}")

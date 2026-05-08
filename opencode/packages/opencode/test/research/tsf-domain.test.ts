@@ -148,6 +148,58 @@ describe("TSF research domain", () => {
     expect(fingerprint.searchBiases).toContain("probabilistic")
   })
 
+  test("keeps probabilistic heads on probabilistic validation metrics", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      forecastMode: "probabilistic",
+      evaluation: {
+        protocol: "fixed_split",
+        metricPrimary: "val_avg_mse",
+        seeds: [42],
+      },
+      runtime: { bridgeOnly: false },
+    })
+    const candidateSpec = {
+      ...validTransformerCandidate(),
+      predictionHead: { type: "quantile", outputDistribution: "quantile", quantiles: [0.1, 0.5, 0.9] },
+      trainingStrategy: {
+        loss: { base: "quantile", horizonWeighting: "uniform", quantiles: [0.1, 0.5, 0.9] },
+        optimizer: { type: "adamw", lr: 0.001, weightDecay: 0.01 },
+        scheduler: { type: "none", warmupSteps: 0 },
+        regularization: { dropout: 0.1, gradClip: 1 },
+        budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 42 },
+      },
+    }
+
+    const missingProbabilisticMetric = Research.DomainRegistry.evaluateRun("tsf", {
+      task: {
+        id: "task_prob",
+        taskSpec: normalizedTask,
+        objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      },
+      candidate: { candidateSpec },
+      run: { metrics: { val_avg_mse: 0.1 } },
+    } as never)
+    const probabilisticMetric = Research.DomainRegistry.evaluateRun("tsf", {
+      task: {
+        id: "task_prob",
+        taskSpec: normalizedTask,
+        objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      },
+      candidate: { candidateSpec },
+      run: { metrics: { val_avg_mse: 0.1, val_avg_pinball: 0.22 } },
+    } as never)
+
+    expect(missingProbabilisticMetric).toMatchObject({
+      primaryMetricName: "val_avg_pinball",
+      primaryMetric: undefined,
+    })
+    expect(probabilisticMetric).toMatchObject({
+      primaryMetricName: "val_avg_pinball",
+      primaryMetric: 0.22,
+    })
+  })
+
   test("profiles TSF dataset files into task fingerprints", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-profile-"))
     const csvPath = path.join(root, "train.csv")
@@ -465,6 +517,7 @@ describe("TSF research domain", () => {
     })
 
     expect(plan.validation.ok).toBe(true)
+    expect(plan.command.timeoutMs).toBe(240_000)
     expect(plan.writes[0]!.content.preprocessing).toMatchObject({
       actions: [
         { type: "missing_mask", mask_channel: true, fill_policy: "mean" },

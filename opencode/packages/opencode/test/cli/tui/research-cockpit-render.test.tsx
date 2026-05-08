@@ -2,7 +2,7 @@
 import { beforeAll, describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { Global } from "@opencode-ai/core/global"
-import { chmod, mkdir, writeFile } from "fs/promises"
+import { chmod, mkdir, readFile, rm, writeFile } from "fs/promises"
 import path from "path"
 import { CommandProvider, useCommandDialog } from "../../../src/cli/cmd/tui/component/dialog-command"
 import { KeybindProvider } from "../../../src/cli/cmd/tui/context/keybind"
@@ -23,6 +23,7 @@ const now = 1_765_000_000_000
 const taskID = "task_neo_cast_01"
 const candidateID = "cand_phase2_01"
 const runID = "run_smoke_01"
+const onboardingPath = path.join(Global.Path.data, "onboarded.json")
 
 async function prepareNeoCastRunnerRoot(root: string) {
   await mkdir(path.join(root, "py"), { recursive: true })
@@ -36,6 +37,8 @@ async function prepareNeoCastRunnerRoot(root: string) {
 beforeAll(async () => {
   await Promise.all([prepareNeoCastRunnerRoot("/tmp/neo-cast"), prepareNeoCastRunnerRoot("/tmp/neo-cast-research")])
   await writeFile("/tmp/ETTh1.csv", "date,OT,HUFL\n2024-01-01,1,2\n", "utf8")
+  await mkdir(Global.Path.data, { recursive: true })
+  await writeFile(onboardingPath, `${JSON.stringify({ cockpit: true })}\n`, "utf8")
 })
 
 function response(body: unknown) {
@@ -582,6 +585,36 @@ describe("ResearchCockpit render", () => {
     })
   })
 
+  test("shows the conversation-first onboarding bubble once", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+    await rm(onboardingPath, { force: true })
+
+    const emptyFetch = ((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(response([]))) as unknown as typeof fetch
+    const app = await testRender(() => <ResearchCockpitHarness fetch={emptyFetch} />, { width: 160, height: 48 })
+
+    try {
+      const frame = await waitForFrame(app, "欢迎来到 NeoResearch")
+      let persisted: Record<string, unknown> = {}
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          persisted = JSON.parse(await readFile(onboardingPath, "utf8")) as Record<string, unknown>
+          break
+        } catch {
+          await Bun.sleep(25)
+        }
+      }
+
+      expect(frame).toContain("常用斜杠命令：/new csv、/dataset prepare、/loop start、/help。")
+      expect(persisted.cockpit).toBe(true)
+    } finally {
+      app.renderer.destroy()
+      await mkdir(Global.Path.data, { recursive: true })
+      await writeFile(onboardingPath, `${JSON.stringify({ cockpit: true })}\n`, "utf8")
+    }
+  })
+
   test("renders a stream-only empty workspace before any task exists", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -595,8 +628,8 @@ describe("ResearchCockpit render", () => {
 
       expect(frame).toContain("NeoResearch Workspace")
       expect(frame).toContain("描述一个预测目标，或创建 CSV 任务开始研究。")
-      expect(frame).toContain("New CSV Task")
-      expect(frame).not.toContain("New CSV Task ^N")
+      expect(frame).toContain("/new")
+      expect(frame).not.toContain("New CSV Task")
       expect(frame).not.toContain("阶段")
       expect(frame).toContain("Intent Agent")
       expect(frame).toContain("下一步")
@@ -751,6 +784,77 @@ describe("ResearchCockpit render", () => {
       expect(posts.map((post) => post.path)).toContain("/session/session_research_chat/prompt_async")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
       expect(frame).toContain("请给出下一步实验建议")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("chat action proposals wait for enter before executing the proposed command", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const posts: Array<{ path: string; body: unknown }> = []
+    const proposal = JSON.stringify({
+      kind: "action_proposal",
+      title: "为当前任务准备数据集",
+      command: "/dataset prepare",
+      reason: "数据集指纹不匹配",
+      reversible: true,
+      requireConfirm: true,
+    })
+    const proposalFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const handled = await mockChatResponse(input, init, posts, proposal, events)
+      if (handled) return handled
+      const url = requestURL(input)
+      if (init?.method === "POST") {
+        posts.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : undefined })
+        if (url.pathname === `/research/tasks/${taskID}/prepare-dataset`) {
+          return response({
+            artifact: {
+              id: "artifact_dataset_prepared",
+              taskID,
+              kind: "dataset_preparation_json",
+              uri: "file:///tmp/dataset-preparation.json",
+              metadata: {},
+              time: { created: now, updated: now },
+            },
+            path: "/tmp/dataset-preparation.json",
+            datasetSpec: {},
+            command: {},
+          })
+        }
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={proposalFetch} events={events.source} />, {
+      width: 160,
+      height: 48,
+    })
+
+    try {
+      await waitForFrame(app, "run_smoke")
+      await app.mockInput.typeText("数据集需要处理吗")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      let frame = await waitForFrame(app, "我建议执行：/dataset prepare")
+      expect(frame).toContain("原因：数据集指纹不匹配")
+      expect(frame).toContain("[Enter 执行]   [Esc 取消]")
+      expect(frame).not.toContain("/why")
+      expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/prepare-dataset`)
+
+      app.mockInput.pressEnter()
+      for (let attempt = 0; attempt < 40 && !posts.some((post) => post.path === `/research/tasks/${taskID}/prepare-dataset`); attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts).toContainEqual({
+        path: `/research/tasks/${taskID}/prepare-dataset`,
+        body: { force: true },
+      })
     } finally {
       app.renderer.destroy()
     }
@@ -1509,6 +1613,8 @@ describe("ResearchCockpit render", () => {
 
       expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/baselines`)
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
+      const frame = await waitForFrame(app, "Research Agent: 0 candidates seeded")
+      expect(frame).not.toContain("Research Agent: 当前研究")
     } finally {
       app.renderer.destroy()
     }
@@ -1655,18 +1761,20 @@ describe("ResearchCockpit render", () => {
       expect(displays).toEqual(
         expect.arrayContaining([
           "/abort",
+          "/candidate",
+          "/dataset",
+          "/help",
+          "/loop",
           "/mode",
-          "/mode-companion",
-          "/mode-socratic",
-          "/seed-baselines",
-          "/profile",
-          "/next",
-          "/agent-loop",
+          "/new",
+          "/run",
+          "/runner",
+          "/seed",
+          "/task",
           "/export",
-          "/ref-gate",
-          "/blind-gate",
         ]),
       )
+      expect(displays).not.toEqual(expect.arrayContaining(["/review", "/review-full", "/agent-loop", "/ref-gate"]))
     } finally {
       app.renderer.destroy()
     }
@@ -1692,11 +1800,9 @@ describe("ResearchCockpit render", () => {
       expect(route?.data.type).toBe("cockpit")
 
       app.mockInput.pressKey("h", { meta: true })
-      for (let attempt = 0; attempt < 20 && route?.data.type !== "home"; attempt++) {
-        await app.renderOnce()
-        await Bun.sleep(25)
-      }
-      expect(route?.data.type).toBe("home")
+      const hintFrame = await waitForFrame(app, "Alt+H 已移除")
+      expect(hintFrame).toContain("请使用 /home")
+      expect(route?.data.type).toBe("cockpit")
     } finally {
       app.renderer.destroy()
     }
@@ -1711,12 +1817,12 @@ describe("ResearchCockpit render", () => {
     try {
       await waitForFrame(app, "run_smoke")
       await app.mockInput.typeText("/")
-      const frame = await waitForFrame(app, "Selected /seed-baselines")
+      const frame = await waitForFrame(app, "Selected /new")
 
-      expect(frame).toContain("Selected /seed-baselines")
-      expect(frame).toContain("/agent-loop")
-      expect(frame).toContain("/ref-gate")
-      expect(frame).toContain("/blind-gate")
+      expect(frame).toContain("Selected /new")
+      expect(frame).toContain("/dataset")
+      expect(frame).toContain("/run")
+      expect(frame).toContain("/loop")
     } finally {
       app.renderer.destroy()
     }
@@ -1734,6 +1840,9 @@ describe("ResearchCockpit render", () => {
         if (url.pathname === `/research/tasks/${taskID}/baselines`) {
           return Promise.resolve(response({ candidates: [], approvals: [] }))
         }
+        if (url.pathname.endsWith("/autonomous/loop")) {
+          return Promise.resolve(response({ iterations: [], stoppedReason: "max_iterations" }))
+        }
       }
       return mockResearchFetch(input, init)
     }) as typeof fetch
@@ -1742,7 +1851,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "run_smoke")
-      await app.mockInput.typeText("/")
+      await app.mockInput.typeText("/loo")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
@@ -1751,7 +1860,7 @@ describe("ResearchCockpit render", () => {
         await Bun.sleep(25)
       }
 
-      expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/baselines`)
+      expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/autonomous/loop`)
     } finally {
       app.renderer.destroy()
     }
@@ -1769,9 +1878,8 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "run_smoke")
-      await app.mockInput.typeText("/exi")
+      await app.mockInput.typeText("/exit")
       await app.renderOnce()
-      expect(app.captureCharFrame()).toContain("/exit")
 
       app.mockInput.pressEnter()
       await app.renderOnce()
@@ -1817,10 +1925,9 @@ describe("ResearchCockpit render", () => {
       }
 
       expect(posts).toContainEqual({
-        path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" },
+        path: `/research/tasks/${taskID}/prepare-dataset`,
+        body: { force: true },
       })
-      expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/baselines`)
     } finally {
       app.renderer.destroy()
     }
@@ -2113,14 +2220,22 @@ describe("ResearchCockpit render", () => {
       expect(frame).not.toContain("NeoResearch alpha")
       expect(frame).toContain("Context")
       expect(frame).toContain("model -")
-      expect(frame).toContain("session -")
+      expect(frame).toContain("session task_neo")
+      expect(frame).toContain("task task_neo researching")
+      expect(frame).toContain("research cand=1/1 runs=1 ok=1")
+      expect(frame).toContain("Research Agent: 当前研究 Neo-Cast Autonomous TSF")
+      expect(frame).toContain("candidate 1/1")
+      expect(frame).toContain("latest smoke succeeded")
       expect(frame).not.toContain("Forecaster")
       expect(frame).not.toContain("Critic waiting")
       expect(frame).not.toContain("Artifacts ")
       expect(frame).not.toContain("Approvals ")
       expect(frame).not.toContain("No champion selected")
       expect(frame).not.toContain("Next Action")
-      expect(frame).not.toContain("Run autonomous loop")
+      expect(frame).toContain("▶ Next: Run autonomous loop")
+      expect(frame).toContain("Enter 执行 · 输入其他问题可追问/跳过")
+      expect(frame).not.toContain("/skip")
+      expect(frame).not.toContain("/why")
       expect(frame).not.toContain("Run Next /next")
       expect(frame).not.toContain("Candidate Table")
       expect(frame).not.toContain("Smoke Prep")
@@ -2134,9 +2249,10 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("tab agents")
       expect(frameLine(frame, "NeoResearch v0.1.0-alpha.0")).toBeGreaterThanOrEqual(44)
       expect(occurrenceCount(frame, "Workflow")).toBe(0)
-      expect(frameLine(frame, "Research Agent")).toBeGreaterThanOrEqual(38)
+      const promptFooterLine = frameLine(frame, "苏格拉底 Reflection Agent Research Agent")
+      expect(promptFooterLine).toBeGreaterThanOrEqual(38)
       expect(frameLine(frame, "esc interrupt")).toBe(frameLine(frame, "tab agents"))
-      expect(frameLine(frame, "ctrl+p commands")).toBeGreaterThan(frameLine(frame, "Research Agent"))
+      expect(frameLine(frame, "ctrl+p commands")).toBeGreaterThan(promptFooterLine)
     } finally {
       app.renderer.destroy()
     }
@@ -2422,7 +2538,6 @@ describe("ResearchCockpit render", () => {
       app.resize(88, 48)
       const frame = await waitForFrame(app, "run_smoke")
 
-      expect(frame).not.toContain("Neo-Cast Autonomous TSF")
       expect(frame).not.toContain("Candidate Table")
       expect(frame).not.toContain("AutoResearch进展")
       expect(frame).not.toContain("Champion")
@@ -3199,37 +3314,35 @@ describe("ResearchCockpit render", () => {
     }
   })
 
-  test("ctrl-n asks for interaction mode before opening the CSV task dialog", async () => {
+  test("ctrl-n shows the migration hint instead of opening the CSV task dialog", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
     const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "New CSV Task")
+      await waitForFrame(app, "/new")
       app.mockInput.pressKey("n", { ctrl: true })
 
-      const frame = await waitForFrame(app, "Interaction mode")
-      expect(frame).toContain("1 Companion")
-      expect(frame).toContain("2 Socratic")
+      const frame = await waitForFrame(app, "Ctrl+N 已移除")
+      expect(frame).toContain("/new csv")
+      expect(frame).not.toContain("Interaction mode")
     } finally {
       app.renderer.destroy()
     }
   })
 
-  test("clicking the cockpit New CSV Task action asks for interaction mode first", async () => {
+  test("new csv slash command asks for interaction mode first", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
     const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "New CSV Task")
-      const lines = frame.split("\n")
-      const y = lines.findIndex((line) => line.includes("New CSV Task"))
-      const x = lines[y].indexOf("New CSV Task") + 2
-
-      await app.mockMouse.click(x, y)
+      await waitForFrame(app, "/new")
+      await app.mockInput.typeText("/new csv")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
       const nextFrame = await waitForFrame(app, "Interaction mode")
 
       expect(nextFrame).toContain("1 Companion")
@@ -3277,7 +3390,7 @@ describe("ResearchCockpit render", () => {
       app.mockInput.pressEnter()
 
       const frame = await waitForFrame(app, "interaction mode switched to 认知伴随")
-      expect(frame).toContain("Mode 认知伴随")
+      expect(frame).toContain("认知伴随")
       expect(patches).toEqual([
         expect.objectContaining({
           interactionMode: "companion",
@@ -3340,8 +3453,6 @@ describe("ResearchCockpit render", () => {
       await app.renderOnce()
       const frame = app.captureCharFrame()
 
-      expect(frame).toContain("Previous Task")
-      expect(frame).toContain("Next Task")
       expect(frame).toContain("Task 2/2")
     } finally {
       app.renderer.destroy()
@@ -3424,6 +3535,87 @@ describe("ResearchCockpit render", () => {
     try {
       await waitForFrame(app, "run_smoke")
       command?.trigger("research.next.run")
+      for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts).toContainEqual({
+        path: `/research/tasks/${taskID}/autonomous/loop`,
+        body: { stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" },
+      })
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("active autonomous loop shows live workflow instead of historical completion", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    let resolveLoop: ((value: Response) => void) | undefined
+    const actionFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (init?.method === "POST") {
+        posts.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : undefined })
+        if (url.pathname.endsWith("/autonomous/loop")) {
+          return new Promise<Response>((resolve) => {
+            resolveLoop = resolve
+          })
+        }
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
+
+    try {
+      await waitForFrame(app, "run_smoke")
+      await app.mockInput.typeText("/loop start")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/autonomous/loop`)
+      const frame = await waitForFrame(app, "→ ModelDesigner Agent")
+      expect(frame).not.toContain("✓ ModelDesigner Agent")
+      expect(frame).toContain("• ModelCompiler Agent")
+      expect(frame).toContain("• TrainEval Agent")
+    } finally {
+      resolveLoop?.(response({ iterations: [], stoppedReason: "max_iterations" }))
+      app.renderer.destroy()
+    }
+  })
+
+  test("pressing enter on an empty prompt executes the next best action", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    const actionFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (url.pathname === `/research/tasks/${taskID}/approvals` && !init?.method) {
+        return Promise.resolve(response([]))
+      }
+      if (init?.method === "POST") {
+        posts.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : undefined })
+        if (url.pathname.endsWith("/autonomous/loop")) {
+          return Promise.resolve(response({ iterations: [], stoppedReason: "max_iterations" }))
+        }
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
+
+    try {
+      await waitForFrame(app, "run_smoke")
+      app.mockInput.pressEnter()
       for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
         await app.renderOnce()
         await Bun.sleep(25)

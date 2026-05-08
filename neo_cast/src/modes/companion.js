@@ -183,7 +183,10 @@ function printCompanionResult(row, attempt = null) {
   const mse = row.val_avg_mse === "NA" ? "N/A" : `${parseFloat(row.val_avg_mse).toFixed(6)}`;
   _tag(`${statusPrefix}:VAL`, mse);
   _tag(`${statusPrefix}:DEC`, verdict);
-  if (row.is_best === "1") {
+  // Session-local best signal — Python's status="keep" means this run improved
+  // over the previous local best. The global champion authority lives in the TS
+  // Research Service's research_champion table (sqlite), not in results.tsv.
+  if (row.status === "keep") {
     _tag(`${statusPrefix}:BEST`, "artifact saved");
   }
 }

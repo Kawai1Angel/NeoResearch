@@ -1,7 +1,10 @@
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
+import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { mkdir, readFile, writeFile } from "fs/promises"
+import path from "path"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { Spinner } from "@tui/component/spinner"
 import { useTextareaKeybindings } from "@tui/component/textarea-keybindings"
@@ -40,6 +43,7 @@ import {
   researchInteractionModeLabel,
   researchCockpitCandidateTitle,
   resolveResearchCockpitProjectRunnerRoot,
+  selectNextBestAction,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
   taskModeForInteractionMode,
@@ -60,6 +64,7 @@ import {
   type ResearchCockpitRunnerStatus,
   type ResearchCockpitSeedSweepResult,
   type ResearchCockpitTask,
+  type ResearchCockpitWorkflowItem,
   type TsfResearchTaskDefaults,
 } from "./research-cockpit-data"
 import {
@@ -72,7 +77,7 @@ import {
 } from "./research-slash-menu"
 import packageJson from "../../../../../package.json"
 
-type CandidateRunStage = Extract<NonNullable<ResearchCockpitRun["stage"]>, "smoke" | "ref_test" | "blind_test">
+type CandidateRunStage = Extract<NonNullable<ResearchCockpitRun["stage"]>, "smoke" | "full" | "ref_test" | "blind_test">
 type ResearchAgentStageStatus = "done" | "active" | "todo"
 type ResearchAgentStage = {
   key: string
@@ -88,6 +93,13 @@ type ResearchCockpitDatasetPreparationResult = {
 }
 
 const chatRequestTimeoutMs = 90_000
+const researchAgentWorkflowOrder = [
+  "HypoPlanner Agent",
+  "ModelDesigner Agent",
+  "ModelCompiler Agent",
+  "TrainEval Agent",
+  "Reflection Agent",
+]
 
 async function researchRequest<T>(
   sdk: ReturnType<typeof useSDK>,
@@ -249,6 +261,35 @@ function workingActionText(action: string, elapsed: string, tick: number) {
   return `Working / ${workingActionLabel(action)} / ${elapsed} ${frame}`
 }
 
+function liveResearchStageForAction(action: string | undefined, hasLiveRunnerOutput: boolean) {
+  if (!action) return undefined
+  if (action === "confirm-intent") return "intent"
+  if (action === "profile-task" || action === "prepare-dataset") return "data"
+  if (action === "seed-baselines") return "ModelDesigner Agent"
+  if (action === "autonomous-loop" || action === "autonomous-iteration") {
+    return hasLiveRunnerOutput ? "TrainEval Agent" : "ModelDesigner Agent"
+  }
+  if (action.startsWith("prepare-")) return "ModelCompiler Agent"
+  if (action.startsWith("execute-") || action.startsWith("seed-sweep-")) return "TrainEval Agent"
+  if (action === "export-artifact") return "publish"
+  return undefined
+}
+
+function overlayLiveResearchWorkflow(
+  items: ResearchCockpitWorkflowItem[],
+  activeLabel: string | undefined,
+): ResearchCockpitWorkflowItem[] {
+  const activeIndex = activeLabel ? researchAgentWorkflowOrder.indexOf(activeLabel) : -1
+  if (activeIndex < 0) return items
+  return items.map((item) => {
+    const itemIndex = researchAgentWorkflowOrder.indexOf(item.label)
+    if (itemIndex < 0) return item
+    if (itemIndex === activeIndex) return { ...item, status: "active" }
+    if (itemIndex > activeIndex) return { ...item, status: "todo" }
+    return item.status === "done" ? item : { ...item, status: "done" }
+  })
+}
+
 function localResearchChatReply(value: string) {
   const normalized = value.trim().toLowerCase().replace(/[!！.。?？\s]+$/g, "")
   const greetings = new Set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽", "在吗"])
@@ -387,6 +428,13 @@ const promptEventHistoryLimit = 20
 const errorEventHistoryLimit = 10
 const runnerOutputBufferSize = 30
 const neoResearchVersion = InstallationVersion === "local" ? packageJson.version : InstallationVersion
+const researchCockpitOnboardingFile = path.join(Global.Path.data, "onboarded.json")
+const researchCockpitOnboardingText = [
+  "欢迎来到 NeoResearch。",
+  "本系统主要通过对话使用，直接告诉我你想做什么即可。",
+  "常用斜杠命令：/new csv、/dataset prepare、/loop start、/help。",
+  "核心快捷键：Enter、Esc、Ctrl+J/K、Ctrl+L、Ctrl+C。",
+].join("\n")
 const interactionModeOptions: Array<{
   key: string
   title: string
@@ -438,6 +486,14 @@ type StreamingChatTurn = {
   text: string
   parts: StreamingChatTextPart[]
   modelLabel?: string
+}
+
+type AgentActionProposal = {
+  title: string
+  command: string
+  reason: string
+  reversible: boolean
+  requireConfirm: boolean
 }
 
 type ChatProviderList = {
@@ -622,6 +678,53 @@ function streamingChatTextFromParts(parts: StreamingChatTextPart[]) {
     .map((part) => part.text.trim())
     .filter(Boolean)
     .join("\n\n")
+}
+
+function parseAgentActionProposal(text: string | undefined): AgentActionProposal | undefined {
+  const trimmed = text?.trim()
+  if (!trimmed) return undefined
+  const jsonText = trimmed.startsWith("```")
+    ? trimmed
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim()
+    : trimmed
+  try {
+    const parsed = JSON.parse(jsonText)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined
+    const record = parsed as Record<string, unknown>
+    if (record.kind !== "action_proposal") return undefined
+    if (typeof record.title !== "string" || typeof record.command !== "string") return undefined
+    const command = record.command.trim()
+    if (!command.startsWith("/")) return undefined
+    return {
+      title: record.title,
+      command,
+      reason: typeof record.reason === "string" ? record.reason : "",
+      reversible: record.reversible !== false,
+      requireConfirm: record.requireConfirm !== false,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+async function hasSeenResearchCockpitOnboarding() {
+  try {
+    const raw = JSON.parse(await readFile(researchCockpitOnboardingFile, "utf8")) as Record<string, unknown>
+    return raw.cockpit === true
+  } catch {
+    return false
+  }
+}
+
+async function markResearchCockpitOnboarded() {
+  await mkdir(path.dirname(researchCockpitOnboardingFile), { recursive: true })
+  await writeFile(
+    researchCockpitOnboardingFile,
+    `${JSON.stringify({ cockpit: true, version: neoResearchVersion, time: Date.now() }, null, 2)}\n`,
+    "utf8",
+  )
 }
 
 function setStreamingChatPartText(parts: StreamingChatTextPart[], id: string, text: string) {
@@ -854,6 +957,7 @@ export function ResearchCockpit() {
   let actionQueue = Promise.resolve()
   let activeActionAbort: AbortController | undefined
   let activeChatAbort: AbortController | undefined
+  const removedShortcutHints = new Set<string>()
   let chatDefaultsKey: string | undefined
   let chatDefaultsPromise: Promise<ResolvedChatDefaults> | undefined
   let activeApiActionKey: string | undefined
@@ -869,6 +973,7 @@ export function ResearchCockpit() {
 
   onMount(() => {
     focusTimer = setTimeout(() => promptInput?.focus(), 0)
+    void showResearchCockpitOnboarding()
   })
   onCleanup(() => {
     if (focusTimer) clearTimeout(focusTimer)
@@ -879,7 +984,52 @@ export function ResearchCockpit() {
 
   useKeyboard((evt) => {
     const name = evt.name?.toLowerCase()
+    if (evt.ctrl && name === "c") {
+      if (abortActiveOperation(false)) {
+        evt.preventDefault()
+        evt.stopPropagation()
+      }
+      return
+    }
+    if (evt.ctrl && name === "l") {
+      setPromptEvents([])
+      setActionEvents([])
+      setErrorEvents([])
+      setRunnerOutputLines([])
+      setStreamingChat(undefined)
+      setError(undefined)
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+    const removedShortcut =
+      evt.ctrl && name === "n"
+        ? "Ctrl+N 已移除。请使用 /new csv 或直接描述一个 CSV 任务。"
+        : evt.ctrl && name === "b"
+          ? "Ctrl+B 已移除。请使用 /seed。"
+          : evt.ctrl && name === "e"
+            ? "Ctrl+E 已移除。请使用 /export bundle。"
+            : evt.meta && (name === "left" || name === "right")
+              ? "Alt+Left/Right 已移除。请使用 /candidate prev 或 /candidate next。"
+              : evt.meta && name === "h"
+                ? "Alt+H 已移除。请使用 /home。"
+                : undefined
+    if (removedShortcut) {
+      if (!removedShortcutHints.has(removedShortcut)) {
+        removedShortcutHints.add(removedShortcut)
+        appendCockpitNotice("shortcut", removedShortcut)
+      }
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
     if (name !== "escape" && name !== "esc") return
+    if (currentActionProposal()) {
+      setStreamingChat(undefined)
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
     if (!abortActiveOperation(false)) return
     evt.preventDefault()
     evt.stopPropagation()
@@ -955,9 +1105,14 @@ export function ResearchCockpit() {
   function persistStreamingChat() {
     const current = streamingChat()
     if (!current?.text) return
+    const proposal = parseAgentActionProposal(current.text)
     setActionEvents((events) => [
       ...events.slice(-(promptEventHistoryLimit - 1)),
-      { id: current.id, action: "chat-stream", text: current.text },
+      {
+        id: current.id,
+        action: proposal ? "action-proposal" : "chat-stream",
+        text: proposal ? `accepted ${proposal.command}: ${proposal.reason || proposal.title}` : current.text,
+      },
     ])
     setStreamingChat(undefined)
   }
@@ -1079,6 +1234,7 @@ export function ResearchCockpit() {
 
   const pendingApproval = createMemo(() => approvals()?.find((approval) => approval.status === "pending"))
   const chatAwaitingFirstToken = createMemo(() => !!chatBusy() || (!!streamingChat() && !streamingChat()?.text))
+  const currentActionProposal = createMemo(() => parseAgentActionProposal(streamingChat()?.text))
   const activeApiAction = createMemo(() => {
     return chatBusy() ?? (streamingChat() && !streamingChat()?.text ? `chat:${streamingChat()?.modelLabel ?? "model"}` : busy())
   })
@@ -1180,6 +1336,19 @@ export function ResearchCockpit() {
       runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
     }),
   )
+  const nextBestAction = createMemo(() =>
+    selectNextBestAction({
+      task: selectedTask(),
+      candidates: taskCandidates(),
+      runs: taskRuns(),
+      artifacts: taskArtifacts(),
+      approvals: taskApprovals(),
+      champion: validChampion() ?? null,
+      fingerprint: taskFingerprint() ?? {},
+      runnerReady: runnerReady(),
+      runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
+    }),
+  )
   async function runAction(name: string, fn: (signal: AbortSignal) => Promise<string>) {
     const run = async () => {
       const abortController = new AbortController()
@@ -1217,6 +1386,21 @@ export function ResearchCockpit() {
       () => undefined,
     )
     await queued
+  }
+
+  async function showResearchCockpitOnboarding() {
+    if (await hasSeenResearchCockpitOnboarding()) return
+    appendCockpitNotice("welcome", researchCockpitOnboardingText, { toast: false })
+    await markResearchCockpitOnboarded().catch(() => undefined)
+  }
+
+  function appendCockpitNotice(action: string, text: string, options?: { toast?: boolean }) {
+    setActionEvents((events) => [
+      ...events.slice(-(promptEventHistoryLimit - 1)),
+      { id: ++streamEventID, action, text },
+    ])
+    if (options?.toast === false) return
+    toast.show({ variant: "info", message: text, duration: 4000 })
   }
 
   function abortActiveOperation(notifyIdle = true) {
@@ -1361,7 +1545,6 @@ export function ResearchCockpit() {
     }
     setCsvInputErrors([])
     await createTask(resolvedMode, {
-      targetCols: ["OT"],
       ...defaults,
       ...parsed,
       ...(interactionMode === undefined ? {} : { interactionMode }),
@@ -1894,8 +2077,37 @@ export function ResearchCockpit() {
     })
   }
 
+  async function confirmCurrentActionProposal() {
+    const proposal = currentActionProposal()
+    if (!proposal) return false
+    persistStreamingChat()
+    setStreamingChat(undefined)
+    await runSlashPrompt(proposal.command)
+    return true
+  }
+
   async function runSlashPrompt(value: string) {
-    const name = value.slice(1).trim().split(/\s+/, 1)[0]?.toLowerCase()
+    const tokens = value.slice(1).trim().split(/\s+/).filter(Boolean)
+    const name = tokens[0]?.toLowerCase()
+    const args = tokens.slice(1)
+    const arg = (index: number) => args[index]?.toLowerCase()
+    const hasArg = (target: string) => args.some((item) => item.toLowerCase() === target)
+    const hasFlag = (target: string) => hasArg(target)
+    const optionValue = (target: string) => {
+      const index = args.findIndex((item) => item.toLowerCase() === target)
+      if (index >= 0) return args[index + 1]?.toLowerCase()
+      const inline = args.find((item) => item.toLowerCase().startsWith(`${target}=`))
+      return inline?.slice(target.length + 1).toLowerCase()
+    }
+    const modeArg = () => {
+      const value = optionValue("--mode")
+      if (value === "review" || value === "autonomous") return value
+      if (hasArg("review")) return "review"
+      if (hasArg("autonomous")) return "autonomous"
+      return undefined
+    }
+    const fullDefaults = (): TsfResearchTaskDefaults => (hasFlag("--full") || hasArg("full") ? { bridgeOnly: false } : {})
+
     if (name === "home") {
       route.navigate({ type: "home" })
       return
@@ -1908,56 +2120,120 @@ export function ResearchCockpit() {
       abortActiveOperation()
       return
     }
-    if (name === "mode") {
-      await switchInteractionMode()
+    if (name === "help") {
+      appendCockpitNotice(
+        "help",
+        "Commands: /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export, /abort, /home",
+      )
       return
     }
-    if (name === "mode-socratic" || name === "socratic") {
-      await switchInteractionMode("socratic")
+    if (name === "new") {
+      const mode = modeArg()
+      const defaults = fullDefaults()
+      if (arg(0) === "csv" || arg(0) === "dataset") {
+        await createCsvTask(mode, defaults)
+        return
+      }
+      if (arg(0) === "review") {
+        await createTask("review", defaults)
+        return
+      }
+      if (arg(0) === "task" || arg(0) === "autonomous" || arg(0) === "preset") {
+        await createTask(mode ?? "autonomous", defaults)
+        return
+      }
+      await createCsvTask(mode, defaults)
       return
     }
-    if (name === "mode-companion" || name === "companion") {
-      await switchInteractionMode("companion")
+    if (name === "review" || name === "review-full") {
+      await createTask("review", name === "review-full" ? { bridgeOnly: false } : {})
       return
     }
-    if (name === "review") {
-      await createTask("review")
-      return
-    }
-    if (name === "review-full") {
-      await createTask("review", { bridgeOnly: false })
-      return
-    }
-    if (name === "review-csv") {
-      await createCsvTask("review")
-      return
-    }
-    if (name === "review-csv-full") {
-      await createCsvTask("review", { bridgeOnly: false })
-      return
-    }
-    if (name === "task" || name === "autonomous") {
-      await createTask("autonomous")
-      return
-    }
-    if (name === "task-full" || name === "autonomous-full") {
-      await createTask("autonomous", { bridgeOnly: false })
+    if (name === "review-csv" || name === "review-csv-full") {
+      await createCsvTask("review", name === "review-csv-full" ? { bridgeOnly: false } : {})
       return
     }
     if (name === "csv" || name === "dataset") {
-      await createCsvTask()
+      if (arg(0) === "prepare") {
+        await prepareTaskDataset()
+        return
+      }
+      if (arg(0) === "profile") {
+        await profileTask()
+        return
+      }
+      if (arg(0) === "status") {
+        appendCockpitNotice("dataset-status", runnerStatus().ready ? "Dataset and runner are ready." : runnerStatus().detail ?? runnerStatus().reason)
+        return
+      }
+      await createCsvTask(undefined, fullDefaults())
       return
     }
     if (name === "csv-full" || name === "dataset-full") {
       await createCsvTask(undefined, { bridgeOnly: false })
       return
     }
-    if (name === "seed" || name === "seed-baselines" || name === "baselines") {
-      await seedBaselines()
+    if (name === "prepare-dataset" || name === "dataset-prepare") {
+      await prepareTaskDataset()
       return
     }
     if (name === "profile") {
       await profileTask()
+      return
+    }
+    if (name === "task") {
+      if (arg(0) === "next") {
+        selectTaskOffset(1)
+        return
+      }
+      if (arg(0) === "prev" || arg(0) === "previous") {
+        selectTaskOffset(-1)
+        return
+      }
+      if (arg(0) === "list") {
+        appendCockpitNotice("task-list", sortedTasks().map((task) => task.title).join(" · ") || "No research tasks.")
+        return
+      }
+      if (arg(0) === "select" && args[1]) {
+        const query = args[1].toLowerCase()
+        const index = sortedTasks().findIndex((task, taskIndex) => task.id.toLowerCase().includes(query) || String(taskIndex + 1) === query)
+        if (index >= 0) setSelectedIndex(index)
+        else appendCockpitNotice("task-select", `No task matched ${args[1]}.`)
+        return
+      }
+      await createTask("autonomous", fullDefaults())
+      return
+    }
+    if (name === "task-full" || name === "autonomous-full") {
+      await createTask("autonomous", { bridgeOnly: false })
+      return
+    }
+    if (name === "autonomous") {
+      await createTask("autonomous")
+      return
+    }
+    if (name === "candidate") {
+      if (arg(0) === "next") {
+        selectCandidateOffset(1)
+        return
+      }
+      if (arg(0) === "prev" || arg(0) === "previous") {
+        selectCandidateOffset(-1)
+        return
+      }
+      if (arg(0) === "approve") {
+        await approvePending()
+        return
+      }
+      if (arg(0) === "reject") {
+        await rejectPending()
+        return
+      }
+      appendCockpitNotice("candidate", `${candidatePosition()} selected.`)
+      return
+    }
+    if (name === "seed" || name === "seed-baselines" || name === "baselines") {
+      await seedBaselines()
       return
     }
     if (name === "approve") {
@@ -1976,7 +2252,40 @@ export function ResearchCockpit() {
       await runRecommendedAction()
       return
     }
+    if (name === "run") {
+      const candidate = commandCandidate()
+      if (arg(0) === "seed-sweep" && candidate) {
+        await executeCandidateSeedSweep(candidate)
+        return
+      }
+      if ((arg(0) === "ref" || arg(0) === "ref-test") && candidate) {
+        await executeCandidate(candidate, "ref_test")
+        return
+      }
+      if ((arg(0) === "blind" || arg(0) === "blind-test") && candidate) {
+        await executeCandidate(candidate, "blind_test")
+        return
+      }
+      if (arg(0) === "full" && candidate) {
+        await executeCandidate(candidate, "full")
+        return
+      }
+      if (arg(0) === "smoke" && candidate) {
+        await executeCandidate(candidate, "smoke")
+        return
+      }
+      await runRecommendedAction()
+      return
+    }
     if (name === "loop" || name === "agent-loop") {
+      if (arg(0) === "stop") {
+        abortActiveOperation()
+        return
+      }
+      if (arg(0) === "status") {
+        appendCockpitNotice("loop-status", workingStatusLine() ?? recommendation().detail)
+        return
+      }
       await runAutonomousLoop()
       return
     }
@@ -1996,12 +2305,44 @@ export function ResearchCockpit() {
       selectCandidateOffset(-1)
       return
     }
+    if (name === "runner") {
+      if (arg(0) === "edit-root") {
+        await editRunnerRoot()
+        return
+      }
+      if (arg(0) === "use-project") {
+        await useProjectRunnerRoot()
+        return
+      }
+      appendCockpitNotice("runner-check", runnerReady() ? "Runner ready." : runnerStatus().detail ?? runnerStatus().reason)
+      return
+    }
     if (name === "runner-root" || name === "use-project-runner") {
       await useProjectRunnerRoot()
       return
     }
     if (name === "edit-runner-root") {
       await editRunnerRoot()
+      return
+    }
+    if (name === "mode") {
+      if (arg(0) === "socratic") {
+        await switchInteractionMode("socratic")
+        return
+      }
+      if (arg(0) === "companion") {
+        await switchInteractionMode("companion")
+        return
+      }
+      await switchInteractionMode()
+      return
+    }
+    if (name === "mode-socratic" || name === "socratic") {
+      await switchInteractionMode("socratic")
+      return
+    }
+    if (name === "mode-companion" || name === "companion") {
+      await switchInteractionMode("companion")
       return
     }
     const candidate = commandCandidate()
@@ -2025,7 +2366,7 @@ export function ResearchCockpit() {
       await executeCandidate(candidate, "blind_test")
       return
     }
-    if (name === "export" || name === "report") {
+    if (name === "export" || name === "report" || name === "bundle") {
       await exportTaskArtifact()
       return
     }
@@ -2098,7 +2439,15 @@ export function ResearchCockpit() {
 
   async function submitPrompt() {
     const value = promptInput?.plainText.trim()
-    if (!value) return
+    if (!value) {
+      if (await confirmCurrentActionProposal()) {
+        promptInput?.focus()
+        return
+      }
+      await runRecommendedAction()
+      promptInput?.focus()
+      return
+    }
     const task = selectedTask()
     promptInput?.clear()
     setPromptValue("")
@@ -2171,6 +2520,10 @@ export function ResearchCockpit() {
   async function runVisibleSlashPrompt(value: string) {
     const option = resolveSlashOption(value, command.slashes(), slashSelection)
     if (!option) return false
+    const token = value.trim().split(/\s+/, 1)[0]?.toLowerCase()
+    if (token && token !== option.display.trim().toLowerCase() && option.aliases?.some((alias) => alias.trim().toLowerCase() === token)) {
+      return false
+    }
     selectSlashOption(option)
     return true
   }
@@ -2180,6 +2533,16 @@ export function ResearchCockpit() {
     const options = command.slashes()
     const name = evt.name?.toLowerCase()
     const ctrlOnly = evt.ctrl && !evt.meta && !evt.shift
+
+    if ((name === "return" || name === "enter") && value.trim().length === 0) {
+      evt.preventDefault()
+      evt.stopPropagation()
+      void (async () => {
+        if (await confirmCurrentActionProposal()) return
+        await runRecommendedAction()
+      })()
+      return
+    }
 
     if (slashMenuHasOptions(value, options)) {
       if (name === "down" || (ctrlOnly && name === "n")) {
@@ -2195,7 +2558,15 @@ export function ResearchCockpit() {
       if (name === "return" || name === "tab") {
         const option = resolveSlashOption(value, options, slashSelection)
         if (!option) return
+        const token = value.trim().split(/\s+/, 1)[0]?.toLowerCase()
         evt.preventDefault()
+        if (token && token !== option.display.trim().toLowerCase() && option.aliases?.some((alias) => alias.trim().toLowerCase() === token)) {
+          void runSlashPrompt(value)
+          promptInput?.clear()
+          setPromptValue("")
+          promptInput?.focus()
+          return
+        }
         selectSlashOption(option)
       }
       return
@@ -2209,10 +2580,136 @@ export function ResearchCockpit() {
 
   command.register(() => [
     {
+      title: "Create or import research task",
+      description: "/new csv --mode autonomous --full",
+      value: "research.new",
+      category: "Research",
+      slash: {
+        name: "new",
+        aliases: [
+          "review",
+          "review-full",
+          "review-csv",
+          "review-csv-full",
+          "csv",
+          "csv-full",
+          "autonomous",
+          "task-full",
+          "autonomous-full",
+        ],
+      },
+      onSelect: () => void createCsvTask(),
+    },
+    {
+      title: "Dataset actions",
+      description: "/dataset prepare|profile|status",
+      value: "research.dataset",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "dataset", aliases: ["prepare-dataset", "dataset-prepare", "profile"] },
+      onSelect: () => void runSlashPrompt("/dataset prepare"),
+    },
+    {
+      title: "Run selected candidate or recommendation",
+      description: "/run smoke|full|ref|blind|seed-sweep",
+      value: "research.run",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "run", aliases: ["iterate", "next", "ref-exec", "blind-exec", "seed-sweep"] },
+      onSelect: () => void runRecommendedAction(),
+    },
+    {
+      title: "Autonomous loop",
+      description: "/loop start|stop|status",
+      value: "research.loop",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "loop", aliases: ["agent-loop"] },
+      onSelect: () => void runAutonomousLoop(),
+    },
+    {
+      title: "Task navigation",
+      description: "/task next|prev|list|select <id>",
+      value: "research.task",
+      category: "Research",
+      keybind: "ctrl+j",
+      slash: { name: "task", aliases: ["task-next", "task-previous", "task-prev"] },
+      onSelect: () => selectTaskOffset(1),
+    },
+    {
+      title: "Select previous research task",
+      value: "research.task.previous",
+      category: "Research",
+      enabled: sortedTasks().length > 1,
+      keybind: "ctrl+k",
+      hidden: true,
+      onSelect: () => selectTaskOffset(-1),
+    },
+    {
+      title: "Candidate actions",
+      description: "/candidate next|prev|approve|reject",
+      value: "research.candidate",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: {
+        name: "candidate",
+        aliases: ["candidate-next", "candidate-previous", "candidate-prev", "cand-next", "cand-prev", "approve", "reject"],
+      },
+      onSelect: () => selectCandidateOffset(1),
+    },
+    {
+      title: "Runner actions",
+      description: "/runner check|edit-root|use-project",
+      value: "research.runner",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "runner", aliases: ["use-project-runner", "runner-root", "edit-runner-root"] },
+      onSelect: () => void runSlashPrompt("/runner check"),
+    },
+    {
+      title: "Switch interaction mode",
+      description: "/mode companion|socratic",
+      value: "research.interaction.mode",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "mode", aliases: ["mode-companion", "mode-socratic", "companion", "socratic"] },
+      onSelect: () => void switchInteractionMode(),
+    },
+    {
+      title: "Seed TSF baselines",
+      value: "research.seed.baselines",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "seed", aliases: ["seed-baselines", "baselines"] },
+      onSelect: () => void seedBaselines(),
+    },
+    {
+      title: "Export final bundle",
+      description: "/export bundle|report",
+      value: "research.export.report",
+      category: "Research",
+      enabled: !!selectedTask(),
+      slash: { name: "export", aliases: ["bundle", "report"] },
+      onSelect: () => void exportTaskArtifact(),
+    },
+    {
+      title: "Abort active cockpit action",
+      value: "research.abort.active",
+      category: "Research",
+      slash: { name: "abort", aliases: ["cancel", "stop"] },
+      onSelect: () => abortActiveOperation(),
+    },
+    {
+      title: "Command help",
+      value: "research.help",
+      category: "Research",
+      slash: { name: "help" },
+      onSelect: () => appendCockpitNotice("help", "Use /help, /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export."),
+    },
+    {
       title: "Back to NeoResearch home",
       value: "research.home",
       category: "Research",
-      keybind: "alt+h",
       slash: { name: "home" },
       onSelect: () => route.navigate({ type: "home" }),
     },
@@ -2231,108 +2728,67 @@ export function ResearchCockpit() {
       onSelect: () => route.navigate({ type: "home" }),
     },
     {
-      title: "Abort active cockpit action",
-      value: "research.abort.active",
-      category: "Research",
-      slash: { name: "abort", aliases: ["cancel", "stop"] },
-      onSelect: () => abortActiveOperation(),
-    },
-    {
-      title: "Switch interaction mode",
-      value: "research.interaction.mode",
-      category: "Research",
-      enabled: !!selectedTask(),
-      slash: { name: "mode" },
-      onSelect: () => void switchInteractionMode(),
-    },
-    {
-      title: "Switch to Companion mode",
-      value: "research.interaction.mode.companion",
-      category: "Research",
-      enabled: !!selectedTask(),
-      slash: { name: "mode-companion", aliases: ["companion"] },
-      onSelect: () => void switchInteractionMode("companion"),
-    },
-    {
-      title: "Switch to Socratic mode",
-      value: "research.interaction.mode.socratic",
-      category: "Research",
-      enabled: !!selectedTask(),
-      slash: { name: "mode-socratic", aliases: ["socratic"] },
-      onSelect: () => void switchInteractionMode("socratic"),
-    },
-    {
       title: "Create TSF review task",
       value: "research.create.review",
       category: "Research",
-      slash: { name: "review" },
+      hidden: true,
       onSelect: () => void createTask("review"),
     },
     {
       title: "Create TSF full-recipe review task",
       value: "research.create.review.full",
       category: "Research",
-      slash: { name: "review-full" },
+      hidden: true,
       onSelect: () => void createTask("review", { bridgeOnly: false }),
     },
     {
       title: "Create TSF review task from CSV",
       value: "research.create.review.csv",
       category: "Research",
-      slash: { name: "review-csv" },
+      hidden: true,
       onSelect: () => void createCsvTask("review"),
     },
     {
       title: "Create TSF full-recipe review task from CSV",
       value: "research.create.review.csv.full",
       category: "Research",
-      slash: { name: "review-csv-full" },
+      hidden: true,
       onSelect: () => void createCsvTask("review", { bridgeOnly: false }),
     },
     {
       title: "Create TSF autonomous task",
       value: "research.create.autonomous",
       category: "Research",
-      slash: { name: "task", aliases: ["autonomous"] },
+      hidden: true,
       onSelect: () => void createTask("autonomous"),
     },
     {
       title: "Create TSF full-recipe autonomous task",
       value: "research.create.autonomous.full",
       category: "Research",
-      slash: { name: "task-full", aliases: ["autonomous-full"] },
+      hidden: true,
       onSelect: () => void createTask("autonomous", { bridgeOnly: false }),
     },
     {
       title: "Create TSF task from CSV",
       value: "research.create.autonomous.csv",
       category: "Research",
-      keybind: "ctrl+n",
-      slash: { name: "csv", aliases: ["dataset"] },
+      hidden: true,
       onSelect: () => void createCsvTask(),
     },
     {
       title: "Create TSF full-recipe task from CSV",
       value: "research.create.autonomous.csv.full",
       category: "Research",
-      slash: { name: "csv-full", aliases: ["dataset-full"] },
+      hidden: true,
       onSelect: () => void createCsvTask(undefined, { bridgeOnly: false }),
-    },
-    {
-      title: "Seed TSF baselines",
-      value: "research.seed.baselines",
-      category: "Research",
-      enabled: !!selectedTask(),
-      keybind: "ctrl+b",
-      slash: { name: "seed-baselines", aliases: ["seed", "baselines"] },
-      onSelect: () => void seedBaselines(),
     },
     {
       title: "Profile research task",
       value: "research.profile.task",
       category: "Research",
       enabled: !!selectedTask(),
-      slash: { name: "profile" },
+      hidden: true,
       onSelect: () => void profileTask(),
     },
     {
@@ -2340,7 +2796,7 @@ export function ResearchCockpit() {
       value: "research.dataset.prepare",
       category: "Research",
       enabled: !!selectedTask(),
-      slash: { name: "prepare-dataset", aliases: ["dataset-prepare"] },
+      hidden: true,
       onSelect: () => void prepareTaskDataset(),
     },
     {
@@ -2348,7 +2804,7 @@ export function ResearchCockpit() {
       value: "research.approve.pending",
       category: "Research",
       enabled: !!pendingApproval(),
-      slash: { name: "approve" },
+      hidden: true,
       onSelect: () => void approvePending(),
     },
     {
@@ -2356,7 +2812,7 @@ export function ResearchCockpit() {
       value: "research.reject.pending",
       category: "Research",
       enabled: !!pendingApproval(),
-      slash: { name: "reject" },
+      hidden: true,
       onSelect: () => void rejectPending(),
     },
     {
@@ -2364,7 +2820,7 @@ export function ResearchCockpit() {
       value: "research.autonomous.iterate",
       category: "Research",
       enabled: selectedTask()?.mode === "autonomous" && runnerReady(),
-      slash: { name: "iterate" },
+      hidden: true,
       onSelect: () => void runAutonomousIteration(),
     },
     {
@@ -2372,8 +2828,7 @@ export function ResearchCockpit() {
       value: "research.autonomous.loop",
       category: "Research",
       enabled: canStartAutonomousLoop(),
-      keybind: "ctrl+l",
-      slash: { name: "agent-loop", aliases: ["loop"] },
+      hidden: true,
       onSelect: () => void runAutonomousLoop(),
     },
     {
@@ -2381,7 +2836,7 @@ export function ResearchCockpit() {
       value: "research.next.run",
       category: "Research",
       enabled: !!selectedTask(),
-      slash: { name: "next" },
+      hidden: true,
       onSelect: () => void runRecommendedAction(),
     },
     {
@@ -2389,26 +2844,15 @@ export function ResearchCockpit() {
       value: "research.task.next",
       category: "Research",
       enabled: sortedTasks().length > 1,
-      keybind: "ctrl+j",
-      slash: { name: "task-next" },
+      hidden: true,
       onSelect: () => selectTaskOffset(1),
-    },
-    {
-      title: "Select previous research task",
-      value: "research.task.previous",
-      category: "Research",
-      enabled: sortedTasks().length > 1,
-      keybind: "ctrl+k",
-      slash: { name: "task-previous", aliases: ["task-prev"] },
-      onSelect: () => selectTaskOffset(-1),
     },
     {
       title: "Select next research candidate",
       value: "research.candidate.next",
       category: "Research",
       enabled: taskCandidates().length > 1,
-      keybind: "alt+right",
-      slash: { name: "candidate-next", aliases: ["cand-next"] },
+      hidden: true,
       onSelect: () => selectCandidateOffset(1),
     },
     {
@@ -2416,8 +2860,7 @@ export function ResearchCockpit() {
       value: "research.candidate.previous",
       category: "Research",
       enabled: taskCandidates().length > 1,
-      keybind: "alt+left",
-      slash: { name: "candidate-previous", aliases: ["candidate-prev", "cand-prev"] },
+      hidden: true,
       onSelect: () => selectCandidateOffset(-1),
     },
     {
@@ -2425,7 +2868,7 @@ export function ResearchCockpit() {
       value: "research.runner.useProject",
       category: "Research",
       enabled: !!selectedTask(),
-      slash: { name: "use-project-runner", aliases: ["runner-root"] },
+      hidden: true,
       onSelect: () => void useProjectRunnerRoot(),
     },
     {
@@ -2433,7 +2876,7 @@ export function ResearchCockpit() {
       value: "research.runner.edit",
       category: "Research",
       enabled: !!selectedTask(),
-      slash: { name: "edit-runner-root" },
+      hidden: true,
       onSelect: () => void editRunnerRoot(),
     },
     {
@@ -2441,7 +2884,7 @@ export function ResearchCockpit() {
       value: "research.candidate.refGate",
       category: "Research",
       enabled: !!commandCandidate() && canRunResearchCockpitCandidate(commandCandidate()!),
-      slash: { name: "ref-gate", aliases: ["ref"] },
+      hidden: true,
       onSelect: () => {
         const candidate = commandCandidate()
         if (!candidate) return
@@ -2453,7 +2896,7 @@ export function ResearchCockpit() {
       value: "research.candidate.seedSweep",
       category: "Research",
       enabled: !!commandCandidate() && runnerReady() && canRunResearchCockpitCandidate(commandCandidate()!),
-      slash: { name: "seed-sweep" },
+      hidden: true,
       onSelect: () => {
         const candidate = commandCandidate()
         if (!candidate) return
@@ -2465,7 +2908,7 @@ export function ResearchCockpit() {
       value: "research.candidate.refExec",
       category: "Research",
       enabled: !!commandCandidate() && runnerReady() && canRunResearchCockpitCandidate(commandCandidate()!),
-      slash: { name: "ref-exec" },
+      hidden: true,
       onSelect: () => {
         const candidate = commandCandidate()
         if (!candidate) return
@@ -2477,7 +2920,7 @@ export function ResearchCockpit() {
       value: "research.candidate.blindGate",
       category: "Research",
       enabled: !!commandCandidate() && canRunResearchCockpitCandidate(commandCandidate()!),
-      slash: { name: "blind-gate", aliases: ["blind"] },
+      hidden: true,
       onSelect: () => {
         const candidate = commandCandidate()
         if (!candidate) return
@@ -2489,21 +2932,12 @@ export function ResearchCockpit() {
       value: "research.candidate.blindExec",
       category: "Research",
       enabled: !!commandCandidate() && runnerReady() && canRunResearchCockpitCandidate(commandCandidate()!),
-      slash: { name: "blind-exec" },
+      hidden: true,
       onSelect: () => {
         const candidate = commandCandidate()
         if (!candidate) return
         void executeCandidate(candidate, "blind_test")
       },
-    },
-    {
-      title: "Export final bundle",
-      value: "research.export.report",
-      category: "Research",
-      enabled: !!selectedTask(),
-      keybind: "ctrl+e",
-      slash: { name: "export", aliases: ["bundle", "report"] },
-      onSelect: () => void exportTaskArtifact(),
     },
   ])
 
@@ -2513,13 +2947,56 @@ export function ResearchCockpit() {
   const latestRun = createMemo(() => (runs() ?? [])[0])
   const streamLines = createMemo<StreamLine[]>(() => {
     const lines: StreamLine[] = []
+    const ambientLines: StreamLine[] = []
+    const persistentLines: StreamLine[] = []
     const run = latestRun()
     const task = selectedTask()
+    if (task) {
+      const candidateCount = taskCandidates().length
+      const candidatePosition = candidateCount > 0 ? `${selectedCandidateIndex() + 1}/${candidateCount}` : "0/0"
+      const runStatus = run ? `latest ${run.stage ?? "run"} ${run.status}` : "no run yet"
+      ambientLines.push({
+        id: "research-session-context",
+        text: `Research Agent: 当前研究 ${task.title} / candidate ${candidatePosition} / ${runStatus}`,
+        tone: "primary",
+      })
+    }
     const liveRunnerLines = runnerOutputLines().filter((item) => {
       if (task && item.taskID && item.taskID !== task.id) return false
       if (run && item.runID !== run.id) return false
       return true
     })
+    const progressArtifact = run
+      ? taskArtifacts().find((artifact) => artifact.kind === "runner_progress_jsonl" && artifact.runID === run.id)
+      : undefined
+    const persistedRunnerLines = Array.isArray(progressArtifact?.metadata.previewLines)
+      ? progressArtifact.metadata.previewLines
+          .map((item, index) => {
+            if (!item || typeof item !== "object" || Array.isArray(item)) return undefined
+            const record = item as JsonRecord
+            if (typeof record.line !== "string") return undefined
+            return {
+              id: `runner-replay-${progressArtifact!.id}-${index}`,
+              text: formatRunnerProgressLine({
+                taskID: typeof record.taskID === "string" ? record.taskID : task?.id,
+                runID: run?.id ?? "",
+                line: record.line,
+                event: typeof record.event === "string" ? record.event : undefined,
+                epoch: typeof record.epoch === "number" ? record.epoch : undefined,
+                horizon: typeof record.horizon === "number" ? record.horizon : undefined,
+                valLoss: typeof record.valLoss === "number" ? record.valLoss : undefined,
+                elapsedS: typeof record.elapsedS === "number" ? record.elapsedS : undefined,
+              }),
+              tone: record.event === "timeout" ? ("warning" as const) : ("muted" as const),
+            }
+          })
+          .filter((item): item is { id: string; text: string; tone: "muted" | "warning" } => item !== undefined)
+      : []
+    if (run && (run.status !== "running" || liveRunnerLines.length === 0)) {
+      for (const item of persistedRunnerLines) {
+        lines.push({ id: item.id, text: item.text, tone: item.tone })
+      }
+    }
     if (run?.status === "running") {
       for (const item of liveRunnerLines) {
         lines.push({ id: `runner-${item.id}`, text: item.text, tone: item.tone })
@@ -2527,14 +3004,14 @@ export function ResearchCockpit() {
     }
     if (run) {
       const tone = run.status === "succeeded" ? "success" : run.status === "failed" ? "error" : "warning"
-      lines.push({
+      ambientLines.push({
         id: `run-${run.id}`,
         text: runSummaryText(run),
         tone,
       })
       const failure = runFailureText(run)
       if (failure) {
-        lines.push({
+        ambientLines.push({
           id: `run-${run.id}-failure`,
           text: `Failure: ${failure}`,
           tone: "error",
@@ -2543,7 +3020,7 @@ export function ResearchCockpit() {
     } else {
       const clarification = socraticClarification()
       if (clarification.active) {
-        lines.push(
+        persistentLines.push(
           {
             id: "socratic-clarification",
             text: `Socratic clarification: slots: ${clarification.missingSlots.join(", ") || "unknown"}`,
@@ -2563,7 +3040,7 @@ export function ResearchCockpit() {
       } else {
         const approval = pendingApproval()
         if (approval) {
-          lines.push(
+          persistentLines.push(
             {
               id: "approval-requested",
               text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue or /reject to stop.`,
@@ -2580,7 +3057,7 @@ export function ResearchCockpit() {
             const mode = taskInteractionMode()
             if (mode === "socratic" || mode === "companion") {
               const title = mode === "socratic" ? "Socratic" : "Companion"
-              lines.push(
+              persistentLines.push(
                 {
                   id: `idle-task-${mode}`,
                   text: `${title} onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。`,
@@ -2593,17 +3070,17 @@ export function ResearchCockpit() {
                 })),
               )
               if (clarification.nextQuestion) {
-                lines.push({
+                persistentLines.push({
                   id: `idle-task-${mode}-next`,
                   text: `Next question: ${clarification.nextQuestion}`,
                   tone: "primary",
                 })
               }
             } else {
-              lines.push({ id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" })
+              persistentLines.push({ id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" })
             }
           } else {
-            lines.push({ id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" })
+            persistentLines.push({ id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" })
           }
         }
       }
@@ -2621,16 +3098,40 @@ export function ResearchCockpit() {
         .slice(-errorEventHistoryLimit)
         .map((event) => ({ id: event.id, kind: "error" as const, event })),
     ].sort((a, b) => a.id - b.id)
+    const timelineLines: StreamLine[] = []
     for (const item of timeline) {
       if (item.kind === "prompt") {
-        lines.push({ id: `prompt-${item.event.id}`, text: `You: ${item.event.text}`, tone: "text" })
-        if (item.event.detail) lines.push({ id: `prompt-detail-${item.event.id}`, text: item.event.detail, tone: "muted" })
+        timelineLines.push({ id: `prompt-${item.event.id}`, text: `You: ${item.event.text}`, tone: "text" })
+        if (item.event.detail) {
+          timelineLines.push({ id: `prompt-detail-${item.event.id}`, text: item.event.detail, tone: "muted" })
+        }
         continue
       }
       if (item.kind === "streaming-chat") {
+        const proposal = parseAgentActionProposal(item.event.text)
+        if (proposal) {
+          timelineLines.push(
+            {
+              id: `streaming-chat-${item.event.id}-proposal-command`,
+              text: `我建议执行：${proposal.command}`,
+              tone: "primary",
+            },
+            {
+              id: `streaming-chat-${item.event.id}-proposal-reason`,
+              text: `原因：${proposal.reason || proposal.title}`,
+              tone: "muted",
+            },
+            {
+              id: `streaming-chat-${item.event.id}-proposal-confirm`,
+              text: proposal.requireConfirm ? "[Enter 执行]   [Esc 取消]" : "只读建议可直接执行。",
+              tone: "success",
+            },
+          )
+          continue
+        }
         const parts = compactStreamTextParts(item.event.text)
         parts.forEach((part, index) => {
-          lines.push({
+          timelineLines.push({
             id: `streaming-chat-${item.event.id}-${index}`,
             text: index === 0 ? `Research Agent: ${part}` : `  ${part}`,
             tone: "primary",
@@ -2639,7 +3140,7 @@ export function ResearchCockpit() {
         continue
       }
       if (item.kind === "chat-loading") {
-        lines.push({
+        timelineLines.push({
           id: `chat-loading-${item.event.id}`,
           text: "Research Agent 正在生成回复...",
           tone: "primary",
@@ -2651,7 +3152,7 @@ export function ResearchCockpit() {
         if (item.event.action === "chat-status" && streamingChat()?.text) continue
         const parts = compactStreamTextParts(item.event.text)
         parts.forEach((part, index) => {
-          lines.push({
+          timelineLines.push({
             id: `action-${item.event.id}-${index}`,
             text: index === 0 ? `${item.event.action === "chat-status" ? "Status" : "Research Agent"}: ${part}` : `  ${part}`,
             tone: item.event.action === "chat-status" ? "muted" : "primary",
@@ -2659,12 +3160,13 @@ export function ResearchCockpit() {
         })
         continue
       }
-      lines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
+      timelineLines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
+    lines.push(...(timelineLines.length > 0 ? [...persistentLines, ...timelineLines] : [...ambientLines, ...persistentLines]))
     return lines
   })
   const promptPlaceholder = createMemo(() => {
-    if (!selectedTask()) return "询问 Research Agent，或使用 New CSV Task 创建带数据集的任务..."
+    if (!selectedTask()) return "询问 Research Agent，或使用 /new csv 创建带数据集的任务..."
     if (socraticClarification().active) return "回答当前 Socratic 问题..."
     if (!intentConfirmed()) return "确认需求后进入 Data Analysis，或继续补充需求..."
     if (taskInteractionMode() === "companion") return "请求建议、批准 checkpoint，或导出 bundle..."
@@ -2724,6 +3226,30 @@ export function ResearchCockpit() {
     if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
     return chatMetadata()?.model ?? "-"
   })
+  const contextSessionLine = createMemo(() => {
+    const sessionID = chatSessionID()
+    if (sessionID) return `session ${shortID(sessionID)}`
+    const task = selectedTask()
+    if (task) return `session ${shortID(task.id)}`
+    return "session -"
+  })
+  const researchContextLines = createMemo(() => {
+    const task = selectedTask()
+    if (!task) return []
+    if (chatUsageTotals().total > 0) {
+      const active = busy()
+      return active ? [`active ${active}`] : []
+    }
+    const candidateCount = taskCandidates().length
+    const candidatePosition = candidateCount > 0 ? `${selectedCandidateIndex() + 1}/${candidateCount}` : "0/0"
+    const lines = [
+      `task ${shortID(task.id)} ${task.status}`,
+      `research cand=${candidatePosition} runs=${taskRuns().length} ok=${succeededRuns()}`,
+    ]
+    const active = busy()
+    if (active) lines.push(`active ${active}`)
+    return lines
+  })
   const promptMetadataText = createMemo(() => {
     const selectedModel = local?.model.current()
     if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
@@ -2751,7 +3277,15 @@ export function ResearchCockpit() {
       runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
     }),
   )
-  const activeResearchAgent = createMemo(() => agentWorkflowProgress().find((item) => item.status === "active"))
+  const hasLiveRunnerProgress = createMemo(() => {
+    const task = selectedTask()
+    return runnerOutputLines().some((item) => !task || !item.taskID || item.taskID === task.id)
+  })
+  const liveResearchStage = createMemo(() => liveResearchStageForAction(busy(), hasLiveRunnerProgress()))
+  const displayAgentWorkflowProgress = createMemo(() =>
+    overlayLiveResearchWorkflow(agentWorkflowProgress(), liveResearchStage()),
+  )
+  const activeResearchAgent = createMemo(() => displayAgentWorkflowProgress().find((item) => item.status === "active"))
   const trainEvalDone = createMemo(() =>
     agentWorkflowProgress().some((item) => item.label === "TrainEval Agent" && item.status === "done"),
   )
@@ -2820,15 +3354,15 @@ export function ResearchCockpit() {
     progressState(hasResultArtifact(), (Boolean(validChampion()) || reflectionDone()) && !hasResultArtifact()),
   )
   const researchAgentStages = createMemo<ResearchAgentStage[]>(() => [
-    { key: "intent", label: "Intent Agent", status: intentProgress() },
-    { key: "data", label: "Data Analysis Agent", status: dataProgress() },
-    ...agentWorkflowProgress().map((item) => ({
+    { key: "intent", label: "Intent Agent", status: liveResearchStage() === "intent" ? "active" : intentProgress() },
+    { key: "data", label: "Data Analysis Agent", status: liveResearchStage() === "data" ? "active" : dataProgress() },
+    ...displayAgentWorkflowProgress().map((item) => ({
       key: item.label,
       label: item.label,
       displayLabel: item.displayLabel,
       status: item.status,
     })),
-    { key: "publish", label: "Publish Agent", status: publishProgress() },
+    { key: "publish", label: "Publish Agent", status: liveResearchStage() === "publish" ? "active" : publishProgress() },
   ])
   const automaticAgentStageIndex = createMemo(() => {
     const stages = researchAgentStages()
@@ -2906,69 +3440,12 @@ export function ResearchCockpit() {
             <text fg={cockpitColors.primary} onMouseUp={() => route.navigate({ type: "home" })}>
               Home
             </text>
-            <text fg={sortedTasks().length < 2 ? cockpitColors.textMuted : cockpitColors.primary} onMouseUp={() => selectTaskOffset(-1)}>
-              Previous Task
-            </text>
-            <text fg={sortedTasks().length < 2 ? cockpitColors.textMuted : cockpitColors.primary} onMouseUp={() => selectTaskOffset(1)}>
-              Next Task
-            </text>
-            <text
-              fg={busy() ? cockpitColors.textMuted : cockpitColors.primary}
-              onMouseUp={() => {
-                if (busy()) return
-                void createCsvTask()
-              }}
-            >
-              New CSV Task
-            </text>
-            <text
-              fg={!selectedTask() || !intentConfirmed() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
-              onMouseUp={() => {
-                if (!selectedTask() || !intentConfirmed() || busy()) return
-                void seedBaselines()
-              }}
-            >
-              Seed Baselines
-            </text>
-            <text
-              fg={
-                !canStartAutonomousLoop() || busy()
-                  ? cockpitColors.textMuted
-                  : cockpitColors.primary
-              }
-              onMouseUp={() => {
-                if (!canStartAutonomousLoop() || busy()) return
-                void runAutonomousLoop()
-              }}
-            >
-              Agent Loop
-            </text>
-            <text
-              fg={!selectedTask() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
-              onMouseUp={() => {
-                if (!selectedTask() || busy()) return
-                void exportTaskArtifact()
-              }}
-            >
-              Export Bundle
-            </text>
-            <text
-              fg={busy() || chatAwaitingFirstToken() ? cockpitColors.warning : cockpitColors.textMuted}
-              onMouseUp={() => {
-                abortActiveOperation()
-              }}
-            >
-              Abort
-            </text>
-            <text
-              fg={!selectedTask() || busy() ? cockpitColors.textMuted : cockpitColors.primary}
-              onMouseUp={() => {
-                if (!selectedTask() || busy()) return
-                void switchInteractionMode()
-              }}
-            >
-              Mode {researchInteractionModeLabel(taskInteractionMode())}
-            </text>
+            <text fg={cockpitColors.textMuted}>/new</text>
+            <text fg={cockpitColors.textMuted}>/dataset</text>
+            <text fg={cockpitColors.textMuted}>/run</text>
+            <text fg={cockpitColors.textMuted}>/loop</text>
+            <text fg={cockpitColors.textMuted}>/export</text>
+            <text fg={cockpitColors.textMuted}>/help</text>
           </box>
         </box>
 
@@ -3010,6 +3487,29 @@ export function ResearchCockpit() {
             </For>
           </box>
         </scrollbox>
+
+        <Show when={nextBestAction()}>
+          {(action) => (
+            <box
+              flexShrink={0}
+              backgroundColor={cockpitColors.panel}
+              border={["left"]}
+              borderColor={cockpitColors.success}
+              paddingLeft={2}
+              paddingRight={2}
+              paddingTop={1}
+              paddingBottom={1}
+              gap={0}
+            >
+              <text fg={cockpitColors.success} attributes={TextAttributes.BOLD} width="100%" overflow="hidden" wrapMode="none">
+                {`▶ Next: ${action().title} (${action().command})`}
+              </text>
+              <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                Enter 执行 · 输入其他问题可追问/跳过
+              </text>
+            </box>
+          )}
+        </Show>
 
         <box
           flexShrink={0}
@@ -3199,7 +3699,7 @@ export function ResearchCockpit() {
                     </text>
                   )}
                 </For>
-                <For each={agentWorkflowProgress()}>
+                <For each={displayAgentWorkflowProgress()}>
                   {(item) => (
                     <text
                       fg={agentStageColor({
@@ -3253,8 +3753,15 @@ export function ResearchCockpit() {
                   model {contextModelLabel()}
                 </text>
                 <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                  session {chatSessionID() ? shortID(chatSessionID()) : "-"}
+                  {contextSessionLine()}
                 </text>
+                <For each={researchContextLines()}>
+                  {(line) => (
+                    <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
+                      {line}
+                    </text>
+                  )}
+                </For>
                 <Show when={contextWindowLine()}>
                   {(line) => (
                     <text fg={cockpitColors.primary} width="100%" overflow="hidden" wrapMode="none">

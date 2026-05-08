@@ -162,6 +162,71 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
         self.assertEqual(exit_code, 5)
         resolve_candidate.assert_not_called()
 
+    def test_skip_smoke_reuses_fresh_resolved_candidate_without_rendering_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".neo-cast"
+            artifacts_dir = state_dir / "artifacts"
+            artifact_dir = artifacts_dir / "run_cached"
+            state_dir.mkdir(parents=True)
+            artifact_dir.mkdir(parents=True)
+            current_path = state_dir / "current_candidate.json"
+            resolved_path = state_dir / "resolved_candidate.json"
+            state_path = state_dir / "runner_state.json"
+            results_path = state_dir / "results.tsv"
+            current_path.write_text('{"recipe_id":"recipe_cached"}\n', encoding="utf-8")
+            resolved_path.write_text(
+                '{"candidate_id":"recipe_cached","model_family":"recipe:mlp"}\n',
+                encoding="utf-8",
+            )
+            (artifact_dir / "training_summary.json").write_text('{"num_params_M":0.25}\n', encoding="utf-8")
+            # Make the resolved file newer than the candidate that smoke already rendered.
+            current_mtime = 1_700_000_000
+            resolved_mtime = current_mtime + 10
+            current_path.touch()
+            resolved_path.touch()
+            current_path.chmod(0o644)
+            resolved_path.chmod(0o644)
+            import os
+
+            os.utime(current_path, (current_mtime, current_mtime))
+            os.utime(resolved_path, (resolved_mtime, resolved_mtime))
+            state = runner.RunnerState(
+                session_id="session_test",
+                best_run_id=None,
+                best_val_avg_mse=None,
+                keep_count=0,
+                crash_streak=0,
+                candidate_counter=0,
+                initialized_at="2026-04-29T00:00:00Z",
+                session_started_at="2026-04-29T00:00:00Z",
+            )
+            train_records = [
+                {"event": "eval_done", "val_avg_mse": 0.111, "val_avg_mae": 0.222},
+                {
+                    "event": "artifact_ready",
+                    "run_id": "cached",
+                    "artifact_dir": str(artifact_dir),
+                },
+                {"event": "done", "status": "success"},
+            ]
+
+            with (
+                patch.object(runner, "STATE_DIR", state_dir),
+                patch.object(runner, "ARTIFACTS_DIR", artifacts_dir),
+                patch.object(runner, "CURRENT_CANDIDATE_PATH", current_path),
+                patch.object(runner, "RESOLVED_CANDIDATE_PATH", resolved_path),
+                patch.object(runner, "STATE_PATH", state_path),
+                patch.object(runner, "RESULTS_PATH", results_path),
+                patch.object(runner, "_resolve_candidate") as resolve_candidate,
+                patch.object(runner, "_run_and_capture", return_value=(0, train_records)),
+                patch.object(runner, "_export_artifact", return_value=0),
+            ):
+                runner.ensure_results_file(force=True)
+                exit_code = runner.run_experiment(state, description="cached candidate", skip_smoke=True)
+
+        self.assertEqual(exit_code, 0)
+        resolve_candidate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

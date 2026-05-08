@@ -6,7 +6,9 @@ import { Bus } from "../../src/bus"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
+import { ResearchRunTable } from "../../src/research/research.sql"
 import { createFileResearchRuntime } from "../../src/research/runtime"
+import { Database, eq } from "../../src/storage"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
 
@@ -234,6 +236,21 @@ printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"smoke_eval_done"}\\n'
 printf '{"event":"artifact_ready","run_id":"metricless","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_metricless"
 printf '{"event":"done","status":"success"}\\n'
+`,
+    "utf8",
+  )
+}
+
+async function writeNaNNeoCastRunner(root: string) {
+  await mkdir(path.join(root, "py"), { recursive: true })
+  await writeFile(
+    path.join(root, "py", "validate.py"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf '{"event":"candidate_resolved"}\\n'
+printf '{"event":"epoch_end","horizon":24,"epoch":1,"val_loss":NaN}\\n'
+printf '{"event":"epoch_end","horizon":24,"epoch":2,"val_loss":NaN}\\n'
+printf '{"event":"epoch_end","horizon":24,"epoch":3,"val_loss":NaN}\\n'
 `,
     "utf8",
   )
@@ -1401,8 +1418,8 @@ describe("Research service", () => {
                   bridgeOnly: true,
                   neoCastProjectRoot: fakeNeoCastRoot,
                 }),
-                contextLength: 192,
-                predictionLengths: [24, 48],
+                contextLength: 12,
+                predictionLengths: [8],
                 dataset: {
                   loaderID: "local_csv",
                   path: datasetPath,
@@ -1420,13 +1437,127 @@ describe("Research service", () => {
         expect(prepared.artifact.kind).toBe("dataset_preparation_json")
         expect(prepared.datasetSpec).toMatchObject({
           source_csv: path.resolve(datasetPath),
-          input_len: 192,
-          horizons: [24, 48],
+          input_len: 12,
+          horizons: [8],
           feature_columns: ["a", "b"],
         })
         const payload = JSON.parse(await readFile(prepared.path, "utf8"))
         expect(payload.command.args).toContain("--source")
         expect(payload.datasetSpec.source_csv).toBe(path.resolve(datasetPath))
+      },
+    })
+  })
+
+  test("prepare dataset reports missing target columns instead of silently dropping them", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writePrepareDataNeoCastRunner(fakeNeoCastRoot)
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "Prepare dataset with missing columns",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec({
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                }),
+                contextLength: 12,
+                predictionLengths: [8],
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["a", "missing_target"],
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+
+        const prepared = await runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id })))
+        expect(prepared.datasetSpec.feature_columns).toEqual(["a"])
+        expect(prepared.command.warnings).toEqual([
+          "Only matched 1/2 requested target columns from CSV header; missing: missing_target.",
+        ])
+
+        const invalidTask = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "Prepare dataset with no matching columns",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec({
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                }),
+                contextLength: 12,
+                predictionLengths: [8],
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["missing_a", "missing_b"],
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+
+        await expect(
+          runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: invalidTask.id }))),
+        ).rejects.toThrow(/None of the requested target columns were found/)
+      },
+    })
+  })
+
+  test("prepare dataset fails early with a friendly message when a custom CSV is too short", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+    await writePrepareDataNeoCastRunner(fakeNeoCastRoot)
+    const datasetPath = path.join(tmp.path, "short.csv")
+    await writeFile(datasetPath, "date,OT\n2024-01-01,1\n2024-01-02,2\n2024-01-03,3\n", "utf8")
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "Short custom CSV",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec({
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                }),
+                contextLength: 96,
+                predictionLengths: [24],
+                dataset: {
+                  loaderID: "local_csv",
+                  path: datasetPath,
+                  targetCols: ["OT"],
+                },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+
+        await expect(
+          runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id }))),
+        ).rejects.toThrow(/Dataset is too short for automatic tsl_custom_70_10_20 splits/)
       },
     })
   })
@@ -1464,6 +1595,98 @@ describe("Research service", () => {
 
         expect(prepared.run.stage).toBe("smoke")
         expect(prepared.run.candidateID).toBe(candidate.id)
+      },
+    })
+  })
+
+  test("stale queued and running runs are reconciled to failed when the service starts", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await createTSFTask("Reconcile stale runs")
+        const candidate = await createCandidate({ taskID: task.id })
+        const running = await createRun({ taskID: task.id, candidateID: candidate.id, status: "running" })
+        const staleTime = Date.now() - 10 * 60 * 1000
+        Database.use((db) =>
+          db
+            .update(ResearchRunTable)
+            .set({ time_updated: staleTime, time_started: staleTime })
+            .where(eq(ResearchRunTable.id, running.id))
+            .run(),
+        )
+
+        const runs = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+        expect(runs[0]).toMatchObject({
+          id: running.id,
+          status: "failed",
+          error: "TUI restart while run was running",
+        })
+        expect(runs[0]?.timeFinished).toBeNumber()
+      },
+    })
+  })
+
+  test("runner execution aborts after repeated NaN validation losses", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeNaNNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "NaN watchdog",
+          { neoCastProjectRoot: fakeNeoCastRoot, pythonExecutable: "bash" },
+          "autonomous",
+        )
+        const candidate = await createCandidate({ taskID: task.id })
+
+        const executed = await runResearch(
+          Research.Service.use((svc) =>
+            svc.executeRun({
+              taskID: task.id,
+              candidateID: candidate.id,
+              stage: "smoke",
+            }),
+          ),
+        )
+
+        expect(executed.run.status).toBe("failed")
+        expect(executed.run.error).toContain("NaN watchdog")
+      },
+    })
+  })
+
+  test("research memory keys distinguish same-basename datasets by path and file hash", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const dirA = path.join(tmp.path, "projA")
+        const dirB = path.join(tmp.path, "projB")
+        await mkdir(dirA, { recursive: true })
+        await mkdir(dirB, { recursive: true })
+        const pathA = path.join(dirA, "ETTh1.csv")
+        const pathB = path.join(dirB, "ETTh1.csv")
+        await writeFile(pathA, "date,OT\n2024-01-01,1\n", "utf8")
+        await writeFile(pathB, "date,OT\n2024-01-01,2\n", "utf8")
+
+        const taskA = await createTSFTask("Dataset A", { datasetPath: pathA })
+        const candidateA = await createCandidate({ taskID: taskA.id })
+        await createRun({ taskID: taskA.id, candidateID: candidateA.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+
+        const taskB = await createTSFTask("Dataset B", { datasetPath: pathB })
+        const candidateB = await createCandidate({ taskID: taskB.id })
+        await createRun({ taskID: taskB.id, candidateID: candidateB.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+
+        const [memoryA] = await runResearch(Research.Service.use((svc) => svc.listMemory(taskA.id)))
+        const [memoryB] = await runResearch(Research.Service.use((svc) => svc.listMemory(taskB.id)))
+        expect(memoryA?.fingerprintSummary.sourceCsv).not.toBe(memoryB?.fingerprintSummary.sourceCsv)
+        expect(String(memoryA?.fingerprintSummary.sourceCsv)).toContain(path.resolve(pathA))
+        expect(String(memoryB?.fingerprintSummary.sourceCsv)).toContain(path.resolve(pathB))
       },
     })
   })
@@ -1658,6 +1881,78 @@ describe("Research service", () => {
             backbone: { type: "rnn" },
           },
         })
+      },
+    })
+  })
+
+  test("requires configured seed coverage before replacing an existing champion", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "seed-confirmed champion task",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                ...validTsfTaskSpec(),
+                evaluation: { protocol: "fixed_split", metricPrimary: "val_avg_mse", seeds: [1, 2, 3] },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 12 },
+            }),
+          ),
+        )
+        const championCandidate = await createCandidate({
+          taskID: task.id,
+          candidateSpec: { ...validTsfCandidateSpec(), recipeID: "stable_champion" } as Research.JsonRecord,
+        })
+        const challenger = await createCandidate({
+          taskID: task.id,
+          candidateSpec: { ...validTsfCandidateSpec(), recipeID: "seeded_challenger" } as Research.JsonRecord,
+        })
+        const championRun = await createRun({
+          taskID: task.id,
+          candidateID: championCandidate.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.5 },
+          resourceUsage: { seed: 1 },
+        })
+
+        expect((await runResearch(Research.Service.use((svc) => svc.getChampion(task.id))))?.runID).toBe(championRun.id)
+
+        await createRun({
+          taskID: task.id,
+          candidateID: challenger.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.48 },
+          resourceUsage: { seed: 1 },
+        })
+        expect((await runResearch(Research.Service.use((svc) => svc.getChampion(task.id))))?.candidateID).toBe(
+          championCandidate.id,
+        )
+
+        await createRun({
+          taskID: task.id,
+          candidateID: challenger.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.47 },
+          resourceUsage: { seed: 2 },
+        })
+        await createRun({
+          taskID: task.id,
+          candidateID: challenger.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.46 },
+          resourceUsage: { seed: 3 },
+        })
+
+        const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))
+        expect(champion?.candidateID).toBe(challenger.id)
+        expect(champion?.primaryMetric).toBeCloseTo(0.47)
       },
     })
   })
@@ -2393,12 +2688,30 @@ describe("Research service", () => {
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
         await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeFile(path.join(fakeNeoCastRoot, "pyproject.toml"), "[project]\nname = \"fake-neo-cast\"\n", "utf8")
+        await writeFile(path.join(fakeNeoCastRoot, "py", "prepare_tsf.py"), "PREPROCESS_VERSION = 1\n", "utf8")
+        const datasetPath = path.join(tmp.path, "train.csv")
+        await writeFile(datasetPath, "date,OT\n2024-01-01,1\n2024-01-02,2\n", "utf8")
 
-        const task = await createTSFTask("execute fake runner", {
-          bridgeOnly: true,
-          neoCastProjectRoot: fakeNeoCastRoot,
-          pythonExecutable: "bash",
-        })
+        const task = await runResearch(
+          Research.Service.use((svc) =>
+            svc.createTask({
+              title: "execute fake runner",
+              domainID: "tsf",
+              mode: "review",
+              taskSpec: {
+                ...validTsfTaskSpec({
+                  bridgeOnly: true,
+                  neoCastProjectRoot: fakeNeoCastRoot,
+                  pythonExecutable: "bash",
+                }),
+                dataset: { loaderID: "local_csv", path: datasetPath, targetCols: ["OT"] },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize", errorPreferences: "balanced" },
+              budget: { maxRuns: 12, latencyBudget: "no_constraint", parameterBudget: "no_constraint" },
+            }),
+          ),
+        )
         const seeded = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
         await runResearch(
           Research.Service.use((svc) =>
@@ -2423,7 +2736,12 @@ describe("Research service", () => {
         expect(executed.run.status).toBe("succeeded")
         expect(executed.run.metrics.val_avg_mse).toBe(0.123)
         expect(executed.run.resourceUsage.exitCode).toBe(0)
-        expect(executed.run.artifactRefs).toHaveLength(3)
+        expect(executed.run.resourceUsage.reproducibility).toMatchObject({
+          datasetSHA: expect.any(String),
+          lockHash: expect.any(String),
+          preprocessSHA: expect.any(String),
+        })
+        expect(executed.run.artifactRefs).toHaveLength(4)
 
         const writtenCandidate = JSON.parse(
           await readFile(path.join(fakeNeoCastRoot, ".neo-cast", "current_candidate.json"), "utf8"),
@@ -2433,6 +2751,7 @@ describe("Research service", () => {
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         expect(artifacts.some((artifact) => artifact.kind === "runner_plan_json")).toBe(true)
         expect(artifacts.some((artifact) => artifact.kind === "runner_artifact")).toBe(true)
+        expect(artifacts.some((artifact) => artifact.kind === "runner_progress_jsonl")).toBe(true)
         const executionLog = artifacts.find((artifact) => artifact.kind === "runner_execution_log_json")
         expect(executionLog?.runID).toBe(executed.run.id)
         expect(executionLog?.metadata).toMatchObject({
@@ -2529,6 +2848,12 @@ describe("Research service", () => {
         expect(progress.find((item) => item.event === "timeout")).toMatchObject({
           elapsedS: 61.4,
         })
+        const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+        const progressArtifact = artifacts.find((artifact) => artifact.kind === "runner_progress_jsonl")
+        expect(progressArtifact?.runID).toBeDefined()
+        const progressLog = await readFile(progressArtifact!.uri.replace("file://", ""), "utf8")
+        expect(progressLog).toContain('"event":"stage_start"')
+        expect(progressLog).toContain('"event":"epoch_end"')
       },
     })
   })
@@ -2562,10 +2887,11 @@ describe("Research service", () => {
 
         expect(executed.run.status).toBe("failed")
         expect(executed.run.resourceUsage.exitCode).toBe(7)
-        expect(executed.run.artifactRefs).toHaveLength(2)
+        expect(executed.run.artifactRefs).toHaveLength(3)
 
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         const executionLog = artifacts.find((artifact) => artifact.kind === "runner_execution_log_json")
+        const progressLog = artifacts.find((artifact) => artifact.kind === "runner_progress_jsonl")
         expect(executionLog?.metadata).toMatchObject({
           runnerID: executed.runPlan.runnerID,
           stage: "smoke",
@@ -2573,6 +2899,7 @@ describe("Research service", () => {
           recordCount: 2,
         })
         expect(executed.run.artifactRefs).toContain(executionLog!.id)
+        expect(executed.run.artifactRefs).toContain(progressLog!.id)
         const executionLogRecord = JSON.parse(await readFile(executionLog!.uri.replace("file://", ""), "utf8"))
         expect(executionLogRecord.stderr).toContain("runner failed before artifact creation")
         expect(executionLogRecord.records.map((record: { event?: string }) => record.event)).toContain("runner_error")

@@ -191,6 +191,13 @@ export type ResearchCockpitRecommendation = {
   detail: string
 }
 
+export type ResearchCockpitNbaAction = {
+  command: string
+  title: string
+  detail: string
+  action: ResearchCockpitRecommendation["action"]
+}
+
 const researchRefreshEventTypes = new Set([
   "research.task.created",
   "research.task.updated",
@@ -354,6 +361,44 @@ export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflow
 }
 
 export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflowInput): ResearchCockpitRecommendation {
+  const nba = selectNextBestAction(input)
+  if (nba) {
+    return {
+      action: nba.action,
+      title: nba.title,
+      detail: nba.detail,
+    }
+  }
+  if (input.runs.some((run) => run.status === "queued" || run.status === "running")) {
+    return {
+      action: "review_state",
+      title: "Run in progress",
+      detail: "Follow the live run block; the next best action will return when execution settles.",
+    }
+  }
+  if (input.task && !hasIntentConfirmation(input) && !hasCockpitProfileEvidence(input)) {
+    return {
+      action: "confirm_intent",
+      title: "Confirm requirements",
+      detail: "Review the Intent Agent slots and confirm before Data Analysis, baselines, or autonomous loop can start.",
+    }
+  }
+  if (input.task) {
+    return {
+      action: "review_state",
+      title: "Review latest research state",
+      detail: "No immediate blocking action is pending.",
+    }
+  }
+
+  return {
+    action: "create_task",
+    title: "Create a dataset-backed TSF task",
+    detail: "Enter a research goal to create a full-recipe autonomous task, or use /new csv to bind a local CSV.",
+  }
+}
+
+export function selectNextBestAction(input: ResearchCockpitWorkflowInput): ResearchCockpitNbaAction | null {
   const pendingApproval = input.approvals.find((approval) => approval.status === "pending")
   const hasProfile = hasCockpitProfileEvidence(input)
   const intentConfirmed = hasIntentConfirmation(input) || hasProfile
@@ -361,44 +406,47 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
   const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
   const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
   const runnableCandidate = input.candidates.find(canRunResearchCockpitCandidate)
+  const hasActiveRun = input.runs.some((run) => run.status === "queued" || run.status === "running")
 
   if (!input.task) {
     return {
+      command: "/new csv",
       action: "create_task",
       title: "Create a dataset-backed TSF task",
-      detail: "Enter a research goal to create a full-recipe autonomous task, or use New CSV Task to bind a local CSV.",
+      detail: "Enter a research goal to create a full-recipe autonomous task, or use /new csv to bind a local CSV.",
     }
   }
+  if (hasActiveRun) return null
   if (pendingApproval) {
     return {
+      command: "/candidate approve",
       action: "approve_gate",
-      title: "Approve pending gate",
+      title: "Review pending gate",
       detail: `${pendingApproval.kind} approval is waiting before the next promotion step.`,
     }
   }
   if (!input.runnerReady) {
     if (input.runnerRepairAction === "prepare_dataset") {
       return {
+        command: "/dataset prepare",
         action: "prepare_dataset",
-        title: "Prepare Neo-Cast dataset",
+        title: "Prepare dataset",
         detail: "Regenerate the runner dataset contract so it matches the selected task.",
       }
     }
     return {
+      command: "/runner check",
       action: "configure_runner",
-      title: "Configure Neo-Cast runner",
+      title: "Check runner",
       detail: "Set taskSpec.runtime.neoCastProjectRoot before executing candidate runs.",
     }
   }
   if (!intentConfirmed) {
-    return {
-      action: "confirm_intent",
-      title: "Confirm requirements",
-      detail: "Review the Intent Agent slots and confirm before Data Analysis, baselines, or autonomous loop can start.",
-    }
+    return null
   }
   if (!hasProfile) {
     return {
+      command: "/dataset profile",
       action: "profile",
       title: "Profile dataset",
       detail: "Generate the dataset fingerprint before comparing architectures.",
@@ -406,13 +454,15 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
   }
   if (!hasCandidates) {
     return {
+      command: "/seed",
       action: "seed_baselines",
-      title: "Seed baseline candidates",
+      title: "Seed baselines",
       detail: "Create initial recipes so the runner has concrete experiments to evaluate.",
     }
   }
   if (input.task.mode === "autonomous") {
     return {
+      command: "/loop start",
       action: "run_autonomous_loop",
       title: "Run autonomous loop",
       detail: "Let the manager iterate across design, runner, analyst, and memory steps.",
@@ -420,6 +470,7 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
   }
   if (runnableCandidate) {
     return {
+      command: "/run smoke",
       action: "run_smoke",
       title: "Run smoke execution",
       detail: `Execute ${runnableCandidate.id} and compare the primary metric.`,
@@ -427,16 +478,13 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
   }
   if (hasSucceededRun && !hasBundle) {
     return {
+      command: "/export bundle",
       action: "export_report",
       title: "Export final bundle",
       detail: "Package the latest evidence, model files, and report into a final bundle.",
     }
   }
-  return {
-    action: "review_state",
-    title: "Review latest research state",
-    detail: hasBundle ? "Inspect the exported bundle and decide whether to continue." : "No immediate blocking action is pending.",
-  }
+  return null
 }
 
 function hasCockpitDatasetProfile(input: Pick<ResearchCockpitWorkflowInput, "artifacts" | "fingerprint">) {
@@ -1037,9 +1085,12 @@ function preparedDatasetSpecPayloadMatchesTask(prepared: JsonRecord, task: Resea
     if (!arrayEquals(optionalNumberArray(taskSpec.predictionLengths), optionalNumberArray(prepared.horizons))) return false
     const targets = optionalStringArray(dataset.targetCols)
     const features = optionalStringArray(prepared.feature_columns)
-    if (targets && features) {
+    if (targets && features && targets.length > 0) {
       const featureSet = new Set(features)
-      if (targets.some((target) => !featureSet.has(target))) return false
+      const anyTargetInFeatures = targets.some((target) => featureSet.has(target))
+      // When none of the task targets appear in the prepared features, Python auto-inferred
+      // the columns (e.g. custom CSV without explicit --feature-cols). Skip the check.
+      if (anyTargetInFeatures && targets.some((target) => !featureSet.has(target))) return false
     }
     return true
   } catch {
@@ -1823,7 +1874,7 @@ export function buildDefaultTsfResearchTask(
       dataset: {
         loaderID: nonEmpty(defaults.datasetPreset) ?? (datasetPath ? "local_csv" : "etth1_tslib_v1"),
         ...(datasetPath ? { path: datasetPath } : {}),
-        targetCols: defaults.targetCols && defaults.targetCols.length > 0 ? defaults.targetCols : ["OT"],
+        targetCols: defaults.targetCols && defaults.targetCols.length > 0 ? defaults.targetCols : (datasetPath ? [] : ["OT"]),
         knownFutureCovariates: [],
         observedPastCovariates: [],
         staticCovariates: [],

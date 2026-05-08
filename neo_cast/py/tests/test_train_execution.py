@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -137,7 +138,7 @@ class TrainExecutionTest(unittest.TestCase):
                 exit_code = train_module.train_models(candidate=candidate, smoke=True, artifact_root=artifact_root)
 
             self.assertEqual(exit_code, 0)
-            summaries = list(artifact_root.glob("run_*/training_summary.json"))
+            summaries = list(artifact_root.glob("smoke/run_*/training_summary.json"))
             self.assertEqual(len(summaries), 1)
             return json.loads(summaries[0].read_text(encoding="utf-8"))
 
@@ -246,6 +247,50 @@ class TrainExecutionTest(unittest.TestCase):
         horizon_done = [event for event in events if event["event"] == "horizon_done"]
         self.assertEqual(len(horizon_done), 1)
         self.assertEqual(horizon_done[0]["reason"], "timeout")
+
+    def test_smoke_artifacts_are_isolated_and_old_smoke_runs_are_collected(self) -> None:
+        candidate = phase2_quantile_candidate()
+        events: list[dict[str, Any]] = []
+
+        def fake_loader(split: str, horizon: int, batch_size: int, shuffle: bool) -> DataLoader:
+            del split, shuffle
+            x = torch.randn(2, 16, 3)
+            y = torch.randn(2, horizon, 3)
+            return DataLoader(TensorDataset(x, y), batch_size=batch_size)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            smoke_root = artifact_root / "smoke"
+            smoke_root.mkdir(parents=True)
+            base_mtime = 1_700_000_000
+            for index in range(35):
+                old_dir = smoke_root / f"run_old_{index:02d}"
+                old_dir.mkdir()
+                os.utime(old_dir, (base_mtime + index, base_mtime + index))
+
+            with (
+                patch.object(train_module, "INPUT_LEN", 16),
+                patch.object(train_module, "NUM_CHANNELS", 3),
+                patch.object(train_module, "make_dataloader", fake_loader),
+                patch.object(train_module, "run_epoch", lambda *args, **kwargs: None),
+                patch.object(train_module, "compute_val_loss", lambda *args, **kwargs: 1.0),
+                patch.object(
+                    train_module,
+                    "evaluate_val_tsf",
+                    lambda models, *, device, horizons: {"val_avg_mse": 0.123, "val_avg_mae": 0.456},
+                ),
+                patch.object(train_module, "_make_run_id", return_value="fresh_smoke"),
+                patch.object(train_module, "save_run_artifacts", lambda **kwargs: Path(kwargs["artifact_dir"]).mkdir(parents=True, exist_ok=True)),
+                patch.object(train_module, "emit", lambda event, **payload: events.append({"event": event, **payload})),
+            ):
+                exit_code = train_module.train_models(candidate=candidate, smoke=True, artifact_root=artifact_root)
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((artifact_root / "smoke" / "run_fresh_smoke").exists())
+            self.assertFalse((artifact_root / "run_fresh_smoke").exists())
+            self.assertLessEqual(len(list((artifact_root / "smoke").glob("run_*"))), 30)
+            artifact_ready = next(event for event in events if event["event"] == "artifact_ready")
+            self.assertIn("/smoke/run_fresh_smoke", artifact_ready["artifact_dir"])
 
 
 if __name__ == "__main__":

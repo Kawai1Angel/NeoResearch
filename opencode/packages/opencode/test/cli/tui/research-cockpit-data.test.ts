@@ -34,6 +34,7 @@ import {
   researchCockpitCandidatePipeline,
   researchCockpitCandidateTitle,
   resolveResearchCockpitProjectRunnerRoot,
+  selectNextBestAction,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
   updateResearchCockpitTaskInteractionMode,
@@ -435,6 +436,93 @@ describe("research cockpit data helpers", () => {
       action: "profile",
       title: "Profile dataset",
     })
+  })
+
+  test("selects one next best action from cockpit state priority", () => {
+    const currentTask = task({
+      id: "task_nba",
+      mode: "autonomous",
+      taskSpec: {
+        runtime: { neoCastProjectRoot: "/tmp/neo-cast" },
+        dataset: { path: "/tmp/electricity.csv", targetCols: ["OT"] },
+        contextLength: 96,
+        predictionLengths: [24],
+      },
+      budget: { maxRuns: 12 },
+    })
+
+    expect(
+      selectNextBestAction({
+        task: currentTask,
+        candidates: [],
+        runs: [],
+        artifacts: [],
+        approvals: [],
+        champion: null,
+        fingerprint: {},
+        runnerReady: false,
+        runnerRepairAction: "prepare_dataset",
+      }),
+    ).toMatchObject({
+      command: "/dataset prepare",
+      title: "Prepare dataset",
+    })
+
+    expect(
+      selectNextBestAction({
+        task: currentTask,
+        candidates: [],
+        runs: [],
+        artifacts: [],
+        approvals: [],
+        champion: null,
+        fingerprint: {},
+        runnerReady: false,
+        runnerRepairAction: "configure_runner",
+      }),
+    ).toMatchObject({
+      command: "/runner check",
+      title: "Check runner",
+    })
+
+    expect(
+      selectNextBestAction({
+        task: currentTask,
+        candidates: [],
+        runs: [{ id: "profile_run", stage: "profile", status: "succeeded", metrics: {}, time: { created: 1, updated: 1 } }],
+        artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+        approvals: [
+          {
+            id: "approval_intent",
+            kind: "protocol",
+            status: "approved",
+            reason: "[checkpoint:intent_confirmed]\n需求交流已确认。",
+            time: { created: 1, updated: 1 },
+          },
+        ],
+        champion: null,
+        fingerprint: { datasetProfile: { rowCount: 100 } },
+        runnerReady: true,
+      }),
+    ).toMatchObject({
+      command: "/seed",
+      title: "Seed baselines",
+    })
+  })
+
+  test("hides next best action while a run is queued or running", () => {
+    expect(
+      selectNextBestAction({
+        task: task({ id: "task_running", mode: "autonomous" }),
+        candidates: [candidate({ id: "candidate_running" })],
+        runs: [{ id: "run_running", stage: "smoke", status: "running", metrics: {}, time: { created: 1, updated: 1 } }],
+        artifacts: [artifact({ id: "profile_artifact", kind: "task_profile_json" })],
+        approvals: [],
+        champion: null,
+        fingerprint: { datasetProfile: { rowCount: 100 } },
+        runnerReady: true,
+      }),
+    ).toBeNull()
   })
 
   test("keeps planning and design agents pending while the runner dataset needs repair", () => {

@@ -87,7 +87,7 @@ class DatasetPresetTest(unittest.TestCase):
         self.assertEqual(spec.val, (700, 800))
         self.assertEqual(spec.ref_test, (800, 1_000))
 
-    def test_custom_task_id_without_preset_uses_contiguous_splits(self) -> None:
+    def test_custom_task_id_without_preset_uses_tsl_custom_splits_by_default(self) -> None:
         df = pd.DataFrame(
             {
                 "date": pd.date_range("2021-01-01", periods=7_588, freq="D"),
@@ -106,6 +106,7 @@ class DatasetPresetTest(unittest.TestCase):
             train_rows=None,
             val_rows=None,
             ref_test_rows=None,
+            split_strategy=None,
             missing_strategy=None,
             missing_limit=None,
             frequency=None,
@@ -114,6 +115,37 @@ class DatasetPresetTest(unittest.TestCase):
         )
 
         self.assertEqual(spec.task_id, "exchange_rate")
+        self.assertEqual(spec.train, (0, 5_311))
+        self.assertEqual(spec.val, (5_311, 6_071))
+        self.assertEqual(spec.ref_test, (6_071, 7_588))
+
+    def test_custom_task_id_can_request_legacy_contiguous_splits(self) -> None:
+        df = pd.DataFrame(
+            {
+                "date": pd.date_range("2021-01-01", periods=7_588, freq="D"),
+                "OT": range(7_588),
+            }
+        )
+
+        spec = prepare_tsf._build_materialize_spec(
+            df=df,
+            dataset_preset=None,
+            task_id="exchange_rate",
+            timestamp_col=None,
+            feature_columns=["OT"],
+            input_len=96,
+            horizons=[24],
+            train_rows=None,
+            val_rows=None,
+            ref_test_rows=None,
+            split_strategy="contiguous_60_20_20",
+            missing_strategy=None,
+            missing_limit=None,
+            frequency=None,
+            allow_irregular=None,
+            irregular_ratio_warn=None,
+        )
+
         self.assertEqual(spec.train, (0, 4_552))
         self.assertEqual(spec.val, (4_552, 6_070))
         self.assertEqual(spec.ref_test, (6_070, 7_588))

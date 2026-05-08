@@ -111,7 +111,7 @@ export const TSFTaskSpec = z
       .object({
         loaderID: z.string().min(1),
         path: z.string().optional(),
-        targetCols: z.array(z.string().min(1)).min(1),
+        targetCols: z.array(z.string().min(1)).default([]),
         knownFutureCovariates: z.array(z.string()).default([]),
         observedPastCovariates: z.array(z.string()).default([]),
         staticCovariates: z.array(z.string()).default([]),
@@ -858,14 +858,28 @@ export function toNeoCastRecipePayload(task: TSFTaskSpec, recipe: TSFCandidateRe
   }
 }
 
-function commandForStage(stage: DomainRunStage, task: TSFTaskSpec, description: string): DomainRunPlan["command"] {
+function commandTimeoutForRecipe(stage: DomainRunStage, recipe?: TSFCandidateRecipe) {
+  if (stage !== "low_fidelity" && stage !== "full") return undefined
+  const timeBudgetS = recipe?.trainingStrategy.budget.timeBudgetS
+  if (typeof timeBudgetS !== "number" || !Number.isFinite(timeBudgetS)) return undefined
+  return Math.max(120, timeBudgetS + 120) * 1000
+}
+
+function commandForStage(
+  stage: DomainRunStage,
+  task: TSFTaskSpec,
+  description: string,
+  recipe?: TSFCandidateRecipe,
+): DomainRunPlan["command"] {
   const runtime = task.runtime
-  return createNeoCastRunnerCommand({
+  const command = createNeoCastRunnerCommand({
     stage,
     runtime,
     description,
     explicitRoot: runtime.neoCastProjectRoot,
   })
+  const timeoutMs = commandTimeoutForRecipe(stage, recipe)
+  return timeoutMs === undefined ? command : { ...command, timeoutMs }
 }
 
 function expectedEvents(stage: DomainRunStage) {
@@ -910,7 +924,7 @@ export function createTSFRunPlan(input: {
         content: payload as DomainRunPlan["writes"][number]["content"],
       },
     ],
-    command: commandForStage(stage, task, description),
+    command: commandForStage(stage, task, description, recipe),
     expectedEvents: expectedEvents(stage),
     expectedMetrics:
       stage === "ref_test"
@@ -1267,7 +1281,9 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
       warning: datasetProfileWarning(datasetPath, "dataset_empty", "Dataset profile requires a header and data rows."),
     }
   }
-  const dataRows = rows.slice(1)
+  const MAX_PROFILE_ROWS = 5000
+  const MAX_PROFILE_COLS = 20
+  const dataRows = rows.slice(1, MAX_PROFILE_ROWS + 1)
   const targetIndexes = task.dataset.targetCols
     .map((target) => header.indexOf(target))
     .filter((index) => index >= 0)
@@ -1281,6 +1297,7 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
             const valid = parsed.filter(Number.isFinite).length
             return valid > 0 && valid / dataRows.length >= 0.5
           })
+          .slice(0, MAX_PROFILE_COLS)
   if (numericIndexes.length === 0) {
     return {
       warning: datasetProfileWarning(
@@ -2662,15 +2679,25 @@ function metricText(metrics: JsonRecord) {
     .join(", ")
 }
 
+function probabilisticMetricName(candidateSpec: JsonRecord, fallbackMetric: string) {
+  const parsed = TSFCandidateRecipe.safeParse(candidateSpec)
+  if (!parsed.success) return fallbackMetric
+  const distribution = parsed.data.predictionHead.outputDistribution
+  if (distribution === "quantile") return "val_avg_pinball"
+  if (distribution === "gaussian") return "val_avg_crps_approx"
+  return fallbackMetric
+}
+
 function evaluateTSFRun(input: DomainRunEvaluationContext): DomainRunEvaluation | undefined {
   const task = TSFTaskSpec.safeParse(input.task.taskSpec)
   const objective = asRecord(input.task.objective)
-  const primaryMetricName =
+  const fallbackMetricName =
     typeof objective.primaryMetric === "string"
       ? objective.primaryMetric
       : typeof objective.metric === "string"
         ? objective.metric
         : ((task.success ? task.data.evaluation.metricPrimary : undefined) ?? "val_avg_mse")
+  const primaryMetricName = probabilisticMetricName(input.candidate.candidateSpec, fallbackMetricName)
   const direction = objective.direction === "maximize" ? "maximize" : "minimize"
   const value = input.run.metrics[primaryMetricName]
   const primaryMetric = typeof value === "number" ? value : undefined

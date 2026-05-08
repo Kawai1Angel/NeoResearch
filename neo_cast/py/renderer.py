@@ -70,7 +70,7 @@ def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | Non
             "param_budget_m": min(float(max_params) / 1_000_000, DEFAULT_PARAM_BUDGET_M)
             if max_params
             else DEFAULT_PARAM_BUDGET_M,
-            "time_budget_s": min(int(budget["time_budget_s"]), DEFAULT_TIME_BUDGET_S),
+            "time_budget_s": DEFAULT_TIME_BUDGET_S,
             "latency_priority": constraints.get("latency_priority", "medium"),
         },
         "smoke_config": smoke_config,

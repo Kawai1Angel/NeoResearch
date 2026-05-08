@@ -173,6 +173,15 @@ def _run_smoke(candidate_path: Path, resolved_path: Path, artifacts_dir: Path) -
     if not resolved_ok:
         print("error: renderer did not emit candidate_resolved")
         return 1
+    print(
+        json.dumps(
+            {
+                "event": "resolved_candidate_ready",
+                "resolved_candidate_path": str(resolved_path.resolve()),
+            }
+        ),
+        flush=True,
+    )
 
     train_cmd = [
         sys.executable,

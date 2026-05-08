@@ -124,7 +124,7 @@ function registerExperimentLineage(projectRoot, row, options = {}) {
       candidate_id: row.candidate_id || null,
       model_family: row.model_family || null,
       status: row.status || null,
-      is_best: row.is_best || null,
+      is_best: row.status === "keep" ? "1" : "0",
       val_avg_mse: row.val_avg_mse || null,
     },
   });
@@ -146,7 +146,7 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
       session_id: row.session_id || null,
       candidate_id: row.candidate_id || null,
       status: row.status || null,
-      is_best: row.is_best || null,
+      is_best: row.status === "keep" ? "1" : "0",
     },
   });
   return registerVersion(projectRoot, {
@@ -159,7 +159,7 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
       session_id: row.session_id || null,
       candidate_id: row.candidate_id || null,
       status: row.status || null,
-      is_best: row.is_best || null,
+      is_best: row.status === "keep" ? "1" : "0",
       report_path: published.reportPath,
       report_manifest_path: published.manifestPath,
       report_copied: published.copied,

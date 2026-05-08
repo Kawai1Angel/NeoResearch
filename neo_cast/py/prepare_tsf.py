@@ -334,6 +334,7 @@ def _build_materialize_spec(
     train_rows: tuple[int, int] | None,
     val_rows: tuple[int, int] | None,
     ref_test_rows: tuple[int, int] | None,
+    split_strategy: str | None = None,
     missing_strategy: str | None,
     missing_limit: int | None,
     frequency: str | None,
@@ -360,6 +361,11 @@ def _build_materialize_spec(
     selected_input_len = input_len or default_spec.input_len
     selected_horizons = horizons or list(default_spec.horizons)
 
+    preset_split_strategy = default_payload.get("split_strategy") if use_preset_policy else None
+    effective_split_strategy = split_strategy or (
+        preset_split_strategy if isinstance(preset_split_strategy, str) else None
+    ) or "tsl_custom_70_10_20"
+
     if train_rows and val_rows and ref_test_rows:
         splits = {
             "train": train_rows,
@@ -372,10 +378,12 @@ def _build_materialize_spec(
             "val": default_spec.val,
             "ref_test": default_spec.ref_test,
         }
-    elif use_preset_policy and default_payload.get("split_strategy") == "tsl_custom_70_10_20":
+    elif effective_split_strategy == "tsl_custom_70_10_20":
         splits = infer_tsl_custom_splits(len(df), selected_input_len, max(selected_horizons))
-    else:
+    elif effective_split_strategy == "contiguous_60_20_20":
         splits = infer_contiguous_splits(len(df), selected_input_len, max(selected_horizons))
+    else:
+        raise ValueError(f"Unsupported split_strategy: {effective_split_strategy}")
 
     return DatasetSpec.from_payload(
         {
@@ -425,6 +433,7 @@ def materialize_visible_splits(
     train_rows: tuple[int, int] | None = None,
     val_rows: tuple[int, int] | None = None,
     ref_test_rows: tuple[int, int] | None = None,
+    split_strategy: str | None = None,
     missing_strategy: str | None = None,
     missing_limit: int | None = None,
     frequency: str | None = None,
@@ -456,6 +465,7 @@ def materialize_visible_splits(
         train_rows=train_rows,
         val_rows=val_rows,
         ref_test_rows=ref_test_rows,
+        split_strategy=split_strategy,
         missing_strategy=missing_strategy,
         missing_limit=missing_limit,
         frequency=frequency,
@@ -1130,6 +1140,12 @@ def main() -> None:
         help="Runner-only reference test row range as start:end.",
     )
     parser.add_argument(
+        "--split-strategy",
+        choices=["tsl_custom_70_10_20", "contiguous_60_20_20"],
+        default=None,
+        help="Automatic split policy when explicit row ranges are omitted. Custom CSV defaults to tsl_custom_70_10_20.",
+    )
+    parser.add_argument(
         "--missing-strategy",
         choices=["reject", "drop", "forward_fill", "mean_fill", "linear_interpolate"],
         default=None,
@@ -1189,6 +1205,7 @@ def main() -> None:
             train_rows=parse_row_range(args.train_rows) if args.train_rows else None,
             val_rows=parse_row_range(args.val_rows) if args.val_rows else None,
             ref_test_rows=parse_row_range(args.ref_test_rows) if args.ref_test_rows else None,
+            split_strategy=args.split_strategy,
             missing_strategy=args.missing_strategy,
             missing_limit=args.missing_limit,
             frequency=args.frequency,

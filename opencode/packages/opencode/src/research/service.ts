@@ -1,12 +1,13 @@
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { cp, mkdir, readFile, writeFile } from "fs/promises"
-import { existsSync } from "fs"
+import { existsSync, openSync, readSync, closeSync } from "fs"
+import { createHash } from "crypto"
 import os from "os"
 import path from "path"
 import { deflateSync } from "zlib"
 import z from "zod"
-import { and, desc, eq, inArray, isNull, ne, Database, NotFoundError } from "@/storage"
+import { and, desc, eq, inArray, isNull, lt, ne, Database, NotFoundError } from "@/storage"
 import { Bus } from "@/bus"
 import { Instance } from "@/project/instance"
 import * as Process from "@/util/process"
@@ -280,6 +281,13 @@ interface RunnerExecution {
   readonly records: Record<string, unknown>[]
 }
 
+const RUNNER_IDLE_TIMEOUT_MS = 180_000
+const RUNNER_ABORT_KILL_GRACE_MS = 5_000
+const RUNNER_NAN_WATCHDOG_LIMIT = 3
+const STALE_RUN_RECONCILE_MS = 5 * 60_000
+const DEFAULT_CUSTOM_SPLIT_STRATEGY = "tsl_custom_70_10_20"
+type DatasetSplitStrategy = "tsl_custom_70_10_20" | "contiguous_60_20_20"
+
 interface RunBudgetExceeded {
   readonly limit: number
   readonly used: number
@@ -431,11 +439,41 @@ function parseProgressLine(line: string): RunnerProgressFields {
   }
 }
 
-function metricsFromRecords(records: Record<string, unknown>[]) {
+function runnerLineHasNaNValidationLoss(line: string) {
+  if (/"val_loss"\s*:\s*NaN\b/i.test(line) || /\bval_loss\s*=\s*NaN\b/i.test(line)) return true
+  try {
+    const parsed = JSON.parse(line)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false
+    const record = parsed as Record<string, unknown>
+    const value = record.val_loss ?? record.valLoss
+    return typeof value === "number" && Number.isNaN(value)
+  } catch {
+    return false
+  }
+}
+
+function runnerLineHasFiniteValidationLoss(line: string) {
+  try {
+    const parsed = JSON.parse(line)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false
+    const record = parsed as Record<string, unknown>
+    return finiteNumber(record.val_loss) !== undefined || finiteNumber(record.valLoss) !== undefined
+  } catch {
+    return false
+  }
+}
+
+function metricsFromRecords(records: Record<string, unknown>[], stage?: DomainRunStage) {
   const metrics: Record<string, number> = {}
   for (const record of records) {
     for (const [key, value] of Object.entries(record)) {
-      if ((key.startsWith("val_") || key.startsWith("ref_test_")) && typeof value === "number") {
+      const acceptsStageMetric =
+        stage === "ref_test"
+          ? key.startsWith("ref_test_")
+          : stage === undefined
+            ? key.startsWith("val_") || key.startsWith("ref_test_")
+            : key.startsWith("val_")
+      if (acceptsStageMetric && typeof value === "number") {
         metrics[key] = value
       }
     }
@@ -696,6 +734,34 @@ function taskEvaluationSeeds(task: ResearchTask, override?: readonly number[]) {
     .filter((seed): seed is number => typeof seed === "number" && Number.isFinite(seed) && seed >= 0)
     .map((seed) => Math.floor(seed))
   return seeds.length > 0 ? [...new Set(seeds)] : [42]
+}
+
+function metricSamplesForCandidate(
+  runs: readonly ResearchRun[],
+  candidateID: ResearchCandidateID,
+  metricName: string,
+  stage: ResearchRun["stage"],
+) {
+  return runs
+    .filter((item) => item.candidateID === candidateID && item.status === "succeeded" && item.stage === stage)
+    .map((item) => metricValue(item.metrics, metricName))
+    .filter((item): item is number => item !== undefined)
+}
+
+function metricSampleSummary(samples: readonly number[]) {
+  const count = samples.length
+  const mean = count === 0 ? undefined : samples.reduce((sum, value) => sum + value, 0) / count
+  const variance =
+    count < 2 || mean === undefined
+      ? 0
+      : samples.reduce((sum, value) => sum + (value - mean) ** 2, 0) / count
+  const std = Math.sqrt(variance)
+  const ci95 = count < 2 ? 0 : 1.96 * (std / Math.sqrt(count))
+  return { count, mean, std, ci95 }
+}
+
+function intervalsOverlap(aMean: number, aCi95: number, bMean: number, bCi95: number) {
+  return aMean - aCi95 <= bMean + bCi95 && bMean - bCi95 <= aMean + aCi95
 }
 
 function typeValue(value: unknown) {
@@ -2498,31 +2564,186 @@ function renderReleasePackageMarkdown(input: {
   ].join("\n")
 }
 
+async function ensureRunnerStateInitialized(plan: DomainRunPlan): Promise<void> {
+  const cwd = plan.command.cwd ?? process.cwd()
+  const stateFile = path.join(cwd, ".neo-cast", "runner_state.json")
+  if (existsSync(stateFile)) return
+
+  const scriptArg = plan.command.args[0]
+  if (typeof scriptArg !== "string" || scriptArg.length === 0) return
+  // Only the runner.py CLI requires `init`; smoke (validate.py) does not.
+  if (!scriptArg.endsWith("runner.py")) return
+
+  const runnerScript = path.isAbsolute(scriptArg) ? scriptArg : path.join(cwd, scriptArg)
+  if (!existsSync(runnerScript)) {
+    throw new Error(
+      `Cannot initialize Neo-Cast runner state: runner script not found at ${runnerScript}`,
+    )
+  }
+
+  const result = await Process.run([plan.command.executable, runnerScript, "init"], {
+    cwd,
+    env: plan.command.env,
+    nothrow: true,
+    timeout: 30_000,
+  })
+  if (result.code !== 0) {
+    const stderr = result.stderr.toString().trim()
+    const stdout = result.stdout.toString().trim()
+    const detail = stderr.length > 0 ? stderr : stdout
+    throw new Error(
+      `Neo-Cast runner init failed (exit ${result.code}) at ${cwd}${detail ? `: ${detail}` : ""}`,
+    )
+  }
+}
+
 async function executeRunnerPlan(
   plan: DomainRunPlan,
   onProgressLine?: (line: string) => void,
 ): Promise<RunnerExecution> {
   const cwd = plan.command.cwd ?? process.cwd()
+  await ensureRunnerStateInitialized(plan)
   for (const item of plan.writes) {
     const file = runnerPath(cwd, item.path)
     await mkdir(path.dirname(file), { recursive: true })
     await writeFile(file, `${JSON.stringify(item.content, null, 2)}\n`, "utf8")
   }
 
+  const abortController = new AbortController()
+  let abortReason: string | undefined
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  let commandTimer: ReturnType<typeof setTimeout> | undefined
+  let consecutiveNaNLosses = 0
+  const clearRunnerTimers = () => {
+    if (idleTimer) clearTimeout(idleTimer)
+    if (commandTimer) clearTimeout(commandTimer)
+    idleTimer = undefined
+    commandTimer = undefined
+  }
+  const abortRunner = (reason: string) => {
+    if (abortReason !== undefined) return
+    abortReason = reason
+    abortController.abort()
+  }
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(
+      () => abortRunner(`Runner idle timeout: no stdout/stderr for ${RUNNER_IDLE_TIMEOUT_MS / 1000}s`),
+      RUNNER_IDLE_TIMEOUT_MS,
+    )
+  }
+  const handleStdoutLine = (line: string) => {
+    resetIdleTimer()
+    if (runnerLineHasNaNValidationLoss(line)) {
+      consecutiveNaNLosses += 1
+      if (consecutiveNaNLosses >= RUNNER_NAN_WATCHDOG_LIMIT) {
+        abortRunner(`NaN watchdog: observed ${consecutiveNaNLosses} consecutive val_loss=NaN records`)
+      }
+    } else if (runnerLineHasFiniteValidationLoss(line)) {
+      consecutiveNaNLosses = 0
+    }
+    onProgressLine?.(line)
+  }
+  resetIdleTimer()
+  if (plan.command.timeoutMs !== undefined) {
+    commandTimer = setTimeout(
+      () => abortRunner(`Runner command timeout: exceeded ${plan.command.timeoutMs}ms`),
+      plan.command.timeoutMs,
+    )
+  }
   const result = await Process.runStreaming([plan.command.executable, ...plan.command.args], {
     cwd,
     env: plan.command.env,
-    timeout: plan.command.timeoutMs,
+    abort: abortController.signal,
+    kill: "SIGKILL",
+    timeout: RUNNER_ABORT_KILL_GRACE_MS,
     nothrow: true,
-    onStdoutLine: onProgressLine,
+    onStdoutLine: handleStdoutLine,
+    onStderrLine: () => resetIdleTimer(),
   })
+  clearRunnerTimers()
   const stdout = result.stdout.toString()
+  const stderr = [result.stderr.toString(), abortReason].filter((item) => item && item.length > 0).join("\n")
   return {
-    exitCode: result.code,
+    exitCode: abortReason === undefined ? result.code : result.code === 0 ? 1 : result.code,
     stdout,
-    stderr: result.stderr.toString(),
+    stderr,
     records: parseRunnerRecords(stdout),
   }
+}
+
+async function sha256File(file: string) {
+  try {
+    return createHash("sha256").update(await readFile(file)).digest("hex")
+  } catch {
+    return undefined
+  }
+}
+
+function firstExistingFile(candidates: readonly string[]) {
+  return candidates.find((candidate) => existsSync(candidate))
+}
+
+async function gitHead(cwd: string) {
+  const result = await Process.run(["git", "rev-parse", "HEAD"], {
+    cwd,
+    nothrow: true,
+    timeout: 5_000,
+  })
+  const value = result.stdout.toString().trim()
+  return result.code === 0 && value.length > 0 ? value : undefined
+}
+
+async function buildReproducibilitySeal(
+  task: ResearchTask,
+  plan: DomainRunPlan,
+  workspaceRoot: string,
+): Promise<JsonRecord> {
+  const taskSpec = recordValue(task.taskSpec)
+  const runtime = recordValue(taskSpec.runtime)
+  const dataset = recordValue(taskSpec.dataset)
+  const neoCastRoot =
+    typeof runtime.neoCastProjectRoot === "string" && runtime.neoCastProjectRoot.length > 0
+      ? path.resolve(runtime.neoCastProjectRoot)
+      : path.resolve(plan.command.cwd ?? workspaceRoot)
+  const sourcePath =
+    typeof dataset.path === "string" && dataset.path.length > 0
+      ? path.resolve(workspaceRoot, dataset.path)
+      : undefined
+  const lockPath = firstExistingFile([
+    path.join(neoCastRoot, "uv.lock"),
+    path.join(neoCastRoot, "poetry.lock"),
+    path.join(neoCastRoot, "pyproject.toml"),
+    path.join(neoCastRoot, "requirements.txt"),
+    path.join(workspaceRoot, "bun.lock"),
+    path.join(workspaceRoot, "bun.lockb"),
+    path.join(workspaceRoot, "package-lock.json"),
+  ])
+  const preprocessPath = firstExistingFile([
+    path.join(neoCastRoot, ".neo-cast", "dataset_spec.json"),
+    path.join(neoCastRoot, ".neo-cast", "dataset", "dataset_spec.json"),
+    path.join(neoCastRoot, "py", "prepare_tsf.py"),
+  ])
+  const [workspaceGitSHA, datasetSHA, lockHash, preprocessSHA] = await Promise.all([
+    gitHead(workspaceRoot),
+    sourcePath === undefined ? undefined : sha256File(sourcePath),
+    lockPath === undefined ? undefined : sha256File(lockPath),
+    preprocessPath === undefined ? undefined : sha256File(preprocessPath),
+  ])
+  return {
+    generatedAt: new Date().toISOString(),
+    workspaceRoot,
+    neoCastRoot,
+    runnerID: plan.runnerID,
+    runnerKind: plan.runnerKind,
+    ...(workspaceGitSHA === undefined ? {} : { gitSHA: workspaceGitSHA }),
+    ...(sourcePath === undefined ? {} : { datasetPath: sourcePath }),
+    ...(datasetSHA === undefined ? {} : { datasetSHA }),
+    ...(lockPath === undefined ? {} : { lockPath }),
+    ...(lockHash === undefined ? {} : { lockHash }),
+    ...(preprocessPath === undefined ? {} : { preprocessPath }),
+    ...(preprocessSHA === undefined ? {} : { preprocessSHA }),
+  } as JsonRecord
 }
 
 function tsfDatasetPreparationConfig(task: ResearchTask) {
@@ -2565,6 +2786,123 @@ function datasetPresetFromLoader(loaderID: string) {
   return undefined
 }
 
+function csvHeaderColumns(csvPath: string): string[] {
+  let fd: number | undefined
+  try {
+    fd = openSync(csvPath, "r")
+    const buf = Buffer.alloc(4096)
+    const bytesRead = readSync(fd, buf, 0, 4096, 0)
+    const chunk = buf.slice(0, bytesRead).toString("utf8")
+    const newline = chunk.indexOf("\n")
+    const firstLine = (newline < 0 ? chunk : chunk.slice(0, newline)).trim()
+    return firstLine.split(",").map((h) => h.trim().replace(/^"|"$/g, ""))
+  } catch {
+    return []
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
+function csvDataRowCount(csvPath: string): number | undefined {
+  let fd: number | undefined
+  try {
+    fd = openSync(csvPath, "r")
+    const buffer = Buffer.alloc(64 * 1024)
+    let position = 0
+    let bytesRead = 0
+    let newlineCount = 0
+    let lastByte = 0
+    do {
+      bytesRead = readSync(fd, buffer, 0, buffer.length, position)
+      for (let index = 0; index < bytesRead; index++) {
+        lastByte = buffer[index]!
+        if (lastByte === 10) newlineCount += 1
+      }
+      position += bytesRead
+    } while (bytesRead > 0)
+    if (position === 0) return 0
+    const physicalLines = newlineCount + (lastByte === 10 ? 0 : 1)
+    return Math.max(0, physicalLines - 1)
+  } catch {
+    return undefined
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
+function splitIsFeasible(
+  totalRows: number,
+  inputLen: number,
+  maxHorizon: number,
+  splitStrategy: DatasetSplitStrategy,
+) {
+  if (splitStrategy === "contiguous_60_20_20") {
+    const trainEnd = Math.floor(totalRows * 0.6)
+    const valEnd = Math.floor(totalRows * 0.8)
+    return trainEnd >= inputLen + maxHorizon &&
+      valEnd - trainEnd >= maxHorizon &&
+      totalRows - valEnd >= maxHorizon
+  }
+  const trainEnd = Math.floor(totalRows * 0.7)
+  const refStart = totalRows - Math.floor(totalRows * 0.2)
+  return trainEnd >= inputLen + maxHorizon &&
+    refStart - trainEnd >= maxHorizon &&
+    totalRows - refStart >= maxHorizon
+}
+
+function minimumRowsForSplit(inputLen: number, maxHorizon: number, splitStrategy: DatasetSplitStrategy) {
+  const approximate =
+    splitStrategy === "contiguous_60_20_20"
+      ? Math.max(Math.ceil((inputLen + maxHorizon) / 0.6), Math.ceil(maxHorizon / 0.2))
+      : Math.max(Math.ceil((inputLen + maxHorizon) / 0.7), Math.ceil(maxHorizon / 0.1), Math.ceil(maxHorizon / 0.2))
+  for (let rows = Math.max(1, approximate - 8); rows <= approximate + 32; rows++) {
+    if (splitIsFeasible(rows, inputLen, maxHorizon, splitStrategy)) return rows
+  }
+  return approximate
+}
+
+function validateCustomDatasetShape(input: {
+  readonly source: string
+  readonly inputLen?: number
+  readonly predictionLengths: readonly number[]
+  readonly splitStrategy: DatasetSplitStrategy
+}) {
+  if (input.inputLen === undefined || input.predictionLengths.length === 0) return
+  const maxHorizon = Math.max(...input.predictionLengths)
+  const rows = csvDataRowCount(input.source)
+  if (rows === undefined) return
+  const minRows = minimumRowsForSplit(input.inputLen, maxHorizon, input.splitStrategy)
+  if (rows >= minRows) return
+  throw new Error(
+    `Dataset is too short for automatic ${input.splitStrategy} splits: rows=${rows}, minimumRows=${minRows}, ` +
+      `input_len=${input.inputLen}, max_horizon=${maxHorizon}. Lower input_len/horizons or provide explicit split rows.`,
+  )
+}
+
+function datasetSourceKey(dataset: Record<string, unknown>) {
+  if (typeof dataset.path === "string" && dataset.path.trim().length > 0) {
+    const absolutePath = path.resolve(dataset.path)
+    const hash = hashFilePrefix(absolutePath)
+    return hash === undefined ? absolutePath : `${absolutePath}#sha256_1mb=${hash}`
+  }
+  if (typeof dataset.loaderID === "string" && dataset.loaderID.length > 0) return `loader:${dataset.loaderID}`
+  return "unknown"
+}
+
+function hashFilePrefix(filePath: string) {
+  let fd: number | undefined
+  try {
+    fd = openSync(filePath, "r")
+    const buffer = Buffer.alloc(1024 * 1024)
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0)
+    return createHash("sha256").update(buffer.subarray(0, bytesRead)).digest("hex").slice(0, 16)
+  } catch {
+    return undefined
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
 function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
   const config = tsfDatasetPreparationConfig(task)
   if (!config) {
@@ -2573,8 +2911,36 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
   const args = ["./bin/neo-cast.js", "prepare-data", "--source", config.source]
   const preset = datasetPresetFromLoader(config.loaderID)
   if (preset) args.push("--dataset-preset", preset)
-  else args.push("--task-id", config.loaderID)
-  if (config.targetCols.length > 0) args.push("--feature-cols", config.targetCols.join(","))
+  else {
+    args.push("--task-id", config.loaderID)
+    args.push("--split-strategy", DEFAULT_CUSTOM_SPLIT_STRATEGY)
+    validateCustomDatasetShape({
+      source: config.source,
+      inputLen: config.contextLength,
+      predictionLengths: config.predictionLengths,
+      splitStrategy: DEFAULT_CUSTOM_SPLIT_STRATEGY,
+    })
+  }
+  const warnings: string[] = []
+  if (config.targetCols.length > 0) {
+    const csvHeaders = csvHeaderColumns(config.source)
+    const validCols = csvHeaders.length > 0
+      ? config.targetCols.filter((col) => csvHeaders.includes(col))
+      : config.targetCols
+    if (csvHeaders.length > 0 && validCols.length === 0) {
+      throw new Error(
+        `None of the requested target columns were found in ${config.source}. ` +
+          `Requested: ${config.targetCols.join(", ")}. CSV header: ${csvHeaders.join(", ")}.`,
+      )
+    }
+    if (csvHeaders.length > 0 && validCols.length < config.targetCols.length) {
+      const missing = config.targetCols.filter((col) => !csvHeaders.includes(col))
+      warnings.push(
+        `Only matched ${validCols.length}/${config.targetCols.length} requested target columns from CSV header; missing: ${missing.join(", ")}.`,
+      )
+    }
+    if (validCols.length > 0) args.push("--feature-cols", validCols.join(","))
+  }
   if (config.contextLength !== undefined) args.push("--input-len", String(config.contextLength))
   if (config.predictionLengths.length > 0) args.push("--horizons", config.predictionLengths.join(","))
   if (force) args.push("--force")
@@ -2583,6 +2949,7 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
     args,
     cwd: config.root,
     source: config.source,
+    warnings,
   }
 }
 
@@ -2778,6 +3145,42 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+
+    const reconcileStaleRuns = Effect.fn("Research.reconcileStaleRuns")(function* () {
+      const cutoff = Date.now() - STALE_RUN_RECONCILE_MS
+      const staleRows = yield* db((d) =>
+        d
+          .select({ run: ResearchRunTable })
+          .from(ResearchRunTable)
+          .innerJoin(ResearchTaskTable, eq(ResearchRunTable.task_id, ResearchTaskTable.id))
+          .where(
+            and(
+              eq(ResearchTaskTable.project_id, Instance.project.id),
+              inArray(ResearchRunTable.status, ["queued", "running"]),
+              lt(ResearchRunTable.time_updated, cutoff),
+            ),
+          )
+          .all(),
+      )
+      for (const item of staleRows) {
+        const finishedAt = Date.now()
+        const row = yield* db((d) =>
+          d
+            .update(ResearchRunTable)
+            .set({
+              status: "failed",
+              error: `TUI restart while run was ${item.run.status}`,
+              time_updated: finishedAt,
+              time_finished: finishedAt,
+            })
+            .where(eq(ResearchRunTable.id, item.run.id))
+            .returning()
+            .get(),
+        )
+        if (row) yield* bus.publish(Event.RunUpdated, { run: mapRun(row) })
+      }
+    })
+    yield* reconcileStaleRuns()
 
     const getTask = Effect.fn("Research.getTask")(function* (taskID: ResearchTaskID) {
       const projectID = Instance.project.id
@@ -3743,21 +4146,63 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
       const direction = evaluation.direction
       const existingChampion = yield* getChampion(task.id)
-      const championUpdated =
-        !existingChampion || isBetterMetric(direction, primaryMetric, existingChampion.primaryMetric)
+      let comparisonMetric = primaryMetric
+      let championUpdated =
+        !existingChampion || isBetterMetric(direction, comparisonMetric, existingChampion.primaryMetric)
+      const seedGate: Record<string, unknown> = {}
+
+      const requiredSeedCount = taskEvaluationSeeds(task).length
+      if (existingChampion && existingChampion.candidateID !== run.candidateID && requiredSeedCount > 1) {
+        const runs = yield* listRuns(task.id)
+        const challengerSummary = metricSampleSummary(
+          metricSamplesForCandidate(runs, run.candidateID, metricName, run.stage),
+        )
+        const championSummary = metricSampleSummary(
+          metricSamplesForCandidate(runs, existingChampion.candidateID, metricName, run.stage),
+        )
+        seedGate.requiredSeeds = requiredSeedCount
+        seedGate.observedSeeds = challengerSummary.count
+        if (challengerSummary.mean !== undefined) {
+          seedGate.mean = challengerSummary.mean
+          seedGate.std = challengerSummary.std
+          seedGate.ci95 = challengerSummary.ci95
+        }
+
+        if (challengerSummary.count < requiredSeedCount || challengerSummary.mean === undefined) {
+          championUpdated = false
+          seedGate.status = "awaiting_seed_confirmation"
+        } else {
+          comparisonMetric = challengerSummary.mean
+          const championComparisonMetric = championSummary.mean ?? existingChampion.primaryMetric
+          const hasComparableUncertainty = challengerSummary.count > 1 && championSummary.count > 1
+          const inconclusive =
+            hasComparableUncertainty &&
+            intervalsOverlap(
+              challengerSummary.mean,
+              challengerSummary.ci95,
+              championComparisonMetric,
+              championSummary.ci95,
+            )
+          championUpdated =
+            !inconclusive && isBetterMetric(direction, comparisonMetric, championComparisonMetric)
+          seedGate.status = inconclusive ? "uncertainty_overlap" : "seed_confirmed"
+          seedGate.championMean = championSummary.mean
+          seedGate.championObservedSeeds = championSummary.count
+        }
+      }
 
       if (championUpdated) {
         yield* setChampion({
           taskID: task.id,
           candidateID: run.candidateID,
           runID: run.id,
-          primaryMetric,
-          utility: evaluation.utility ?? (direction === "minimize" ? -primaryMetric : primaryMetric),
+          primaryMetric: comparisonMetric,
+          utility: direction === "minimize" ? -comparisonMetric : comparisonMetric,
         })
       }
 
       const evalDataset = recordValue(recordValue(task.taskSpec).dataset)
-      const evalSourceCsv = typeof evalDataset.path === "string" ? path.basename(evalDataset.path) : (typeof evalDataset.loaderID === "string" ? evalDataset.loaderID : "unknown")
+      const evalSourceCsv = datasetSourceKey(evalDataset)
       yield* createMemory({
         taskID: task.id,
         domainID: task.domainID,
@@ -3770,13 +4215,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           sourceCsv: evalSourceCsv,
         },
         candidateSummary: runCandidateMemorySummary(candidate, run, {
-          primaryMetric,
+          primaryMetric: comparisonMetric,
           championUpdated,
+          ...(Object.keys(seedGate).length === 0 ? {} : { seedGate }),
         }),
         outcome: championUpdated ? "accepted" : "rejected",
         lesson: championUpdated
-          ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} became champion on ${metricName}=${primaryMetric}.`
-          : `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} did not improve champion on ${metricName}=${primaryMetric}.`,
+          ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} became champion on ${metricName}=${comparisonMetric}.`
+          : `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} did not improve champion on ${metricName}=${comparisonMetric}.`,
       })
     })
 
@@ -3785,7 +4231,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
       const candidate = run.candidateID === undefined ? undefined : yield* getCandidateForTask(task.id, run.candidateID)
       const failedDataset = recordValue(recordValue(task.taskSpec).dataset)
-      const failedSourceCsv = typeof failedDataset.path === "string" ? path.basename(failedDataset.path) : (typeof failedDataset.loaderID === "string" ? failedDataset.loaderID : "unknown")
+      const failedSourceCsv = datasetSourceKey(failedDataset)
       yield* createMemory({
         taskID: task.id,
         domainID: task.domainID,
@@ -3823,7 +4269,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
       const running = yield* updateRunStatus({ runID: prepared.run.id, status: "running" })
       let progressPublishQueue = Promise.resolve()
+      const persistedProgressLines: JsonRecord[] = []
       const publishProgressLine = Instance.bind((line: string) => {
+        const parsed = parseProgressLine(line)
+        persistedProgressLines.push({
+          time: new Date().toISOString(),
+          line,
+          ...parsed,
+        } as JsonRecord)
         progressPublishQueue = progressPublishQueue
           .then(() =>
             Effect.runPromise(
@@ -3831,7 +4284,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                 taskID: running.taskID,
                 runID: running.id,
                 line,
-                ...parseProgressLine(line),
+                ...parsed,
               }),
             ),
           )
@@ -3842,7 +4295,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         await progressPublishQueue
         return result
       })
-      const metrics = metricsFromRecords(execution.records)
+      const metrics = metricsFromRecords(execution.records, prepared.runPlan.stage)
       const artifactRefs: ResearchArtifactID[] = [...running.artifactRefs]
 
       const executionLogRoot = runnerPath(Instance.directory, ".neo-research/runner-executions")
@@ -3891,6 +4344,34 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       })
       artifactRefs.push(executionLogArtifact.id)
 
+      if (persistedProgressLines.length > 0) {
+        const progressRoot = runnerPath(Instance.directory, ".neo-research/runner-progress")
+        const progressDirectory = path.join(progressRoot, running.taskID)
+        const progressPath = path.join(progressDirectory, `${running.id}.jsonl`)
+        yield* Effect.promise(async () => {
+          await mkdir(progressDirectory, { recursive: true })
+          await writeFile(
+            progressPath,
+            `${persistedProgressLines.map((item) => JSON.stringify(item)).join("\n")}\n`,
+            "utf8",
+          )
+        })
+        const progressArtifact = yield* createArtifact({
+          taskID: running.taskID,
+          runID: running.id,
+          kind: "runner_progress_jsonl",
+          uri: `file://${progressPath}`,
+          metadata: {
+            runnerID: prepared.runPlan.runnerID,
+            runnerKind: prepared.runPlan.runnerKind,
+            stage: prepared.runPlan.stage,
+            lineCount: persistedProgressLines.length,
+            previewLines: persistedProgressLines.slice(-30),
+          },
+        })
+        artifactRefs.push(progressArtifact.id)
+      }
+
       for (const artifactDir of artifactDirsFromRecords(execution.records)) {
         const artifact = yield* createArtifact({
           taskID: running.taskID,
@@ -3906,6 +4387,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       }
 
       const succeeded = execution.exitCode === 0
+      const task = yield* getTask(running.taskID)
+      const reproducibility = succeeded
+        ? yield* Effect.promise(() => buildReproducibilitySeal(task, prepared.runPlan, Instance.directory))
+        : undefined
       const run = yield* updateRunStatus({
         runID: running.id,
         status: succeeded ? "succeeded" : "failed",
@@ -3914,6 +4399,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           ...running.resourceUsage,
           exitCode: execution.exitCode,
           runnerID: prepared.runPlan.runnerID,
+          ...(reproducibility === undefined ? {} : { reproducibility }),
         } as ResearchRun["resourceUsage"],
         artifactRefs,
         error: succeeded ? undefined : execution.stderr || `Runner exited with code ${execution.exitCode}`,
@@ -4880,7 +5366,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                     } as JsonRecord,
                   })
                 }
-              }).pipe(Effect.catchCause(() => Effect.void))
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  bus.publish(Event.ReflectionAgentFailed, {
+                    taskID: input.taskID,
+                    agent: "ReflectionAgent",
+                    stage: "mid_loop_reflection",
+                    status: "failed",
+                    metadata: errorMetadata(Cause.squash(cause)),
+                  }),
+                ),
+              )
             }
           }
           const targetReached =
@@ -5016,6 +5512,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           args: command.args,
           cwd: command.cwd,
           exitCode: execution.code,
+          warnings: command.warnings,
         },
         stdout: execution.stdout.toString(),
         stderr: execution.stderr.toString(),
@@ -5037,6 +5534,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           inputLen: typeof datasetSpec.input_len === "number" ? datasetSpec.input_len : 0,
           horizons: Array.isArray(datasetSpec.horizons) ? datasetSpec.horizons.join(",") : "",
           featureColumns: Array.isArray(datasetSpec.feature_columns) ? datasetSpec.feature_columns.join(",") : "",
+          warnings: command.warnings.join("\n"),
         },
       })
       return {
@@ -5174,6 +5672,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           champion === undefined
             ? undefined
             : artifacts.find((artifact) => artifact.kind === "runner_artifact" && artifact.runID === champion.runID)
+        const championRun = champion === undefined ? undefined : runs.find((run) => run.id === champion.runID)
+        const championReproducibility =
+          championRun === undefined ? {} : recordValue(recordValue(championRun.resourceUsage).reproducibility)
         const championArtifactDir =
           championRunnerArtifact === undefined ? undefined : filePathFromURI(championRunnerArtifact.uri)
         const copiedFiles: Record<string, string> = {
@@ -5292,6 +5793,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             },
             integrity,
             files: copiedFiles,
+            reproducibility:
+              Object.keys(championReproducibility).length === 0 ? null : championReproducibility,
           }
           await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
         })

@@ -288,6 +288,57 @@ function profileDerivedSearchDirectives(taskFingerprint: unknown) {
   return directives
 }
 
+function pushUniqueBy<T>(items: T[], item: T | undefined, key: (item: T) => string) {
+  if (item === undefined) return
+  const itemKey = key(item)
+  if (items.some((existing) => key(existing) === itemKey)) return
+  items.push(item)
+}
+
+function metricSortValue(run: DomainProposalContext["runs"][number]) {
+  const value = run.metrics.val_avg_mse
+  return typeof value === "number" && Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
+}
+
+function representativeCandidates(context: DomainProposalContext) {
+  const selected: DomainProposalContext["candidates"][number][] = []
+  const byID = new Map(context.candidates.map((candidate) => [candidate.id, candidate]))
+  pushUniqueBy(selected, context.champion === undefined ? undefined : byID.get(context.champion.candidateID), (item) => item.id)
+  for (const run of [...context.runs].filter((item) => item.status === "succeeded").sort((a, b) => metricSortValue(a) - metricSortValue(b)).slice(0, 3)) {
+    pushUniqueBy(selected, byID.get(run.candidateID), (item) => item.id)
+  }
+  pushUniqueBy(selected, context.candidates.find((item) => item.approvalStatus === "rejected"), (item) => item.id)
+  pushUniqueBy(selected, byID.get(context.runs.find((item) => item.status === "failed")?.candidateID ?? ""), (item) => item.id)
+  for (const candidate of context.candidates.slice(-5)) pushUniqueBy(selected, candidate, (item) => item.id)
+  return selected.slice(0, 10)
+}
+
+function representativeRuns(context: DomainProposalContext) {
+  const selected: DomainProposalContext["runs"][number][] = []
+  const key = (run: DomainProposalContext["runs"][number]) => `${run.candidateID}:${run.stage}:${run.status}:${JSON.stringify(run.metrics)}`
+  for (const run of context.runs.filter((item) => item.candidateID === context.champion?.candidateID)) {
+    pushUniqueBy(selected, run, key)
+  }
+  pushUniqueBy(selected, context.runs.find((item) => item.status === "failed"), key)
+  for (const run of [...context.runs].filter((item) => item.status === "succeeded").sort((a, b) => metricSortValue(a) - metricSortValue(b)).slice(0, 4)) {
+    pushUniqueBy(selected, run, key)
+  }
+  for (const run of context.runs.slice(-6)) pushUniqueBy(selected, run, key)
+  return selected.slice(0, 12)
+}
+
+function representativeMemory(context: DomainProposalContext) {
+  const selected: DomainProposalContext["memory"][number][] = []
+  const key = (item: DomainProposalContext["memory"][number]) => `${item.outcome}:${item.lesson}`
+  for (const outcome of ["accepted", "rejected", "failed"]) {
+    for (const item of context.memory.filter((memory) => memory.outcome === outcome).slice(0, 3)) {
+      pushUniqueBy(selected, item, key)
+    }
+  }
+  for (const item of context.memory.slice(-4)) pushUniqueBy(selected, item, key)
+  return selected.slice(0, 12)
+}
+
 function buildUserPrompt(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
@@ -310,9 +361,9 @@ function buildUserPrompt(input: {
       datasetProfileSummary: profile,
       searchBiases,
       profileDerivedSearchDirectives: profileDerivedSearchDirectives(input.proposalContext.taskFingerprint),
-      existingCandidates: input.proposalContext.candidates.slice(-8),
-      runs: input.proposalContext.runs.slice(-12),
-      memory: input.proposalContext.memory.slice(0, 8),
+      existingCandidates: representativeCandidates(input.proposalContext),
+      runs: representativeRuns(input.proposalContext),
+      memory: representativeMemory(input.proposalContext),
       champion: input.proposalContext.champion,
       instruction:
         "Propose a new candidate that is different from existing candidates and suitable for the task. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
@@ -392,6 +443,82 @@ function llmMetadata(config: NeoCastLLMConfig, status: string, extra: JsonRecord
   }
 }
 
+type CandidateRiskLevel = "low" | "medium" | "high"
+
+function riskRank(risk: CandidateRiskLevel) {
+  return risk === "high" ? 2 : risk === "medium" ? 1 : 0
+}
+
+function maxRisk(current: CandidateRiskLevel, next: CandidateRiskLevel): CandidateRiskLevel {
+  return riskRank(next) > riskRank(current) ? next : current
+}
+
+function numberField(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function candidateGovernance(candidateSpec: JsonRecord) {
+  let risk: CandidateRiskLevel = "low"
+  const preprocessing = isRecord(candidateSpec.preprocessing) ? candidateSpec.preprocessing : {}
+  const actions = Array.isArray(preprocessing.actions) ? preprocessing.actions : []
+  if (
+    actions.some((action) => {
+      if (!isRecord(action)) return false
+      return typeof action.type === "string" && action.type !== "none"
+    })
+  ) {
+    risk = maxRisk(risk, "medium")
+  }
+
+  const embedding = isRecord(candidateSpec.embedding) ? candidateSpec.embedding : {}
+  const backbone = isRecord(candidateSpec.backbone) ? candidateSpec.backbone : {}
+  const fusion = isRecord(candidateSpec.fusion) ? candidateSpec.fusion : {}
+  const predictionHead = isRecord(candidateSpec.predictionHead) ? candidateSpec.predictionHead : {}
+  const trainingStrategy = isRecord(candidateSpec.trainingStrategy) ? candidateSpec.trainingStrategy : {}
+  const loss = isRecord(trainingStrategy.loss) ? trainingStrategy.loss : {}
+  const scheduler = isRecord(trainingStrategy.scheduler) ? trainingStrategy.scheduler : {}
+  const budget = isRecord(trainingStrategy.budget) ? trainingStrategy.budget : {}
+
+  const embeddingType = typeof embedding.type === "string" ? embedding.type : undefined
+  const backboneType = typeof backbone.type === "string" ? backbone.type : undefined
+  const fusionType = typeof fusion.type === "string" ? fusion.type : undefined
+  const headType = typeof predictionHead.type === "string" ? predictionHead.type : undefined
+  const outputDistribution =
+    typeof predictionHead.outputDistribution === "string" ? predictionHead.outputDistribution : undefined
+  const lossBase = typeof loss.base === "string" ? loss.base : undefined
+  const schedulerType = typeof scheduler.type === "string" ? scheduler.type : undefined
+
+  if (embeddingType !== undefined && !["none", "patch"].includes(embeddingType)) risk = maxRisk(risk, "medium")
+  if (backboneType !== undefined && !["linear", "mlp", "transformer"].includes(backboneType)) {
+    risk = maxRisk(risk, "medium")
+  }
+  if (fusionType !== undefined && fusionType !== "temporal") risk = maxRisk(risk, "medium")
+  if (headType !== undefined && headType !== "linear") risk = maxRisk(risk, "medium")
+  if (outputDistribution !== undefined && outputDistribution !== "point") risk = maxRisk(risk, "medium")
+  if (lossBase !== undefined && lossBase !== "mse") risk = maxRisk(risk, "medium")
+  if (schedulerType !== undefined && schedulerType !== "none") risk = maxRisk(risk, "medium")
+
+  const largeDimensions = [
+    numberField(embedding, "dModel"),
+    numberField(backbone, "hiddenDim"),
+    numberField(backbone, "dModel"),
+  ].some((value) => value !== undefined && value > 512)
+  const deepBackbone = [numberField(backbone, "depth"), numberField(backbone, "nLayers"), numberField(backbone, "numLayers")]
+    .some((value) => value !== undefined && value > 6)
+  const aggressiveBudget =
+    (numberField(budget, "timeBudgetS") ?? 0) > 1_200 ||
+    (numberField(budget, "batchSize") ?? 0) > 1_024 ||
+    (numberField(budget, "maxEpochs") ?? 0) > 100
+
+  if (largeDimensions || deepBackbone || aggressiveBudget) risk = "high"
+
+  return {
+    riskLevel: risk,
+    approvalStatus: risk === "low" ? "auto_approved" : "pending",
+  } as const
+}
+
 export async function proposeLLMCandidate(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
@@ -432,10 +559,7 @@ export async function proposeLLMCandidate(input: {
     const user = buildUserPrompt(input)
     const text = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
     const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
-    const bridgeOnly = runtime.bridgeOnly !== false
-    const governance = bridgeOnly
-      ? ({ riskLevel: "low", approvalStatus: "auto_approved" } as const)
-      : ({ riskLevel: "medium", approvalStatus: "pending" } as const)
+    const governance = candidateGovernance(candidateSpec)
     return {
       proposal: {
         candidateSpec,

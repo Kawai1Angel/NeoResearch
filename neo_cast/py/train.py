@@ -14,6 +14,7 @@ import copy
 import json
 import os
 import random
+import shutil
 import string
 import time
 from datetime import datetime, timezone
@@ -42,11 +43,30 @@ PROJECT_ROOT = Path(os.environ.get("NEO_CAST_PROJECT_ROOT", Path(__file__).resol
 DEFAULT_STATE_DIR = PROJECT_ROOT / ".neo-cast"
 DEFAULT_RESOLVED_CANDIDATE = DEFAULT_STATE_DIR / "resolved_candidate.json"
 DEFAULT_ARTIFACTS_DIR = DEFAULT_STATE_DIR / "artifacts"
+SMOKE_ARTIFACT_KEEP = 30
 
 
 def emit(event: str, **payload: Any) -> None:
     record = {"event": event, **payload}
     print(json.dumps(record), flush=True)
+
+
+def _artifact_dir_for_run(artifact_root: Path, run_id: str, *, smoke: bool) -> Path:
+    parent = artifact_root / "smoke" if smoke else artifact_root
+    return parent / f"run_{run_id}"
+
+
+def _gc_smoke_artifacts(artifact_root: Path, *, keep: int = SMOKE_ARTIFACT_KEEP) -> None:
+    smoke_root = artifact_root / "smoke"
+    if keep <= 0 or not smoke_root.exists():
+        return
+    try:
+        run_dirs = [path for path in smoke_root.iterdir() if path.is_dir() and path.name.startswith("run_")]
+    except OSError:
+        return
+    run_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for stale_dir in run_dirs[keep:]:
+        shutil.rmtree(stale_dir, ignore_errors=True)
 
 
 def set_seed(seed: int) -> None:
@@ -649,7 +669,7 @@ def train_models(
     }
 
     run_id = _make_run_id()
-    artifact_dir = artifact_root / f"run_{run_id}"
+    artifact_dir = _artifact_dir_for_run(artifact_root, run_id, smoke=smoke)
     save_run_artifacts(
         artifact_dir=artifact_dir,
         run_id=run_id,
@@ -659,6 +679,8 @@ def train_models(
         val_results=val_results,
         training_summary=training_summary,
     )
+    if smoke:
+        _gc_smoke_artifacts(artifact_root)
 
     emit("smoke_eval_done" if smoke else "eval_done", **{k: round(v, 6) for k, v in val_results.items()})
     emit("artifact_ready", artifact_dir=str(artifact_dir.resolve()), run_id=run_id)
