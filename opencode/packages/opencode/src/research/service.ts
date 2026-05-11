@@ -488,6 +488,13 @@ function objectiveMetricName(objective: ResearchTask["objective"]) {
   return "val_avg_mse"
 }
 
+function objectiveSecondaryMetricName(objective: ResearchTask["objective"], primaryMetricName: string) {
+  const record = objective as Record<string, unknown>
+  const configured = record.secondaryMetric ?? record.tieBreakerMetric ?? record.longHorizonMetric
+  if (typeof configured === "string" && configured.length > 0) return configured
+  return primaryMetricName === "val_avg_mse" ? "val_h720_mse" : undefined
+}
+
 function objectiveDirection(objective: ResearchTask["objective"]) {
   const direction = (objective as Record<string, unknown>).direction
   return direction === "maximize" ? "maximize" : "minimize"
@@ -552,6 +559,19 @@ function loopPolicyValue(inputValue: unknown, task: ResearchTask, ...keys: strin
 function loopPolicyInteger(inputValue: unknown, task: ResearchTask, ...keys: string[]) {
   const value = loopPolicyValue(inputValue, task, ...keys)
   return value === undefined || value < 0 ? undefined : Math.floor(value)
+}
+
+function loopPolicyRate(inputValue: unknown, task: ResearchTask, ...keys: string[]) {
+  const value = loopPolicyValue(inputValue, task, ...keys)
+  if (value === undefined) return undefined
+  return Math.max(0, Math.min(1, value))
+}
+
+function shouldForceExplorationIteration(index: number, explorationRate: number | undefined) {
+  if (explorationRate === undefined || explorationRate <= 0) return false
+  if (explorationRate >= 1) return true
+  const interval = Math.max(1, Math.round(1 / explorationRate))
+  return (index + 1) % interval === 0
 }
 
 function candidateRecipeID(candidateSpec: ResearchCandidate["candidateSpec"]) {
@@ -4150,6 +4170,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       let championUpdated =
         !existingChampion || isBetterMetric(direction, comparisonMetric, existingChampion.primaryMetric)
       const seedGate: Record<string, unknown> = {}
+      let championStandoff: Record<string, unknown> | undefined
 
       const requiredSeedCount = taskEvaluationSeeds(task).length
       if (existingChampion && existingChampion.candidateID !== run.candidateID && requiredSeedCount > 1) {
@@ -4191,6 +4212,33 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         }
       }
 
+      if (championUpdated && existingChampion && existingChampion.candidateID !== run.candidateID) {
+        const secondaryMetricName = objectiveSecondaryMetricName(task.objective, metricName)
+        if (secondaryMetricName !== undefined) {
+          const challengerSecondary = metricValue(run.metrics, secondaryMetricName)
+          const championRun = yield* getRunForTask(task.id, existingChampion.runID)
+          const championSecondary = metricValue(championRun.metrics, secondaryMetricName)
+          if (
+            challengerSecondary !== undefined &&
+            championSecondary !== undefined &&
+            isBetterMetric(direction, championSecondary, challengerSecondary)
+          ) {
+            championUpdated = false
+            championStandoff = {
+              status: "secondary_metric_regressed",
+              primaryMetricName: metricName,
+              secondaryMetricName,
+              challengerPrimary: comparisonMetric,
+              championPrimary: existingChampion.primaryMetric,
+              challengerSecondary,
+              championSecondary,
+              championCandidateID: existingChampion.candidateID,
+              championRunID: existingChampion.runID,
+            }
+          }
+        }
+      }
+
       if (championUpdated) {
         yield* setChampion({
           taskID: task.id,
@@ -4218,10 +4266,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           primaryMetric: comparisonMetric,
           championUpdated,
           ...(Object.keys(seedGate).length === 0 ? {} : { seedGate }),
+          ...(championStandoff === undefined ? {} : { championStandoff }),
         }),
         outcome: championUpdated ? "accepted" : "rejected",
         lesson: championUpdated
           ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} became champion on ${metricName}=${comparisonMetric}.`
+          : championStandoff !== undefined
+            ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} champion standoff on ${metricName}=${comparisonMetric}; ${championStandoff.secondaryMetricName} regressed versus ${championStandoff.championCandidateID}.`
           : `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} did not improve champion on ${metricName}=${comparisonMetric}.`,
       })
     })
@@ -4738,6 +4789,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
       yield* ensureRunBudget(task, "queued")
+      const forceExplore = input.forceExplore === true
       const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
 
       const existingMeta =
@@ -4756,18 +4808,30 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         selectedHypothesis,
         reflectionHypotheses,
       })
-      const mergedSearchBiases = Array.isArray(taskFingerprint.searchBiases)
-        ? (taskFingerprint.searchBiases as unknown[])
+      const taskFingerprintWithExploration = forceExplore
+        ? ({
+            ...taskFingerprint,
+            searchBiases: [
+              ...new Set([
+                ...(Array.isArray(taskFingerprint.searchBiases) ? taskFingerprint.searchBiases : []),
+                "explore_untried_backbone",
+              ]),
+            ],
+          } as JsonRecord)
+        : taskFingerprint
+      const mergedSearchBiases = Array.isArray(taskFingerprintWithExploration.searchBiases)
+        ? (taskFingerprintWithExploration.searchBiases as unknown[])
         : []
 
       const managerTrace: ResearchManagerStep[] = [
         managerStep("diagnostic", "completed", "Built task fingerprint for autonomous planning.", {
           domainID: task.domainID,
-          targetCount: (taskFingerprint as Record<string, unknown>).targetCount,
-          contextLength: (taskFingerprint as Record<string, unknown>).contextLength,
-          maxPredictionLength: (taskFingerprint as Record<string, unknown>).maxPredictionLength,
-          bridgeOnly: (taskFingerprint as Record<string, unknown>).bridgeOnly,
+          targetCount: (taskFingerprintWithExploration as Record<string, unknown>).targetCount,
+          contextLength: (taskFingerprintWithExploration as Record<string, unknown>).contextLength,
+          maxPredictionLength: (taskFingerprintWithExploration as Record<string, unknown>).maxPredictionLength,
+          bridgeOnly: (taskFingerprintWithExploration as Record<string, unknown>).bridgeOnly,
           searchBiases: mergedSearchBiases,
+          explorationMode: forceExplore ? "forced" : "balanced",
           reflectionHypothesesCount: reflectionHypotheses.length,
         }),
       ]
@@ -4802,10 +4866,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         attemptedCandidateIDs: new Set(designerSelection.attemptedCandidateIDs),
         inconclusiveCandidateIDs: new Set(designerSelection.inconclusiveCandidateIDs),
       }
-      let candidate = designerSelection.candidate
+      let candidate = forceExplore ? undefined : designerSelection.candidate
 
       const proposalApprovals: ResearchApproval[] = []
       let proposalCreated = false
+      let explorationFallback = false
       let selectionSource: "existing_frontier" | "domain_proposal" = "existing_frontier"
       let rankings: DomainCandidateRanking[] = [...designerSelection.rankings]
       let llmMetadata: JsonRecord = {}
@@ -4814,7 +4879,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         const champion = yield* getChampion(task.id)
         const proposalContext = {
           taskSpec: task.taskSpec,
-          taskFingerprint,
+          taskFingerprint: taskFingerprintWithExploration,
           candidates: candidates.map((item) => ({
             id: item.id,
             candidateSpec: item.candidateSpec,
@@ -4835,6 +4900,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             lesson: item.lesson,
             fingerprintSummary: item.fingerprintSummary,
             candidateSummary: item.candidateSummary,
+            time: item.time.updated,
           })),
           champion:
             champion === undefined
@@ -4901,6 +4967,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           }
         }
       }
+      if (!candidate && forceExplore && designerSelection.candidate) {
+        candidate = designerSelection.candidate
+        selectionSource = "existing_frontier"
+        explorationFallback = true
+        rankings = [...designerSelection.rankings]
+      }
       if (!candidate) throw new Error(`No approved autonomous candidate is ready for task: ${task.id}`)
 
       const rankPredictor = rankPredictorArtifactRecord(rankings)
@@ -4939,6 +5011,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             attemptedCandidateCount: attemptState.attemptedCandidateIDs.size,
             inconclusiveCandidateCount: attemptState.inconclusiveCandidateIDs.size,
             proposalCreated,
+            explorationMode: forceExplore ? "forced" : "balanced",
+            explorationFallback,
             rankingCount: rankings.length,
             rankPredictorVersion: rankPredictor.version,
             ...(topRankedRecipeID === undefined ? {} : { topRankedRecipeID }),
@@ -5215,7 +5289,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         task,
         candidate,
         run: finalRun,
-        taskFingerprint,
+        taskFingerprint: taskFingerprintWithExploration,
         selectionSource,
         rankings,
         readyCandidateIDs,
@@ -5283,6 +5357,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds")
       const timeBudgetSeconds = loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS")
       const maxCrashStreak = loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak")
+      const explorationRate = loopPolicyRate(input.explorationRate, task, "explorationRate", "exploration")
       const startedAt = Date.now()
       let bestMetric: number | undefined
       let noImproveStreak = 0
@@ -5305,6 +5380,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           taskID: input.taskID,
           stage: input.stage,
           description,
+          forceExplore: shouldForceExplorationIteration(index, explorationRate),
         }).pipe(
           Effect.map((iteration) => ({ status: "iteration" as const, iteration })),
           Effect.catchCause((cause) => {
@@ -6979,6 +7055,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               maxNoImprove: input.maxNoImprove,
               timeBudgetSeconds: input.timeBudgetSeconds,
               maxCrashStreak: input.maxCrashStreak ?? 3,
+              explorationRate: input.explorationRate,
             })
             yield* markWorkflowPhase("searching")
             return result

@@ -98,10 +98,11 @@ export NEO_CAST_LLM_API_KEY="your-key"
 
 ### 无 API Key 模式（开发调试）
 
-加 `--mock-llm` 标志，使用内置启发式规则生成候选，完全离线：
+加 `--mock-llm` 标志，或设置 `NEO_CAST_USE_MOCK=1`，使用内置启发式规则生成候选，完全离线。未配置 LLM API Key 时，`doctor` 会给出 warn 和 mock fallback 提示，不再阻塞本地 alpha demo：
 
 ```bash
 neo-cast design --requirement "test model" --mock-llm
+NEO_CAST_USE_MOCK=1 neo-cast design --requirement "test model"
 ```
 
 验证当前配置是否正确：

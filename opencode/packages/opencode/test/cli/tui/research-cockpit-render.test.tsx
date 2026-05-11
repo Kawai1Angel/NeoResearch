@@ -124,7 +124,15 @@ function mockResearchFetch(input: RequestInfo | URL, _init?: RequestInit) {
           stage: "smoke",
           status: "succeeded",
           metrics: { val_avg_mse: 0.1234 },
-          resourceUsage: { wallClockSec: 4 },
+          resourceUsage: {
+            wallClockSec: 4,
+            reproducibility: {
+              gitSHA: "5bd5c6e89abc",
+              datasetSHA: "a3f1d9ee0022",
+              preprocessSHA: "7b21a0ff3344",
+              lockHash: "9d88cafe1122",
+            },
+          },
           artifactRefs: [],
           time: { created: now - 12_000, updated: now - 8_000 },
         },
@@ -1341,6 +1349,284 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("tokens in=1,000 out=400")
       expect(frame).toContain("reason=80 cache=32")
       expect(frame).toContain("cost $0.01")
+      expect(frame).toContain("research cand=1/1 runs=1 ok=1")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("shows the champion run reproducibility seal in the cockpit context", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await mkdir(Global.Path.data, { recursive: true })
+    const app = await testRender(() => <ResearchCockpitHarness fetch={researchFetch} />, {
+      width: 170,
+      height: 48,
+    })
+
+    try {
+      const frame = await waitForFrame(app, "repro g@5bd5c6e d@a3f1 c@7b21")
+      expect(frame).toContain("Champion")
+      expect(frame).toContain("repro g@5bd5c6e d@a3f1 c@7b21")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("shows estimated research context tokens before chat usage is available", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const contextFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/config/providers") {
+        const provider = providerFixture()
+        return Promise.resolve(
+          response({
+            providers: [
+              {
+                ...provider,
+                models: {
+                  ...provider.models,
+                  "gpt-test": {
+                    ...provider.models["gpt-test"],
+                    cost: { input: 2, output: 8, cache: { read: 0.5, write: 2 } },
+                  },
+                },
+              },
+            ],
+            default: { openai: "gpt-test" },
+          }),
+        )
+      }
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={contextFetch} />, {
+      width: 170,
+      height: 48,
+    })
+
+    try {
+      const frame = await waitForFrame(app, "research cand=1/1 runs=1 ok=1")
+      expect(frame).toMatch(/~[0-9,]+ \/ 128,000 \(research est\. \$0\.\d{4}\)/)
+      expect(frame).not.toContain("chat-only")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("keeps the selected task stable when refresh reorders tasks", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const taskA = {
+      id: "task_stable_a",
+      projectID: "project_neo_cast",
+      title: "Stable Task A",
+      domainID: "tsf",
+      mode: "autonomous",
+      status: "researching",
+      taskSpec: {
+        contextLength: 96,
+        predictionLengths: [24],
+        runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast" },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12, maxParallel: 1 },
+      time: { created: now - 60_000, updated: now - 1_000 },
+    }
+    const taskB = {
+      ...taskA,
+      id: "task_stable_b",
+      title: "Stable Task B",
+      time: { created: now - 50_000, updated: now - 2_000 },
+    }
+    let taskBUpdatedToTop = false
+    let taskFetchesAfterReorder = 0
+    const stableFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/config/providers") return Promise.resolve(response({ providers: [providerFixture()], default: { openai: "gpt-test" } }))
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      if (path === "/research/tasks") {
+        if (taskBUpdatedToTop) taskFetchesAfterReorder++
+        return Promise.resolve(
+          response([
+            taskA,
+            {
+              ...taskB,
+              time: {
+                ...taskB.time,
+                updated: taskBUpdatedToTop ? now + 1_000 : taskB.time.updated,
+              },
+            },
+          ]),
+        )
+      }
+      if (path.match(/^\/research\/tasks\/task_stable_[ab]\/(candidates|runs|artifacts|approvals)$/)) return Promise.resolve(response([]))
+      if (path.match(/^\/research\/tasks\/task_stable_[ab]\/champion$/)) return Promise.resolve(response(null))
+      if (path.match(/^\/research\/tasks\/task_stable_[ab]\/fingerprint$/)) return Promise.resolve(response({}))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={stableFetch} events={events.source} />, {
+      width: 160,
+      height: 48,
+    })
+
+    try {
+      await waitForFrame(app, "Stable Task A")
+      await app.mockInput.typeText("/task next")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+      await waitForFrame(app, "Stable Task B")
+
+      taskBUpdatedToTop = true
+      events.emit({ type: "research.task.updated", properties: { task: { ...taskB, time: { ...taskB.time, updated: now + 1_000 } } } })
+
+      const frame = await waitForFrame(app, "Task 1/2")
+      expect(taskFetchesAfterReorder).toBeGreaterThan(0)
+      expect(frame).toContain("Stable Task B")
+      expect(frame).not.toContain("Stable Task A")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("keeps the selected candidate stable when refresh reorders candidates", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const first = candidateFixture(1)
+    const second = candidateFixture(2)
+    let reverseCandidates = false
+    let candidateFetchesAfterReverse = 0
+    const stableFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/config/providers") return Promise.resolve(response({ providers: [providerFixture()], default: { openai: "gpt-test" } }))
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      if (path === `/research/tasks/${taskID}/candidates`) {
+        if (reverseCandidates) candidateFetchesAfterReverse++
+        return Promise.resolve(response(reverseCandidates ? [second, first] : [first, second]))
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={stableFetch} events={events.source} />, {
+      width: 160,
+      height: 48,
+    })
+
+    try {
+      await waitForFrame(app, "candidate 1/2")
+      await app.mockInput.typeText("/candidate next")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+      await waitForFrame(app, "candidate 2/2")
+
+      reverseCandidates = true
+      events.emit({ type: "research.candidate.updated", properties: { candidate: second } })
+
+      const frame = await waitForFrame(app, "candidate 1/2")
+      expect(candidateFetchesAfterReverse).toBeGreaterThan(0)
+      expect(frame).toContain("candidate 1/2")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("does not leak one task chat token usage into another task context", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const taskA = {
+      id: "task_usage_a",
+      projectID: "project_neo_cast",
+      title: "Usage Task A",
+      domainID: "tsf",
+      mode: "autonomous",
+      status: "researching",
+      taskSpec: {
+        contextLength: 96,
+        predictionLengths: [24],
+        runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast" },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12, maxParallel: 1 },
+      time: { created: now - 60_000, updated: now - 1_000 },
+    }
+    const taskB = {
+      ...taskA,
+      id: "task_usage_b",
+      title: "Usage Task B",
+      time: { created: now - 50_000, updated: now - 2_000 },
+    }
+    const chatFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      const method = requestMethod(input, init)
+      if (url.pathname === "/config/providers") return response({ providers: [providerFixture()], default: { openai: "gpt-test" } })
+      if (url.pathname === "/agent") return response([agentFixture()])
+      if (url.pathname === "/research/tasks") return response([taskA, taskB])
+      if (url.pathname.match(/^\/research\/tasks\/task_usage_[ab]\/(candidates|runs|artifacts|approvals)$/)) return response([])
+      if (url.pathname.match(/^\/research\/tasks\/task_usage_[ab]\/champion$/)) return response(null)
+      if (url.pathname.match(/^\/research\/tasks\/task_usage_[ab]\/fingerprint$/)) return response({})
+      if (method === "POST" && url.pathname === "/session") {
+        return response({
+          id: "session_usage_a",
+          title: "NeoResearch Cockpit",
+          version: "0.0.0",
+          time: { created: now, updated: now },
+        })
+      }
+      if (method === "POST" && url.pathname === "/session/session_usage_a/prompt_async") {
+        setTimeout(
+          () =>
+            emitAssistantText(events, "Usage recorded on task A.", {
+              sessionID: "session_usage_a",
+              messageID: "msg_usage_task_a",
+              partID: "part_usage_task_a",
+              usage: {
+                cost: 0.0123,
+                tokens: {
+                  total: 1512,
+                  input: 1000,
+                  output: 400,
+                  reasoning: 80,
+                  cache: { read: 20, write: 12 },
+                },
+              },
+            }),
+          0,
+        )
+        return new Response(null, { status: 204 })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} events={events.source} />, {
+      width: 170,
+      height: 48,
+    })
+
+    try {
+      await waitForFrame(app, "Usage Task A")
+      await app.mockInput.typeText("解释 A")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+      await waitForFrame(app, "Usage recorded on task A.")
+      await waitForFrame(app, "tokens in=1,000 out=400")
+
+      await app.mockInput.typeText("/task next")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      const frame = await waitForFrame(app, "Usage Task B")
+      expect(frame).toContain("session task_usa")
+      expect(frame).not.toContain("tokens in=1,000 out=400")
+      expect(frame).not.toContain("cost $0.01")
     } finally {
       app.renderer.destroy()
     }
@@ -2187,10 +2473,13 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("Neo-Cast Autonomous TSF")
       expect(frame).toContain("苏格拉底")
       expect(frame).not.toContain("交互模式")
+      // After B-3 fix: with a smoke-succeeded run + champion but no train run,
+      // the active stage is TrainEval Agent (not Reflection — historical
+      // champion no longer drives Reflection active).
       expect(
         frame
           .split("\n")
-          .some((line) => line.includes("苏格拉底") && line.includes("Reflection Agent") && line.includes("Research Agent")),
+          .some((line) => line.includes("苏格拉底") && line.includes("TrainEval Agent") && line.includes("Research Agent")),
       ).toBe(true)
       expect(frame).toContain("AutoResearch进展")
       expect(frame).toContain("Intent Agent")
@@ -2221,7 +2510,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("Context")
       expect(frame).toContain("model -")
       expect(frame).toContain("session task_neo")
-      expect(frame).toContain("task task_neo researching")
+      expect(frame).toMatch(/~[0-9,]+ \(research est\.\)/)
       expect(frame).toContain("research cand=1/1 runs=1 ok=1")
       expect(frame).toContain("Research Agent: 当前研究 Neo-Cast Autonomous TSF")
       expect(frame).toContain("candidate 1/1")
@@ -2249,7 +2538,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("tab agents")
       expect(frameLine(frame, "NeoResearch v0.1.0-alpha.0")).toBeGreaterThanOrEqual(44)
       expect(occurrenceCount(frame, "Workflow")).toBe(0)
-      const promptFooterLine = frameLine(frame, "苏格拉底 Reflection Agent Research Agent")
+      const promptFooterLine = frameLine(frame, "苏格拉底 TrainEval Agent Research Agent")
       expect(promptFooterLine).toBeGreaterThanOrEqual(38)
       expect(frameLine(frame, "esc interrupt")).toBe(frameLine(frame, "tab agents"))
       expect(frameLine(frame, "ctrl+p commands")).toBeGreaterThan(promptFooterLine)
@@ -2563,10 +2852,15 @@ describe("ResearchCockpit render", () => {
     try {
       const frame = await waitForFrame(app, "GPT Test")
       const lines = frame.split("\n")
+      // Agent-agnostic search: with the B-3 fix, the prompt agent label depends
+      // on actual workflow evidence (champion alone no longer drives Reflection
+      // Agent active). The default fixture lands on TrainEval Agent. This test
+      // is about layout (role line directly above the footer), not the specific
+      // agent — match any cockpit agent label.
       const roleLine = lines.findIndex(
         (line) =>
           line.includes("苏格拉底") &&
-          line.includes("Reflection Agent") &&
+          /\bAgent\b/.test(line) &&
           (line.includes("GPT Test") || line.includes("Research Agent")),
       )
       const footerLine = frameLine(frame, "tab agents")
@@ -2659,7 +2953,11 @@ describe("ResearchCockpit render", () => {
       ["profile", "苏格拉底", "Data Analysis Agent"],
       ["profile_confirmed", "苏格拉底", "HypoPlanner Agent"],
       ["explore", "苏格拉底", "ModelDesigner Agent"],
-      ["results", "苏格拉底", "Reflection Agent"],
+      // After the B-3 fix, a task with a champion but no successful train run
+      // lands on Publish Agent (champion alone no longer activates Reflection
+      // Agent in the absence of train evidence). This matches the intent
+      // captured by the `validChampion()` shortcut in automaticPromptAgentLabel.
+      ["results", "苏格拉底", "Publish Agent"],
     ] as const
 
     for (const [phase, modeLabel, agentLabel] of cases) {
@@ -3592,6 +3890,109 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("live intent confirmation keeps a single active AutoResearch progress marker", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    let intentConfirmed = false
+    let approvalsFetchesAfterConfirm = 0
+    let resolveReply: ((value: Response) => void) | undefined
+    const task = {
+      id: "task_confirm_intent_live",
+      projectID: "project_neo_cast",
+      title: "Confirm Intent Live Task",
+      domainID: "tsf",
+      mode: "autonomous",
+      status: "researching",
+      taskSpec: {
+        contextLength: 96,
+        predictionLengths: [24],
+        runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast" },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12, maxParallel: 1 },
+      time: { created: now - 60_000, updated: now },
+    }
+    const approval = {
+      id: "approval_intent_live",
+      taskID: task.id,
+      kind: "protocol",
+      status: "approved",
+      reason: "[checkpoint:intent_confirmed]\nIntent requirements confirmed.",
+      time: { created: now - 5_000, updated: now - 4_000 },
+      timeReplied: now - 4_000,
+    }
+    const confirmFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      const method = requestMethod(input, init)
+      if (path === "/config/providers") {
+        return Promise.resolve(response({ providers: [providerFixture()], default: { openai: "gpt-test" } }))
+      }
+      if (path === "/agent") return Promise.resolve(response([agentFixture()]))
+      if (path === "/research/tasks") return Promise.resolve(response([task]))
+      if (path === `/research/tasks/${task.id}/fingerprint`) {
+        return Promise.resolve(response({ datasetProfile: { rowCount: 1024, targetCount: 1 } }))
+      }
+      if (path === `/research/tasks/${task.id}/candidates`) return Promise.resolve(response([]))
+      if (path === `/research/tasks/${task.id}/runs`) return Promise.resolve(response([]))
+      if (path === `/research/tasks/${task.id}/artifacts`) return Promise.resolve(response([]))
+      if (path === `/research/tasks/${task.id}/champion`) return Promise.resolve(response(null))
+      if (path === `/research/tasks/${task.id}/approvals`) {
+        if (intentConfirmed) approvalsFetchesAfterConfirm++
+        return Promise.resolve(response(intentConfirmed ? [approval] : []))
+      }
+      if (method === "POST" && path === "/research/approvals") {
+        return Promise.resolve(response({ ...approval, status: "pending", timeReplied: undefined }))
+      }
+      if (method === "POST" && path === `/research/approvals/${approval.id}/reply`) {
+        intentConfirmed = true
+        setTimeout(
+          () =>
+            events.emit({
+              type: "research.approval.updated",
+              properties: { approval },
+            }),
+          0,
+        )
+        return new Promise<Response>((resolve) => {
+          resolveReply = resolve
+        })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={confirmFetch} events={events.source} />, {
+      width: 160,
+      height: 48,
+    })
+
+    try {
+      await waitForFrame(app, "Seed baselines")
+      await app.mockInput.typeText("开始预测")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      let frame = ""
+      for (let attempt = 0; attempt < 80; attempt++) {
+        await app.renderOnce()
+        frame = app.captureCharFrame()
+        if (approvalsFetchesAfterConfirm > 0 && frame.includes("→ Intent Agent")) break
+        await Bun.sleep(25)
+      }
+      expect(approvalsFetchesAfterConfirm).toBeGreaterThan(0)
+      const activeAgentLines = frame
+        .split("\n")
+        .filter((line) => /│\s+→ .*Agent/.test(line))
+      expect(activeAgentLines).toHaveLength(1)
+      expect(activeAgentLines[0]).toContain("Intent Agent")
+      expect(frame).not.toContain("→ Data Analysis Agent")
+    } finally {
+      resolveReply?.(response(approval))
+      app.renderer.destroy()
+    }
+  })
+
   test("pressing enter on an empty prompt executes the next best action", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -3946,6 +4347,175 @@ describe("ResearchCockpit render", () => {
 
       const frame = await waitForFrame(app, "epoch 2 | h24 | val_loss 0.1235")
       expect(frame).toContain(`${runningRunID} smoke running`)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("formats structured runner json progress instead of printing raw records", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const runningRunID = "run_json_progress"
+    const runningFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/runs`) {
+        return Promise.resolve(
+          response([
+            {
+              id: runningRunID,
+              taskID,
+              candidateID,
+              stage: "smoke",
+              status: "running",
+              metrics: {},
+              resourceUsage: {},
+              artifactRefs: [],
+              time: { created: now - 1_000, updated: now - 500 },
+            },
+          ]),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={runningFetch} events={events.source} />, {
+      width: 170,
+      height: 56,
+    })
+
+    try {
+      await waitForFrame(app, `${runningRunID} smoke running`)
+      events.emit({
+        type: "research.runner.progress.line",
+        properties: {
+          taskID,
+          runID: runningRunID,
+          line: '{"event":"candidate_resolved","candidate_id":"tsf_linear_raw_baseline","resolved_candidate_path":"/tmp/very/long/path/resolved_candidate.json"}',
+          event: "candidate_resolved",
+        },
+      })
+
+      const frame = await waitForFrame(app, "candidate resolved | tsf_linear_raw_baseline")
+      expect(frame).not.toContain('{"event":"candidate_resolved"')
+      expect(frame).toContain(".../resolved_candidate.json")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("does not refetch structured state for high-frequency epoch runner progress", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const runningRunID = "run_epoch_progress"
+    let runsFetches = 0
+    const runningFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/runs`) {
+        runsFetches++
+        return Promise.resolve(
+          response([
+            {
+              id: runningRunID,
+              taskID,
+              candidateID,
+              stage: "smoke",
+              status: "running",
+              metrics: {},
+              resourceUsage: {},
+              artifactRefs: [],
+              time: { created: now - 1_000, updated: now - 500 },
+            },
+          ]),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={runningFetch} events={events.source} />, {
+      width: 170,
+      height: 56,
+    })
+
+    try {
+      await waitForFrame(app, `${runningRunID} smoke running`)
+      const fetchesBeforeProgress = runsFetches
+      for (let epoch = 1; epoch <= 3; epoch++) {
+        events.emit({
+          type: "research.runner.progress.line",
+          properties: {
+            taskID,
+            runID: runningRunID,
+            line: `{"event":"epoch_end","horizon":24,"epoch":${epoch},"val_loss":0.12345}`,
+            event: "epoch_end",
+            epoch,
+            horizon: 24,
+            valLoss: 0.12345,
+          },
+        })
+      }
+      await waitForFrame(app, "epoch 3 | h24 | val_loss 0.1235")
+      await Bun.sleep(75)
+      await app.renderOnce()
+
+      expect(runsFetches).toBe(fetchesBeforeProgress)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("runner progress events refresh structured run state", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const changingRunID = "run_refresh_progress"
+    let runStatus: "running" | "succeeded" = "running"
+    const progressFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/runs`) {
+        return Promise.resolve(
+          response([
+            {
+              id: changingRunID,
+              taskID,
+              candidateID,
+              stage: "smoke",
+              status: runStatus,
+              metrics: runStatus === "succeeded" ? { val_avg_mse: 0.101 } : {},
+              resourceUsage: {},
+              artifactRefs: [],
+              time: { created: now - 1_000, updated: now - 500 },
+            },
+          ]),
+        )
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={progressFetch} events={events.source} />, {
+      width: 170,
+      height: 56,
+    })
+
+    try {
+      await waitForFrame(app, `${changingRunID} smoke running`)
+      runStatus = "succeeded"
+      events.emit({
+        type: "research.runner.progress.line",
+        properties: {
+          taskID,
+          runID: changingRunID,
+          line: '{"event":"smoke_eval_done","val_avg_mse":0.101}',
+          event: "smoke_eval_done",
+        },
+      })
+
+      const frame = await waitForFrame(app, `${changingRunID} smoke succeeded`)
+      expect(frame).toContain("val_avg_mse 0.101")
     } finally {
       app.renderer.destroy()
     }

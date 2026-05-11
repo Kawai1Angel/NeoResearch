@@ -542,6 +542,7 @@ export const ResearchRoutes = lazy(() =>
           maxNoImprove: z.number().int().min(0).optional(),
           timeBudgetSeconds: z.number().positive().optional(),
           maxCrashStreak: z.number().int().min(0).optional(),
+          explorationRate: z.number().min(0).max(1).optional(),
           outputDir: z.string().optional(),
           forceDatasetPreparation: z.boolean().optional(),
         }),
@@ -590,6 +591,7 @@ export const ResearchRoutes = lazy(() =>
           stage: Research.ExecutableRunStage.zod.optional(),
           description: z.string().optional(),
           seed: z.number().int().min(0).optional(),
+          forceExplore: z.boolean().optional(),
         }),
       ),
       async (c) =>
@@ -657,6 +659,7 @@ export const ResearchRoutes = lazy(() =>
           maxNoImprove: z.number().int().min(0).optional(),
           timeBudgetSeconds: z.number().positive().optional(),
           maxCrashStreak: z.number().int().min(0).optional(),
+          explorationRate: z.number().min(0).max(1).optional(),
         }),
       ),
       async (c) =>

@@ -256,7 +256,7 @@ node ./bin/neo-cast.js config init
 node ./bin/neo-cast.js config show
 ```
 
-If `ANTHROPIC_API_KEY` is missing, `design --mock-llm` still works. The default non-mock path uses `src/llm.js` and the Anthropic SDK.
+If no LLM API key is configured, `doctor` reports the missing key as a warning instead of blocking local checks. Use `design --mock-llm`, or set `NEO_CAST_USE_MOCK=1` in your shell / `.env.local`, to run the offline heuristic candidate factory for alpha demos. The default non-mock path uses `src/llm.js` and the Anthropic SDK.
 
 ### GLM5 / OpenAI-Compatible Relay
 

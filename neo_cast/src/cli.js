@@ -47,6 +47,7 @@ const {
   writeCurrentCandidate,
 } = require("./python-bridge");
 const { getRuntimePaths, initRuntime, runtimeReady } = require("./runtime");
+const { isMockLlmEnabled } = require("./mock-mode");
 const { publishReleaseReport } = require("./report-output");
 const { getLatestVersionRef, getNextVersionId, registerVersion } = require("./versioning");
 const fs = require("fs");
@@ -114,6 +115,10 @@ Design flags:
   --require-approval Pause after model design and require: neo-cast checkpoint approve model_design
   --time-budget      Autonomous wall-clock budget, e.g. 2h, 90m, 3600s
   --max-no-improve   Autonomous plateau limit; defaults to 8 consecutive non-improving runs
+
+No API key?
+  Use \`--mock-llm\` on design commands, or set \`NEO_CAST_USE_MOCK=1\`, to run the
+  offline heuristic candidate factory for alpha demos.
 `.trim();
   console.log(helpText);
 }
@@ -862,12 +867,13 @@ async function handleDesign(positionals, rawFlags) {
     return 1;
   }
   const isAutonomous = Boolean(rawFlags.autonomous);
+  const mockLlm = isMockLlmEnabled({ mockLlm: rawFlags["mock-llm"] });
 
   const configResult = resolveConfig({
     projectRoot,
     flags: mapCliFlags(rawFlags),
   });
-  if (configResult.validationErrors.length > 0 && !rawFlags["mock-llm"]) {
+  if (configResult.validationErrors.length > 0 && !mockLlm) {
     console.error(`Config errors: ${configResult.validationErrors.join(" | ")}`);
     return 1;
   }
@@ -910,7 +916,7 @@ async function handleDesign(positionals, rawFlags) {
       timeBudgetMs,
       maxNoImprove,
       maxCandidates: Infinity,
-      mockLlm: Boolean(rawFlags["mock-llm"]),
+      mockLlm,
       useReflection: Boolean(rawFlags["use-reflection"]),
       useMutation: Boolean(rawFlags["use-mutation"]),
       skipSmoke: Boolean(rawFlags["skip-smoke"]),
@@ -980,7 +986,7 @@ async function handleDesign(positionals, rawFlags) {
         requirementBundle.requirementText,
         history,
         configResult.resolved,
-        { attempt, mockLlm: Boolean(rawFlags["mock-llm"]), taskContext }
+        { attempt, mockLlm, taskContext }
       )
     );
 
@@ -994,7 +1000,7 @@ async function handleDesign(positionals, rawFlags) {
           configResult.resolved,
           {
             projectRoot,
-            mockLlm: Boolean(rawFlags["mock-llm"]),
+            mockLlm,
             taskContext,
             attempt,
           }

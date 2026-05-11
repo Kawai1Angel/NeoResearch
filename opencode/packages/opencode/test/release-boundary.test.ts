@@ -118,6 +118,7 @@ describe("NeoResearch npm package boundary", () => {
       "bun test test/cli/research-command.test.ts --timeout 30000",
       "bun test test/cli/doctor.test.ts",
       "bun test test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-cockpit-render.test.tsx test/cli/tui/research-home-render.test.tsx test/cli/tui/research-slash-menu.test.tsx",
+      "bun test test/research/e2e-autonomous-loop.test.ts --timeout 120000",
       "bun test test/research/service.test.ts --timeout 30000",
       "bun run typecheck",
       "bun run build",

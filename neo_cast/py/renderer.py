@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from model_recipe import compile_model_recipe, is_model_recipe_payload
+from model_recipe import compile_model_recipe, is_model_recipe_payload, prediction_horizons_from_input
 from prepare_tsf import DATASET, HORIZONS, INPUT_LEN, NUM_CHANNELS, PARAM_BUDGET, SEED, TIME_BUDGET
 from recipe_bridge import is_recipe_payload, normalize_recipe_id
 from validate import detect_payload_kind, validate_payload
@@ -47,11 +47,12 @@ def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | Non
     budget = strategy["budget"]
     constraints = normalized_recipe.get("constraints") or {}
     max_params = constraints.get("max_params")
-    task_input_len = int(model_recipe.get("input", {}).get("history_window", INPUT_LEN)) if model_recipe else INPUT_LEN
-    task_horizon = int(model_recipe.get("input", {}).get("prediction_horizon", HORIZONS[0])) if model_recipe else None
+    model_input = model_recipe.get("input", {}) if model_recipe else {}
+    task_input_len = int(model_input.get("history_window", INPUT_LEN)) if model_recipe else INPUT_LEN
+    task_horizons = prediction_horizons_from_input(model_input) if model_recipe else list(HORIZONS)
     smoke_config = SMOKE_CONFIG.copy()
-    if task_horizon:
-        smoke_config["horizon"] = task_horizon
+    if task_horizons:
+        smoke_config["horizon"] = task_horizons[0]
     resolved = {
         "schema_version": "resolved_candidate.v1",
         "candidate_id": recipe_id,
@@ -77,7 +78,7 @@ def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | Non
         "task": {
             "task_id": DATASET,
             "input_len": task_input_len,
-            "horizons": [task_horizon] if task_horizon else list(HORIZONS),
+            "horizons": task_horizons,
             "num_channels": NUM_CHANNELS,
         },
         "notes": normalized_recipe.get("notes"),

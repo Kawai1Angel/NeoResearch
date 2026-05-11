@@ -283,6 +283,74 @@ def _parse_eval_metrics(records: list[dict[str, Any]]) -> dict[str, float] | Non
     return None
 
 
+def _records_indicate_candidate_failure(records: list[dict[str, Any]]) -> bool:
+    candidate_error_kinds = {"param_budget_exceeded"}
+    for record in records:
+        if record.get("event") == "error" and record.get("kind") in candidate_error_kinds:
+            return True
+        if record.get("event") == "done" and record.get("status") in {"smoke_fail", "full_fail"}:
+            return True
+    return False
+
+
+def _candidate_safe_exit_code(exit_code: int, records: list[dict[str, Any]]) -> int:
+    if exit_code == 0:
+        return 0
+    if exit_code == 2:
+        return 1
+    if _records_indicate_candidate_failure(records):
+        return 1
+    return exit_code
+
+
+def _metric_horizons(metrics: dict[str, Any] | None) -> list[int]:
+    if not isinstance(metrics, dict):
+        return []
+    horizons: list[int] = []
+    for key in metrics.keys():
+        if not key.startswith("val_h") or not key.endswith("_mse"):
+            continue
+        raw_horizon = key[len("val_h") : -len("_mse")]
+        try:
+            horizon = int(raw_horizon)
+        except ValueError:
+            continue
+        if horizon not in horizons:
+            horizons.append(horizon)
+    return sorted(horizons)
+
+
+def _candidate_task_horizons(candidate: dict[str, Any]) -> list[int]:
+    try:
+        horizons = candidate.get("task", {}).get("horizons", [])
+        return sorted({int(horizon) for horizon in horizons})
+    except (TypeError, ValueError):
+        return []
+
+
+def _val_metrics_for_run(run_id: str | None) -> dict[str, Any] | None:
+    if not run_id:
+        return None
+    metrics_path = ARTIFACTS_DIR / f"run_{run_id}" / "val_metrics.json"
+    try:
+        return read_json(metrics_path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
+def _horizon_signature(horizons: list[int]) -> str:
+    return ",".join(str(horizon) for horizon in sorted(horizons)) or "unknown"
+
+
+def _best_is_comparable(state: RunnerState, current_horizons: list[int]) -> bool:
+    if state.best_val_avg_mse is None or state.best_run_id is None:
+        return True
+    best_horizons = _metric_horizons(_val_metrics_for_run(state.best_run_id))
+    if not best_horizons or not current_horizons:
+        return True
+    return best_horizons == sorted(current_horizons)
+
+
 def _write_training_curves(records: list[dict[str, Any]], artifact_dir: Path | None) -> None:
     if artifact_dir is None:
         return
@@ -477,7 +545,7 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
                 params_m=None,
                 status=status,
             )
-            return smoke_exit
+            return _candidate_safe_exit_code(smoke_exit, smoke_records)
 
         candidate_id, model_family = _candidate_context()
 
@@ -506,9 +574,10 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
             params_m=None,
             status="crash",
         )
-        return train_exit if train_exit != 0 else 1
+        return _candidate_safe_exit_code(train_exit if train_exit != 0 else 1, train_records)
 
     training_summary = read_json(artifact_dir / "training_summary.json")
+    resolved_candidate = read_json(RESOLVED_CANDIDATE_PATH)
     params_m = float(training_summary.get("num_params_M", 0.0))
     val_avg_mse = float(val_metrics["val_avg_mse"])
     _write_training_curves(train_records, artifact_dir)
@@ -529,7 +598,11 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         return export_exit
     _append_artifact_trace(artifact_dir)
 
-    improved = state.best_val_avg_mse is None or val_avg_mse < state.best_val_avg_mse
+    current_horizons = _metric_horizons(val_metrics) or _candidate_task_horizons(resolved_candidate)
+    comparable = _best_is_comparable(state, current_horizons)
+    if not comparable:
+        print(f"runner_champion_standoff=current_horizons:{_horizon_signature(current_horizons)}")
+    improved = state.best_val_avg_mse is None or not comparable or val_avg_mse < state.best_val_avg_mse
     status = "keep" if improved else "discard"
 
     if improved:

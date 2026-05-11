@@ -319,3 +319,76 @@ test("LLM proposal prompt samples representative candidate, run, and memory hist
   expect(userPrompt.memory.map((item: { lesson: string }) => item.lesson)).toContain("accepted lesson from early champion")
   expect(userPrompt.memory.map((item: { lesson: string }) => item.lesson)).toContain("failed lesson from late crash")
 })
+
+test("LLM proposal prompt weights memory by recency and exposes forbidden failed signatures", async () => {
+  const workspaceRoot = await mkdtemp(path.join(tmpdir(), "opencode-llm-proposal-memory-policy-"))
+  process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+  process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
+  process.env.NEO_CAST_LLM_MODEL = "test-model"
+  process.env.NEO_CAST_LLM_API_KEY = "test-key"
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+    const [, init] = args
+    requestBody = JSON.parse(String(init?.body ?? "{}"))
+    return Promise.resolve(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(llmRecipe()) } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ) as ReturnType<typeof fetch>
+  }) as unknown as typeof fetch
+
+  const now = Date.now()
+  await proposeLLMCandidate({
+    task: task(false),
+    proposalContext: {
+      ...proposalContext,
+      memory: [
+        {
+          outcome: "failed",
+          lesson: "ancient failed MLP recipe should not be repeated",
+          candidateSummary: {
+            recipeID: "ancient_failed_mlp",
+            candidateSpec: { recipeID: "ancient_failed_mlp", backbone: { type: "mlp" } },
+          },
+          time: now - 10 * 60 * 60 * 1000,
+        },
+        {
+          outcome: "rejected",
+          lesson: "recent rejected transformer recipe should not be repeated",
+          candidateSummary: {
+            recipeID: "recent_rejected_transformer",
+            candidateSpec: { recipeID: "recent_rejected_transformer", backbone: { type: "transformer" } },
+          },
+          time: now - 10 * 60 * 1000,
+        },
+      ] as DomainProposalContext["memory"],
+    },
+    workspaceRoot,
+  })
+
+  const body = requestBody as { messages: Array<{ role: string; content: string }> }
+  const userPrompt = JSON.parse(body.messages.find((message) => message.role === "user")?.content ?? "{}")
+  expect(userPrompt.memory).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        lesson: "ancient failed MLP recipe should not be repeated",
+        memoryWeight: expect.any(Number),
+      }),
+      expect.objectContaining({
+        lesson: "recent rejected transformer recipe should not be repeated",
+        memoryWeight: expect.any(Number),
+      }),
+    ]),
+  )
+  const ancient = userPrompt.memory.find((item: { lesson: string }) => item.lesson.startsWith("ancient failed"))
+  const recent = userPrompt.memory.find((item: { lesson: string }) => item.lesson.startsWith("recent rejected"))
+  expect(recent.memoryWeight).toBeGreaterThan(ancient.memoryWeight)
+  expect(userPrompt.forbidden_signatures).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining("ancient_failed_mlp"),
+      expect.stringContaining("recent_rejected_transformer"),
+    ]),
+  )
+  expect(userPrompt.instruction).toContain("do not repeat")
+})

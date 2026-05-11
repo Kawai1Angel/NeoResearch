@@ -138,6 +138,20 @@ test("heuristic mock candidate emits a high-level model recipe", () => {
   assert.equal(candidate.constraints.latency_sensitive, true);
 });
 
+test("heuristic mock candidate preserves the full task horizon objective", () => {
+  const { _buildHeuristicCandidate } = require("../src/llm");
+
+  const candidate = _buildHeuristicCandidate(
+    "small TSF baseline for ETTh1 with 4 horizons",
+    1,
+    { input_len: 512, horizons: [96, 192, 336, 720] },
+  );
+
+  assert.equal(candidate.schema_version, "model_recipe.v1");
+  assert.equal(candidate.input.prediction_horizon, 96);
+  assert.deepEqual(candidate.input.prediction_horizons, [96, 192, 336, 720]);
+});
+
 test("LLM candidate defaults complete required frequency embedding fields", () => {
   const candidate = _ensureCandidateDefaults(
     {

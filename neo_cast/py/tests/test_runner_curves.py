@@ -103,7 +103,7 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
                 exit_code = runner.run_experiment(state, description="bad candidate", skip_smoke=False)
                 rows = runner.load_results()
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 1)
         self.assertEqual(rows[-1]["status"], "invalid")
         self.assertEqual(rows[-1]["candidate_id"], "smoke_1")
         self.assertEqual(rows[-1]["model_family"], "unknown")
@@ -226,6 +226,129 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         resolve_candidate.assert_not_called()
+
+    def test_full_train_candidate_failure_returns_continue_safe_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".neo-cast"
+            artifacts_dir = state_dir / "artifacts"
+            state_dir.mkdir(parents=True)
+            current_path = state_dir / "current_candidate.json"
+            resolved_path = state_dir / "resolved_candidate.json"
+            state_path = state_dir / "runner_state.json"
+            results_path = state_dir / "results.tsv"
+            current_path.write_text('{"recipe_id":"recipe_too_large"}\n', encoding="utf-8")
+            resolved_path.write_text(
+                '{"candidate_id":"recipe_too_large","model_family":"recipe_factory"}\n',
+                encoding="utf-8",
+            )
+            state = runner.RunnerState(
+                session_id="session_test",
+                best_run_id="run_best",
+                best_val_avg_mse=0.5,
+                keep_count=1,
+                crash_streak=0,
+                candidate_counter=0,
+                initialized_at="2026-04-29T00:00:00Z",
+                session_started_at="2026-04-29T00:00:00Z",
+            )
+            train_records = [
+                {
+                    "event": "error",
+                    "kind": "param_budget_exceeded",
+                    "candidate_id": "recipe_too_large",
+                    "num_params_m": 2.3,
+                    "allowed_m": 1.0,
+                },
+                {"event": "done", "status": "full_fail"},
+            ]
+
+            with (
+                patch.object(runner, "STATE_DIR", state_dir),
+                patch.object(runner, "ARTIFACTS_DIR", artifacts_dir),
+                patch.object(runner, "CURRENT_CANDIDATE_PATH", current_path),
+                patch.object(runner, "RESOLVED_CANDIDATE_PATH", resolved_path),
+                patch.object(runner, "STATE_PATH", state_path),
+                patch.object(runner, "RESULTS_PATH", results_path),
+                patch.object(runner, "_run_and_capture", return_value=(3, train_records)),
+            ):
+                runner.ensure_results_file(force=True)
+                exit_code = runner.run_experiment(state, description="oversized candidate", skip_smoke=True)
+                rows = runner.load_results()
+                saved_state = runner.load_state()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(rows[-1]["status"], "crash")
+        self.assertEqual(saved_state.crash_streak, 1)
+
+    def test_incomparable_best_horizons_start_new_champion_comparison_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".neo-cast"
+            artifacts_dir = state_dir / "artifacts"
+            old_artifact_dir = artifacts_dir / "run_old_single"
+            new_artifact_dir = artifacts_dir / "run_new_full"
+            old_artifact_dir.mkdir(parents=True)
+            new_artifact_dir.mkdir(parents=True)
+            (old_artifact_dir / "val_metrics.json").write_text(
+                '{"val_avg_mse":0.1,"val_h96_mse":0.1}\n',
+                encoding="utf-8",
+            )
+            (new_artifact_dir / "training_summary.json").write_text('{"num_params_M":0.25}\n', encoding="utf-8")
+            state_dir.mkdir(parents=True, exist_ok=True)
+            current_path = state_dir / "current_candidate.json"
+            resolved_path = state_dir / "resolved_candidate.json"
+            state_path = state_dir / "runner_state.json"
+            results_path = state_dir / "results.tsv"
+            current_path.write_text('{"recipe_id":"recipe_full_horizons"}\n', encoding="utf-8")
+            resolved_path.write_text(
+                '{"candidate_id":"recipe_full_horizons","model_family":"recipe_factory"}\n',
+                encoding="utf-8",
+            )
+            state = runner.RunnerState(
+                session_id="session_test",
+                best_run_id="old_single",
+                best_val_avg_mse=0.1,
+                keep_count=1,
+                crash_streak=0,
+                candidate_counter=0,
+                initialized_at="2026-04-29T00:00:00Z",
+                session_started_at="2026-04-29T00:00:00Z",
+            )
+            train_records = [
+                {
+                    "event": "eval_done",
+                    "val_avg_mse": 0.9,
+                    "val_h96_mse": 0.5,
+                    "val_h192_mse": 0.8,
+                    "val_h336_mse": 1.0,
+                    "val_h720_mse": 1.3,
+                },
+                {
+                    "event": "artifact_ready",
+                    "run_id": "new_full",
+                    "artifact_dir": str(new_artifact_dir),
+                },
+                {"event": "done", "status": "success"},
+            ]
+
+            with (
+                patch.object(runner, "STATE_DIR", state_dir),
+                patch.object(runner, "ARTIFACTS_DIR", artifacts_dir),
+                patch.object(runner, "CURRENT_CANDIDATE_PATH", current_path),
+                patch.object(runner, "RESOLVED_CANDIDATE_PATH", resolved_path),
+                patch.object(runner, "STATE_PATH", state_path),
+                patch.object(runner, "RESULTS_PATH", results_path),
+                patch.object(runner, "_run_and_capture", return_value=(0, train_records)),
+                patch.object(runner, "_export_artifact", return_value=0),
+            ):
+                runner.ensure_results_file(force=True)
+                exit_code = runner.run_experiment(state, description="full horizon candidate", skip_smoke=True)
+                rows = runner.load_results()
+                saved_state = runner.load_state()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(rows[-1]["status"], "keep")
+        self.assertEqual(saved_state.best_run_id, "new_full")
+        self.assertEqual(saved_state.best_val_avg_mse, 0.9)
 
 
 if __name__ == "__main__":

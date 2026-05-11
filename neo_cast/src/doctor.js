@@ -91,9 +91,10 @@ function checkAnthropicApiKey(env = process.env) {
   const hasKey = Boolean(env.ANTHROPIC_API_KEY);
   return {
     name: "anthropic_api_key",
-    ok: hasKey,
+    ok: true,
+    level: hasKey ? "ok" : "warn",
     message: hasKey ? "ANTHROPIC_API_KEY is set." : "ANTHROPIC_API_KEY is not set.",
-    details: hasKey ? "" : "Set ANTHROPIC_API_KEY before using LLM-backed commands.",
+    details: hasKey ? "" : "Set ANTHROPIC_API_KEY for live LLM calls, or run design with `--mock-llm` / `NEO_CAST_USE_MOCK=1` for offline alpha demos.",
   };
 }
 
@@ -101,13 +102,14 @@ function checkOpenAICompatibleApiKey(env = process.env) {
   const hasKey = Boolean(env.NEO_CAST_LLM_API_KEY || env.OPENAI_API_KEY || env.AIGCBEST_API_KEY);
   return {
     name: "openai_compatible_api_key",
-    ok: hasKey,
+    ok: true,
+    level: hasKey ? "ok" : "warn",
     message: hasKey
       ? "OPENAI-compatible API key is set."
       : "OPENAI-compatible API key is not set.",
     details: hasKey
       ? ""
-      : "Set NEO_CAST_LLM_API_KEY, OPENAI_API_KEY, or AIGCBEST_API_KEY before using openai-compatible providers.",
+      : "Set NEO_CAST_LLM_API_KEY, OPENAI_API_KEY, or AIGCBEST_API_KEY for live LLM calls, or run design with `--mock-llm` / `NEO_CAST_USE_MOCK=1` for offline alpha demos.",
   };
 }
 
@@ -163,7 +165,7 @@ function formatDoctorReport(report) {
 
   lines.push(report.ok ? "neo-cast doctor: OK" : "neo-cast doctor: issues found");
   for (const check of report.checks) {
-    const status = check.ok ? "OK" : "FAIL";
+    const status = check.level === "warn" ? "WARN" : check.ok ? "OK" : "FAIL";
     lines.push(`[${status}] ${check.name}: ${check.message}`);
     if (check.details) {
       lines.push(`  ${check.details}`);

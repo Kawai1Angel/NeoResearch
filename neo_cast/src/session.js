@@ -34,7 +34,12 @@ function getLatestSessionRow(projectRoot = process.cwd()) {
 // instead we derive the session-local best by scanning val_avg_mse over completed rows.
 // Tie-break is "first occurrence wins" so the originally improving run keeps the BEST tag.
 function getBestSessionRow(projectRoot = process.cwd()) {
+  const state = loadRunnerState(projectRoot);
   const rows = getSessionRows(projectRoot);
+  if (state?.best_run_id) {
+    const stateBest = rows.find((row) => row.run_id === state.best_run_id);
+    if (stateBest) return stateBest;
+  }
   let best = null;
   let bestMse = Infinity;
   for (const row of rows) {

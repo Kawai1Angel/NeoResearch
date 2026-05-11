@@ -46,6 +46,20 @@ test("getBestSessionRow returns the latest best row for the active session", () 
   assert.equal(getBestSessionRow(projectRoot)?.run_id, "run_new");
 });
 
+test("getBestSessionRow honors runner state when best_run_id defines the comparable champion", () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-session-"));
+  writeProjectState(
+    projectRoot,
+    { session_id: "session_a", best_run_id: "run_full" },
+    [
+      { session_id: "session_a", run_id: "run_single", candidate_id: "single", model_family: "linear", val_avg_mse: "0.10", is_best: "0" },
+      { session_id: "session_a", run_id: "run_full", candidate_id: "full", model_family: "tcn", val_avg_mse: "0.90", is_best: "0" },
+    ],
+  );
+
+  assert.equal(getBestSessionRow(projectRoot)?.run_id, "run_full");
+});
+
 test("loadRunnerState treats corrupt state JSON as unavailable", () => {
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-session-"));
   const stateDir = path.join(projectRoot, ".neo-cast");

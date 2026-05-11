@@ -1,4 +1,5 @@
 import { readFile } from "fs/promises"
+import { createHash } from "crypto"
 import os from "os"
 import path from "path"
 import type { DomainCandidateProposal, DomainProposalContext } from "./domain"
@@ -327,16 +328,64 @@ function representativeRuns(context: DomainProposalContext) {
   return selected.slice(0, 12)
 }
 
+function memoryWeight(item: DomainProposalContext["memory"][number], now: number) {
+  if (typeof item.time !== "number" || !Number.isFinite(item.time)) return 1
+  const ageMinutes = Math.max(0, (now - item.time) / 60_000)
+  return 1 / (1 + ageMinutes / 60)
+}
+
+function memoryPromptRecord(item: DomainProposalContext["memory"][number], now: number) {
+  return {
+    ...item,
+    memoryWeight: Number(memoryWeight(item, now).toFixed(4)),
+  }
+}
+
 function representativeMemory(context: DomainProposalContext) {
   const selected: DomainProposalContext["memory"][number][] = []
   const key = (item: DomainProposalContext["memory"][number]) => `${item.outcome}:${item.lesson}`
+  const now = Date.now()
+  const byWeight = (left: DomainProposalContext["memory"][number], right: DomainProposalContext["memory"][number]) =>
+    memoryWeight(right, now) - memoryWeight(left, now)
   for (const outcome of ["accepted", "rejected", "failed"]) {
-    for (const item of context.memory.filter((memory) => memory.outcome === outcome).slice(0, 3)) {
+    for (const item of context.memory.filter((memory) => memory.outcome === outcome).sort(byWeight).slice(0, 3)) {
       pushUniqueBy(selected, item, key)
     }
   }
-  for (const item of context.memory.slice(-4)) pushUniqueBy(selected, item, key)
-  return selected.slice(0, 12)
+  for (const item of [...context.memory].sort(byWeight).slice(0, 4)) pushUniqueBy(selected, item, key)
+  return selected.slice(0, 12).map((item) => memoryPromptRecord(item, now))
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`
+  if (!isRecord(value)) return JSON.stringify(value)
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+    .join(",")}}`
+}
+
+function candidateSignatureFromMemory(item: DomainProposalContext["memory"][number]) {
+  const summary = isRecord(item.candidateSummary) ? item.candidateSummary : {}
+  const candidateSpec = isRecord(summary.candidateSpec) ? summary.candidateSpec : undefined
+  const recipeID =
+    typeof summary.recipeID === "string"
+      ? summary.recipeID
+      : candidateSpec && typeof candidateSpec.recipeID === "string"
+        ? candidateSpec.recipeID
+        : undefined
+  const signatureSource = candidateSpec ?? (recipeID === undefined ? undefined : { recipeID })
+  if (signatureSource === undefined) return undefined
+  const hash = createHash("sha256").update(stableJson(signatureSource)).digest("hex").slice(0, 12)
+  return `${recipeID ?? "candidate"}#${hash}`
+}
+
+function forbiddenCandidateSignatures(context: DomainProposalContext) {
+  const signatures = context.memory
+    .filter((item) => item.outcome === "failed" || item.outcome === "rejected")
+    .map(candidateSignatureFromMemory)
+    .filter((item): item is string => item !== undefined)
+  return [...new Set(signatures)].slice(0, 24)
 }
 
 function buildUserPrompt(input: {
@@ -364,9 +413,10 @@ function buildUserPrompt(input: {
       existingCandidates: representativeCandidates(input.proposalContext),
       runs: representativeRuns(input.proposalContext),
       memory: representativeMemory(input.proposalContext),
+      forbidden_signatures: forbiddenCandidateSignatures(input.proposalContext),
       champion: input.proposalContext.champion,
       instruction:
-        "Propose a new candidate that is different from existing candidates and suitable for the task. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
+        "Propose a new candidate that is different from existing candidates and suitable for the task; do not repeat forbidden_signatures. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
     },
     null,
     2,

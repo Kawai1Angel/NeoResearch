@@ -5,6 +5,7 @@
   "input": {
     "history_window": 96,
     "prediction_horizon": 24,
+    "prediction_horizons": [24],
     "covariates": true
   },
   "architecture": {

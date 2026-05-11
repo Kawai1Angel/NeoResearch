@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const { formatUserCorrections } = require("./corrections");
+const { isMockLlmEnabled } = require("./mock-mode");
 const {
   _buildHeuristicCandidate,
   _ensureCandidateDefaults,
@@ -256,7 +257,7 @@ async function reflectAndPropose(requirement, history, previousRow, resolvedConf
   const projectRoot = options.projectRoot || process.cwd();
   const attempt = options.attempt || 2;
 
-  if (options.mockLlm || process.env.NEO_CAST_MOCK_LLM) {
+  if (isMockLlmEnabled(options)) {
     const candidate = _buildHeuristicCandidate(requirement, attempt);
     candidate.recipe_id = `recipe_reflect_mock_${Date.now()}_${attempt}`;
     _ensureCandidateDefaults(candidate, "reflect_mock", attempt);

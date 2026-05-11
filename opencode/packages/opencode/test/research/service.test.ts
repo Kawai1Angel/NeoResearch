@@ -1957,6 +1957,67 @@ describe("Research service", () => {
     })
   })
 
+  test("champion selection records a standoff when long-horizon metric regresses", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await createTSFTask("champion tie-breaker standoff")
+        const current = await createCandidate({ taskID: task.id, rationale: "current long-horizon stable champion" })
+        const challenger = await createCandidate({
+          taskID: task.id,
+          candidateSpec: {
+            ...validTsfCandidateSpec(),
+            recipeID: "tsf_patch_mlp_lower_avg_worse_h720",
+            hypothesis: "Improves average MSE but regresses horizon 720.",
+          },
+          rationale: "primary metric improves but tail horizon regresses",
+        })
+
+        const championRun = await createRun({
+          taskID: task.id,
+          candidateID: current.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.2, val_h720_mse: 0.31 },
+        })
+        const challengerRun = await createRun({
+          taskID: task.id,
+          candidateID: challenger.id,
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.19, val_h720_mse: 0.92 },
+        })
+
+        const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))
+        expect(champion).toMatchObject({
+          candidateID: current.id,
+          runID: championRun.id,
+          primaryMetric: 0.2,
+        })
+
+        const memory = await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))
+        expect(memory[0]).toMatchObject({
+          outcome: "rejected",
+          candidateSummary: {
+            runID: challengerRun.id,
+            primaryMetric: 0.19,
+            championUpdated: false,
+            championStandoff: {
+              status: "secondary_metric_regressed",
+              primaryMetricName: "val_avg_mse",
+              secondaryMetricName: "val_h720_mse",
+              challengerPrimary: 0.19,
+              championPrimary: 0.2,
+              challengerSecondary: 0.92,
+              championSecondary: 0.31,
+            },
+          },
+        })
+        expect(memory[0]?.lesson).toContain("champion standoff")
+      },
+    })
+  })
+
   test("persists dataset profile warnings without failing profile runs", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const missingDatasetPath = path.join(tmp.path, "missing", "train.csv")
@@ -3759,6 +3820,49 @@ describe("Research service", () => {
         expect(loopRecord.iterations.map((iteration: { managerTraceRoles: string[] }) => iteration.managerTraceRoles)).toEqual(
           loop.iterations.map((iteration) => iteration.managerTrace.map((step) => step.role)),
         )
+      },
+    })
+  })
+
+  test("autonomous loop forced exploration creates a new domain proposal instead of exploiting ready frontier", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await createTSFTask(
+          "autonomous forced exploration",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+
+        const loopInput = {
+          taskID: task.id,
+          stage: "smoke" as const,
+          maxIterations: 1,
+          explorationRate: 1,
+          description: "forced explore",
+        }
+        const loop = await runResearch(Research.Service.use((svc) => svc.runAutonomousLoop(loopInput)))
+
+        expect(loop.iterations).toHaveLength(1)
+        expect(loop.iterations[0]?.candidate.generatedBy).toBe("mutation")
+        expect(loop.iterations[0]?.candidate.candidateSpec.recipeID).toBe("tsf_bridge_patch_mlp_wide_adamw")
+        expect(loop.iterations[0]?.managerTrace.find((step) => step.role === "design")?.metadata).toMatchObject({
+          explorationMode: "forced",
+          selectionSource: "domain_proposal",
+          proposalCreated: true,
+        })
+
+        const candidates = await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))
+        expect(candidates).toHaveLength(4)
       },
     })
   })

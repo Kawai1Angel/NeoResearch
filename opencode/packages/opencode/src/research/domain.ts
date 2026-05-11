@@ -114,6 +114,7 @@ export type DomainProposalContext = {
     readonly lesson: string
     readonly fingerprintSummary?: JsonRecord
     readonly candidateSummary: JsonRecord
+    readonly time?: number
   }[]
   readonly champion?: {
     readonly candidateID: string

@@ -49,7 +49,7 @@ export function resetResearchSlashMenuSelectionForTest() {
 
 export function slashInputQuery(value: string) {
   if (!value.startsWith("/")) return
-  const query = value.slice(1)
+  const query = value.slice(1).trimEnd()
   if (query.match(/\s/)) return
   return query.toLowerCase()
 }

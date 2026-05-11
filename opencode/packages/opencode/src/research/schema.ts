@@ -503,6 +503,7 @@ export class AutonomousIterationInput extends Schema.Class<AutonomousIterationIn
   taskID: ResearchTaskID,
   stage: Schema.optional(ExecutableRunStage),
   description: Schema.optional(Schema.String),
+  forceExplore: Schema.optional(Schema.Boolean),
 }) {
   static readonly zod = zod(this)
 }
@@ -517,6 +518,7 @@ export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("Rese
   maxNoImprove: Schema.optional(Schema.Number),
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
+  explorationRate: Schema.optional(Schema.Number),
 }) {
   static readonly zod = zod(this)
 }
@@ -547,6 +549,7 @@ export class RunFullPipelineInput extends Schema.Class<RunFullPipelineInput>("Re
   maxNoImprove: Schema.optional(Schema.Number),
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
+  explorationRate: Schema.optional(Schema.Number),
   outputDir: Schema.optional(Schema.String),
   forceDatasetPreparation: Schema.optional(Schema.Boolean),
 }) {

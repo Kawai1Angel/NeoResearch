@@ -295,23 +295,27 @@ export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflow
   const hasProfile = hasCockpitProfileEvidence(input)
   const hasCandidates = input.candidates.length > 0
   const hypothesisCount = researchCockpitHypothesisCount(input)
+  // Historical `input.champion` is a long-lived task-level snapshot; it must NOT
+  // coalesce upstream stages to "done" because the cockpit would render every
+  // stage as ✓ on a fresh task that simply has a champion from a prior session.
+  // Stage progress is derived only from per-run / per-artifact / per-candidate
+  // evidence collected for the active task.
   const hasHypothesisPlan =
     hypothesisCount !== undefined ||
     input.artifacts.some((artifact) => artifact.kind === "hypo_plan_md" || artifact.kind === "hypotheses_yaml") ||
-    (hasProfile && (hasCandidates || hasCompletedCompilerRun(input) || hasTrainEvalEvidence(input) || Boolean(input.champion)))
+    (hasProfile && (hasCandidates || hasCompletedCompilerRun(input) || hasTrainEvalEvidence(input)))
   const requirementsConfirmed = hasRequirementsConfirmation(input) || hasHypothesisPlan
   const hasCompilerEvidence =
     input.artifacts.some((artifact) => artifact.kind === "model_compile_report_md") ||
     hasCompletedCompilerRun(input) ||
-    hasTrainEvalEvidence(input) ||
-    Boolean(input.champion)
+    hasTrainEvalEvidence(input)
   const hasRunningCompiler = input.runs.some((run) => run.stage === "smoke" && (run.status === "queued" || run.status === "running"))
-  const trainEvalDone = hasTrainEvalEvidence(input) || Boolean(input.champion)
+  const trainEvalDone = hasTrainEvalEvidence(input)
   const hasRunningTrainEval = input.runs.some(
     (run) => isTrainEvalRun(run) && (run.status === "queued" || run.status === "running"),
   )
   const reflectionDone = hasReflectionEvidence(input)
-  const reflectionActive = (trainEvalDone || Boolean(input.champion)) && !reflectionDone
+  const reflectionActive = trainEvalDone && !reflectionDone
   const designerIteration = modelDesignerIteration(input)
   const planningActive = hasProfile && input.runnerReady && requirementsConfirmed
   const designActive = hasHypothesisPlan && input.runnerReady

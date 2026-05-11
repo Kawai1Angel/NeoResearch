@@ -746,13 +746,17 @@ export const ResearchIterateCommand = cmd({
           type: "string",
           demandOption: true,
         }),
-      ),
+      ).option("force-explore", {
+        describe: "force this iteration to create an exploratory candidate",
+        type: "boolean",
+      }),
     ),
   handler: async (
     args: FormatArg & {
       taskID?: string
       stage?: Research.ExecutableRunStage
       description?: string
+      forceExplore?: boolean
     },
   ) => {
     if (!args.taskID) return
@@ -762,6 +766,7 @@ export const ResearchIterateCommand = cmd({
         taskID,
         stage: args.stage,
         description: args.description,
+        forceExplore: args.forceExplore,
       }),
     )
     print(iteration, args.format, () => formatResearchAutonomousIteration(iteration))
@@ -784,6 +789,10 @@ export const ResearchLoopCommand = cmd({
             describe: "maximum autonomous iterations to run",
             type: "number",
             default: 3,
+          })
+          .option("exploration", {
+            describe: "forced exploration rate from 0 to 1",
+            type: "number",
           }),
       ),
     ),
@@ -793,6 +802,7 @@ export const ResearchLoopCommand = cmd({
       stage?: Research.ExecutableRunStage
       description?: string
       maxIterations?: number
+      exploration?: number
     },
   ) => {
     if (!args.taskID) return
@@ -803,6 +813,7 @@ export const ResearchLoopCommand = cmd({
         stage: args.stage,
         description: args.description,
         maxIterations: args.maxIterations,
+        explorationRate: args.exploration,
       }),
     )
     print(loop, args.format, () => formatResearchAutonomousLoop(loop))
@@ -860,6 +871,10 @@ export const ResearchPipelineCommand = cmd({
           type: "number",
           default: 3,
         })
+        .option("exploration", {
+          describe: "forced exploration rate from 0 to 1",
+          type: "number",
+        })
         .option("stage", {
           describe: "execution stage for model search",
           choices: ["baseline", "smoke", "low_fidelity", "full", "ref_test", "blind_test"] as const,
@@ -882,6 +897,7 @@ export const ResearchPipelineCommand = cmd({
       stage?: Research.ExecutableRunStage
       description?: string
       outputDir?: string
+      exploration?: number
     },
   ) => {
     if (!args.taskID) return
@@ -892,6 +908,7 @@ export const ResearchPipelineCommand = cmd({
         stage: args.stage,
         description: args.description,
         maxIterations: args.maxIterations,
+        explorationRate: args.exploration,
         outputDir: args.outputDir,
       }),
     )
@@ -916,6 +933,10 @@ export const ResearchVibeCommand = cmd({
           type: "number",
           default: 3,
         })
+        .option("exploration", {
+          describe: "forced exploration rate from 0 to 1",
+          type: "number",
+        })
         .option("runner-root", {
           describe: "Neo-Cast runner root",
           type: "string",
@@ -931,6 +952,7 @@ export const ResearchVibeCommand = cmd({
     args: FormatArg & {
       goal?: string[]
       maxIterations?: number
+      exploration?: number
       runnerRoot?: string
       interactionMode?: ResearchInteractionMode
     },
@@ -952,6 +974,7 @@ export const ResearchVibeCommand = cmd({
           stage: "smoke",
           description: goal,
           maxIterations: args.maxIterations,
+          explorationRate: args.exploration,
           outputDir: ".neo-research/final",
         })
         return pipeline.publish

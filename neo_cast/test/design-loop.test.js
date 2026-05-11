@@ -26,7 +26,7 @@ function loadCliWithStubs(state = {}) {
     "./config": {
       buildPublicConfigView: () => ({}),
       ensureUserConfigFile: () => "",
-      resolveConfig: () => ({ resolved: {}, validationErrors: [] }),
+      resolveConfig: () => state.configResult || ({ resolved: {}, validationErrors: [] }),
     },
     "./checkpoint": {
       requestCheckpoint: (options) => {
@@ -287,6 +287,39 @@ test("design delegates autonomous mode to the autonomous loop with budgets", asy
     assert.equal(harness.autonomousOptions[0].useMutation, true);
     assert.equal(harness.autonomousOptions[0].skipSmoke, true);
   } finally {
+    harness.restore();
+  }
+});
+
+test("design treats NEO_CAST_USE_MOCK as mock mode for config validation and generation", async () => {
+  const previous = process.env.NEO_CAST_USE_MOCK;
+  process.env.NEO_CAST_USE_MOCK = "1";
+  const harness = loadCliWithStubs({
+    configResult: {
+      resolved: {},
+      validationErrors: ["llm.base_url is required for openai-compatible provider."],
+    },
+  });
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "offline alpha demo",
+      "--mode",
+      "companion",
+      "--max-candidates",
+      "1",
+      "--skip-smoke",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(harness.generatedAttempts, [1]);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.NEO_CAST_USE_MOCK;
+    } else {
+      process.env.NEO_CAST_USE_MOCK = previous;
+    }
     harness.restore();
   }
 });

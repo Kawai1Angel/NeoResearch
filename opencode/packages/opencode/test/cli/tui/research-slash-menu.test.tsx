@@ -8,6 +8,7 @@ import {
   moveSlashSelection,
   resetResearchSlashMenuSelectionForTest,
   resolveSlashOption,
+  slashInputQuery,
   slashOptionMatches,
   type SlashOption,
 } from "../../../src/cli/cmd/tui/routes/research-slash-menu"
@@ -118,4 +119,14 @@ test("slash popup ranks prefix matches before substring priority matches", () =>
     "/task-next",
   ])
   expect(resolveSlashOption("/ex", options)?.display).toBe("/export")
+})
+
+test("slash query tolerates a trailing space inserted by command shortcuts", () => {
+  const options = [
+    { display: "/loop", description: "Run autonomous loop" },
+    { display: "/new", description: "Create task" },
+  ]
+
+  expect(slashInputQuery("/loop ")).toBe("loop")
+  expect(resolveSlashOption("/loop ", options)?.display).toBe("/loop")
 })

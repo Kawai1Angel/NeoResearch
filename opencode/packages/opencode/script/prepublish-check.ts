@@ -51,6 +51,11 @@ const checks = [
       ),
   },
   {
+    name: "AutoResearch e2e smoke",
+    command: "bun test test/research/e2e-autonomous-loop.test.ts --timeout 120000",
+    run: () => $`bun test test/research/e2e-autonomous-loop.test.ts --timeout 120000`.env(releaseEnv),
+  },
+  {
     name: "research service tests",
     command: "bun test test/research/service.test.ts --timeout 30000",
     run: () => $`bun test test/research/service.test.ts --timeout 30000`.env(releaseEnv),

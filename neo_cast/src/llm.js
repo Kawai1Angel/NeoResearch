@@ -1,6 +1,7 @@
 "use strict";
 
 const { formatUserCorrections } = require("./corrections");
+const { isMockLlmEnabled } = require("./mock-mode");
 
 // ---------------------------------------------------------------------------
 // Heuristic fallback (used when LLM is mocked or API fails)
@@ -25,6 +26,16 @@ function _architectureBackboneForFamily(modelFamily) {
   if (modelFamily === "tcn") return "temporal_conv";
   if (modelFamily === "nlinear") return "linear";
   return modelFamily;
+}
+
+function _taskHorizons(taskContext = {}) {
+  const rawHorizons = Array.isArray(taskContext.horizons) && taskContext.horizons.length > 0
+    ? taskContext.horizons
+    : [96, 192, 336, 720];
+  const horizons = rawHorizons
+    .map((item) => Number(item))
+    .filter((item) => Number.isInteger(item) && item > 0);
+  return horizons.length > 0 ? Array.from(new Set(horizons)) : [96, 192, 336, 720];
 }
 
 function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
@@ -53,9 +64,7 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
     text.includes("部署") ||
     text.includes("推理")
   );
-  const horizons = Array.isArray(taskContext.horizons) && taskContext.horizons.length > 0
-    ? taskContext.horizons
-    : [96, 192, 336, 720];
+  const horizons = _taskHorizons(taskContext);
   const multiscaleBlocks = embedding.type === "multiscale_patch"
     ? embedding.scales?.length || 3
     : Math.max(Number(architecture.n_layers || architecture.n_blocks || architecture.depth || 1), options.useMultiscale ? 3 : 0);
@@ -67,6 +76,7 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
     input: {
       history_window: Number(taskContext.input_len || 512),
       prediction_horizon: Number(horizons[0] || 96),
+      prediction_horizons: horizons.map((horizon) => Number(horizon)),
       covariates: recipe.fusion?.channel_mode === "shared",
     },
     architecture: {
@@ -363,12 +373,13 @@ Required fields:
   schema_version: "model_recipe.v1"
   model_name: PascalCase model name, e.g. "MultiScaleTinyForecaster"
   hypothesis: 1-2 sentence rationale for why this candidate may improve val_avg_mse
-  input: { history_window, prediction_horizon, covariates }
+  input: { history_window, prediction_horizon, prediction_horizons, covariates }
   architecture: { backbone, decomposition, multiscale_blocks, attention, channel_fusion, hidden_dim, d_model, layers, heads, kernel_size, patch_len, stride, dropout, output_distribution }
   training: { loss, optimizer, learning_rate, batch_size, max_epochs, time_budget_s, patience, seed, weight_decay, grad_clip }
   constraints: { max_params, latency_sensitive, max_latency_ms }
 
-Use history_window and prediction_horizon from the task context.
+Use history_window, prediction_horizon, and prediction_horizons from the task context.
+Set input.prediction_horizons to the full task horizon list, not just the first horizon.
 constraints.max_params may be an integer or a human-readable string like "5M".
 constraints.latency_sensitive should be true when deployment, inference speed, or compact serving is important.
 
@@ -433,10 +444,11 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
     if (!candidate.model_name) candidate.model_name = `TinyForecaster${attempt}`;
     if (!candidate.hypothesis) candidate.hypothesis = "Structured model recipe generated for the prepared forecasting task.";
     if (!candidate.input) {
-      candidate.input = { history_window: 512, prediction_horizon: 96, covariates: true };
+      candidate.input = { history_window: 512, prediction_horizon: 96, prediction_horizons: [96], covariates: true };
     }
     if (candidate.input.history_window === undefined) candidate.input.history_window = 512;
     if (candidate.input.prediction_horizon === undefined) candidate.input.prediction_horizon = 96;
+    if (candidate.input.prediction_horizons === undefined) candidate.input.prediction_horizons = [candidate.input.prediction_horizon];
     if (candidate.input.covariates === undefined) candidate.input.covariates = true;
     if (!candidate.architecture) candidate.architecture = { backbone: "linear" };
     if (!candidate.architecture.backbone) candidate.architecture.backbone = "linear";
@@ -517,6 +529,26 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
   return candidate;
 }
 
+function _alignCandidateWithTaskContext(candidate, taskContext = {}) {
+  if (!_looksLikeModelRecipe(candidate)) return candidate;
+  const horizons = _taskHorizons(taskContext);
+  if (!candidate.input) {
+    candidate.input = {
+      history_window: Number(taskContext.input_len || 512),
+      prediction_horizon: horizons[0],
+      covariates: true,
+    };
+  }
+  if (candidate.input.history_window === undefined && taskContext.input_len !== undefined) {
+    candidate.input.history_window = Number(taskContext.input_len);
+  }
+  candidate.input.prediction_horizons = horizons;
+  if (!horizons.includes(Number(candidate.input.prediction_horizon))) {
+    candidate.input.prediction_horizon = horizons[0];
+  }
+  return candidate;
+}
+
 function _resolveLlmTimeoutMs(llm = {}, fallbackSeconds = 120) {
   const seconds = Number(llm.timeout_seconds ?? fallbackSeconds);
   const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : fallbackSeconds;
@@ -588,7 +620,7 @@ async function _generateWithAnthropic(requirement, history, resolvedConfig, atte
 
   const candidate = _extractJsonObject(text);
 
-  return _ensureCandidateDefaults(candidate, "llm", attempt);
+  return _alignCandidateWithTaskContext(_ensureCandidateDefaults(candidate, "llm", attempt), taskContext);
 }
 
 async function _generateWithOpenAICompatible(requirement, history, resolvedConfig, attempt, taskContext = {}) {
@@ -640,7 +672,7 @@ async function _generateWithOpenAICompatible(requirement, history, resolvedConfi
   }
 
   const candidate = _extractJsonObject(text);
-  return _ensureCandidateDefaults(candidate, "glm", attempt);
+  return _alignCandidateWithTaskContext(_ensureCandidateDefaults(candidate, "glm", attempt), taskContext);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +681,7 @@ async function _generateWithOpenAICompatible(requirement, history, resolvedConfi
 
 async function generateCandidate(requirement, history, resolvedConfig, options = {}) {
   const attempt = options.attempt || 1;
-  const useMock = Boolean(options.mockLlm || process.env.NEO_CAST_MOCK_LLM);
+  const useMock = isMockLlmEnabled(options);
   const taskContext = options.taskContext || {};
 
   if (useMock) {
@@ -690,5 +722,6 @@ module.exports = {
   _ensureCandidateDefaults,
   _extractJsonObject,
   _resolveLlmTimeoutMs,
+  _taskHorizons,
   _withLlmTimeout,
 };

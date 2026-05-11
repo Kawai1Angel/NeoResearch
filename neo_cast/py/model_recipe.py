@@ -80,6 +80,31 @@ def _number(value: Any, fallback: float) -> float:
     return parsed
 
 
+def prediction_horizons_from_input(model_input: dict[str, Any]) -> list[int]:
+    primary = _positive_int(model_input.get("prediction_horizon"), 96)
+    raw_horizons = model_input.get("prediction_horizons")
+    if raw_horizons is None:
+        return [primary]
+    if not isinstance(raw_horizons, list) or len(raw_horizons) == 0:
+        raise ValueError("input.prediction_horizons must be a non-empty array")
+
+    horizons: list[int] = []
+    for index, item in enumerate(raw_horizons):
+        try:
+            horizon = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"input.prediction_horizons[{index}] must be a positive integer") from exc
+        if horizon <= 0:
+            raise ValueError(f"input.prediction_horizons[{index}] must be a positive integer")
+        if horizon in horizons:
+            raise ValueError("input.prediction_horizons must not contain duplicates")
+        horizons.append(horizon)
+
+    if primary not in horizons:
+        raise ValueError("input.prediction_horizons must include input.prediction_horizon")
+    return horizons
+
+
 def _compile_preprocessing(architecture: dict[str, Any]) -> dict[str, Any]:
     if architecture.get("decomposition"):
         return {
@@ -249,6 +274,7 @@ def compile_model_recipe(model_recipe: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("compile_model_recipe expects schema_version='model_recipe.v1'")
 
     model_input = model_recipe["input"]
+    prediction_horizons = prediction_horizons_from_input(model_input)
     architecture = model_recipe["architecture"]
     training = model_recipe["training"]
     constraints = model_recipe["constraints"]
@@ -261,6 +287,7 @@ def compile_model_recipe(model_recipe: dict[str, Any]) -> dict[str, Any]:
         f"model_name={model_recipe['model_name']}",
         f"history_window={model_input['history_window']}",
         f"prediction_horizon={model_input['prediction_horizon']}",
+        f"prediction_horizons={prediction_horizons}",
     ]
     if model_recipe.get("notes"):
         notes.append(str(model_recipe["notes"]))

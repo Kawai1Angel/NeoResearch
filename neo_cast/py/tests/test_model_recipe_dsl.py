@@ -13,7 +13,7 @@ if str(PY_ROOT) not in sys.path:
 from factory.build_model import build_model
 from model_recipe import compile_model_recipe, parse_max_params
 from renderer import resolve_payload
-from validate import detect_payload_kind, validate_payload
+from validate import detect_payload_kind, validate_payload, validate_required_horizons
 
 
 def make_model_recipe() -> dict:
@@ -87,6 +87,30 @@ class ModelRecipeDslTest(unittest.TestCase):
         self.assertEqual(resolved["model_recipe"]["schema_version"], "model_recipe.v1")
         self.assertEqual(resolved["task"]["input_len"], 96)
         self.assertEqual(resolved["task"]["horizons"], [24])
+
+    def test_model_recipe_renderer_preserves_multiple_prediction_horizons(self) -> None:
+        payload = make_model_recipe()
+        payload["input"]["prediction_horizons"] = [24, 48, 96]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            payload_path = Path(tmp_dir) / "model_recipe.json"
+            payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            self.assertEqual(validate_payload("model-recipe", payload_path), [])
+
+        resolved = resolve_payload(payload)
+        self.assertEqual(resolved["task"]["horizons"], [24, 48, 96])
+
+    def test_required_horizon_validation_rejects_missing_objective_horizons(self) -> None:
+        errors = validate_required_horizons(
+            {"schema_version": "resolved_candidate.v1", "task": {"horizons": [96]}},
+            required_horizons=[96, 192, 336, 720],
+        )
+
+        self.assertEqual(
+            errors,
+            ["task.horizons missing required prediction horizons: 192, 336, 720"],
+        )
 
     def test_parse_max_params_accepts_human_readable_units(self) -> None:
         self.assertEqual(parse_max_params("5M"), 5_000_000)

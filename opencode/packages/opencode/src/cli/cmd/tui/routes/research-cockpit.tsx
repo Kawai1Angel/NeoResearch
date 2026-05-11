@@ -100,6 +100,7 @@ const researchAgentWorkflowOrder = [
   "TrainEval Agent",
   "Reflection Agent",
 ]
+const researchAgentFullStageOrder = ["intent", "data", ...researchAgentWorkflowOrder, "publish"]
 
 async function researchRequest<T>(
   sdk: ReturnType<typeof useSDK>,
@@ -275,19 +276,31 @@ function liveResearchStageForAction(action: string | undefined, hasLiveRunnerOut
   return undefined
 }
 
+function shouldRefreshForRunnerProgressEvent(event: string | undefined) {
+  return event === "smoke_eval_done" || event === "artifact_ready" || event === "done" || event === "timeout"
+}
+
 function overlayLiveResearchWorkflow(
   items: ResearchCockpitWorkflowItem[],
   activeLabel: string | undefined,
 ): ResearchCockpitWorkflowItem[] {
-  const activeIndex = activeLabel ? researchAgentWorkflowOrder.indexOf(activeLabel) : -1
-  if (activeIndex < 0) return items
   return items.map((item) => {
-    const itemIndex = researchAgentWorkflowOrder.indexOf(item.label)
-    if (itemIndex < 0) return item
-    if (itemIndex === activeIndex) return { ...item, status: "active" }
-    if (itemIndex > activeIndex) return { ...item, status: "todo" }
-    return item.status === "done" ? item : { ...item, status: "done" }
+    const status = overlayLiveResearchStageStatus(item.label, item.status, activeLabel)
+    return status === item.status ? item : { ...item, status }
   })
+}
+
+function overlayLiveResearchStageStatus(
+  key: string,
+  fallback: ResearchAgentStageStatus,
+  activeLabel: string | undefined,
+): ResearchAgentStageStatus {
+  const activeIndex = activeLabel ? researchAgentFullStageOrder.indexOf(activeLabel) : -1
+  const stageIndex = researchAgentFullStageOrder.indexOf(key)
+  if (activeIndex < 0 || stageIndex < 0) return fallback
+  if (stageIndex === activeIndex) return "active"
+  if (stageIndex > activeIndex) return "todo"
+  return "done"
 }
 
 function localResearchChatReply(value: string) {
@@ -323,6 +336,23 @@ function runDurationText(run: ResearchCockpitRun) {
 
 function runSummaryText(run: ResearchCockpitRun) {
   return `${run.id} ${run.stage ?? "run"} ${run.status} / ${metricText(run.metrics)}${runDurationText(run)}`
+}
+
+function shortSeal(value: unknown, length: number) {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, length) : undefined
+}
+
+function reproducibilitySealText(run: ResearchCockpitRun | undefined) {
+  const repro = recordValue(run?.resourceUsage?.reproducibility)
+  const git = shortSeal(repro.gitSHA, 7)
+  const dataset = shortSeal(repro.datasetSHA, 4)
+  const code = shortSeal(repro.preprocessSHA ?? repro.codeSHA ?? repro.lockHash, 4)
+  const parts = [
+    git === undefined ? undefined : `g@${git}`,
+    dataset === undefined ? undefined : `d@${dataset}`,
+    code === undefined ? undefined : `c@${code}`,
+  ].filter((item): item is string => item !== undefined)
+  return parts.length === 0 ? undefined : `repro ${parts.join(" ")}`
 }
 
 function parseRunnerProgressRecord(line: string) {
@@ -362,10 +392,43 @@ function formatRunnerProgressLine(data: RunnerProgressLineEvent) {
     const mse = progressRecordNumber(record, "val_avg_mse")
     return mse === undefined ? "smoke_eval_done" : `smoke_eval_done | val_avg_mse ${mse.toFixed(4)}`
   }
+  if (data.event === "candidate_resolved") {
+    const candidate = progressRecordString(record, "candidate_id")
+    const resolvedPath = progressRecordString(record, "resolved_candidate_path")
+    return [
+      "candidate resolved",
+      candidate,
+      resolvedPath ? compactTailPath(resolvedPath) : undefined,
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join(" | ")
+  }
+  if (data.event === "resolved_candidate_ready") {
+    const resolvedPath = progressRecordString(record, "resolved_candidate_path")
+    return resolvedPath ? `resolved candidate ready | ${compactTailPath(resolvedPath)}` : "resolved candidate ready"
+  }
+  if (data.event === "horizon_done") {
+    const horizon = progressRecordNumber(record, "horizon")
+    const best = progressRecordNumber(record, "best_val_loss")
+    const reason = progressRecordString(record, "reason")
+    return [
+      horizon === undefined ? "horizon done" : `horizon ${horizon} done`,
+      best === undefined ? undefined : `best_val_loss ${best.toFixed(4)}`,
+      reason,
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join(" | ")
+  }
   if (data.event === "artifact_ready") {
     const runID = progressRecordString(record, "run_id")
     return runID ? `artifact_ready | run ${runID}` : "artifact_ready"
   }
+  if (data.event === "done") {
+    const status = progressRecordString(record, "status")
+    return status ? `runner done | ${status}` : "runner done"
+  }
+  const event = progressRecordString(record, "event")
+  if (event) return event.replace(/_/g, " ")
   return data.line
 }
 
@@ -481,6 +544,7 @@ type StreamingChatTextPart = {
 type StreamingChatTurn = {
   id: number
   sessionID: string
+  contextKey: string
   messageID?: string
   partID?: string
   text: string
@@ -500,7 +564,24 @@ type ChatProviderList = {
   providers: Array<{
     id: string
     name?: string
-    models?: Record<string, { id?: string; name?: string; limit?: { context?: number } }>
+    models?: Record<
+      string,
+      {
+        id?: string
+        name?: string
+        limit?: { context?: number }
+        cost?: {
+          input?: number
+          output?: number
+          cache?: { read?: number; write?: number }
+          experimentalOver200K?: {
+            input?: number
+            output?: number
+            cache?: { read?: number; write?: number }
+          }
+        }
+      }
+    >
   }>
   default: Record<string, string>
 }
@@ -521,6 +602,7 @@ type ResolvedChatDefaults = {
   model: ChatModelSelection
   modelLabel: string
   modelLimit?: number
+  inputCostPerMillion?: number
   providerLabel?: string
 }
 
@@ -536,6 +618,16 @@ type ChatUsageEntry = {
   cacheWrite: number
   cost: number
   time: number
+}
+
+type ResearchContextEstimateInput = {
+  task: ResearchCockpitTask | undefined
+  candidates: ResearchCockpitCandidate[]
+  runs: ResearchCockpitRun[]
+  artifacts: ResearchCockpitArtifact[]
+  approvals: ResearchCockpitApproval[]
+  champion: ResearchCockpitChampion | null | undefined
+  fingerprint: JsonRecord
 }
 
 function useOptionalLocal() {
@@ -554,11 +646,80 @@ function formatTokenNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(Math.round(value))
 }
 
+function estimateTokenCountFromText(value: string) {
+  const text = value.trim()
+  if (!text) return 0
+  return Math.ceil(text.length / 4)
+}
+
+function safeJsonForTokenEstimate(value: unknown) {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function estimateResearchContextTokens(input: ResearchContextEstimateInput) {
+  const task = input.task
+  if (!task) return 0
+  const payload = {
+    instructions:
+      "NeoResearch TSF cockpit context: task, fingerprint, candidates, runs, artifacts, approvals, and champion.",
+    task: {
+      id: task.id,
+      title: task.title,
+      domainID: task.domainID,
+      mode: task.mode,
+      status: task.status,
+      objective: task.objective,
+      budget: task.budget,
+      taskSpec: task.taskSpec,
+    },
+    fingerprint: input.fingerprint,
+    candidates: input.candidates.slice(0, 5).map((candidate) => ({
+      id: candidate.id,
+      approvalStatus: candidate.approvalStatus,
+      generatedBy: candidate.generatedBy,
+      riskLevel: candidate.riskLevel,
+      rationale: candidate.rationale,
+      candidateSpec: candidate.candidateSpec,
+    })),
+    runs: input.runs.slice(-8).map((run) => ({
+      id: run.id,
+      candidateID: run.candidateID,
+      stage: run.stage,
+      status: run.status,
+      metrics: run.metrics,
+      error: run.error,
+      resourceUsage: run.resourceUsage,
+    })),
+    artifacts: input.artifacts.slice(-8).map((artifact) => ({
+      kind: artifact.kind,
+      uri: artifact.uri,
+      metadata: artifact.metadata,
+    })),
+    approvals: input.approvals.slice(-8).map((approval) => ({
+      kind: approval.kind,
+      status: approval.status,
+      reason: approval.reason,
+    })),
+    champion: input.champion,
+  }
+  return Math.max(1, estimateTokenCountFromText(safeJsonForTokenEstimate(payload)))
+}
+
 function formatDollar(value: number) {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
   }).format(value)
+}
+
+function formatEstimatedDollar(value: number) {
+  if (value > 0 && value < 0.0001) return "<$0.0001"
+  if (value > 0 && value < 0.01) return `$${value.toFixed(4)}`
+  return formatDollar(value)
 }
 
 function chatUsageEntryFromInfo(info: unknown): ChatUsageEntry | undefined {
@@ -933,7 +1094,9 @@ export function ResearchCockpit() {
   let streamEventID = 0
   const [refresh, setRefresh] = createSignal(0)
   const [selectedIndex, setSelectedIndex] = createSignal(0)
+  const [selectedTaskID, setSelectedTaskID] = createSignal<string>()
   const [selectedCandidateIndex, setSelectedCandidateIndex] = createSignal(0)
+  const [selectedCandidateID, setSelectedCandidateID] = createSignal<string>()
   const [selectedAgentStageIndex, setSelectedAgentStageIndex] = createSignal<number>()
   const [busy, setBusy] = createSignal<string>()
   const [chatBusy, setChatBusy] = createSignal<string>()
@@ -949,8 +1112,8 @@ export function ResearchCockpit() {
     [],
   )
   const [streamingChat, setStreamingChat] = createSignal<StreamingChatTurn>()
-  const [chatSessionID, setChatSessionID] = createSignal<string>()
-  const [chatUsageByMessage, setChatUsageByMessage] = createSignal<Record<string, ChatUsageEntry>>({})
+  const [chatSessionByContext, setChatSessionByContext] = createSignal<Record<string, string>>({})
+  const [chatUsageByContext, setChatUsageByContext] = createSignal<Record<string, Record<string, ChatUsageEntry>>>({})
   const [interactionModeByTask, setInteractionModeByTask] = createSignal<Record<string, ResearchInteractionMode>>({})
   const routedGoalsHandled = new Set<string>()
   let routedCsvTaskHandled = false
@@ -1042,7 +1205,7 @@ export function ResearchCockpit() {
     if (payload.type === "message.updated") {
       const info = properties.info
       if (info?.sessionID !== current.sessionID || info.role !== "assistant") return
-      recordChatUsage(info)
+      recordChatUsage(current.contextKey, info)
       setStreamingChat((draft) => (draft ? { ...draft, messageID: info.id } : draft))
       return
     }
@@ -1093,12 +1256,15 @@ export function ResearchCockpit() {
     }
   }
 
-  function recordChatUsage(info: unknown) {
+  function recordChatUsage(contextKey: string, info: unknown) {
     const entry = chatUsageEntryFromInfo(info)
     if (!entry) return
-    setChatUsageByMessage((current) => ({
+    setChatUsageByContext((current) => ({
       ...current,
-      [entry.messageID]: entry,
+      [contextKey]: {
+        ...(current[contextKey] ?? {}),
+        [entry.messageID]: entry,
+      },
     }))
   }
 
@@ -1122,7 +1288,17 @@ export function ResearchCockpit() {
   })
 
   const sortedTasks = createMemo(() => sortResearchCockpitTasks(tasks() ?? []))
-  const selectedTask = createMemo(() => sortedTasks()[selectedIndex()])
+  const selectedTaskIndex = createMemo(() => {
+    const tasks = sortedTasks()
+    if (tasks.length === 0) return 0
+    const id = selectedTaskID()
+    if (id) {
+      const index = tasks.findIndex((task) => task.id === id)
+      if (index >= 0) return index
+    }
+    return Math.max(0, Math.min(selectedIndex(), tasks.length - 1))
+  })
+  const selectedTask = createMemo(() => sortedTasks()[selectedTaskIndex()])
   const selectedTaskSource = createMemo(() => {
     const task = selectedTask()
     if (!task) return undefined
@@ -1135,12 +1311,18 @@ export function ResearchCockpit() {
 
   createEffect(() => {
     const count = sortedTasks().length
-    if (count === 0 && selectedIndex() !== 0) {
-      setSelectedIndex(0)
+    const id = selectedTaskID()
+    if (count === 0) {
+      if (selectedIndex() !== 0) setSelectedIndex(0)
+      setSelectedTaskID(undefined)
       return
     }
-    if (count > 0 && selectedIndex() >= count) {
-      setSelectedIndex(count - 1)
+    if (id && !sortedTasks().some((task) => task.id === id)) {
+      setSelectedTaskID(undefined)
+    }
+    const index = selectedTaskIndex()
+    if (selectedIndex() !== index) {
+      setSelectedIndex(index)
     }
   })
 
@@ -1173,6 +1355,9 @@ export function ResearchCockpit() {
           tone: eventName === "timeout" ? "warning" : "muted",
         },
       ])
+      if (shouldRefreshForRunnerProgressEvent(eventName) && shouldRefreshResearchCockpitOnEvent(researchPayload)) {
+        setRefresh((value) => value + 1)
+      }
       return
     }
     if (!shouldRefreshResearchCockpitOnEvent(researchPayload)) return
@@ -1311,16 +1496,46 @@ export function ResearchCockpit() {
     }
     return item
   })
-  const selectedCandidate = createMemo(() => taskCandidates()[selectedCandidateIndex()])
+  const championRun = createMemo(() => {
+    const item = validChampion()
+    if (!item) return undefined
+    return taskRuns().find((run) => run.id === item.runID)
+  })
+  const reproducibilityContextLine = createMemo(() => reproducibilitySealText(championRun()))
+  const selectedCandidateEffectiveIndex = createMemo(() => {
+    const candidates = taskCandidates()
+    if (candidates.length === 0) return 0
+    const id = selectedCandidateID()
+    if (id) {
+      const index = candidates.findIndex((candidate) => candidate.id === id)
+      if (index >= 0) return index
+    }
+    return Math.max(0, Math.min(selectedCandidateIndex(), candidates.length - 1))
+  })
+  const selectedCandidate = createMemo(() => taskCandidates()[selectedCandidateEffectiveIndex()])
   const commandCandidate = () => selectedCandidate()
+  let selectedCandidateTaskID: string | undefined
   createEffect(() => {
-    const count = taskCandidates().length
-    if (count === 0 && selectedCandidateIndex() !== 0) {
+    const taskID = selectedTask()?.id
+    if (selectedCandidateTaskID !== taskID) {
+      selectedCandidateTaskID = taskID
+      setSelectedCandidateID(undefined)
       setSelectedCandidateIndex(0)
       return
     }
-    if (count > 0 && selectedCandidateIndex() >= count) {
-      setSelectedCandidateIndex(count - 1)
+    const count = taskCandidates().length
+    const id = selectedCandidateID()
+    if (count === 0 && selectedCandidateIndex() !== 0) {
+      setSelectedCandidateIndex(0)
+      setSelectedCandidateID(undefined)
+      return
+    }
+    if (id && !taskCandidates().some((candidate) => candidate.id === id)) {
+      setSelectedCandidateID(undefined)
+    }
+    const index = selectedCandidateEffectiveIndex()
+    if (selectedCandidateIndex() !== index) {
+      setSelectedCandidateIndex(index)
     }
   })
   const recommendation = createMemo(() =>
@@ -1502,6 +1717,7 @@ export function ResearchCockpit() {
         body: JSON.stringify(payload),
       })
       setSelectedIndex(0)
+      setSelectedTaskID(task.id)
       return `${task.title} created`
     })
   }
@@ -1647,6 +1863,10 @@ export function ResearchCockpit() {
     })
   }
 
+  function currentChatContextKey() {
+    return selectedTask()?.id ?? "__workspace__"
+  }
+
   async function loadChatDefaults(): Promise<ResolvedChatDefaults> {
     const [providersResult, agentsResult] = await Promise.all([
       researchRequest<ChatProviderList>(sdk, "/config/providers"),
@@ -1667,6 +1887,7 @@ export function ResearchCockpit() {
         ? local?.model.parsed().model ?? defaults.model.modelID
         : model?.name ?? model?.id ?? defaults.model.modelID,
       modelLimit: model?.limit?.context,
+      inputCostPerMillion: finiteNumber(model?.cost?.input) || undefined,
       providerLabel: provider?.name ?? provider?.id,
     }
   }
@@ -1686,13 +1907,17 @@ export function ResearchCockpit() {
   }
 
   async function ensureChatSession() {
-    const existing = chatSessionID()
+    const contextKey = currentChatContextKey()
+    const existing = chatSessionByContext()[contextKey]
     if (existing) return existing
     const session = await researchRequest<{ id: string }>(sdk, "/session", {
       method: "POST",
       body: JSON.stringify({ title: "NeoResearch Cockpit" }),
     })
-    setChatSessionID(session.id)
+    setChatSessionByContext((current) => ({
+      ...current,
+      [contextKey]: session.id,
+    }))
     return session.id
   }
 
@@ -1730,12 +1955,13 @@ export function ResearchCockpit() {
     await runChatAction(async (signal) => {
       const localReply = localResearchChatReply(value)
       if (localReply) return localReply
+      const contextKey = currentChatContextKey()
       const [sessionID, defaults] = await Promise.all([
         ensureChatSession(),
         resolvedDefaults ? Promise.resolve(resolvedDefaults) : resolveChatDefaults(),
       ])
       persistStreamingChat()
-      setStreamingChat({ id: ++streamEventID, sessionID, text: "", parts: [], modelLabel: defaults.modelLabel })
+      setStreamingChat({ id: ++streamEventID, sessionID, contextKey, text: "", parts: [], modelLabel: defaults.modelLabel })
       setChatBusy(`chat:${defaults.modelLabel}`)
       try {
         await researchRequestNoContent(
@@ -1942,15 +2168,21 @@ export function ResearchCockpit() {
   }
 
   function selectTaskOffset(offset: number) {
-    const count = sortedTasks().length
+    const tasks = sortedTasks()
+    const count = tasks.length
     if (count < 2) return
-    setSelectedIndex((value) => (value + offset + count) % count)
+    const next = (selectedTaskIndex() + offset + count) % count
+    setSelectedIndex(next)
+    setSelectedTaskID(tasks[next]?.id)
   }
 
   function selectCandidateOffset(offset: number) {
-    const count = taskCandidates().length
+    const candidates = taskCandidates()
+    const count = candidates.length
     if (count < 2) return
-    setSelectedCandidateIndex((value) => (value + offset + count) % count)
+    const next = (selectedCandidateEffectiveIndex() + offset + count) % count
+    setSelectedCandidateIndex(next)
+    setSelectedCandidateID(candidates[next]?.id)
   }
 
   async function useProjectRunnerRoot() {
@@ -2197,8 +2429,10 @@ export function ResearchCockpit() {
       if (arg(0) === "select" && args[1]) {
         const query = args[1].toLowerCase()
         const index = sortedTasks().findIndex((task, taskIndex) => task.id.toLowerCase().includes(query) || String(taskIndex + 1) === query)
-        if (index >= 0) setSelectedIndex(index)
-        else appendCockpitNotice("task-select", `No task matched ${args[1]}.`)
+        if (index >= 0) {
+          setSelectedIndex(index)
+          setSelectedTaskID(sortedTasks()[index]?.id)
+        } else appendCockpitNotice("task-select", `No task matched ${args[1]}.`)
         return
       }
       await createTask("autonomous", fullDefaults())
@@ -2404,6 +2638,7 @@ export function ResearchCockpit() {
         method: "POST",
         body: JSON.stringify(payload),
       })
+      setSelectedTaskID(task.id)
       const runnerOptions = { validateRuntime: true }
       const executableTask = canExecuteResearchCockpitTask(task, runnerOptions) ? task : { ...task, taskSpec: payload.taskSpec }
       let detail = eventDetail
@@ -2514,6 +2749,13 @@ export function ResearchCockpit() {
     }
     promptInput?.clear()
     setPromptValue("")
+    promptInput?.focus()
+  }
+
+  function insertSlashPrefix(prefix: string) {
+    const text = prefix.trimEnd()
+    promptInput?.setText(text)
+    setPromptValue(text)
     promptInput?.focus()
   }
 
@@ -2953,7 +3195,7 @@ export function ResearchCockpit() {
     const task = selectedTask()
     if (task) {
       const candidateCount = taskCandidates().length
-      const candidatePosition = candidateCount > 0 ? `${selectedCandidateIndex() + 1}/${candidateCount}` : "0/0"
+      const candidatePosition = candidateCount > 0 ? `${selectedCandidateEffectiveIndex() + 1}/${candidateCount}` : "0/0"
       const runStatus = run ? `latest ${run.stage ?? "run"} ${run.status}` : "no run yet"
       ambientLines.push({
         id: "research-session-context",
@@ -3077,10 +3319,20 @@ export function ResearchCockpit() {
                 })
               }
             } else {
-              persistentLines.push({ id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" })
+              persistentLines.push(
+                { id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" },
+                {
+                  id: "idle-task-hint",
+                  text: "提示：点击顶栏 /loop 启动自主搜索，或 /run baseline 跑一个手动候选。",
+                  tone: "muted",
+                },
+              )
             }
           } else {
-            persistentLines.push({ id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" })
+            persistentLines.push(
+              { id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" },
+              { id: "idle-empty-hint", text: "提示：点击顶栏 /new 创建任务，或输入 /help 查看所有命令。", tone: "muted" },
+            )
           }
         }
       }
@@ -3173,7 +3425,8 @@ export function ResearchCockpit() {
     if (taskInteractionMode() === "socratic") return "回答下一个澄清问题、请求实验或导出..."
     return "请求下一个实验、批准 gate，或导出报告..."
   })
-  const [chatMetadata] = createResource(async () => {
+  const chatMetadataSource = createMemo(() => currentChatDefaultsKey())
+  const [chatMetadata] = createResource(chatMetadataSource, async () => {
     try {
       const defaults = await resolveChatDefaults()
       const modelID = defaults.model.modelID
@@ -3181,13 +3434,14 @@ export function ResearchCockpit() {
         agent: defaults.agent,
         model: defaults.modelLabel,
         modelLimit: defaults.modelLimit,
+        inputCostPerMillion: defaults.inputCostPerMillion,
         provider: defaults.providerLabel,
       }
     } catch {
       return undefined
     }
   })
-  const chatUsageEntries = createMemo(() => Object.values(chatUsageByMessage()))
+  const chatUsageEntries = createMemo(() => Object.values(chatUsageByContext()[currentChatContextKey()] ?? {}))
   const latestChatUsage = createMemo(() => chatUsageEntries().toSorted((left, right) => left.time - right.time).at(-1))
   const chatUsageTotals = createMemo(() =>
     chatUsageEntries().reduce(
@@ -3203,10 +3457,39 @@ export function ResearchCockpit() {
       { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     ),
   )
+  const estimatedResearchContextTokenCount = createMemo(() =>
+    estimateResearchContextTokens({
+      task: selectedTask(),
+      candidates: taskCandidates(),
+      runs: taskRuns(),
+      artifacts: taskArtifacts(),
+      approvals: taskApprovals(),
+      champion: validChampion() ?? null,
+      fingerprint: taskFingerprint() ?? {},
+    }),
+  )
+  const estimatedResearchContextCost = createMemo(() => {
+    const tokens = estimatedResearchContextTokenCount()
+    const inputCostPerMillion = chatMetadata()?.inputCostPerMillion
+    if (tokens <= 0 || !inputCostPerMillion || inputCostPerMillion <= 0) return undefined
+    return (tokens * inputCostPerMillion) / 1_000_000
+  })
+  const estimatedContextSuffix = createMemo(() => {
+    const cost = estimatedResearchContextCost()
+    return cost && cost > 0 ? `(research est. ${formatEstimatedDollar(cost)})` : "(research est.)"
+  })
   const contextWindowLine = createMemo(() => {
     const latest = latestChatUsage()
-    if (!latest) return
     const limit = chatMetadata()?.modelLimit
+    if (!latest) {
+      const estimated = estimatedResearchContextTokenCount()
+      if (estimated > 0) {
+        if (!limit || limit <= 0) return `~${formatTokenNumber(estimated)} ${estimatedContextSuffix()}`
+        return `~${formatTokenNumber(estimated)} / ${formatTokenNumber(limit)} ${estimatedContextSuffix()}`
+      }
+      if (!limit || limit <= 0) return undefined
+      return `0 / ${formatTokenNumber(limit)}`
+    }
     if (!limit || limit <= 0) return formatTokenNumber(latest.total)
     const pct = Math.max(1, Math.round((latest.total / limit) * 100))
     return `${formatTokenNumber(latest.total)} / ${formatTokenNumber(limit)} (${pct}%)`
@@ -3227,7 +3510,7 @@ export function ResearchCockpit() {
     return chatMetadata()?.model ?? "-"
   })
   const contextSessionLine = createMemo(() => {
-    const sessionID = chatSessionID()
+    const sessionID = chatSessionByContext()[currentChatContextKey()]
     if (sessionID) return `session ${shortID(sessionID)}`
     const task = selectedTask()
     if (task) return `session ${shortID(task.id)}`
@@ -3236,17 +3519,17 @@ export function ResearchCockpit() {
   const researchContextLines = createMemo(() => {
     const task = selectedTask()
     if (!task) return []
-    if (chatUsageTotals().total > 0) {
-      const active = busy()
-      return active ? [`active ${active}`] : []
-    }
     const candidateCount = taskCandidates().length
-    const candidatePosition = candidateCount > 0 ? `${selectedCandidateIndex() + 1}/${candidateCount}` : "0/0"
+    const candidatePosition = candidateCount > 0 ? `${selectedCandidateEffectiveIndex() + 1}/${candidateCount}` : "0/0"
+    const researchLine = `research cand=${candidatePosition} runs=${taskRuns().length} ok=${succeededRuns()}`
+    const active = busy()
+    if (chatUsageTotals().total > 0 || estimatedResearchContextTokenCount() > 0) {
+      return active ? [researchLine, `active ${active}`] : [researchLine]
+    }
     const lines = [
       `task ${shortID(task.id)} ${task.status}`,
-      `research cand=${candidatePosition} runs=${taskRuns().length} ok=${succeededRuns()}`,
+      researchLine,
     ]
-    const active = busy()
     if (active) lines.push(`active ${active}`)
     return lines
   })
@@ -3337,12 +3620,12 @@ export function ResearchCockpit() {
   const selectedTaskPosition = createMemo(() => {
     const count = sortedTasks().length
     if (count === 0) return "Task 0/0"
-    return `Task ${selectedIndex() + 1}/${count}`
+    return `Task ${selectedTaskIndex() + 1}/${count}`
   })
   const candidatePosition = createMemo(() => {
     const count = taskCandidates().length
     if (count === 0) return "Candidate 0/0"
-    return `Candidate ${selectedCandidateIndex() + 1}/${count}`
+    return `Candidate ${selectedCandidateEffectiveIndex() + 1}/${count}`
   })
   const taskSummary = createMemo(() => `${selectedTaskPosition()} · ${candidatePosition()}`)
   const progressState = (done: boolean, active: boolean) => (done ? "done" : active ? "active" : "todo")
@@ -3353,17 +3636,32 @@ export function ResearchCockpit() {
   const publishProgress = createMemo(() =>
     progressState(hasResultArtifact(), (Boolean(validChampion()) || reflectionDone()) && !hasResultArtifact()),
   )
-  const researchAgentStages = createMemo<ResearchAgentStage[]>(() => [
-    { key: "intent", label: "Intent Agent", status: liveResearchStage() === "intent" ? "active" : intentProgress() },
-    { key: "data", label: "Data Analysis Agent", status: liveResearchStage() === "data" ? "active" : dataProgress() },
-    ...displayAgentWorkflowProgress().map((item) => ({
-      key: item.label,
-      label: item.label,
-      displayLabel: item.displayLabel,
-      status: item.status,
-    })),
-    { key: "publish", label: "Publish Agent", status: liveResearchStage() === "publish" ? "active" : publishProgress() },
-  ])
+  const researchAgentStages = createMemo<ResearchAgentStage[]>(() => {
+    const live = liveResearchStage()
+    return [
+      {
+        key: "intent",
+        label: "Intent Agent",
+        status: overlayLiveResearchStageStatus("intent", intentProgress(), live),
+      },
+      {
+        key: "data",
+        label: "Data Analysis Agent",
+        status: overlayLiveResearchStageStatus("data", dataProgress(), live),
+      },
+      ...displayAgentWorkflowProgress().map((item) => ({
+        key: item.label,
+        label: item.label,
+        displayLabel: item.displayLabel,
+        status: item.status,
+      })),
+      {
+        key: "publish",
+        label: "Publish Agent",
+        status: overlayLiveResearchStageStatus("publish", publishProgress(), live),
+      },
+    ]
+  })
   const automaticAgentStageIndex = createMemo(() => {
     const stages = researchAgentStages()
     if (stages.length === 0) return -1
@@ -3440,12 +3738,24 @@ export function ResearchCockpit() {
             <text fg={cockpitColors.primary} onMouseUp={() => route.navigate({ type: "home" })}>
               Home
             </text>
-            <text fg={cockpitColors.textMuted}>/new</text>
-            <text fg={cockpitColors.textMuted}>/dataset</text>
-            <text fg={cockpitColors.textMuted}>/run</text>
-            <text fg={cockpitColors.textMuted}>/loop</text>
-            <text fg={cockpitColors.textMuted}>/export</text>
-            <text fg={cockpitColors.textMuted}>/help</text>
+            <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/new")}>
+              /new
+            </text>
+            <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/dataset")}>
+              /dataset
+            </text>
+            <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/run")}>
+              /run
+            </text>
+            <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/loop")}>
+              /loop
+            </text>
+            <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/export")}>
+              /export
+            </text>
+            <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/help")}>
+              /help
+            </text>
           </box>
         </box>
 
@@ -3751,6 +4061,7 @@ export function ResearchCockpit() {
                 </text>
                 <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
                   model {contextModelLabel()}
+                  {reproducibilityContextLine() ? ` / ${reproducibilityContextLine()}` : ""}
                 </text>
                 <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
                   {contextSessionLine()}

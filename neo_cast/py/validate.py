@@ -102,6 +102,50 @@ def detect_payload_kind(payload_path: str | Path) -> str:
     )
 
 
+def _normalize_horizons(raw_horizons: Any, name: str) -> list[int]:
+    if not isinstance(raw_horizons, list) or len(raw_horizons) == 0:
+        raise ValueError(f"{name} must be a non-empty array")
+    horizons: list[int] = []
+    for index, item in enumerate(raw_horizons):
+        try:
+            horizon = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name}[{index}] must be a positive integer") from exc
+        if horizon <= 0:
+            raise ValueError(f"{name}[{index}] must be a positive integer")
+        if horizon in horizons:
+            raise ValueError(f"{name} must not contain duplicates")
+        horizons.append(horizon)
+    return horizons
+
+
+def validate_required_horizons(
+    resolved_candidate: dict[str, Any],
+    *,
+    required_horizons: list[int] | None = None,
+) -> list[str]:
+    if required_horizons is None:
+        from prepare_tsf import HORIZONS
+
+        required = list(HORIZONS)
+    else:
+        required = list(required_horizons)
+    try:
+        normalized_required = _normalize_horizons(required, "required_horizons")
+        candidate_horizons = _normalize_horizons(
+            resolved_candidate.get("task", {}).get("horizons"),
+            "task.horizons",
+        )
+    except ValueError as exc:
+        return [str(exc)]
+
+    missing = [horizon for horizon in normalized_required if horizon not in candidate_horizons]
+    if missing:
+        missing_text = ", ".join(str(horizon) for horizon in missing)
+        return [f"task.horizons missing required prediction horizons: {missing_text}"]
+    return []
+
+
 def _emit_validation_result(kind: str, payload: str | Path, errors: list[str]) -> int:
     if errors:
         print("validation_status: invalid")
@@ -173,6 +217,16 @@ def _run_smoke(candidate_path: Path, resolved_path: Path, artifacts_dir: Path) -
     if not resolved_ok:
         print("error: renderer did not emit candidate_resolved")
         return 1
+    try:
+        resolved_candidate = load_json(resolved_path)
+    except Exception as exc:
+        print(f"error: failed to load resolved candidate for horizon validation: {exc}")
+        return 1
+    horizon_errors = validate_required_horizons(resolved_candidate)
+    if horizon_errors:
+        for item in horizon_errors:
+            print(f"error: {item}")
+        return 2
     print(
         json.dumps(
             {
