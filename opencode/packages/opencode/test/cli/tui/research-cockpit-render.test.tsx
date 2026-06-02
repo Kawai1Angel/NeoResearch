@@ -949,7 +949,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "model GPT Test")
+      await waitForFrame(app, "chat GPT Test")
       await app.mockInput.typeText("first question")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1331,7 +1331,7 @@ describe("ResearchCockpit render", () => {
 
     const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} events={events.source} />, {
       width: 170,
-      height: 48,
+      height: 52,
     })
 
     try {
@@ -1343,7 +1343,7 @@ describe("ResearchCockpit render", () => {
       await waitForFrame(app, "Token usage recorded.")
       const frame = await waitForFrame(app, "Context")
       expect(frame).toContain("Context")
-      expect(frame).toContain("model GPT Test")
+      expect(frame).toContain("chat GPT Test")
       expect(frame).toContain("session session_")
       expect(frame).toContain("1,512 / 128,000 (1%)")
       expect(frame).toContain("tokens in=1,000 out=400")
@@ -1360,7 +1360,7 @@ describe("ResearchCockpit render", () => {
     await mkdir(Global.Path.data, { recursive: true })
     const app = await testRender(() => <ResearchCockpitHarness fetch={researchFetch} />, {
       width: 170,
-      height: 48,
+      height: 52,
     })
 
     try {
@@ -2306,7 +2306,7 @@ describe("ResearchCockpit render", () => {
         body: {
           stage: "smoke",
           description: "Forecast ETTh1 horizon 24",
-          maxIterations: 3,
+          maxIterations: 10,
         }
       })
       expect(frame).toContain("Forecast ETTh1 horizon 24")
@@ -2459,7 +2459,7 @@ describe("ResearchCockpit render", () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
-    const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 48 })
+    const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 52 })
 
     try {
       const frame = await waitForFrame(app, "run_smoke")
@@ -2508,7 +2508,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("NeoResearch v0.1.0-alpha.0")
       expect(frame).not.toContain("NeoResearch alpha")
       expect(frame).toContain("Context")
-      expect(frame).toContain("model -")
+      expect(frame).toContain("chat -")
       expect(frame).toContain("session task_neo")
       expect(frame).toMatch(/~[0-9,]+ \(research est\.\)/)
       expect(frame).toContain("research cand=1/1 runs=1 ok=1")
@@ -2536,10 +2536,10 @@ describe("ResearchCockpit render", () => {
       expect(frame).not.toContain("Round 1:")
       expect(frame).not.toContain("generate_model")
       expect(frame).toContain("tab agents")
-      expect(frameLine(frame, "NeoResearch v0.1.0-alpha.0")).toBeGreaterThanOrEqual(44)
+      expect(frameLine(frame, "NeoResearch v0.1.0-alpha.0")).toBeGreaterThanOrEqual(48)
       expect(occurrenceCount(frame, "Workflow")).toBe(0)
       const promptFooterLine = frameLine(frame, "苏格拉底 TrainEval Agent Research Agent")
-      expect(promptFooterLine).toBeGreaterThanOrEqual(38)
+      expect(promptFooterLine).toBeGreaterThanOrEqual(42)
       expect(frameLine(frame, "esc interrupt")).toBe(frameLine(frame, "tab agents"))
       expect(frameLine(frame, "ctrl+p commands")).toBeGreaterThan(promptFooterLine)
     } finally {
@@ -2644,23 +2644,18 @@ describe("ResearchCockpit render", () => {
     }
   })
 
-  test("appends chat output after Socratic onboarding without replacing the context", async () => {
+  test("routes Socratic chat input to slot-fill (intent/answer) instead of chat model", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
-    const events = createCockpitEventSource()
-    const posts: Array<{ path: string; body: unknown }> = []
+    const intentAnswerPosts: Array<{ path: string; body: unknown }> = []
     const onboardingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const handled = await mockChatResponse(
-        input,
-        init,
-        posts,
-        "收到，我会沿用当前澄清上下文继续确认目标。",
-        events,
-      )
-      if (handled) return handled
-      const path = requestURL(input).pathname
-      if (path === "/research/tasks" && !init?.method) {
+      const reqPath = requestURL(input).pathname
+      if (reqPath === "/research/tasks/task_new_socratic/intent/answer" && init?.method === "POST") {
+        intentAnswerPosts.push({ path: reqPath, body: JSON.parse(init.body as string) })
+        return Promise.resolve(response({}))
+      }
+      if (reqPath === "/research/tasks" && !init?.method) {
         return Promise.resolve(
           response([
             {
@@ -2677,11 +2672,11 @@ describe("ResearchCockpit render", () => {
           ]),
         )
       }
-      if (path.startsWith("/research/tasks/task_new_socratic/")) return Promise.resolve(response([]))
+      if (reqPath.startsWith("/research/tasks/task_new_socratic/")) return Promise.resolve(response([]))
       return mockResearchFetch(input, init)
     }) as typeof fetch
 
-    const app = await testRender(() => <ResearchCockpitHarness fetch={onboardingFetch} events={events.source} />, {
+    const app = await testRender(() => <ResearchCockpitHarness fetch={onboardingFetch} />, {
       width: 160,
       height: 48,
     })
@@ -2692,11 +2687,22 @@ describe("ResearchCockpit render", () => {
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Research Agent: 收到，我会沿用当前澄清上下文")
+      // Give the async POST time to complete then verify routing
+      for (let i = 0; i < 10; i++) {
+        await app.renderOnce()
+        if (intentAnswerPosts.length > 0) break
+        await Bun.sleep(20)
+      }
+
+      // Input must have been routed to slot fill, not chat model
+      expect(intentAnswerPosts.length).toBeGreaterThan(0)
+      const post = intentAnswerPosts[0]!
+      expect(post.path).toBe("/research/tasks/task_new_socratic/intent/answer")
+
+      // Socratic onboarding context must still be visible
+      const frame = app.captureCharFrame()
       expect(frame).toContain("Socratic onboarding")
       expect(frame).toContain("Next question")
-      expect(frame).toContain("预测对象是 ETTh2 的 OT")
-      expect(frameLine(frame, "Socratic onboarding")).toBeLessThan(frameLine(frame, "预测对象是 ETTh2 的 OT"))
     } finally {
       app.renderer.destroy()
     }
@@ -2808,7 +2814,7 @@ describe("ResearchCockpit render", () => {
     try {
       const frame = await waitForFrame(app, "Socratic clarification")
 
-      expect(frame).toContain("slots: dataset.path")
+      expect(frame).toContain("slots: data_source")
       expect(frame).toContain("Next question: NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
       expect(frame).toContain("回答当前 Socratic 问题")
     } finally {
@@ -3840,7 +3846,7 @@ describe("ResearchCockpit render", () => {
 
       expect(posts).toContainEqual({
         path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" },
+        body: { stage: "full", maxIterations: 10, description: "cockpit autonomous loop" },
       })
     } finally {
       app.renderer.destroy()
@@ -3882,7 +3888,7 @@ describe("ResearchCockpit render", () => {
       expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/autonomous/loop`)
       const frame = await waitForFrame(app, "→ ModelDesigner Agent")
       expect(frame).not.toContain("✓ ModelDesigner Agent")
-      expect(frame).toContain("• ModelCompiler Agent")
+      expect(frame).toContain("✓ ModelCompiler Agent")
       expect(frame).toContain("• TrainEval Agent")
     } finally {
       resolveLoop?.(response({ iterations: [], stoppedReason: "max_iterations" }))
@@ -4024,7 +4030,7 @@ describe("ResearchCockpit render", () => {
 
       expect(posts).toContainEqual({
         path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" },
+        body: { stage: "full", maxIterations: 10, description: "cockpit autonomous loop" },
       })
     } finally {
       app.renderer.destroy()
@@ -4900,7 +4906,7 @@ describe("ResearchCockpit render", () => {
         { path: `/research/tasks/${taskID}/prepare-dataset`, body: { force: true } },
         {
           path: `/research/tasks/${taskID}/autonomous/loop`,
-          body: { stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" },
+          body: { stage: "full", maxIterations: 10, description: "cockpit autonomous loop" },
         },
       ])
     } finally {
@@ -5180,6 +5186,69 @@ describe("ResearchCockpit render", () => {
       expect(frame).toMatch(/Working \/ seed-baselines \/ 0s \[[=> ]+\]/)
       expect(frameLine(frame, "Working / seed-baselines")).toBeLessThan(frameLine(frame, "esc interrupt"))
       resolveBaselines?.(response({ candidates: [], approvals: [] }))
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("renders DataAnalysis and HypoPlanner agent completed events in stream lines", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const events = createCockpitEventSource()
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={researchFetch} events={events.source} />,
+      { width: 160, height: 48 },
+    )
+
+    try {
+      await waitForFrame(app, "run_smoke")
+
+      // DataAnalysis: LLM not configured → "skipped"
+      events.emit({
+        type: "research.agent.dataAnalysis.completed",
+        properties: {
+          taskID,
+          agent: "DataAnalysisAgent",
+          stage: "data_analysis",
+          status: "completed",
+          metadata: { llmStatus: "skipped", warningCount: 0, searchBiases: [] },
+        },
+      })
+      const frameAfterDA = await waitForFrame(app, "[DataAnalysis]")
+      expect(frameAfterDA).toContain("[DataAnalysis]")
+
+      // HypoPlanner: LLM not configured → "skipped"
+      events.emit({
+        type: "research.agent.hypoPlanner.completed",
+        properties: {
+          taskID,
+          agent: "HypoPlannerAgent",
+          stage: "hypo_planning",
+          status: "completed",
+          metadata: { llmStatus: "skipped", hypothesisCount: 3 },
+        },
+      })
+      const frameAfterHP = await waitForFrame(app, "[HypoPlanner]")
+      expect(frameAfterHP).toContain("[HypoPlanner]")
+
+      // HypoPlanner: LLM used with preview
+      events.emit({
+        type: "research.agent.hypoPlanner.completed",
+        properties: {
+          taskID,
+          agent: "HypoPlannerAgent",
+          stage: "hypo_planning",
+          status: "completed",
+          metadata: {
+            llmStatus: "used",
+            hypothesisCount: 2,
+            llmPreview: "h1: RevIN normalisation | h2: Patch-based context window",
+          },
+        },
+      })
+      const frameAfterHPUsed = await waitForFrame(app, "h1: RevIN")
+      expect(frameAfterHPUsed).toContain("h1: RevIN")
     } finally {
       app.renderer.destroy()
     }

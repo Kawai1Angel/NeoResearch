@@ -30,6 +30,11 @@ export interface HypoPlannerResult {
   readonly planMarkdown: string
   readonly hypothesesYaml: string
   readonly evidenceSummary: string
+  readonly llm: {
+    readonly status: "disabled" | "not_configured" | "used" | "failed" | "skipped"
+    readonly model?: string
+    readonly error?: string
+  }
 }
 
 export interface HypoPlannerInput {
@@ -37,6 +42,7 @@ export interface HypoPlannerInput {
   readonly dataAnalysis: DataAnalysisAgentResult
   readonly runs: readonly ResearchRun[]
   readonly memory: readonly ResearchMemory[]
+  readonly llmHypotheses?: readonly HypothesisObject[]
 }
 
 interface HypothesisRule {
@@ -423,7 +429,8 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
 
 export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResult {
   const evidenceSummary = extractEvidenceSummary(input.dataAnalysis)
-  const hypotheses = generateHypotheses(input)
+  const useLLMHypotheses = input.llmHypotheses !== undefined && input.llmHypotheses.length > 0
+  const hypotheses = useLLMHypotheses ? [...input.llmHypotheses!] : generateHypotheses(input)
   const plan = buildExperimentPlan({ hypotheses, task: input.task })
   const partial = {
     agent: "HypoPlannerAgent" as const,
@@ -431,6 +438,7 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
     plan,
     hypothesesYaml: buildHypothesesYaml(plan),
     evidenceSummary,
+    llm: { status: useLLMHypotheses ? ("used" as const) : ("disabled" as const) },
   }
   return {
     ...partial,

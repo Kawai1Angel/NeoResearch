@@ -48,6 +48,12 @@ export class ResearchAgentStageChanged extends Schema.Class<ResearchAgentStageCh
   metadata: Schema.optional(JsonRecord),
 }) {}
 
+export class ResearchAgentStreamDelta extends Schema.Class<ResearchAgentStreamDelta>("ResearchAgentStreamDelta")({
+  taskID: ResearchTaskID,
+  agent: Schema.String,
+  delta: Schema.String,
+}) {}
+
 export class ResearchRunnerProgressLine extends Schema.Class<ResearchRunnerProgressLine>("ResearchRunnerProgressLine")({
   taskID: ResearchTaskID,
   runID: Schema.String,
@@ -76,9 +82,11 @@ export const Event = {
   IntentAgentCompleted: BusEvent.define("research.agent.intent.completed", ResearchAgentStageChanged),
   IntentAgentFailed: BusEvent.define("research.agent.intent.failed", ResearchAgentStageChanged),
   DataAnalysisAgentStarted: BusEvent.define("research.agent.dataAnalysis.started", ResearchAgentStageChanged),
+  DataAnalysisAgentStreamDelta: BusEvent.define("research.agent.dataAnalysis.stream.delta", ResearchAgentStreamDelta),
   DataAnalysisAgentCompleted: BusEvent.define("research.agent.dataAnalysis.completed", ResearchAgentStageChanged),
   DataAnalysisAgentFailed: BusEvent.define("research.agent.dataAnalysis.failed", ResearchAgentStageChanged),
   HypoPlannerAgentStarted: BusEvent.define("research.agent.hypoPlanner.started", ResearchAgentStageChanged),
+  HypoPlannerAgentStreamDelta: BusEvent.define("research.agent.hypoPlanner.stream.delta", ResearchAgentStreamDelta),
   HypoPlannerAgentCompleted: BusEvent.define("research.agent.hypoPlanner.completed", ResearchAgentStageChanged),
   HypoPlannerAgentFailed: BusEvent.define("research.agent.hypoPlanner.failed", ResearchAgentStageChanged),
   NASAgentStarted: BusEvent.define("research.agent.nas.started", ResearchAgentStageChanged),
@@ -93,4 +101,5 @@ export const Event = {
   ReflectionAgentFailed: BusEvent.define("research.agent.reflection.failed", ResearchAgentStageChanged),
   RunVerified: BusEvent.define("research.run.verified", ResearchAgentStageChanged),
   RunRejectedByVerifier: BusEvent.define("research.run.rejected_by_verifier", ResearchAgentStageChanged),
+  ModelDesignerCompleted: BusEvent.define("research.agent.modelDesigner.completed", ResearchAgentStageChanged),
 }

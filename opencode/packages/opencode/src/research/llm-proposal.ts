@@ -7,6 +7,17 @@ import type { JsonRecord, ResearchTask } from "./schema"
 
 type LLMProvider = "anthropic" | "openai-compatible"
 
+export type LLMTokenUsage = {
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
+type LLMResponse = { text: string; usage: LLMTokenUsage }
+
+const ZERO_USAGE: LLMTokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+
 export type NeoCastLLMConfig = {
   readonly provider: LLMProvider
   readonly model: string
@@ -52,6 +63,7 @@ const keyMap: Record<string, string> = {
   adjacency_source: "adjacencySource",
   gate_type: "gateType",
   prediction_head: "predictionHead",
+  share_across_horizons: "shareAcrossHorizons",
   output_distribution: "outputDistribution",
   horizon_specific: "horizonSpecific",
   variance_floor: "varianceFloor",
@@ -67,6 +79,7 @@ const keyMap: Record<string, string> = {
   batch_size: "batchSize",
   supervised_weight: "supervisedWeight",
   teacher_weight: "teacherWeight",
+  post_processing: "postProcessing",
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -166,13 +179,99 @@ function camelizeKnown(value: unknown): unknown {
   return result
 }
 
-function pruneCandidateSpec(value: unknown): JsonRecord {
-  const spec = isRecord(value) ? { ...value } : {}
-  delete spec.constraints
-  delete spec.postProcessing
+// Valid top-level keys in TSFCandidateRecipe (schema is .strict()).
+const RECIPE_ALLOWED_KEYS = new Set([
+  "recipeVersion", "recipeID", "hypothesis", "preprocessing",
+  "embedding", "backbone", "fusion", "predictionHead", "trainingStrategy", "notes",
+])
 
+// Allowed camelCase keys per backbone type (schema is .strict()).
+const BACKBONE_ALLOWED_KEYS: Record<string, readonly string[]> = {
+  linear: ["type", "shared", "bias"],
+  mlp: ["type", "depth", "hiddenDim", "activation", "dropout"],
+  transformer: ["type", "dModel", "nHeads", "nLayers", "dropout", "ffnMult"],
+  dlinear: ["type", "kernelSize", "bias"],
+  tcn: ["type", "hiddenDim", "nLayers", "kernelSize", "activation", "dropout"],
+  nbeats: ["type", "hiddenDim", "nBlocks", "nLayers", "activation", "dropout"],
+  timesnet: ["type", "hiddenDim", "nLayers", "topK", "kernelSize", "dropout"],
+  rnn: ["type", "cell", "hiddenDim", "numLayers", "dropout"],
+  ssm: ["type", "stateDim", "depth", "dropout"],
+  mixer: ["type", "hiddenDim", "depth", "temporalMixing", "channelMixing", "dropout"],
+}
+
+// Safe defaults for required integer fields that LLMs frequently omit.
+const BACKBONE_REQUIRED_DEFAULTS: Record<string, Record<string, number>> = {
+  mlp: { depth: 2, hiddenDim: 128 },
+  transformer: { dModel: 64, nHeads: 4, nLayers: 2 },
+  dlinear: { kernelSize: 25 },
+  tcn: { hiddenDim: 128, nLayers: 3, kernelSize: 5 },
+  nbeats: { hiddenDim: 128, nBlocks: 4, nLayers: 3 },
+  timesnet: { hiddenDim: 128, nLayers: 3, topK: 5, kernelSize: 5 },
+  rnn: { hiddenDim: 128, numLayers: 2 },
+  ssm: { stateDim: 64, depth: 2 },
+  mixer: { hiddenDim: 128, depth: 2 },
+}
+
+const EMBEDDING_ALLOWED_KEYS: Record<string, readonly string[]> = {
+  none: ["type"],
+  patch: ["type", "patchLen", "stride", "dModel"],
+  invert: ["type", "dModel"],
+  frequency: ["type", "nFreq", "complexMode", "dModel"],
+  calendar: ["type", "fields", "embedDim"],
+  multiscale_patch: ["type", "scales", "dModel"],
+}
+
+const EMBEDDING_REQUIRED_DEFAULTS: Record<string, Record<string, number>> = {
+  patch: { patchLen: 16, stride: 8, dModel: 64 },
+  invert: { dModel: 64 },
+  frequency: { nFreq: 16, dModel: 64 },
+  calendar: { embedDim: 32 },
+}
+
+// Backbones that only support embedding.type='none' (domain constraint in tsf.ts).
+const BACKBONE_REQUIRES_NONE_EMBEDDING = new Set(["timesnet", "dlinear", "rnn", "ssm", "nbeats"])
+
+const FUSION_ALLOWED_KEYS: Record<string, readonly string[]> = {
+  temporal: ["type", "channelMode"],
+  feature: ["type", "variateToken", "crossAttention"],
+  temporal_then_feature: ["type", "gate", "residual"],
+  feature_then_temporal: ["type", "gate", "residual"],
+  graph: ["type", "adjacencySource", "sparsity"],
+  gated_hybrid: ["type", "gateType"],
+}
+
+function applyAllowedAndDefaults(
+  obj: Record<string, unknown>,
+  allowed: readonly string[] | undefined,
+  defaults: Record<string, number>,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = {}
+  for (const key of allowed ?? Object.keys(obj)) {
+    if (key in obj) next[key] = obj[key]
+  }
+  for (const [key, value] of Object.entries(defaults)) {
+    if (typeof next[key] !== "number" || !Number.isFinite(next[key] as number)) next[key] = value
+  }
+  return next
+}
+
+function normalizeNumber(obj: Record<string, unknown>, key: string, fallback: number) {
+  if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) obj[key] = fallback
+}
+
+function pruneCandidateSpec(value: unknown): JsonRecord {
+  // Strip top-level keys not in the schema (TSFCandidateRecipe is .strict()).
+  const raw = isRecord(value) ? value : {}
+  const spec: Record<string, unknown> = {}
+  for (const key of RECIPE_ALLOWED_KEYS) {
+    if (key in raw) spec[key] = raw[key]
+  }
+
+  // Guarantee preprocessing.actions is a valid array.
   const preprocessing = spec.preprocessing
-  if (isRecord(preprocessing) && Array.isArray(preprocessing.actions)) {
+  if (!isRecord(preprocessing) || !Array.isArray(preprocessing.actions)) {
+    spec.preprocessing = { actions: [{ type: "none" }] }
+  } else {
     preprocessing.actions = preprocessing.actions.map((action) => {
       if (!isRecord(action)) return action
       const next = { ...action }
@@ -181,19 +280,66 @@ function pruneCandidateSpec(value: unknown): JsonRecord {
     })
   }
 
-  const predictionHead = spec.predictionHead
-  if (isRecord(predictionHead) && predictionHead.type === "linear") {
-    delete predictionHead.shareAcrossHorizons
+  // Normalize backbone: strip unknown keys, fill required number defaults.
+  const backboneType = isRecord(spec.backbone) && typeof spec.backbone.type === "string"
+    ? spec.backbone.type : undefined
+  if (isRecord(spec.backbone)) {
+    spec.backbone = applyAllowedAndDefaults(
+      spec.backbone,
+      backboneType !== undefined ? BACKBONE_ALLOWED_KEYS[backboneType] : undefined,
+      backboneType !== undefined ? (BACKBONE_REQUIRED_DEFAULTS[backboneType] ?? {}) : {},
+    )
   }
 
-  const fusion = spec.fusion
-  if (isRecord(fusion) && fusion.type === "gated_hybrid") {
-    delete fusion.residual
+  // Normalize embedding: strip unknown keys, fill required number defaults.
+  // Certain backbones require embedding.type='none' (domain constraint).
+  if (backboneType !== undefined && BACKBONE_REQUIRES_NONE_EMBEDDING.has(backboneType)) {
+    spec.embedding = { type: "none" }
+  } else if (isRecord(spec.embedding)) {
+    const emb = spec.embedding
+    const type = typeof emb.type === "string" ? emb.type : undefined
+    spec.embedding = applyAllowedAndDefaults(
+      emb,
+      type !== undefined ? EMBEDDING_ALLOWED_KEYS[type] : undefined,
+      type !== undefined ? (EMBEDDING_REQUIRED_DEFAULTS[type] ?? {}) : {},
+    )
   }
 
-  const backbone = spec.backbone
-  if (isRecord(backbone) && backbone.type === "ssm") {
-    delete backbone.kernelSize
+  // Normalize fusion: strip unknown keys (each variant is .strict()).
+  if (isRecord(spec.fusion)) {
+    const fusionType = typeof spec.fusion.type === "string" ? spec.fusion.type : undefined
+    const allowed = fusionType !== undefined ? FUSION_ALLOWED_KEYS[fusionType] : undefined
+    if (allowed !== undefined) {
+      const next: Record<string, unknown> = {}
+      for (const key of allowed) {
+        if (key in spec.fusion) next[key] = spec.fusion[key]
+      }
+      spec.fusion = next
+    }
+  }
+
+  // Normalize predictionHead: strip shareAcrossHorizons; fill required quantiles default.
+  if (isRecord(spec.predictionHead)) {
+    const ph = spec.predictionHead
+    if (ph.type === "linear") delete ph.shareAcrossHorizons
+    if (ph.type === "quantile" && !Array.isArray(ph.quantiles)) {
+      ph.quantiles = [0.1, 0.5, 0.9]
+    }
+    if (ph.type === "residual_correction" && (typeof ph.correctionDim !== "number" || !Number.isFinite(ph.correctionDim as number))) {
+      ph.correctionDim = 64
+    }
+  }
+
+  // Normalize trainingStrategy: fill required number fields with safe defaults.
+  if (isRecord(spec.trainingStrategy)) {
+    const ts = spec.trainingStrategy
+    if (isRecord(ts.optimizer)) normalizeNumber(ts.optimizer, "lr", 0.001)
+    if (isRecord(ts.budget)) {
+      normalizeNumber(ts.budget, "maxEpochs", 30)
+      normalizeNumber(ts.budget, "timeBudgetS", 600)
+      normalizeNumber(ts.budget, "batchSize", 32)
+      normalizeNumber(ts.budget, "patience", 5)
+    }
   }
 
   return spec as JsonRecord
@@ -205,9 +351,9 @@ const EXAMPLE_CANDIDATE = {
   hypothesis: "DLinear 通过趋势-残差分解直接预测，参数量少，适合具有明显趋势的序列。",
   preprocessing: { actions: [{ type: "series_decomposition", kernel_size: 25 }] },
   embedding: { type: "none" },
-  backbone: { type: "dlinear", individual: false },
+  backbone: { type: "dlinear", kernel_size: 25, bias: true },
   fusion: { type: "temporal", channel_mode: "independent" },
-  prediction_head: { type: "linear", output_distribution: "point", share_across_horizons: false },
+  prediction_head: { type: "linear", output_distribution: "point" },
   post_processing: { type: "auto" },
   training_strategy: {
     loss: { base: "mse", horizon_weighting: "uniform" },
@@ -227,14 +373,34 @@ function buildSystemPrompt() {
     "Return exactly one JSON object using Neo-Cast recipe_schema_v1 snake_case field names.",
     "Each field must have a single concrete value — NOT a list of alternatives.",
     "Do not return markdown fences or any prose outside JSON.",
-    "Available module options (choose one value per field):",
+    "Do NOT include post_processing, constraints, or any key not shown in the example or schema below.",
+    "",
+    "Available module options (choose exactly one value per field):",
     "  preprocessing.actions[].type: none | instance_norm | series_decomposition | seasonal_differencing | missing_mask | sample_reweighting",
     "  embedding.type: none | patch | multiscale_patch | invert | frequency | calendar",
     "  backbone.type: linear | mlp | transformer | dlinear | tcn | nbeats | timesnet | rnn | ssm | mixer",
     "  fusion.type: temporal | feature | temporal_then_feature | feature_then_temporal | graph | gated_hybrid",
     "  prediction_head.type: linear | direct_multi_horizon | quantile | gaussian | residual_correction",
+    "  training_strategy.loss.base: mse | mae | huber | quantile | distillation",
+    "  training_strategy.optimizer.type: adam | adamw | sgd",
+    "  training_strategy.scheduler.type: none | cosine | one_cycle | plateau  ← ONLY these four values",
+    "",
+    "Required numeric fields by backbone type (ALL must be present as integers ≥ 1):",
+    "  linear: (none required beyond type)",
+    "  mlp: depth (int ≥1, ≤24), hidden_dim (int ≥1, ≤4096)",
+    "  transformer: d_model (int ≥1, ≤1024), n_heads (int ≥1, ≤32), n_layers (int ≥1, ≤24)",
+    "  dlinear: kernel_size (int ≥3, ≤255)",
+    "  tcn: hidden_dim (int ≥1, ≤4096), n_layers (int ≥1, ≤24), kernel_size (int ≥2, ≤255)",
+    "  nbeats: hidden_dim (int ≥1, ≤4096), n_blocks (int ≥1, ≤64), n_layers (int ≥1, ≤24)",
+    "  timesnet: hidden_dim (int ≥1, ≤4096), n_layers (int ≥1, ≤24), top_k (int ≥1, ≤16), kernel_size (int ≥2, ≤255)",
+    "  rnn: hidden_dim (int ≥1, ≤4096), num_layers (int ≥1, ≤24)",
+    "  ssm: state_dim (int ≥1, ≤4096), depth (int ≥1, ≤24)",
+    "  mixer: hidden_dim (int ≥1, ≤4096), depth (int ≥1, ≤24)",
+    "",
+    "Required numeric fields in training_strategy.budget (ALL required, no defaults):",
+    "  max_epochs (int ≥1, ≤1000), time_budget_s (int ≥1), batch_size (int ≥1, ≤512), patience (int ≥1, ≤100)",
+    "",
     "Treat profileDerivedSearchDirectives as high-priority search priors unless they conflict with runtime constraints.",
-    "Include training_strategy with loss, optimizer, scheduler, regularization, and budget sub-objects.",
     `\nEXAMPLE (follow this exact structure):\n${JSON.stringify(EXAMPLE_CANDIDATE, null, 2)}`,
   ].join("\n")
 }
@@ -391,6 +557,9 @@ function forbiddenCandidateSignatures(context: DomainProposalContext) {
 function buildUserPrompt(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
+  readonly dataAnalysisMarkdown?: string
+  readonly hypoPlanMarkdown?: string
+  readonly previousReflectionMarkdown?: string
 }) {
   const profile = profileRecord(input.proposalContext.taskFingerprint)
   const searchBiases = isRecord(input.proposalContext.taskFingerprint)
@@ -410,6 +579,9 @@ function buildUserPrompt(input: {
       datasetProfileSummary: profile,
       searchBiases,
       profileDerivedSearchDirectives: profileDerivedSearchDirectives(input.proposalContext.taskFingerprint),
+      ...(input.dataAnalysisMarkdown ? { dataAnalysisReport: input.dataAnalysisMarkdown } : {}),
+      ...(input.hypoPlanMarkdown ? { hypothesisPlan: input.hypoPlanMarkdown } : {}),
+      ...(input.previousReflectionMarkdown ? { previousSessionReflection: input.previousReflectionMarkdown } : {}),
       existingCandidates: representativeCandidates(input.proposalContext),
       runs: representativeRuns(input.proposalContext),
       memory: representativeMemory(input.proposalContext),
@@ -423,7 +595,7 @@ function buildUserPrompt(input: {
   )
 }
 
-async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string, system: string, user: string) {
+async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string, system: string, user: string): Promise<LLMResponse> {
   if (!config.baseURL) throw new Error("OPENAI-compatible provider requires llm.base_url")
   const response = await fetch(`${config.baseURL.replace(/\/+$/, "")}/chat/completions`, {
     method: "POST",
@@ -445,10 +617,19 @@ async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string,
   if (!response.ok) throw new Error(payload?.error?.message || payload?.message || `${response.status}`)
   const text = payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text
   if (typeof text !== "string" || !text.trim()) throw new Error("OpenAI-compatible API returned empty content")
-  return text
+  const u = payload?.usage
+  const usage: LLMTokenUsage = typeof u === "object" && u !== null
+    ? {
+        inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : 0,
+        outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : 0,
+        cacheReadTokens: typeof u.prompt_tokens_details?.cached_tokens === "number" ? u.prompt_tokens_details.cached_tokens : 0,
+        cacheWriteTokens: 0,
+      }
+    : ZERO_USAGE
+  return { text, usage }
 }
 
-async function requestAnthropic(config: NeoCastLLMConfig, apiKey: string, system: string, user: string) {
+async function requestAnthropic(config: NeoCastLLMConfig, apiKey: string, system: string, user: string): Promise<LLMResponse> {
   const baseURL = config.baseURL ?? "https://api.anthropic.com/v1"
   const response = await fetch(`${baseURL.replace(/\/+$/, "")}/messages`, {
     method: "POST",
@@ -474,21 +655,196 @@ async function requestAnthropic(config: NeoCastLLMConfig, apiKey: string, system
         .join("\n")
     : ""
   if (!text.trim()) throw new Error("Anthropic API returned empty content")
-  return text
+  const u = payload?.usage
+  const usage: LLMTokenUsage = typeof u === "object" && u !== null
+    ? {
+        inputTokens: typeof u.input_tokens === "number" ? u.input_tokens : 0,
+        outputTokens: typeof u.output_tokens === "number" ? u.output_tokens : 0,
+        cacheReadTokens: typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : 0,
+        cacheWriteTokens: typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : 0,
+      }
+    : ZERO_USAGE
+  return { text, usage }
 }
 
-export async function requestNeoCastLLM(config: NeoCastLLMConfig, apiKey: string, system: string, user: string) {
+export async function requestNeoCastLLM(config: NeoCastLLMConfig, apiKey: string, system: string, user: string): Promise<LLMResponse> {
   return config.provider === "anthropic"
     ? requestAnthropic(config, apiKey, system, user)
     : requestOpenAICompatible(config, apiKey, system, user)
 }
 
-function llmMetadata(config: NeoCastLLMConfig, status: string, extra: JsonRecord = {}): JsonRecord {
+async function requestAnthropicStream(
+  config: NeoCastLLMConfig,
+  apiKey: string,
+  system: string,
+  user: string,
+  onDelta: (delta: string) => void,
+): Promise<LLMResponse> {
+  const baseURL = config.baseURL ?? "https://api.anthropic.com/v1"
+  const response = await fetch(`${baseURL.replace(/\/+$/, "")}/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: config.model,
+      max_tokens: config.maxTokens,
+      temperature: config.temperature,
+      system,
+      messages: [{ role: "user", content: user }],
+      stream: true,
+    }),
+  })
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(async () => ({ error: { message: await response.text() } }))
+    throw new Error(payload?.error?.message || payload?.message || `${response.status}`)
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let fullText = ""
+  let usage: LLMTokenUsage = ZERO_USAGE
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue
+      const data = line.slice(6).trim()
+      if (data === "[DONE]" || !data) continue
+      try {
+        const event = JSON.parse(data) as Record<string, unknown>
+        if (event.type === "content_block_delta") {
+          const delta = (event.delta as Record<string, unknown> | undefined)
+          if (delta?.type === "text_delta" && typeof delta.text === "string") {
+            onDelta(delta.text)
+            fullText += delta.text
+          }
+        } else if (event.type === "message_delta" || event.type === "message_start") {
+          const u = (event.usage ?? (event.message as Record<string, unknown> | undefined)?.usage) as Record<string, unknown> | undefined
+          if (u && typeof u === "object") {
+            usage = {
+              inputTokens: typeof u.input_tokens === "number" ? u.input_tokens : usage.inputTokens,
+              outputTokens: typeof u.output_tokens === "number" ? u.output_tokens : usage.outputTokens,
+              cacheReadTokens: typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : usage.cacheReadTokens,
+              cacheWriteTokens: typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : usage.cacheWriteTokens,
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+  if (!fullText.trim()) throw new Error("Anthropic streaming API returned empty content")
+  return { text: fullText, usage }
+}
+
+async function requestOpenAICompatibleStream(
+  config: NeoCastLLMConfig,
+  apiKey: string,
+  system: string,
+  user: string,
+  onDelta: (delta: string) => void,
+): Promise<LLMResponse> {
+  if (!config.baseURL) throw new Error("OPENAI-compatible provider requires llm.base_url")
+  const response = await fetch(`${config.baseURL.replace(/\/+$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: config.model,
+      max_tokens: config.maxTokens,
+      temperature: config.temperature,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+  })
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(async () => ({ error: { message: await response.text() } }))
+    throw new Error(payload?.error?.message || payload?.message || `${response.status}`)
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let fullText = ""
+  let usage: LLMTokenUsage = ZERO_USAGE
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue
+      const data = line.slice(6).trim()
+      if (data === "[DONE]" || !data) continue
+      try {
+        const event = JSON.parse(data) as Record<string, unknown>
+        const choices = Array.isArray(event.choices) ? event.choices : []
+        const delta = (choices[0] as Record<string, unknown> | undefined)?.delta
+        const content = typeof (delta as Record<string, unknown> | undefined)?.content === "string"
+          ? (delta as Record<string, unknown>).content as string
+          : undefined
+        if (content) {
+          onDelta(content)
+          fullText += content
+        }
+        const u = event.usage as Record<string, unknown> | undefined
+        if (u && typeof u === "object") {
+          usage = {
+            inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : usage.inputTokens,
+            outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : usage.outputTokens,
+            cacheReadTokens: typeof (u.prompt_tokens_details as Record<string, unknown> | undefined)?.cached_tokens === "number"
+              ? (u.prompt_tokens_details as Record<string, unknown>).cached_tokens as number
+              : usage.cacheReadTokens,
+            cacheWriteTokens: 0,
+          }
+        }
+      } catch {}
+    }
+  }
+  if (!fullText.trim()) throw new Error("OpenAI-compatible streaming API returned empty content")
+  return { text: fullText, usage }
+}
+
+export async function requestNeoCastLLMStream(
+  config: NeoCastLLMConfig,
+  apiKey: string,
+  system: string,
+  user: string,
+  onDelta: (delta: string) => void,
+): Promise<LLMResponse> {
+  return config.provider === "anthropic"
+    ? requestAnthropicStream(config, apiKey, system, user, onDelta)
+    : requestOpenAICompatibleStream(config, apiKey, system, user, onDelta)
+}
+
+export function usageToMetadata(usage: LLMTokenUsage): JsonRecord {
+  if (usage.inputTokens === 0 && usage.outputTokens === 0) return {}
+  return {
+    llmInputTokens: usage.inputTokens,
+    llmOutputTokens: usage.outputTokens,
+    ...(usage.cacheReadTokens > 0 ? { llmCacheReadTokens: usage.cacheReadTokens } : {}),
+    ...(usage.cacheWriteTokens > 0 ? { llmCacheWriteTokens: usage.cacheWriteTokens } : {}),
+  }
+}
+
+function llmMetadata(config: NeoCastLLMConfig, status: string, extra: JsonRecord = {}, usage?: LLMTokenUsage): JsonRecord {
   return {
     llmStatus: status,
     llmProvider: config.provider,
     llmModel: config.model,
     ...(config.baseURL === undefined ? {} : { llmBaseURL: config.baseURL }),
+    ...(usage ? usageToMetadata(usage) : {}),
     ...extra,
   }
 }
@@ -575,6 +931,9 @@ export async function proposeLLMCandidate(input: {
   readonly workspaceRoot: string
   /** Fallback key+baseURL resolved from the opencode auth.json when env vars are absent. */
   readonly authJsonKey?: { readonly key: string; readonly baseURL: string; readonly model: string }
+  readonly dataAnalysisMarkdown?: string
+  readonly hypoPlanMarkdown?: string
+  readonly previousReflectionMarkdown?: string
 }): Promise<LLMProposalResult> {
   const runtime = isRecord(input.task.taskSpec.runtime) ? input.task.taskSpec.runtime : {}
   const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -586,10 +945,12 @@ export async function proposeLLMCandidate(input: {
   let effectiveConfig = config
   if (!apiKey && input.authJsonKey) {
     apiKey = input.authJsonKey.key
+    // Empty baseURL signals Anthropic native path (auth.json stores "" for anthropic).
+    const isAnthropicNative = !input.authJsonKey.baseURL
     effectiveConfig = {
       ...config,
-      provider: "openai-compatible",
-      model: input.authJsonKey.model,
+      provider: isAnthropicNative ? "anthropic" : "openai-compatible",
+      model: isAnthropicNative ? config.model : input.authJsonKey.model,
       ...(input.authJsonKey.baseURL ? { baseURL: input.authJsonKey.baseURL } : {}),
     }
   }
@@ -604,29 +965,120 @@ export async function proposeLLMCandidate(input: {
     }
   }
 
-  try {
-    const system = buildSystemPrompt()
-    const user = buildUserPrompt(input)
-    const text = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
-    const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
-    const governance = candidateGovernance(candidateSpec)
-    return {
-      proposal: {
-        candidateSpec,
-        rationale:
-          typeof candidateSpec.hypothesis === "string"
-            ? candidateSpec.hypothesis
-            : "LLM-generated TSF candidate.",
-        ...governance,
-        generatedBy: "llm",
-      },
-      metadata: llmMetadata(effectiveConfig, "used"),
+  const system = buildSystemPrompt()
+  const user = buildUserPrompt({
+    task: input.task,
+    proposalContext: input.proposalContext,
+    dataAnalysisMarkdown: input.dataAnalysisMarkdown,
+    hypoPlanMarkdown: input.hypoPlanMarkdown,
+    previousReflectionMarkdown: input.previousReflectionMarkdown,
+  })
+  const maxAttempts = 3
+  let lastError: unknown
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { text, usage } = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
+      const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
+      const governance = candidateGovernance(candidateSpec)
+      return {
+        proposal: {
+          candidateSpec,
+          rationale:
+            typeof candidateSpec.hypothesis === "string"
+              ? candidateSpec.hypothesis
+              : "LLM-generated TSF candidate.",
+          ...governance,
+          generatedBy: "llm",
+        },
+        metadata: llmMetadata(effectiveConfig, "used", {}, usage),
+      }
+    } catch (error) {
+      lastError = error
+      if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, 1500 * attempt))
     }
-  } catch (error) {
+  }
+  {
+    const error = lastError
     return {
       metadata: llmMetadata(effectiveConfig, "failed", {
         llmError: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
       }),
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Auth.json key resolution — shared between service.ts and intent-agent.ts
+// ---------------------------------------------------------------------------
+
+export const OPENCODE_PROVIDER_BASE_URLS: Record<string, string> = {
+  zhipuai: "https://open.bigmodel.cn/api/paas/v4",
+  "zhipuai-coding-plan": "https://open.bigmodel.cn/api/paas/v4",
+  openai: "https://api.openai.com/v1",
+  deepseek: "https://api.deepseek.com/v1",
+  anthropic: "",
+}
+
+const OPENCODE_PROVIDER_DEFAULT_MODELS: Record<string, string> = {
+  zhipuai: "glm-4-flash",
+  "zhipuai-coding-plan": "glm-4-flash",
+  openai: "gpt-4o-mini",
+  deepseek: "deepseek-chat",
+}
+
+export interface AuthJsonKeyResult {
+  readonly key: string
+  readonly baseURL: string
+  readonly model: string
+}
+
+export async function resolveApiKeyFromAuthJson(): Promise<AuthJsonKeyResult | undefined> {
+  if (process.env.OPENCODE_TEST_HOME) return undefined
+  const candidates = [
+    process.env.XDG_DATA_HOME ? path.join(process.env.XDG_DATA_HOME, "neo-research", "auth.json") : undefined,
+    path.join(os.homedir(), ".local", "share", "neo-research", "auth.json"),
+    path.join(os.homedir(), ".local", "share", "opencode", "auth.json"),
+  ].filter((p): p is string => p !== undefined)
+  for (const authPath of candidates) {
+    try {
+      const raw = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>
+      const priority = ["anthropic", "openai", ...Object.keys(OPENCODE_PROVIDER_BASE_URLS)]
+      const order = [...new Set(priority)]
+      for (const providerID of order) {
+        const entry = raw[providerID]
+        if (!entry || typeof entry !== "object") continue
+        const rec = entry as Record<string, unknown>
+        if (rec.type !== "api" || typeof rec.key !== "string" || !rec.key) continue
+        const baseURL = OPENCODE_PROVIDER_BASE_URLS[providerID] ?? ""
+        const model = OPENCODE_PROVIDER_DEFAULT_MODELS[providerID] ?? "gpt-4o-mini"
+        return { key: rec.key, baseURL, model }
+      }
+    } catch {
+      // file missing or unreadable
+    }
+  }
+  return undefined
+}
+
+// Resolves the effective LLM config + API key, falling back to auth.json when env vars are absent.
+export async function resolveEffectiveLLMConfig(input: {
+  readonly workspaceRoot: string
+  readonly neoCastProjectRoot?: string
+}): Promise<{ apiKey: string; config: NeoCastLLMConfig } | undefined> {
+  const config = await resolveNeoCastLLMConfig(input)
+  let apiKey = apiKeyFor(config)
+  let effectiveConfig = config
+  if (!apiKey) {
+    const authEntry = await resolveApiKeyFromAuthJson()
+    if (!authEntry) return undefined
+    apiKey = authEntry.key
+    const isAnthropicNative = !authEntry.baseURL
+    effectiveConfig = {
+      ...config,
+      provider: isAnthropicNative ? "anthropic" : "openai-compatible",
+      model: isAnthropicNative ? config.model : authEntry.model,
+      ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
+    }
+  }
+  return { apiKey, config: effectiveConfig }
 }

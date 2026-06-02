@@ -25,10 +25,15 @@ import {
   canExecuteResearchCockpitTask,
   canRunResearchCockpitCandidate,
   findBestResearchCockpitMetric,
+  formatResearchCockpitCandidateRecipeLines,
+  formatResearchCockpitCandidateArchitectureExpandedLines,
   formatResearchCockpitExport,
   formatResearchCockpitProfile,
   formatResearchCockpitIteration,
+  formatResearchCockpitLLMDesignLines,
+  formatResearchCockpitTaskAgentLLMLines,
   formatResearchCockpitLoop,
+  formatResearchCockpitRefTestLines,
   formatResearchCockpitRunResult,
   formatResearchCockpitSeedSweep,
   formatResearchCockpitIntentCheckpointReason,
@@ -49,6 +54,8 @@ import {
   taskModeForInteractionMode,
   updateResearchCockpitTaskInteractionMode,
   updateResearchCockpitTaskRunnerRoot,
+  computeResearchLLMTokenTotals,
+  getLatestResearchInputTokens,
   type CreateResearchTaskInput,
   type JsonRecord,
   type ResearchCockpitApproval,
@@ -189,6 +196,39 @@ function formatError(error: unknown) {
   return text.length > 180 ? text.slice(0, 177) + "..." : text
 }
 
+function parseBlockedErrorPayload(err: unknown): { name: string; reason: string; checkpointPhase?: string } | undefined {
+  if (!(err instanceof Error)) return undefined
+  try {
+    const payload = JSON.parse(err.message) as unknown
+    if (!isJsonRecord(payload)) return undefined
+    if (payload.name !== "ResearchPipelineBlockedError") return undefined
+    const data = payload.data
+    if (!isJsonRecord(data) || typeof data.reason !== "string") return undefined
+    return {
+      name: String(payload.name),
+      reason: data.reason,
+      checkpointPhase: typeof data.checkpointPhase === "string" ? data.checkpointPhase : undefined,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function isHumanCheckpointRequired(err: unknown): boolean {
+  const payload = parseBlockedErrorPayload(err)
+  if (!payload) return false
+  return (
+    payload.reason === "human_checkpoint_required" || payload.reason === "reflection_requested_human_review"
+  )
+}
+
+function formatCheckpointMessage(err: unknown): string {
+  const blocked = parseBlockedErrorPayload(err)
+  if (!blocked) return "等待 checkpoint 确认"
+  if (blocked.reason === "reflection_requested_human_review") return "Reflection Agent 建议人工介入 — /approve 确认后继续发布"
+  return blocked.checkpointPhase ? `等待 ${blocked.checkpointPhase} checkpoint 确认` : "等待 checkpoint 确认"
+}
+
 function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -226,7 +266,17 @@ function parseErrorPayload(value: string): string | undefined {
     if (typeof payload.message === "string" && payload.message.trim()) return payload.message
     if (isJsonRecord(data) && typeof data.error === "string" && data.error.trim()) return data.error
     if (typeof payload.error === "string" && payload.error.trim()) return payload.error
-    if (typeof payload.name === "string" && payload.name.trim() && payload.name !== "UnknownError") return payload.name
+    if (typeof payload.name === "string" && payload.name.trim() && payload.name !== "UnknownError") {
+      if (payload.name === "ResearchPipelineBlockedError" && isJsonRecord(data)) {
+        const parts: string[] = [payload.name]
+        if (typeof data.reason === "string") parts.push(data.reason)
+        if (typeof data.checkpointPhase === "string") parts.push(`(${data.checkpointPhase})`)
+        if (Array.isArray(data.missingFields) && data.missingFields.length > 0)
+          parts.push(`[${data.missingFields.join(", ")}]`)
+        return parts.join(": ")
+      }
+      return payload.name
+    }
   } catch {
     return undefined
   }
@@ -299,7 +349,8 @@ function overlayLiveResearchStageStatus(
   const stageIndex = researchAgentFullStageOrder.indexOf(key)
   if (activeIndex < 0 || stageIndex < 0) return fallback
   if (stageIndex === activeIndex) return "active"
-  if (stageIndex > activeIndex) return "todo"
+  // Never downgrade a historically completed stage; only promote pending stages to "done".
+  if (stageIndex > activeIndex) return fallback === "done" ? "done" : "todo"
   return "done"
 }
 
@@ -311,7 +362,7 @@ function localResearchChatReply(value: string) {
 }
 
 function socraticSlotLine(slot: ReturnType<typeof buildSocraticClarificationState>["slots"][number]) {
-  const mark = slot.status === "filled" ? "✓" : "→"
+  const mark = slot.status === "filled" ? "✓" : slot.status === "review" ? "◎" : "→"
   return `${mark} ${slot.label}${slot.value ? `: ${slot.value}` : ""}`
 }
 
@@ -823,7 +874,7 @@ function hasMeaningfulFingerprint(value: unknown) {
 
 function isFinalResearchArtifact(artifact: ResearchCockpitArtifact) {
   const kind = artifact.kind.toLowerCase()
-  return kind.includes("final") || kind.includes("bundle") || kind.includes("report")
+  return kind.includes("final") || kind.includes("bundle")
 }
 
 function compactStreamTextParts(value: string) {
@@ -1106,6 +1157,9 @@ export function ResearchCockpit() {
   const [runnerOutputLines, setRunnerOutputLines] = createSignal<
     Array<{ id: number; taskID?: string; runID: string; text: string; tone: StreamLine["tone"] }>
   >([])
+  const [designLLMLines, setDesignLLMLines] = createSignal<
+    Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }>
+  >([])
   const [promptValue, setPromptValue] = createSignal("")
   const [csvInputErrors, setCsvInputErrors] = createSignal<string[]>([])
   const [promptEvents, setPromptEvents] = createSignal<Array<{ id: number; text: string; taskID?: string; detail?: string }>>(
@@ -1115,7 +1169,21 @@ export function ResearchCockpit() {
   const [chatSessionByContext, setChatSessionByContext] = createSignal<Record<string, string>>({})
   const [chatUsageByContext, setChatUsageByContext] = createSignal<Record<string, Record<string, ChatUsageEntry>>>({})
   const [interactionModeByTask, setInteractionModeByTask] = createSignal<Record<string, ResearchInteractionMode>>({})
+  const [liveAgentEventStage, setLiveAgentEventStage] = createSignal<string | undefined>(undefined)
+  const [dataAnalysisStream, setDataAnalysisStream] = createSignal<{
+    id: number
+    taskID?: string
+    text: string
+    done: boolean
+  } | undefined>()
+  const [hypoPlannerStream, setHypoPlannerStream] = createSignal<{
+    id: number
+    taskID?: string
+    text: string
+    done: boolean
+  } | undefined>()
   const routedGoalsHandled = new Set<string>()
+  const reportedRunIDs = new Set<string>()
   let routedCsvTaskHandled = false
   let actionQueue = Promise.resolve()
   let activeActionAbort: AbortController | undefined
@@ -1159,6 +1227,7 @@ export function ResearchCockpit() {
       setActionEvents([])
       setErrorEvents([])
       setRunnerOutputLines([])
+      setDesignLLMLines([])
       setStreamingChat(undefined)
       setError(undefined)
       evt.preventDefault()
@@ -1287,6 +1356,14 @@ export function ResearchCockpit() {
     return researchRequest<ResearchCockpitTask[]>(sdk, "/research/tasks?limit=30")
   })
 
+  const [researchLLMStatus] = createResource(refresh, async () => {
+    try {
+      return await researchRequest<{ status: string; provider: string; model: string; source: string }>(sdk, "/research/llm")
+    } catch {
+      return undefined
+    }
+  })
+
   const sortedTasks = createMemo(() => sortResearchCockpitTasks(tasks() ?? []))
   const selectedTaskIndex = createMemo(() => {
     const tasks = sortedTasks()
@@ -1359,6 +1436,343 @@ export function ResearchCockpit() {
         setRefresh((value) => value + 1)
       }
       return
+    }
+    if (researchPayload.type === "research.agent.dataAnalysis.started") {
+      const data = researchPayload.properties as { taskID?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      setLiveAgentEventStage("DataAnalysis Agent")
+      setDataAnalysisStream({ id: ++streamEventID, taskID, text: "", done: false })
+      return
+    }
+    if (researchPayload.type === "research.agent.dataAnalysis.stream.delta") {
+      const data = researchPayload.properties as { taskID?: string; delta?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const delta = data?.delta
+      if (delta) {
+        setDataAnalysisStream((prev) => prev ? { ...prev, text: prev.text + delta } : prev)
+      }
+      return
+    }
+    if (researchPayload.type === "research.agent.hypoPlanner.started") {
+      const data = researchPayload.properties as { taskID?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      setLiveAgentEventStage("HypoPlanner Agent")
+      setHypoPlannerStream({ id: ++streamEventID, taskID, text: "", done: false })
+      return
+    }
+    if (researchPayload.type === "research.agent.hypoPlanner.stream.delta") {
+      const data = researchPayload.properties as { taskID?: string; delta?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const delta = data?.delta
+      if (delta) {
+        setHypoPlannerStream((prev) => prev ? { ...prev, text: prev.text + delta } : prev)
+      }
+      return
+    }
+    if (researchPayload.type === "research.agent.reflection.started") {
+      const data = researchPayload.properties as { taskID?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      setLiveAgentEventStage("Reflection Agent")
+      setDesignLLMLines((prev) => [
+        ...prev,
+        { id: ++streamEventID, taskID, text: "[Reflection] 分析中...", tone: "muted" as const },
+      ])
+      return
+    }
+    if (
+      researchPayload.type === "research.agent.reflection.completed" ||
+      researchPayload.type === "research.agent.reflection.failed"
+    ) {
+      const data = researchPayload.properties as { taskID?: string; metadata?: Record<string, unknown> } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const meta = data?.metadata ?? {}
+      const newLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
+      if (researchPayload.type === "research.agent.reflection.completed") {
+        const decision = typeof meta.decision === "string" ? meta.decision : undefined
+        const decisionReason = typeof meta.decisionReason === "string" ? meta.decisionReason : undefined
+        const bestMetric = typeof meta.bestMetric === "number" ? meta.bestMetric : undefined
+        const primaryMetricName = typeof meta.primaryMetricName === "string" ? meta.primaryMetricName : "metric"
+        const plateauStreak = typeof meta.plateauStreak === "number" ? meta.plateauStreak : 0
+        const hypothesisCount = typeof meta.hypothesisCount === "number" ? meta.hypothesisCount : 0
+        const llmStatus = typeof meta.llmStatus === "string" ? meta.llmStatus : undefined
+        const llmNarrative = typeof meta.llmNarrative === "string" ? meta.llmNarrative : undefined
+        const tone: StreamLine["tone"] =
+          decision === "stop" ? "success" : decision === "request_human" ? "warning" : "muted"
+        const metricPart = bestMetric !== undefined ? ` best ${primaryMetricName}=${bestMetric.toFixed(4)}` : ""
+        const plateauPart = plateauStreak > 0 ? ` plateau=${plateauStreak}` : ""
+        newLines.push({ id: ++streamEventID, taskID, text: `[Reflection] ${decision ?? "completed"}${metricPart}${plateauPart}`, tone })
+        if (decisionReason) newLines.push({ id: ++streamEventID, taskID, text: `  ${decisionReason}`, tone: "muted" })
+        if (hypothesisCount > 0)
+          newLines.push({
+            id: ++streamEventID,
+            taskID,
+            text: `  ${hypothesisCount} hypothesis${hypothesisCount > 1 ? "es" : ""} for next round`,
+            tone: "muted",
+          })
+        if (llmStatus === "used" && llmNarrative) {
+          for (const part of llmNarrative.split("\n\n").slice(0, 3)) {
+            const trimmed = part.trim()
+            if (trimmed)
+              newLines.push({
+                id: ++streamEventID,
+                taskID,
+                text: `  ${trimmed.length > 160 ? trimmed.slice(0, 157) + "..." : trimmed}`,
+                tone: "muted",
+              })
+          }
+        }
+      } else {
+        newLines.push({ id: ++streamEventID, taskID, text: "[Reflection] failed", tone: "error" })
+      }
+      if (newLines.length > 0) setDesignLLMLines((prev) => [...prev, ...newLines])
+      setLiveAgentEventStage(undefined)
+      setRefresh((value) => value + 1)
+      return
+    }
+    if (
+      researchPayload.type === "research.agent.modelDesigner.completed" ||
+      researchPayload.type === "research.agent.dataAnalysis.completed" ||
+      researchPayload.type === "research.agent.hypoPlanner.completed"
+    ) {
+      const data = researchPayload.properties as { taskID?: string; metadata?: Record<string, unknown> } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const meta = data?.metadata ?? {}
+      const llmStatus = typeof meta.llmStatus === "string" ? meta.llmStatus : undefined
+      const llmPreview = typeof meta.llmPreview === "string" ? meta.llmPreview : undefined
+      const newLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
+      if (researchPayload.type === "research.agent.modelDesigner.completed") {
+        const llmModel = typeof meta.llmModel === "string" ? meta.llmModel : undefined
+        const llmProvider = typeof meta.llmProvider === "string" ? meta.llmProvider : undefined
+        const llmError = typeof meta.llmError === "string" ? meta.llmError : undefined
+        const llmHypothesis = typeof meta.llmHypothesis === "string" ? meta.llmHypothesis : undefined
+        const recipeID = typeof meta.recipeID === "string" ? meta.recipeID : undefined
+        const candidateID = typeof meta.candidateID === "string" ? meta.candidateID : undefined
+        const generatedBy = typeof meta.generatedBy === "string" ? meta.generatedBy : undefined
+        const riskLevel = typeof meta.riskLevel === "string" ? meta.riskLevel : undefined
+        const isBaseline = generatedBy === "heuristic" || (recipeID !== undefined && recipeID.includes("baseline"))
+        const modelLabel = llmModel ?? llmProvider ?? "LLM"
+        if (llmStatus === "used") {
+          const recipePart = recipeID ? ` / ${recipeID}` : ""
+          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] LLM ${modelLabel} → 生成成功${recipePart}`, tone: "success" })
+          if (llmHypothesis) {
+            const h = llmHypothesis.length > 120 ? `${llmHypothesis.slice(0, 117)}...` : llmHypothesis
+            newLines.push({ id: ++streamEventID, taskID, text: `  ${h}`, tone: "muted" })
+          }
+        } else if (llmStatus === "failed" || llmStatus === "invalid") {
+          const errPart = llmError ? `: ${llmError.slice(0, 100)}` : ""
+          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] LLM ${modelLabel} → ${llmStatus}${errPart}`, tone: "error" })
+        } else if (llmStatus === "not_configured") {
+          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] LLM not configured — heuristic candidate`, tone: "warning" })
+        } else {
+          const idPart = candidateID ? ` ${candidateID}` : ""
+          const recipePart = recipeID ? ` / ${recipeID}` : ""
+          const riskPart = riskLevel && riskLevel !== "low" ? ` [${riskLevel}]` : ""
+          const baselinePart = isBaseline ? " [baseline]" : ""
+          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] 复用候选${idPart}${recipePart}${baselinePart}${riskPart}`, tone: "muted" })
+        }
+        const eventCandidateSpec =
+          meta.candidateSpec !== null && typeof meta.candidateSpec === "object" && !Array.isArray(meta.candidateSpec)
+            ? (meta.candidateSpec as Record<string, unknown>)
+            : undefined
+        const specForArch =
+          eventCandidateSpec ??
+          (candidateID ? taskCandidates().find((c) => c.id === candidateID)?.candidateSpec : undefined)
+        if (specForArch) {
+          for (const line of formatResearchCockpitCandidateArchitectureExpandedLines({ candidateSpec: specForArch })) {
+            newLines.push({ id: ++streamEventID, taskID, text: line, tone: "muted" })
+          }
+        }
+      } else if (researchPayload.type === "research.agent.dataAnalysis.completed") {
+        const llmContent = typeof meta.llmContent === "string" ? meta.llmContent : undefined
+        const fullText = llmContent ?? llmPreview
+        if (llmStatus === "used" && fullText) {
+          setDataAnalysisStream((prev) => ({
+            id: prev?.id ?? ++streamEventID,
+            taskID,
+            text: fullText,
+            done: true,
+          }))
+        } else if (llmStatus === "skipped") {
+          setDataAnalysisStream({ id: ++streamEventID, taskID, text: "(heuristic — LLM not configured)", done: true })
+        } else {
+          setDataAnalysisStream((prev) => prev ? { ...prev, done: true } : prev)
+        }
+        setLiveAgentEventStage(undefined)
+        setRefresh((value) => value + 1)
+        return
+      } else if (researchPayload.type === "research.agent.hypoPlanner.completed") {
+        const hypothesisLines = llmStatus === "used" && llmPreview
+          ? llmPreview
+          : llmStatus === "failed" ? "(LLM failed — heuristic hypotheses used)"
+          : llmStatus === "skipped" ? "(heuristic — LLM not configured)"
+          : undefined
+        setHypoPlannerStream((prev) => ({
+          id: prev?.id ?? ++streamEventID,
+          taskID,
+          text: hypothesisLines ?? prev?.text ?? "",
+          done: true,
+        }))
+        setLiveAgentEventStage(undefined)
+        setRefresh((value) => value + 1)
+        return
+      }
+      if (newLines.length > 0) setDesignLLMLines((prev) => [...prev, ...newLines])
+      setRefresh((value) => value + 1)
+      return
+    }
+    if (researchPayload.type === "research.agent.publish.started") {
+      const data = researchPayload.properties as { taskID?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      setLiveAgentEventStage("publish")
+      setDesignLLMLines((prev) => [
+        ...prev,
+        { id: ++streamEventID, taskID, text: "[Publish] 开始发布 — 运行冠军 ref_test 并打包模型...", tone: "muted" as const },
+      ])
+      return
+    }
+    if (researchPayload.type === "research.agent.publish.completed") {
+      const data = researchPayload.properties as { taskID?: string; metadata?: Record<string, unknown> } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const meta = data?.metadata ?? {}
+      const artifactPath = typeof meta.path === "string" ? meta.path : undefined
+      const kind = typeof meta.kind === "string" ? meta.kind : undefined
+      const championCandidateID = typeof meta.championCandidateID === "string" ? meta.championCandidateID : undefined
+      const championPrimaryMetric = typeof meta.championPrimaryMetric === "number" ? meta.championPrimaryMetric : undefined
+      const championUtility = typeof meta.championUtility === "number" ? meta.championUtility : undefined
+      const recipeID = typeof meta.recipeID === "string" ? meta.recipeID : undefined
+      const embeddingType = typeof meta.embeddingType === "string" ? meta.embeddingType : undefined
+      const backboneType = typeof meta.backboneType === "string" ? meta.backboneType : undefined
+      const refTestMetrics =
+        meta.refTestMetrics !== null && typeof meta.refTestMetrics === "object" && !Array.isArray(meta.refTestMetrics)
+          ? (meta.refTestMetrics as Record<string, unknown>)
+          : undefined
+      const newLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
+      const metricPart = championPrimaryMetric !== undefined ? ` / val_avg_mse=${championPrimaryMetric.toFixed(4)}` : ""
+      const utilityPart = championUtility !== undefined ? ` / utility=${championUtility.toFixed(3)}` : ""
+      newLines.push({ id: ++streamEventID, taskID, text: `[Publish] 发布完成 / ${kind ?? "model_export_package"}${metricPart}${utilityPart}`, tone: "success" })
+      if (championCandidateID) {
+        const recipePart = recipeID ? ` / ${recipeID}` : ""
+        newLines.push({ id: ++streamEventID, taskID, text: `  Champion: ${championCandidateID}${recipePart}`, tone: "muted" })
+        const championCandidate = taskCandidates().find((c) => c.id === championCandidateID)
+        if (championCandidate) {
+          for (const line of formatResearchCockpitCandidateArchitectureExpandedLines(championCandidate)) {
+            newLines.push({ id: ++streamEventID, taskID, text: line, tone: "muted" })
+          }
+        } else {
+          const archParts = [embeddingType, backboneType].filter(Boolean).join("+")
+          if (archParts) newLines.push({ id: ++streamEventID, taskID, text: `  Architecture: ${archParts}`, tone: "muted" })
+        }
+      }
+      if (refTestMetrics !== undefined) {
+        const avgMse = typeof refTestMetrics.ref_test_avg_mse === "number" ? refTestMetrics.ref_test_avg_mse : undefined
+        const avgMae = typeof refTestMetrics.ref_test_avg_mae === "number" ? refTestMetrics.ref_test_avg_mae : undefined
+        const parts = [
+          avgMse !== undefined ? `ref_test_avg_mse=${avgMse.toFixed(4)}` : undefined,
+          avgMae !== undefined ? `avg_mae=${avgMae.toFixed(4)}` : undefined,
+        ].filter((p): p is string => p !== undefined)
+        if (parts.length > 0) {
+          newLines.push({ id: ++streamEventID, taskID, text: `  Test Set: ${parts.join(" / ")}`, tone: "success" })
+        }
+        const horizons = [96, 192, 336, 720]
+        const hParts = horizons
+          .map((h) => {
+            const v = refTestMetrics[`ref_test_h${h}_mse`]
+            return typeof v === "number" ? `h${h}=${v.toFixed(4)}` : undefined
+          })
+          .filter((p): p is string => p !== undefined)
+        if (hParts.length > 0) {
+          newLines.push({ id: ++streamEventID, taskID, text: `    Horizons: ${hParts.join(" / ")}`, tone: "muted" })
+        }
+      }
+      if (artifactPath) newLines.push({ id: ++streamEventID, taskID, text: `  ${artifactPath}`, tone: "muted" })
+      setDesignLLMLines((prev) => [...prev, ...newLines])
+      setLiveAgentEventStage(undefined)
+      setRefresh((value) => value + 1)
+      return
+    }
+    if (researchPayload.type === "research.agent.publish.failed") {
+      const data = researchPayload.properties as { taskID?: string; metadata?: Record<string, unknown> } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const meta = data?.metadata ?? {}
+      const errMsg = typeof meta.message === "string" ? meta.message : typeof meta.error === "string" ? meta.error : "unknown error"
+      const refTestSkipped = meta.refTestSkipped === true
+      const tone: StreamLine["tone"] = refTestSkipped ? "warning" : "error"
+      const label = refTestSkipped ? "[Publish] ref_test 跳过" : "[Publish] 发布失败"
+      setDesignLLMLines((prev) => [
+        ...prev,
+        { id: ++streamEventID, taskID, text: `${label}: ${errMsg.slice(0, 120)}`, tone },
+      ])
+      setLiveAgentEventStage(undefined)
+      setRefresh((value) => value + 1)
+      return
+    }
+    if (researchPayload.type === "research.run.updated") {
+      const data = researchPayload.properties as {
+        run?: {
+          id?: string
+          taskID?: string
+          stage?: string
+          status?: string
+          error?: string
+          metrics?: Record<string, unknown>
+          resourceUsage?: Record<string, unknown>
+        }
+      } | undefined
+      const run = data?.run
+      const task = selectedTask()
+      if (run && task && run.taskID === task.id && run.status === "succeeded" && run.stage !== "smoke" && run.stage !== "profile") {
+        const runKey = run.id ? `succeeded:${run.id}` : undefined
+        if (!runKey || !reportedRunIDs.has(runKey)) {
+          if (runKey) reportedRunIDs.add(runKey)
+          const metrics = run.metrics ?? {}
+          const valAvgMse = typeof metrics.val_avg_mse === "number" ? metrics.val_avg_mse : undefined
+          const mseStr = valAvgMse !== undefined ? ` / val_avg_mse=${valAvgMse.toFixed(4)}` : ""
+          const wallClock = run.resourceUsage?.wallClockSec
+          const timePart = typeof wallClock === "number" ? ` / ${wallClock.toFixed(1)}s` : ""
+          setDesignLLMLines((prev) => [
+            ...prev,
+            { id: ++streamEventID, taskID: task.id, text: `[TrainEval ${run.stage ?? "run"}] succeeded${mseStr}${timePart}`, tone: "success" as const },
+          ])
+        }
+      }
+      if (
+        run &&
+        task &&
+        run.taskID === task.id &&
+        run.status === "failed" &&
+        run.stage !== "smoke" &&
+        run.stage !== "profile"
+      ) {
+        const runKey = run.id ? `failed:${run.id}` : undefined
+        if (!runKey || !reportedRunIDs.has(runKey)) {
+          if (runKey) reportedRunIDs.add(runKey)
+          const errorPreview = run.error?.trim() ? formatError(run.error.trim()) : "unknown error"
+          setDesignLLMLines((prev) => [
+            ...prev,
+            { id: ++streamEventID, taskID: task.id, text: `[TrainEval ${run.stage}] failed: ${errorPreview}`, tone: "error" as const },
+          ])
+        }
+      }
     }
     if (!shouldRefreshResearchCockpitOnEvent(researchPayload)) return
     setRefresh((value) => value + 1)
@@ -1501,6 +1915,13 @@ export function ResearchCockpit() {
     if (!item) return undefined
     return taskRuns().find((run) => run.id === item.runID)
   })
+  const championRefTestRun = createMemo(() => {
+    const item = validChampion()
+    if (!item) return undefined
+    return taskRuns().find(
+      (r) => r.candidateID === item.candidateID && r.stage === "ref_test" && r.status === "succeeded",
+    )
+  })
   const reproducibilityContextLine = createMemo(() => reproducibilitySealText(championRun()))
   const selectedCandidateEffectiveIndex = createMemo(() => {
     const candidates = taskCandidates()
@@ -1579,17 +2000,27 @@ export function ResearchCockpit() {
         toast.show({ variant: "info", message })
         setRefresh((value) => value + 1)
       } catch (err) {
-        const message = abortController.signal.aborted
-          ? name === "chat"
-            ? "Chat request canceled."
-            : `${name} canceled.`
-          : formatError(err)
-        setError(message)
-        setErrorEvents((events) => [
-          ...events.slice(-(errorEventHistoryLimit - 1)),
-          { id: ++streamEventID, action: name, text: message },
-        ])
-        toast.show({ variant: "error", message })
+        if (!abortController.signal.aborted && isHumanCheckpointRequired(err)) {
+          const message = formatCheckpointMessage(err)
+          setActionEvents((events) => [
+            ...events.slice(-(promptEventHistoryLimit - 1)),
+            { id: ++streamEventID, action: name, text: message },
+          ])
+          toast.show({ variant: "info", message })
+          setRefresh((value) => value + 1)
+        } else {
+          const message = abortController.signal.aborted
+            ? name === "chat"
+              ? "Chat request canceled."
+              : `${name} canceled.`
+            : formatError(err)
+          setError(message)
+          setErrorEvents((events) => [
+            ...events.slice(-(errorEventHistoryLimit - 1)),
+            { id: ++streamEventID, action: name, text: message },
+          ])
+          toast.show({ variant: "error", message })
+        }
       } finally {
         if (activeActionAbort === abortController) activeActionAbort = undefined
         setBusy(undefined)
@@ -1797,6 +2228,22 @@ export function ResearchCockpit() {
           body: JSON.stringify({ status }),
         },
       )
+      if (
+        status === "approved" &&
+        /\[checkpoint:(?:search_space_confirmed|final_model_selection)\]/.test(approval.reason)
+      ) {
+        const phaseMatch = approval.reason.match(/\[checkpoint:([^\]]+)\]/)
+        const phase = phaseMatch?.[1] ?? "checkpoint"
+        const reasonLines = approval.reason
+          .split(/\r?\n/)
+          .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+        const taskID = selectedTask()?.id
+        setDesignLLMLines((prev) => [
+          ...prev,
+          { id: ++streamEventID, taskID, text: `[${phase}] approved ✓`, tone: "success" as const },
+          ...reasonLines.map((line) => ({ id: ++streamEventID, taskID, text: `  ${line}`, tone: "muted" as const })),
+        ])
+      }
       return `${shortID(updated.id)} ${updated.status}`
     })
   }
@@ -1809,6 +2256,7 @@ export function ResearchCockpit() {
     const task = selectedTask()
     if (!task) return
     await runAction("confirm-intent", async () => {
+      const reason = formatResearchCockpitIntentCheckpointReason(task)
       const approval = await researchRequest<ResearchCockpitApproval>(
         sdk,
         "/research/approvals",
@@ -1817,7 +2265,7 @@ export function ResearchCockpit() {
           body: JSON.stringify({
             taskID: task.id,
             kind: "protocol",
-            reason: formatResearchCockpitIntentCheckpointReason(task),
+            reason,
           }),
         },
       )
@@ -1829,6 +2277,14 @@ export function ResearchCockpit() {
           body: JSON.stringify({ status: "approved", replyMessage: "Intent requirements confirmed." }),
         },
       )
+      const reasonLines = reason
+        .split(/\r?\n/)
+        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+      setDesignLLMLines((prev) => [
+        ...prev,
+        { id: ++streamEventID, taskID: task.id, text: "[intent_confirmed] approved ✓", tone: "success" as const },
+        ...reasonLines.map((line) => ({ id: ++streamEventID, taskID: task.id, text: `  ${line}`, tone: "muted" as const })),
+      ])
       return `${shortID(updated.id)} intent confirmed`
     })
   }
@@ -1993,6 +2449,73 @@ export function ResearchCockpit() {
     })
   }
 
+  async function runDataAnalysis() {
+    const task = selectedTask()
+    if (!task) return
+    await runAction("data-analysis", async (signal) => {
+      const result = await researchRequest<{
+        nas?: { loop: ResearchCockpitLoopResult }
+        publish?: ResearchCockpitExportResult
+      }>(
+        sdk,
+        `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
+        {
+          method: "POST",
+          body: JSON.stringify({ stage: "smoke", description: "data analysis + hypo planning", maxIterations: 3 }),
+          signal,
+        },
+        600_000,
+      )
+      if (result.nas?.loop) return formatResearchCockpitLoop(result.nas.loop)
+      return "data analysis pipeline completed"
+    })
+  }
+
+  async function runHypoPlanning() {
+    const task = selectedTask()
+    if (!task) return
+    await runAction("hypo-planning", async (signal) => {
+      const result = await researchRequest<{
+        nas?: { loop: ResearchCockpitLoopResult }
+        publish?: ResearchCockpitExportResult
+      }>(
+        sdk,
+        `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
+        {
+          method: "POST",
+          body: JSON.stringify({ stage: "smoke", description: "hypothesis planning", maxIterations: 3 }),
+          signal,
+        },
+        600_000,
+      )
+      if (result.nas?.loop) return formatResearchCockpitLoop(result.nas.loop)
+      return "hypothesis planning pipeline completed"
+    })
+  }
+
+  async function runPublishPipeline() {
+    const task = selectedTask()
+    if (!task) return
+    await runAction("publish-pipeline", async (signal) => {
+      const result = await researchRequest<{
+        nas?: { loop: ResearchCockpitLoopResult }
+        publish?: ResearchCockpitExportResult
+      }>(
+        sdk,
+        `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
+        {
+          method: "POST",
+          body: JSON.stringify({ stage: "full", maxIterations: 10, description: "resume pipeline: reflection & publish" }),
+          signal,
+        },
+        600_000,
+      )
+      if (result.publish) return `publish completed`
+      if (result.nas?.loop) return formatResearchCockpitLoop(result.nas.loop)
+      return "publish pipeline completed"
+    })
+  }
+
   async function runAutonomousLoop() {
     const task = selectedTask()
     if (!task || task.mode !== "autonomous") return
@@ -2000,6 +2523,17 @@ export function ResearchCockpit() {
       await confirmIntentCheckpoint()
       return
     }
+    const explicitMode =
+      task.interactionMode === "companion" || task.interactionMode === "socratic"
+        ? task.interactionMode
+        : (() => {
+            const v = (task.taskSpec as Record<string, unknown> | undefined)?.metadata
+            const meta = v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+            return meta.interactionMode === "companion" || meta.interactionMode === "socratic"
+              ? meta.interactionMode
+              : interactionModeByTask()[task.id]
+          })()
+    const usesPipeline = explicitMode === "companion" || explicitMode === "socratic"
     await runAction("autonomous-loop", async (signal) => {
       let preparedDataset: ResearchCockpitDatasetPreparationResult | undefined
       if (!runnerReady()) {
@@ -2012,12 +2546,30 @@ export function ResearchCockpit() {
           )
         }
       }
+      if (usesPipeline) {
+        const result = await researchRequest<{
+          nas?: { loop: ResearchCockpitLoopResult }
+          publish?: ResearchCockpitExportResult
+        }>(
+          sdk,
+          `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
+          {
+            method: "POST",
+            body: JSON.stringify({ stage: "full", maxIterations: 10, description: "cockpit companion pipeline" }),
+            signal,
+          },
+          600_000,
+        )
+        const loopMessage = result.nas?.loop ? formatResearchCockpitLoop(result.nas.loop) : "pipeline completed"
+        if (preparedDataset) return `dataset prepared ${shortID(preparedDataset.artifact.id)} / ${loopMessage}`
+        return loopMessage
+      }
       const result = await researchRequest<ResearchCockpitLoopResult>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/autonomous/loop`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "smoke", maxIterations: 3, description: "cockpit autonomous loop" }),
+          body: JSON.stringify({ stage: "full", maxIterations: 10, description: "cockpit autonomous loop" }),
           signal,
         },
       )
@@ -2279,6 +2831,18 @@ export function ResearchCockpit() {
     }
     if (next === "seed_baselines") {
       await seedBaselines()
+      return
+    }
+    if (next === "run_data_analysis") {
+      await runDataAnalysis()
+      return
+    }
+    if (next === "run_hypo_planning") {
+      await runHypoPlanning()
+      return
+    }
+    if (next === "resume_publish_pipeline") {
+      await runPublishPipeline()
       return
     }
     if (next === "run_autonomous_loop") {
@@ -2652,7 +3216,7 @@ export function ResearchCockpit() {
           `/research/tasks/${encodeURIComponent(executableTask.id)}/pipeline`,
           {
             method: "POST",
-            body: JSON.stringify({ stage: "smoke", description: value, maxIterations: 3 }),
+            body: JSON.stringify({ stage: "smoke", description: value, maxIterations: 10 }),
           },
         )
         detail = `${eventDetail}; completed multi-agent pipeline`
@@ -2717,7 +3281,58 @@ export function ResearchCockpit() {
       return
     }
     const clarification = socraticClarification()
-    if (clarification.active && task.status === "paused" && clarification.nextQuestion) {
+    // Companion and socratic mode: allow slot fill when idle (task just created, pipeline not yet started).
+    // Review mode: allow slot fill when idle after intent reject (intentPendingReview flag set).
+    const isCompanion = interactionModeForTask(task) === "companion"
+    const isSocratic = interactionModeForTask(task) === "socratic"
+    const isReviewMode = clarification.reviewMode === true && task.status === "idle"
+    if (isReviewMode) {
+      // Snapshot before-state so we can diff after the LLM call
+      const slotsBefore = new Map<string, string | undefined>(clarification.slots.map((s) => [s.id as string, s.value]))
+      await runAction("intent-modify", async () => {
+        type ModifyResult = {
+          llm?: { status: string; provider?: string; model?: string; error?: string }
+          intentSpec?: Record<string, unknown>
+        }
+        const result = await researchRequest<ModifyResult>(
+          sdk,
+          `/research/tasks/${encodeURIComponent(task.id)}/intent/modify`,
+          { method: "POST", body: JSON.stringify({ message: value }) },
+        )
+        const llm: { status?: string; provider?: string; model?: string; error?: string } = result.llm ?? {}
+        if (llm.status === "not_configured") return "LLM 未配置，无法解析修改意图"
+        if (llm.status === "failed") return `LLM 调用失败：${llm.error ?? "未知错误"}`
+        if (llm.status !== "used") return "LLM 未启用 (需设置 API key 或 NEO_RESEARCH_INTENT_LLM=1)"
+        const llmTag = `[${llm.provider ?? "?"}/${llm.model ?? "?"}]`
+        const spec = (result.intentSpec ?? {}) as Record<string, unknown>
+        const slotLabels: Record<string, string> = {
+          forecast_object: "预测对象", data_source: "数据来源", target_columns: "目标列",
+          lookback_window: "lookback window", prediction_horizon: "预测 horizon",
+          time_grain: "时间粒度", exogenous_variables: "外生变量", business_context: "业务背景",
+          primary_metric: "主指标", secondary_metrics: "辅助指标", error_preferences: "误差偏好",
+          latency_budget: "延迟预算", parameter_budget: "参数预算",
+          interpretability: "可解释性", deployment_target: "部署目标",
+        }
+        const changes: string[] = []
+        for (const [slotID, label] of Object.entries(slotLabels)) {
+          const raw = spec[slotID]
+          if (raw === undefined || raw === null) continue
+          const after = Array.isArray(raw) ? raw.join(", ") : String(raw)
+          // skip empty values (e.g. exogenous_variables=[]) — no real change to report
+          if (after.trim() === "") continue
+          const before = slotsBefore.get(slotID) ?? ""
+          if (after !== before) changes.push(`${label} → ${after}`)
+        }
+        if (changes.length === 0) return `LLM ${llmTag} 调用成功，未识别到需修改的字段`
+        return `LLM ${llmTag} 已更新 ${changes.length} 个字段：${changes.join(" · ")}`
+      })
+      promptInput?.focus()
+      return
+    }
+    // Both companion and socratic modes: fill slots from chat input whenever idle, paused, or intent_gathering.
+    // "intent_gathering" is also valid: after the first answer runIntentAgent sets this status while the
+    // LLM runs; the second answer must still route to the slot-fill path, not fall through to chat.
+    if ((task.status === "paused" || task.status === "idle" || task.status === "intent_gathering") && (clarification.active || isCompanion || isSocratic) && clarification.nextQuestion) {
       const slotID = slotFromSocraticQuestion(clarification.nextQuestion)
       if (slotID !== "unknown") {
         try {
@@ -2726,7 +3341,7 @@ export function ResearchCockpit() {
             body: JSON.stringify({ slots: { [slotID]: value } }),
           })
         } catch {
-          // fall through to chat
+          // DB changes (task update, pending approval) propagate via SSE events
         }
         promptInput?.focus()
         return
@@ -3202,12 +3817,56 @@ export function ResearchCockpit() {
         text: `Research Agent: 当前研究 ${task.title} / candidate ${candidatePosition} / ${runStatus}`,
         tone: "primary",
       })
+      for (const item of formatResearchCockpitTaskAgentLLMLines(taskArtifacts())) {
+        ambientLines.push({ id: item.id, text: item.text, tone: item.tone })
+      }
+      const champ = validChampion()
+      const refTestRun = championRefTestRun()
+      if (champ && refTestRun) {
+        for (const item of formatResearchCockpitRefTestLines(champ, refTestRun)) {
+          ambientLines.push({ id: item.id, text: item.text, tone: item.tone })
+        }
+      }
     }
     const liveRunnerLines = runnerOutputLines().filter((item) => {
       if (task && item.taskID && item.taskID !== task.id) return false
       if (run && item.runID !== run.id) return false
       return true
     })
+    const liveDesignLines = designLLMLines().filter((item) => !task || !item.taskID || item.taskID === task.id)
+    const daStream = dataAnalysisStream()
+    if (daStream && (!task || !daStream.taskID || daStream.taskID === task.id)) {
+      lines.push({ id: `da-stream-${daStream.id}-header`, text: `[DataAnalysis]`, tone: "muted" })
+      const daLines = compactStreamTextParts(daStream.text)
+      for (let i = 0; i < daLines.length; i++) {
+        lines.push({ id: `da-stream-${daStream.id}-${i}`, text: `  ${daLines[i]}`, tone: "muted" })
+      }
+      if (!daStream.done) {
+        lines.push({ id: `da-stream-${daStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+      }
+    }
+    const hypoStream = hypoPlannerStream()
+    if (hypoStream && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
+      lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
+      const hypoLines = compactStreamTextParts(hypoStream.text)
+      for (let i = 0; i < hypoLines.length; i++) {
+        lines.push({ id: `hypo-stream-${hypoStream.id}-${i}`, text: `  ${hypoLines[i]}`, tone: "muted" })
+      }
+      if (!hypoStream.done) {
+        lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+      }
+    }
+    for (const item of liveDesignLines) {
+      lines.push({ id: `design-live-${item.id}`, text: item.text, tone: item.tone })
+    }
+    const traceArtifact = run
+      ? taskArtifacts().find((artifact) => artifact.kind === "research_manager_trace_json" && artifact.runID === run.id)
+      : undefined
+    if (liveDesignLines.length === 0) {
+      for (const item of formatResearchCockpitLLMDesignLines(traceArtifact)) {
+        lines.push({ id: item.id, text: item.text, tone: item.tone })
+      }
+    }
     const progressArtifact = run
       ? taskArtifacts().find((artifact) => artifact.kind === "runner_progress_jsonl" && artifact.runID === run.id)
       : undefined
@@ -3259,9 +3918,25 @@ export function ResearchCockpit() {
           tone: "error",
         })
       }
-    } else {
-      const clarification = socraticClarification()
-      if (clarification.active) {
+    }
+    const approval = pendingApproval()
+    const clarification = socraticClarification()
+    if (clarification.active) {
+      // Socratic clarification takes highest priority — must resolve slots before pipeline can proceed
+      if (clarification.reviewMode) {
+        persistentLines.push(
+          {
+            id: "intent-review-header",
+            text: "Intent 已驳回 — 请描述你想修改的内容，LLM 会识别并更新对应字段；确认无误后输入 /confirm 继续",
+            tone: "warning",
+          },
+          ...clarification.slots.map((slot) => ({
+            id: `review-slot-${slot.id}`,
+            text: socraticSlotLine(slot),
+            tone: slot.status === "filled" ? ("success" as const) : ("muted" as const),
+          })),
+        )
+      } else {
         persistentLines.push(
           {
             id: "socratic-clarification",
@@ -3279,62 +3954,64 @@ export function ResearchCockpit() {
             tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
           })),
         )
-      } else {
-        const approval = pendingApproval()
-        if (approval) {
+      }
+    } else if (approval) {
+      // Show checkpoint/approval reason regardless of run state — checkpoints like
+      // final_model_selection fire after NAS runs exist, so the old !run gate hid them.
+      const reasonLines = approval.reason
+        .split(/\r?\n/)
+        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+      persistentLines.push(
+        {
+          id: "approval-requested",
+          text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue or /reject to stop.`,
+          tone: "warning",
+        },
+        ...reasonLines.map((line, i) => ({
+          id: `approval-reason-${i}`,
+          text: line,
+          tone: "muted" as const,
+        })),
+      )
+    } else if (!run) {
+      if (task) {
+        const mode = taskInteractionMode()
+        if (mode === "socratic" || mode === "companion") {
+          const title = mode === "socratic" ? "Socratic" : "Companion"
           persistentLines.push(
             {
-              id: "approval-requested",
-              text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue or /reject to stop.`,
-              tone: "warning",
+              id: `idle-task-${mode}`,
+              text: `${title} onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。`,
+              tone: "primary",
             },
+            ...clarification.slots.map((slot) => ({
+              id: `idle-${mode}-slot-${slot.id}`,
+              text: socraticSlotLine(slot),
+              tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
+            })),
+          )
+          if (clarification.nextQuestion) {
+            persistentLines.push({
+              id: `idle-task-${mode}-next`,
+              text: `Next question: ${clarification.nextQuestion}`,
+              tone: "primary",
+            })
+          }
+        } else {
+          persistentLines.push(
+            { id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" },
             {
-              id: "approval-reason",
-              text: approval.reason,
+              id: "idle-task-hint",
+              text: "提示：点击顶栏 /loop 启动自主搜索，或 /run baseline 跑一个手动候选。",
               tone: "muted",
             },
           )
-        } else {
-          if (task) {
-            const mode = taskInteractionMode()
-            if (mode === "socratic" || mode === "companion") {
-              const title = mode === "socratic" ? "Socratic" : "Companion"
-              persistentLines.push(
-                {
-                  id: `idle-task-${mode}`,
-                  text: `${title} onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。`,
-                  tone: "primary",
-                },
-                ...clarification.slots.map((slot) => ({
-                  id: `idle-${mode}-slot-${slot.id}`,
-                  text: socraticSlotLine(slot),
-                  tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
-                })),
-              )
-              if (clarification.nextQuestion) {
-                persistentLines.push({
-                  id: `idle-task-${mode}-next`,
-                  text: `Next question: ${clarification.nextQuestion}`,
-                  tone: "primary",
-                })
-              }
-            } else {
-              persistentLines.push(
-                { id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" },
-                {
-                  id: "idle-task-hint",
-                  text: "提示：点击顶栏 /loop 启动自主搜索，或 /run baseline 跑一个手动候选。",
-                  tone: "muted",
-                },
-              )
-            }
-          } else {
-            persistentLines.push(
-              { id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" },
-              { id: "idle-empty-hint", text: "提示：点击顶栏 /new 创建任务，或输入 /help 查看所有命令。", tone: "muted" },
-            )
-          }
         }
+      } else {
+        persistentLines.push(
+          { id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" },
+          { id: "idle-empty-hint", text: "提示：点击顶栏 /new 创建任务，或输入 /help 查看所有命令。", tone: "muted" },
+        )
       }
     }
     const timeline = [
@@ -3419,6 +4096,7 @@ export function ResearchCockpit() {
   })
   const promptPlaceholder = createMemo(() => {
     if (!selectedTask()) return "询问 Research Agent，或使用 /new csv 创建带数据集的任务..."
+    if (socraticClarification().reviewMode) return "描述你想修改的内容（LLM 自动识别字段），或输入 /confirm 确认..."
     if (socraticClarification().active) return "回答当前 Socratic 问题..."
     if (!intentConfirmed()) return "确认需求后进入 Data Analysis，或继续补充需求..."
     if (taskInteractionMode() === "companion") return "请求建议、批准 checkpoint，或导出 bundle..."
@@ -3468,6 +4146,7 @@ export function ResearchCockpit() {
       fingerprint: taskFingerprint() ?? {},
     }),
   )
+  const latestResearchInputTokens = createMemo(() => getLatestResearchInputTokens(taskArtifacts()))
   const estimatedResearchContextCost = createMemo(() => {
     const tokens = estimatedResearchContextTokenCount()
     const inputCostPerMillion = chatMetadata()?.inputCostPerMillion
@@ -3482,6 +4161,12 @@ export function ResearchCockpit() {
     const latest = latestChatUsage()
     const limit = chatMetadata()?.modelLimit
     if (!latest) {
+      const realTokens = latestResearchInputTokens()
+      if (realTokens > 0) {
+        if (!limit || limit <= 0) return formatTokenNumber(realTokens)
+        const pct = Math.max(1, Math.round((realTokens / limit) * 100))
+        return `${formatTokenNumber(realTokens)} / ${formatTokenNumber(limit)} (${pct}%)`
+      }
       const estimated = estimatedResearchContextTokenCount()
       if (estimated > 0) {
         if (!limit || limit <= 0) return `~${formatTokenNumber(estimated)} ${estimatedContextSuffix()}`
@@ -3495,14 +4180,20 @@ export function ResearchCockpit() {
     return `${formatTokenNumber(latest.total)} / ${formatTokenNumber(limit)} (${pct}%)`
   })
   const sessionTokenLines = createMemo(() => {
-    const totals = chatUsageTotals()
-    if (totals.total <= 0) return []
-    const cache = totals.cacheRead + totals.cacheWrite
-    return [
-      `tokens in=${formatTokenNumber(totals.input)} out=${formatTokenNumber(totals.output)}`,
-      `reason=${formatTokenNumber(totals.reasoning)} cache=${formatTokenNumber(cache)}`,
-      totals.cost > 0 ? `cost ${formatDollar(totals.cost)}` : undefined,
-    ].filter((item): item is string => Boolean(item))
+    const chat = chatUsageTotals()
+    const research = computeResearchLLMTokenTotals(taskArtifacts())
+    const lines: string[] = []
+    if (chat.total > 0) {
+      const cache = chat.cacheRead + chat.cacheWrite
+      lines.push(`tokens in=${formatTokenNumber(chat.input)} out=${formatTokenNumber(chat.output)}`)
+      lines.push(`reason=${formatTokenNumber(chat.reasoning)} cache=${formatTokenNumber(cache)}`)
+      if (chat.cost > 0) lines.push(`cost ${formatDollar(chat.cost)}`)
+    }
+    if (research.inputTokens > 0 || research.outputTokens > 0) {
+      const cache = research.cacheReadTokens + research.cacheWriteTokens
+      lines.push(`research in=${formatTokenNumber(research.inputTokens)} out=${formatTokenNumber(research.outputTokens)}${cache > 0 ? ` cache=${formatTokenNumber(cache)}` : ""}`)
+    }
+    return lines
   })
   const contextModelLabel = createMemo(() => {
     const selectedModel = local?.model.current()
@@ -3564,7 +4255,39 @@ export function ResearchCockpit() {
     const task = selectedTask()
     return runnerOutputLines().some((item) => !task || !item.taskID || item.taskID === task.id)
   })
-  const liveResearchStage = createMemo(() => liveResearchStageForAction(busy(), hasLiveRunnerProgress()))
+  const liveResearchStage = createMemo(() => {
+    const action = busy()
+    if (!action) return undefined
+    // Reflection stage is tracked precisely via SSE events
+    const eventStage = liveAgentEventStage()
+    if (eventStage) return eventStage
+    // For autonomous loop: derive from actual run state to avoid stale hasLiveRunnerProgress.
+    if (action === "autonomous-loop" || action === "autonomous-iteration") {
+      const runs = taskRuns()
+      if (
+        runs.some(
+          (r) =>
+            (r.stage === "low_fidelity" || r.stage === "full" || r.stage === "ref_test" || r.stage === "blind_test") &&
+            (r.status === "queued" || r.status === "running"),
+        )
+      )
+        return "TrainEval Agent"
+      if (runs.some((r) => r.stage === "smoke" && (r.status === "queued" || r.status === "running")))
+        return "ModelCompiler Agent"
+      // Between iterations: only force ModelDesigner "active" before any training has run.
+      // Once training runs exist, return undefined so the overlay doesn't downgrade "done" stages.
+      const hasCompletedTraining = runs.some(
+        (r) =>
+          (r.stage === "low_fidelity" || r.stage === "full" || r.stage === "ref_test" || r.stage === "blind_test") &&
+          (r.status === "succeeded" || r.status === "failed" || r.status === "rejected"),
+      )
+      return hasCompletedTraining ? undefined : "ModelDesigner Agent"
+    }
+    return liveResearchStageForAction(action, hasLiveRunnerProgress())
+  })
+  createEffect(() => {
+    if (!busy()) setLiveAgentEventStage(undefined)
+  })
   const displayAgentWorkflowProgress = createMemo(() =>
     overlayLiveResearchWorkflow(agentWorkflowProgress(), liveResearchStage()),
   )
@@ -3633,8 +4356,12 @@ export function ResearchCockpit() {
   const dataProgress = createMemo(() =>
     progressState(hasProfileProgress(), Boolean(selectedTask()) && intentConfirmed() && !hasProfileProgress()),
   )
+  const hasActiveRun = createMemo(() => taskRuns().some((run) => run.status === "queued" || run.status === "running"))
   const publishProgress = createMemo(() =>
-    progressState(hasResultArtifact(), (Boolean(validChampion()) || reflectionDone()) && !hasResultArtifact()),
+    progressState(
+      hasResultArtifact(),
+      false, // only active via live overlay when export-artifact action runs
+    ),
   )
   const researchAgentStages = createMemo<ResearchAgentStage[]>(() => {
     const live = liveResearchStage()
@@ -3791,7 +4518,7 @@ export function ResearchCockpit() {
                 ) : line.spinner ? (
                   <Spinner>{line.text}</Spinner>
                 ) : (
-                  <text fg={streamLineColor(line.tone)}>{line.text}</text>
+                  <text fg={streamLineColor(line.tone)} width="100%" wrapMode="word">{line.text}</text>
                 )
               }
             </For>
@@ -4060,8 +4787,26 @@ export function ResearchCockpit() {
                   Context
                 </text>
                 <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                  model {contextModelLabel()}
+                  chat {contextModelLabel()}
                   {reproducibilityContextLine() ? ` / ${reproducibilityContextLine()}` : ""}
+                </text>
+                <text
+                  fg={
+                    researchLLMStatus()?.status === "ready"
+                      ? cockpitColors.success
+                      : researchLLMStatus()?.status === "not_configured"
+                        ? cockpitColors.warning
+                        : cockpitColors.textMuted
+                  }
+                  width="100%"
+                  overflow="hidden"
+                  wrapMode="none"
+                >
+                  {researchLLMStatus()?.status === "ready"
+                    ? `research ${researchLLMStatus()!.model}${researchLLMStatus()!.source === "auth_json" ? " (key)" : " (env)"}`
+                    : researchLLMStatus()?.status === "not_configured"
+                      ? "research LLM: not configured"
+                      : "research LLM: ..."}
                 </text>
                 <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
                   {contextSessionLine()}

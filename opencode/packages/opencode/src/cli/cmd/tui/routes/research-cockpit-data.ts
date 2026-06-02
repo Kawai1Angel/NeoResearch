@@ -182,8 +182,11 @@ export type ResearchCockpitRecommendation = {
     | "configure_runner"
     | "prepare_dataset"
     | "profile"
+    | "run_data_analysis"
+    | "run_hypo_planning"
     | "seed_baselines"
     | "run_autonomous_loop"
+    | "resume_publish_pipeline"
     | "run_smoke"
     | "export_report"
     | "review_state"
@@ -456,6 +459,33 @@ export function selectNextBestAction(input: ResearchCockpitWorkflowInput): Resea
       detail: "Generate the dataset fingerprint before comparing architectures.",
     }
   }
+  const explicitInteractionMode =
+    input.task?.interactionMode === "companion" || input.task?.interactionMode === "socratic"
+      ? input.task.interactionMode
+      : (() => {
+          const v = asRecord(asRecord(input.task?.taskSpec).metadata).interactionMode
+          return v === "companion" || v === "socratic" ? v : undefined
+        })()
+  if (explicitInteractionMode !== undefined) {
+    const workflow = asRecord(asRecord(asRecord(input.task?.taskSpec).metadata).workflow)
+    const completedPhaseList = Array.isArray(workflow.completedPhases) ? (workflow.completedPhases as string[]) : []
+    if (!completedPhaseList.includes("data_analysis")) {
+      return {
+        command: "/pipeline data-analysis",
+        action: "run_data_analysis",
+        title: "Run Data Analysis",
+        detail: "Inspect dataset patterns, targets, missingness, and seasonality before hypothesis planning.",
+      }
+    }
+    if (!completedPhaseList.includes("hypo_planning")) {
+      return {
+        command: "/pipeline hypo-planning",
+        action: "run_hypo_planning",
+        title: "Run Hypothesis Planning",
+        detail: "Turn the data-analysis handoff into testable architecture hypotheses.",
+      }
+    }
+  }
   if (!hasCandidates) {
     return {
       command: "/seed",
@@ -464,7 +494,16 @@ export function selectNextBestAction(input: ResearchCockpitWorkflowInput): Resea
       detail: "Create initial recipes so the runner has concrete experiments to evaluate.",
     }
   }
-  if (input.task.mode === "autonomous") {
+  if (input.task.mode === "autonomous" && input.task.status !== "completed") {
+    const workflow = asRecord(asRecord(asRecord(input.task?.taskSpec).metadata).workflow)
+    if (workflow.lastCheckpoint === "final_model_selection") {
+      return {
+        command: "/pipeline publish",
+        action: "resume_publish_pipeline",
+        title: "Resume pipeline: reflection & publish",
+        detail: "Model selection approved — resume pipeline to run reflection, ref_test, and export the final bundle.",
+      }
+    }
     return {
       command: "/loop start",
       action: "run_autonomous_loop",
@@ -915,6 +954,296 @@ export function researchCockpitCandidatePipeline(candidate: ResearchCockpitCandi
     .join(" / ")
 }
 
+function fmt(key: string, value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value === "boolean") return value ? key : `${key}=false`
+  if (typeof value === "number") {
+    const s = Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(3)))
+    return `${key}=${s}`
+  }
+  if (typeof value === "string" && value.length > 0) return `${key}=${value}`
+  return undefined
+}
+
+function formatPreprocessingDetail(actions: unknown[]): string {
+  return actions
+    .map((action) => {
+      const a = asRecord(action)
+      const type = typeof a.type === "string" ? a.type : "?"
+      if (type === "none") return "none"
+      const params: string[] = []
+      if (type === "instance_norm") {
+        if (a.affine) params.push("affine")
+        if (typeof a.eps === "number") params.push(fmt("eps", a.eps) ?? "")
+      } else if (type === "series_decomposition") {
+        const p = fmt("k", a.kernelSize ?? a.kernel_size)
+        if (p) params.push(p)
+      } else if (type === "seasonal_differencing") {
+        const p = fmt("period", a.period)
+        if (p) params.push(p)
+        const o = fmt("order", a.order)
+        if (o && a.order !== 1) params.push(o)
+      } else if (type === "missing_mask") {
+        const p = fmt("fill", a.fillPolicy ?? a.fill_policy)
+        if (p) params.push(p)
+      } else if (type === "sample_reweighting") {
+        const p = fmt("scheme", a.scheme)
+        if (p) params.push(p)
+      }
+      return params.length > 0 ? `${type}(${params.filter(Boolean).join(",")})` : type
+    })
+    .join("+")
+}
+
+function formatEmbeddingDetail(emb: Record<string, unknown>): string {
+  const type = typeof emb.type === "string" ? emb.type : "?"
+  if (type === "none") return "none"
+  const params: Array<string | undefined> = []
+  if (type === "patch") {
+    params.push(fmt("len", emb.patchLen ?? emb.patch_len))
+    params.push(fmt("stride", emb.stride))
+    params.push(fmt("d", emb.dModel ?? emb.d_model))
+  } else if (type === "multiscale_patch") {
+    const scales = Array.isArray(emb.scales) ? emb.scales.map((s: unknown) => {
+      const sr = asRecord(s)
+      return `${sr.patchLen ?? sr.patch_len}x${sr.stride}`
+    }).join(",") : ""
+    if (scales) params.push(`scales=[${scales}]`)
+    params.push(fmt("d", emb.dModel ?? emb.d_model))
+  } else if (type === "invert") {
+    params.push(fmt("d", emb.dModel ?? emb.d_model))
+  } else if (type === "frequency") {
+    params.push(fmt("nFreq", emb.nFreq ?? emb.n_freq))
+    params.push(fmt("d", emb.dModel ?? emb.d_model))
+  } else if (type === "calendar") {
+    const fields = Array.isArray(emb.fields) ? emb.fields.join(",") : ""
+    if (fields) params.push(`fields=[${fields}]`)
+  }
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+function formatBackboneDetail(bb: Record<string, unknown>): string {
+  const type = typeof bb.type === "string" ? bb.type : "?"
+  const params: Array<string | undefined> = []
+  if (type === "linear") {
+    if (bb.shared) params.push("shared")
+  } else if (type === "mlp") {
+    params.push(fmt("depth", bb.depth))
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("act", bb.activation))
+    params.push(fmt("drop", bb.dropout))
+  } else if (type === "transformer") {
+    params.push(fmt("d", bb.dModel ?? bb.d_model))
+    params.push(fmt("heads", bb.nHeads ?? bb.n_heads))
+    params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
+    params.push(fmt("drop", bb.dropout))
+  } else if (type === "rnn") {
+    params.push(fmt("cell", bb.cell))
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("layers", bb.numLayers ?? bb.num_layers))
+  } else if (type === "dlinear") {
+    params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+  } else if (type === "tcn") {
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
+    params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+  } else if (type === "ssm") {
+    params.push(fmt("state", bb.stateDim ?? bb.state_dim))
+    params.push(fmt("depth", bb.depth))
+  } else if (type === "mixer") {
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("depth", bb.depth))
+    params.push(fmt("tmix", bb.temporalMixing ?? bb.temporal_mixing))
+  } else if (type === "nbeats") {
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("blocks", bb.nBlocks ?? bb.n_blocks))
+    params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
+  } else if (type === "timesnet") {
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
+    params.push(fmt("topK", bb.topK ?? bb.top_k))
+  }
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+function formatFusionDetail(fusion: Record<string, unknown>): string {
+  const type = typeof fusion.type === "string" ? fusion.type : "?"
+  const params: Array<string | undefined> = []
+  if (type === "temporal") {
+    params.push(fmt("ch", fusion.channelMode ?? fusion.channel_mode))
+  } else if (type === "feature") {
+    if (fusion.crossAttention ?? fusion.cross_attention) params.push("xattn")
+  } else if (type === "graph") {
+    params.push(fmt("adj", fusion.adjacencySource ?? fusion.adjacency_source))
+  } else if (type === "gated_hybrid") {
+    params.push(fmt("gate", fusion.gateType ?? fusion.gate_type))
+  }
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+function formatHeadDetail(head: Record<string, unknown>): string {
+  const type = typeof head.type === "string" ? head.type : "?"
+  const params: Array<string | undefined> = []
+  if (type === "quantile") {
+    const q = Array.isArray(head.quantiles) ? `q=[${head.quantiles.join(",")}]` : undefined
+    if (q) params.push(q)
+  } else if (type === "direct_multi_horizon") {
+    if (head.horizonSpecific ?? head.horizon_specific) params.push("horizon_specific")
+  } else if (type === "residual_correction") {
+    params.push(fmt("base", head.baseHead ?? head.base_head))
+    params.push(fmt("corrDim", head.correctionDim ?? head.correction_dim))
+  }
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+function formatOptimizerDetail(opt: Record<string, unknown>): string {
+  const type = typeof opt.type === "string" ? opt.type : "?"
+  const params: Array<string | undefined> = []
+  params.push(fmt("lr", opt.lr))
+  if (typeof opt.weightDecay === "number" && opt.weightDecay > 0) params.push(fmt("wd", opt.weightDecay))
+  if (typeof opt.weight_decay === "number" && opt.weight_decay > 0) params.push(fmt("wd", opt.weight_decay))
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+function formatSchedulerDetail(sched: Record<string, unknown>): string {
+  const type = typeof sched.type === "string" ? sched.type : "?"
+  if (type === "none") return "none"
+  const params: Array<string | undefined> = []
+  if (typeof sched.warmupSteps === "number" && sched.warmupSteps > 0) params.push(fmt("warmup", sched.warmupSteps))
+  if (typeof sched.warmup_steps === "number" && sched.warmup_steps > 0) params.push(fmt("warmup", sched.warmup_steps))
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+export type ResearchCockpitCandidateRecipeLines = {
+  architecture: string
+  training: string
+}
+
+export function formatResearchCockpitCandidateRecipeLines(candidate: ResearchCockpitCandidate): ResearchCockpitCandidateRecipeLines {
+  const spec = candidate.candidateSpec
+  const preprocessingActions = Array.isArray(asRecord(spec.preprocessing).actions) ? (asRecord(spec.preprocessing).actions as unknown[]) : [{ type: "none" }]
+  const prep = formatPreprocessingDetail(preprocessingActions)
+  const emb = formatEmbeddingDetail(asRecord(spec.embedding))
+  const bb = formatBackboneDetail(asRecord(spec.backbone))
+  const fusion = formatFusionDetail(asRecord(spec.fusion))
+  const head = formatHeadDetail(asRecord(spec.predictionHead))
+  const strategy = asRecord(spec.trainingStrategy)
+  const lossRec = asRecord(strategy.loss)
+  const lossBase = typeof lossRec.base === "string" ? lossRec.base : "?"
+  const lossWeight = typeof lossRec.horizonWeighting === "string" && lossRec.horizonWeighting !== "uniform" ? `(${lossRec.horizonWeighting})` : ""
+  const loss = `${lossBase}${lossWeight}`
+  const opt = formatOptimizerDetail(asRecord(strategy.optimizer))
+  const sched = formatSchedulerDetail(asRecord(strategy.scheduler))
+  const architecture = [
+    `prep=${prep}`,
+    `emb=${emb}`,
+    `backbone=${bb}`,
+    `fusion=${fusion}`,
+    `head=${head}`,
+  ].join(" / ")
+  const training = [
+    `loss=${loss}`,
+    `opt=${opt}`,
+    `sched=${sched}`,
+  ].join(" / ")
+  return { architecture, training }
+}
+
+export function formatResearchCockpitCandidateArchitectureExpandedLines(candidate: { candidateSpec: JsonRecord }): string[] {
+  const spec = candidate.candidateSpec
+  const lines: string[] = []
+
+  const prepActions = Array.isArray(asRecord(spec.preprocessing).actions)
+    ? (asRecord(spec.preprocessing).actions as unknown[])
+    : [{ type: "none" }]
+  lines.push(`  preprocessing:  ${formatPreprocessingDetail(prepActions)}`)
+
+  const emb = asRecord(spec.embedding)
+  const embType = typeof emb.type === "string" ? emb.type : "?"
+  const embParams: string[] = []
+  if (embType !== "none") {
+    const patchLen = emb.patchLen ?? emb.patch_len
+    const stride = emb.stride
+    const nFreq = emb.nFreq ?? emb.n_freq
+    const dModel = emb.dModel ?? emb.d_model
+    const complexMode = emb.complexMode ?? emb.complex_mode
+    if (patchLen !== undefined) embParams.push(`patch=${patchLen}`)
+    if (stride !== undefined) embParams.push(`stride=${stride}`)
+    if (nFreq !== undefined) embParams.push(`n_freq=${nFreq}`)
+    if (dModel !== undefined) embParams.push(`d_model=${dModel}`)
+    if (complexMode !== undefined) embParams.push(`complex_mode=${complexMode}`)
+  }
+  lines.push(`  embedding:      ${embType}${embParams.length ? `(${embParams.join(", ")})` : ""}`)
+
+  const bb = asRecord(spec.backbone)
+  const bbType = typeof bb.type === "string" ? bb.type : "?"
+  const bbParams: string[] = []
+  const bbDModel = bb.dModel ?? bb.d_model
+  const nHeads = bb.nHeads ?? bb.n_heads
+  const nLayers = bb.nLayers ?? bb.n_layers
+  const hiddenDim = bb.hiddenDim ?? bb.hidden_dim
+  const bbDropout = bb.dropout
+  if (bbDModel !== undefined) bbParams.push(`d_model=${bbDModel}`)
+  if (nHeads !== undefined) bbParams.push(`n_heads=${nHeads}`)
+  if (nLayers !== undefined) bbParams.push(`n_layers=${nLayers}`)
+  if (hiddenDim !== undefined) bbParams.push(`h=${hiddenDim}`)
+  if (typeof bbDropout === "number" && bbDropout > 0) bbParams.push(`dropout=${bbDropout}`)
+  lines.push(`  backbone:       ${bbType}${bbParams.length ? `(${bbParams.join(", ")})` : ""}`)
+
+  const fusion = asRecord(spec.fusion)
+  const fusionType = typeof fusion.type === "string" ? fusion.type : "?"
+  const fusionParams: string[] = []
+  const channelMode = fusion.channelMode ?? fusion.channel_mode
+  if (channelMode !== undefined) fusionParams.push(`channel_mode=${channelMode}`)
+  lines.push(`  fusion:         ${fusionType}${fusionParams.length ? `(${fusionParams.join(", ")})` : ""}`)
+
+  const head = asRecord(spec.predictionHead ?? spec.prediction_head)
+  const headType = typeof head.type === "string" ? head.type : "?"
+  const headParams: string[] = []
+  const outputDist = head.outputDistribution ?? head.output_distribution
+  if (outputDist !== undefined) headParams.push(`output_dist=${outputDist}`)
+  lines.push(`  prediction_head: ${headType}${headParams.length ? `(${headParams.join(", ")})` : ""}`)
+
+  const strategy = asRecord(spec.trainingStrategy ?? spec.training_strategy)
+  const lossRec = asRecord(strategy.loss)
+  const lossBase = typeof lossRec.base === "string" ? lossRec.base : "?"
+  const lossHW = lossRec.horizonWeighting ?? lossRec.horizon_weighting
+  const lossStr = typeof lossHW === "string" && lossHW !== "uniform" ? `${lossBase}(horizon_weighting=${lossHW})` : lossBase
+  lines.push(`  loss:           ${lossStr}`)
+
+  const opt = asRecord(strategy.optimizer)
+  const optType = typeof opt.type === "string" ? opt.type : "?"
+  const optParams: string[] = []
+  const lr = opt.lr
+  const wd = opt.weightDecay ?? opt.weight_decay
+  if (lr !== undefined) optParams.push(`lr=${lr}`)
+  if (typeof wd === "number" && wd > 0) optParams.push(`weight_decay=${wd}`)
+  lines.push(`  optimizer:      ${optType}${optParams.length ? `(${optParams.join(", ")})` : ""}`)
+
+  const sched = asRecord(strategy.scheduler)
+  const schedType = typeof sched.type === "string" ? sched.type : "?"
+  const schedParams: string[] = []
+  const warmupSteps = sched.warmupSteps ?? sched.warmup_steps
+  if (typeof warmupSteps === "number" && warmupSteps > 0) schedParams.push(`warmup_steps=${warmupSteps}`)
+  lines.push(`  scheduler:      ${schedType}${schedParams.length ? `(${schedParams.join(", ")})` : ""}`)
+
+  const reg = asRecord(strategy.regularization)
+  const regParts: string[] = []
+  const regDropout = reg.dropout
+  const gradClip = reg.gradClip ?? reg.grad_clip
+  if (typeof regDropout === "number") regParts.push(`dropout=${regDropout}`)
+  if (typeof gradClip === "number") regParts.push(`grad_clip=${gradClip}`)
+  if (regParts.length > 0) lines.push(`  regularization: ${regParts.join(", ")}`)
+
+  return lines
+}
+
 export function canRunResearchCockpitCandidate(candidate: ResearchCockpitCandidate) {
   return candidate.approvalStatus === "approved" || candidate.approvalStatus === "auto_approved"
 }
@@ -1351,6 +1680,142 @@ export function formatResearchCockpitRunResult(result: { run: ResearchCockpitRun
   return `run ${result.run.status} / ${result.run.id} / ${primaryMetricText(result.run.metrics)}`
 }
 
+export type ResearchCockpitRefTestLine = {
+  id: string
+  text: string
+  tone: "success" | "muted"
+}
+
+export function formatResearchCockpitRefTestLines(
+  champion: ResearchCockpitChampion,
+  refTestRun: ResearchCockpitRun,
+): ResearchCockpitRefTestLine[] {
+  const m = refTestRun.metrics as Record<string, unknown>
+  const avgMse = typeof m.ref_test_avg_mse === "number" ? m.ref_test_avg_mse : undefined
+  const avgMae = typeof m.ref_test_avg_mae === "number" ? m.ref_test_avg_mae : undefined
+  const horizons = [96, 192, 336, 720]
+  const horizonParts = horizons
+    .map((h) => {
+      const v = m[`ref_test_h${h}_mse`]
+      return typeof v === "number" ? `h${h}=${formatMetric(v)}` : undefined
+    })
+    .filter((p): p is string => p !== undefined)
+
+  const summaryParts = [
+    avgMse !== undefined ? `ref_test_avg_mse=${formatMetric(avgMse)}` : undefined,
+    avgMae !== undefined ? `avg_mae=${formatMetric(avgMae)}` : undefined,
+  ].filter((p): p is string => p !== undefined)
+
+  const lines: ResearchCockpitRefTestLine[] = [
+    {
+      id: `ref-test-summary-${refTestRun.id}`,
+      text: `Test Set: champion ${champion.candidateID} / run ${refTestRun.id} / ${summaryParts.join(" / ") || "-"}`,
+      tone: "success",
+    },
+  ]
+  if (horizonParts.length > 0) {
+    lines.push({
+      id: `ref-test-horizons-${refTestRun.id}`,
+      text: `  Horizons: ${horizonParts.join(" / ")}`,
+      tone: "muted",
+    })
+  }
+  return lines
+}
+
+export type ResearchCockpitLLMDesignLine = {
+  id: string
+  text: string
+  tone: "primary" | "success" | "warning" | "error" | "muted"
+}
+
+export function formatResearchCockpitLLMDesignLines(
+  artifact: ResearchCockpitArtifact | undefined,
+): ResearchCockpitLLMDesignLine[] {
+  if (!artifact || artifact.kind !== "research_manager_trace_json") return []
+  const meta = artifact.metadata
+  const llmStatus = typeof meta.llmStatus === "string" ? meta.llmStatus : undefined
+  if (!llmStatus) return []
+  const llmModel = typeof meta.llmModel === "string" ? meta.llmModel : undefined
+  const llmProvider = typeof meta.llmProvider === "string" ? meta.llmProvider : undefined
+  const llmError = typeof meta.llmError === "string" ? meta.llmError : undefined
+  const llmHypothesis = typeof meta.llmHypothesis === "string" ? meta.llmHypothesis : undefined
+  const llmRecipeID = typeof meta.llmRecipeID === "string" ? meta.llmRecipeID : undefined
+
+  const modelLabel = llmModel ?? llmProvider ?? "LLM"
+  const lines: ResearchCockpitLLMDesignLine[] = []
+
+  if (llmStatus === "used") {
+    const recipePart = llmRecipeID ? ` / ${llmRecipeID}` : ""
+    lines.push({
+      id: `llm-design-${artifact.id}-status`,
+      text: `LLM ${modelLabel} → 生成成功${recipePart}`,
+      tone: "success",
+    })
+    if (llmHypothesis) {
+      const hypothesis = llmHypothesis.length > 120 ? `${llmHypothesis.slice(0, 117)}...` : llmHypothesis
+      lines.push({
+        id: `llm-design-${artifact.id}-hypothesis`,
+        text: `  Hypothesis: ${hypothesis}`,
+        tone: "muted",
+      })
+    }
+  } else if (llmStatus === "failed" || llmStatus === "invalid") {
+    const errorPart = llmError ? `: ${llmError.slice(0, 100)}` : ""
+    lines.push({
+      id: `llm-design-${artifact.id}-status`,
+      text: `LLM ${modelLabel} → ${llmStatus}${errorPart}`,
+      tone: "error",
+    })
+  } else if (llmStatus === "not_configured") {
+    lines.push({
+      id: `llm-design-${artifact.id}-status`,
+      text: `LLM not configured — falling back to heuristic candidate`,
+      tone: "warning",
+    })
+  }
+
+  return lines
+}
+
+export type ResearchCockpitTaskAgentLLMLine = {
+  id: string
+  text: string
+  tone: "success" | "warning" | "muted"
+}
+
+export function formatResearchCockpitTaskAgentLLMLines(
+  artifacts: ResearchCockpitArtifact[],
+): ResearchCockpitTaskAgentLLMLine[] {
+  const lines: ResearchCockpitTaskAgentLLMLine[] = []
+
+  const dataAnalysisArtifact = artifacts.find((a) => a.kind === "dataset_analysis_report")
+  if (dataAnalysisArtifact) {
+    const status = typeof dataAnalysisArtifact.metadata.llmStatus === "string" ? dataAnalysisArtifact.metadata.llmStatus : undefined
+    const preview = typeof dataAnalysisArtifact.metadata.llmPreview === "string" ? dataAnalysisArtifact.metadata.llmPreview : undefined
+    if (status === "used" && preview) {
+      const clipped = preview.length > 160 ? `${preview.slice(0, 157)}...` : preview
+      lines.push({ id: `llm-data-${dataAnalysisArtifact.id}-label`, text: `[DataAnalysis]`, tone: "muted" })
+      lines.push({ id: `llm-data-${dataAnalysisArtifact.id}-preview`, text: `  ${clipped}`, tone: "muted" })
+    }
+  }
+
+  const hypoPlanArtifact = artifacts.find((a) => a.kind === "hypo_plan_md")
+  if (hypoPlanArtifact) {
+    const status = typeof hypoPlanArtifact.metadata.llmStatus === "string" ? hypoPlanArtifact.metadata.llmStatus : undefined
+    const preview = typeof hypoPlanArtifact.metadata.llmPreview === "string" ? hypoPlanArtifact.metadata.llmPreview : undefined
+    if (status === "used" && preview) {
+      lines.push({ id: `llm-hypo-${hypoPlanArtifact.id}-label`, text: `[HypoPlanner]`, tone: "muted" })
+      for (const [i, part] of preview.split(" | ").entries()) {
+        const clipped = part.length > 120 ? `${part.slice(0, 117)}...` : part
+        lines.push({ id: `llm-hypo-${hypoPlanArtifact.id}-${i}`, text: `  ${clipped}`, tone: "muted" })
+      }
+    }
+  }
+
+  return lines
+}
+
 export type TsfResearchTaskDefaults = {
   datasetPath?: string
   datasetPreset?: string
@@ -1512,7 +1977,7 @@ function splitNumberOption(value: string) {
     .map((item) => Math.floor(item))
 }
 
-function tsfRuntime(neoCastProjectRoot?: string, bridgeOnly = true): JsonRecord {
+function tsfRuntime(neoCastProjectRoot?: string, bridgeOnly = false): JsonRecord {
   const root = neoCastProjectRoot?.trim()
   return {
     bridgeOnly,
@@ -1542,6 +2007,7 @@ export function interactionModeForTask(task: ResearchCockpitTask | undefined): R
 
 export type SocraticClarificationState = {
   active: boolean
+  reviewMode?: boolean
   missingSlots: string[]
   nextQuestion?: string
   questionCount: number
@@ -1551,26 +2017,26 @@ export type SocraticClarificationState = {
 export type SocraticIntentSlotID =
   | "interaction_mode"
   | "forecast_object"
-  | "dataset.path"
-  | "dataset.targetCols"
-  | "contextLength"
-  | "predictionLengths"
-  | "intent.exogenous_variables"
-  | "intent.business_context"
-  | "objective.primaryMetric"
-  | "objective.secondaryMetrics"
-  | "objective.error_preferences"
-  | "budget.latency_budget"
-  | "budget.parameter_budget"
-  | "intent.interpretability"
-  | "runtime.deployment_target"
+  | "data_source"
+  | "target_columns"
+  | "lookback_window"
+  | "prediction_horizon"
+  | "exogenous_variables"
+  | "business_context"
+  | "primary_metric"
+  | "secondary_metrics"
+  | "error_preferences"
+  | "latency_budget"
+  | "parameter_budget"
+  | "interpretability"
+  | "deployment_target"
 
 export type SocraticIntentSlot = {
   id: SocraticIntentSlotID
   label: string
   question: string
   required?: boolean
-  status: "filled" | "missing"
+  status: "filled" | "missing" | "review"
   value?: string
 }
 
@@ -1586,68 +2052,68 @@ const socraticIntentSlotDefinitions: Array<Omit<SocraticIntentSlot, "status" | "
     question: "这次预测对象具体是什么？请说明业务对象和被预测现象。",
   },
   {
-    id: "dataset.path",
+    id: "data_source",
     label: "CSV 数据集路径",
     question: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
   },
   {
-    id: "dataset.targetCols",
+    id: "target_columns",
     label: "目标列",
     question: "需要预测哪些目标列？",
   },
   {
-    id: "contextLength",
+    id: "lookback_window",
     label: "lookback window",
     question: "模型应使用多长的 lookback window 作为输入上下文？",
   },
   {
-    id: "predictionLengths",
+    id: "prediction_horizon",
     label: "预测 horizon",
     question: "需要评估哪些预测 horizon？",
   },
   {
-    id: "intent.exogenous_variables",
+    id: "exogenous_variables",
     label: "外生变量",
     question: "是否有天气、节假日、价格、事件等外生变量？如果没有，请明确为 none。",
   },
   {
-    id: "intent.business_context",
+    id: "business_context",
     label: "业务背景",
     question: "这个预测结果最终服务哪个业务决策或研究判断？",
   },
   {
-    id: "objective.primaryMetric",
+    id: "primary_metric",
     label: "主指标",
     question: "模型搜索应该优化哪个验证指标？",
   },
   {
-    id: "objective.secondaryMetrics",
+    id: "secondary_metrics",
     label: "辅助指标",
     required: false,
     question: "除了主指标，还要同时关注哪些辅助指标或 horizon-wise trade-off？",
   },
   {
-    id: "objective.error_preferences",
+    id: "error_preferences",
     label: "误差偏好",
     question: "误差偏好是什么：更重视短期、长期、峰值、平均误差，还是稳定性？",
   },
   {
-    id: "budget.latency_budget",
+    id: "latency_budget",
     label: "延迟预算",
     question: "部署或推理是否有延迟预算？例如单次推理、批处理窗口或无硬约束。",
   },
   {
-    id: "budget.parameter_budget",
+    id: "parameter_budget",
     label: "参数预算",
     question: "模型参数量或资源预算有什么限制？",
   },
   {
-    id: "intent.interpretability",
+    id: "interpretability",
     label: "可解释性",
     question: "是否需要可解释性、消融解释或简单模型优先？",
   },
   {
-    id: "runtime.deployment_target",
+    id: "deployment_target",
     label: "部署目标",
     question: "最终模型部署目标是什么：本地 CPU、GPU 服务、边缘设备、离线批处理，还是仅研究报告？",
   },
@@ -1661,6 +2127,23 @@ export function buildSocraticClarificationState(
   const interactionMode = interactionModeForTask(task)
   const includeSlotOverview = interactionMode === "socratic" || (options.includeCompanion === true && interactionMode === "companion")
   if (!includeSlotOverview) return { active: false, missingSlots: [], questionCount: 0, slots: [] }
+
+  // Intent review mode: user rejected the intent checkpoint and needs to modify slots.
+  const taskSpec = asRecord(task?.taskSpec)
+  const metadata = asRecord(taskSpec.metadata)
+  if (metadata.intentPendingReview === true && task?.status === "idle") {
+    const slots = socraticSlotsForTaskReview(task)
+    const firstReviewSlot = slots.find((s) => s.status === "review")
+    return {
+      active: true,
+      reviewMode: true,
+      missingSlots: slots.map((s) => s.id),
+      nextQuestion: firstReviewSlot?.question,
+      questionCount: slots.length,
+      slots,
+    }
+  }
+
   const approval =
     interactionMode === "socratic"
       ? approvals.find(
@@ -1706,19 +2189,19 @@ export function buildSocraticClarificationState(
 }
 
 export function slotFromSocraticQuestion(question: string): string {
-  if (/数据集路径|csv.*路径|dataset path/i.test(question)) return "dataset.path"
-  if (/目标列|target.*col/i.test(question)) return "dataset.targetCols"
-  if (/lookback.*window|lookback/i.test(question)) return "contextLength"
-  if (/horizon|预测.*horizon|predictionLength/i.test(question)) return "predictionLengths"
-  if (/外生变量|exogenous/i.test(question)) return "intent.exogenous_variables"
-  if (/业务背景|业务决策|business.*context/i.test(question)) return "intent.business_context"
-  if (/主指标|优化.*指标|primary.*metric/i.test(question)) return "objective.primaryMetric"
-  if (/辅助指标|secondary.*metric/i.test(question)) return "objective.secondaryMetrics"
-  if (/误差偏好|error.*prefer/i.test(question)) return "objective.error_preferences"
-  if (/延迟预算|latency.*budget/i.test(question)) return "budget.latency_budget"
-  if (/参数预算|parameter.*budget/i.test(question)) return "budget.parameter_budget"
-  if (/可解释性|interpretab/i.test(question)) return "intent.interpretability"
-  if (/部署目标|deployment.*target/i.test(question)) return "runtime.deployment_target"
+  if (/数据集路径|csv.*路径|dataset path/i.test(question)) return "data_source"
+  if (/目标列|target.*col/i.test(question)) return "target_columns"
+  if (/lookback.*window|lookback/i.test(question)) return "lookback_window"
+  if (/horizon|预测.*horizon|predictionLength/i.test(question)) return "prediction_horizon"
+  if (/外生变量|exogenous/i.test(question)) return "exogenous_variables"
+  if (/业务背景|业务决策|business.*context/i.test(question)) return "business_context"
+  if (/主指标|优化.*指标|primary.*metric/i.test(question)) return "primary_metric"
+  if (/辅助指标|secondary.*metric/i.test(question)) return "secondary_metrics"
+  if (/误差偏好|error.*prefer/i.test(question)) return "error_preferences"
+  if (/延迟预算|latency.*budget/i.test(question)) return "latency_budget"
+  if (/参数预算|parameter.*budget/i.test(question)) return "parameter_budget"
+  if (/可解释性|interpretab/i.test(question)) return "interpretability"
+  if (/部署目标|deployment.*target/i.test(question)) return "deployment_target"
   if (/交互模式|interaction.*mode/i.test(question)) return "interaction_mode"
   if (/预测对象|forecast.*object/i.test(question)) return "forecast_object"
   return "unknown"
@@ -1750,6 +2233,33 @@ function socraticSlotsForTask(task: ResearchCockpitTask | undefined, forcedMissi
   })
 }
 
+// In review mode (after intent reject), all slots cycle as "review" so the user can
+// confirm or override each one. The question carries the current value as a reminder.
+function socraticSlotsForTaskReview(task: ResearchCockpitTask): SocraticIntentSlot[] {
+  const taskSpec = asRecord(task.taskSpec)
+  const dataset = asRecord(taskSpec.dataset)
+  const objective = asRecord(task.objective)
+  const budget = asRecord(task.budget)
+  const metadata = asRecord(taskSpec.metadata)
+  const intentSlots = asRecord(metadata.intentSlots)
+  return socraticIntentSlotDefinitions.map((slot) => {
+    const answeredValue = intentSlots[slot.id] !== undefined ? String(intentSlots[slot.id]) : undefined
+    const value =
+      answeredValue ??
+      socraticSlotValue(slot.id, dataset, taskSpec, objective, budget, metadata) ??
+      (slot.id === "interaction_mode" ? interactionModeForTask(task) : undefined)
+    const reviewQuestion = value !== undefined
+      ? `${slot.question} (当前: ${value})`
+      : slot.question
+    return {
+      ...slot,
+      question: reviewQuestion,
+      status: "review" as const,
+      ...(value !== undefined ? { value } : {}),
+    }
+  })
+}
+
 function socraticSlotValue(
   slot: SocraticIntentSlotID,
   dataset: Record<string, unknown>,
@@ -1766,56 +2276,56 @@ function socraticSlotValue(
     const value = taskSpec.forecastObject ?? taskSpec.predictionObject ?? metadata.forecastObject
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "dataset.path") {
+  if (slot === "data_source") {
     const value = dataset.path
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "dataset.targetCols") {
+  if (slot === "target_columns") {
     const values = optionalStringArray(dataset.targetCols)
     return values && values.length > 0 ? values.join(",") : undefined
   }
-  if (slot === "contextLength") {
+  if (slot === "lookback_window") {
     const value = taskSpec.contextLength
     return typeof value === "number" && Number.isFinite(value) ? String(value) : undefined
   }
-  if (slot === "predictionLengths") {
+  if (slot === "prediction_horizon") {
     const values = optionalNumberArray(taskSpec.predictionLengths)
     return values && values.length > 0 ? values.join(",") : undefined
   }
-  if (slot === "intent.exogenous_variables") {
+  if (slot === "exogenous_variables") {
     const value = dataset.exogenousCols ?? dataset.exogenousVariables ?? dataset.knownFutureCovariates
     if (Array.isArray(value)) return value.join(",") || "none"
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "intent.business_context") {
+  if (slot === "business_context") {
     const value = taskSpec.businessContext ?? taskSpec.business_context ?? objective.businessContext ?? metadata.businessContext ?? metadata.userPrompt
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "objective.primaryMetric") {
+  if (slot === "primary_metric") {
     const value = objective.primaryMetric
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "objective.secondaryMetrics") {
+  if (slot === "secondary_metrics") {
     const values = optionalStringArray(objective.secondaryMetrics)
     return values && values.length > 0 ? values.join(",") : undefined
   }
-  if (slot === "objective.error_preferences") {
+  if (slot === "error_preferences") {
     const value = objective.errorPreferences ?? objective.errorPreference
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "budget.latency_budget") {
+  if (slot === "latency_budget") {
     const value = budget.latencyBudget
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "budget.parameter_budget") {
+  if (slot === "parameter_budget") {
     const value = budget.parameterBudget
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "intent.interpretability") {
+  if (slot === "interpretability") {
     const value = taskSpec.interpretability ?? objective.interpretability ?? metadata.interpretability
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
-  if (slot === "runtime.deployment_target") {
+  if (slot === "deployment_target") {
     const runtime = asRecord(taskSpec.runtime)
     const value = runtime.deploymentTarget ?? taskSpec.deploymentTarget ?? metadata.deploymentTarget
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
@@ -1885,7 +2395,7 @@ export function buildDefaultTsfResearchTask(
       },
       ...(Object.keys(constraints).length === 0 ? {} : { constraints }),
       metadata,
-      runtime: tsfRuntime(neoCastProjectRoot, defaults.bridgeOnly ?? true),
+      runtime: tsfRuntime(neoCastProjectRoot, defaults.bridgeOnly ?? false),
     },
     objective: {
       primaryMetric: "val_avg_mse",
@@ -1924,4 +2434,42 @@ export function buildDefaultTsfResearchTaskFromGoal(
     ...buildDefaultTsfResearchTask(mode, neoCastProjectRoot, defaults),
     title: goalTitle(goal, defaults),
   }
+}
+
+export type ResearchLLMTokenTotals = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  callCount: number
+}
+
+export function computeResearchLLMTokenTotals(artifacts: ResearchCockpitArtifact[]): ResearchLLMTokenTotals {
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens = 0
+  let cacheWriteTokens = 0
+  let callCount = 0
+  for (const artifact of artifacts) {
+    const m = artifact.metadata
+    const input = typeof m.llmInputTokens === "number" && Number.isFinite(m.llmInputTokens) ? m.llmInputTokens : 0
+    const output = typeof m.llmOutputTokens === "number" && Number.isFinite(m.llmOutputTokens) ? m.llmOutputTokens : 0
+    if (input > 0 || output > 0) {
+      inputTokens += input
+      outputTokens += output
+      cacheReadTokens += typeof m.llmCacheReadTokens === "number" && Number.isFinite(m.llmCacheReadTokens) ? m.llmCacheReadTokens : 0
+      cacheWriteTokens += typeof m.llmCacheWriteTokens === "number" && Number.isFinite(m.llmCacheWriteTokens) ? m.llmCacheWriteTokens : 0
+      callCount++
+    }
+  }
+  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, callCount }
+}
+
+export function getLatestResearchInputTokens(artifacts: ResearchCockpitArtifact[]): number {
+  for (let i = artifacts.length - 1; i >= 0; i--) {
+    const m = artifacts[i].metadata
+    const input = typeof m.llmInputTokens === "number" && Number.isFinite(m.llmInputTokens) ? m.llmInputTokens : 0
+    if (input > 0) return input
+  }
+  return 0
 }

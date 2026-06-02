@@ -7,6 +7,7 @@ export {
   and,
   or,
   inArray,
+  notInArray,
   desc,
   not,
   sql,

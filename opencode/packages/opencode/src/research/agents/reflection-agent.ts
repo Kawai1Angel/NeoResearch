@@ -1,3 +1,4 @@
+import type { LLMTokenUsage } from "../llm-proposal"
 import type {
   JsonRecord,
   ResearchArtifact,
@@ -71,6 +72,7 @@ export interface ReflectionAgentResult {
     readonly model?: string
     readonly text?: string
     readonly error?: string
+    readonly usage?: LLMTokenUsage
   }
 }
 

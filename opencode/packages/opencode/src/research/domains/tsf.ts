@@ -1461,24 +1461,6 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
       fusion: { type: "temporal", channelMode: "independent" },
       predictionHead: { type: "linear", outputDistribution: "point" },
     }),
-    recipe(task, {
-      recipeID: "tsf_patch_mlp_baseline",
-      hypothesis: "Patch embedding plus an MLP backbone should capture local temporal motifs cheaply.",
-      preprocessing: { actions: [{ type: "none" }] },
-      embedding: { type: "patch", patchLen, stride, dModel },
-      backbone: { type: "mlp", depth: 2, hiddenDim: 128, activation: "gelu", dropout: 0.1 },
-      fusion: { type: "temporal", channelMode: "independent" },
-      predictionHead: { type: "linear", outputDistribution: "point" },
-    }),
-    recipe(task, {
-      recipeID: "tsf_patch_transformer_baseline",
-      hypothesis: "Patch embedding plus a small transformer should test whether attention improves the task.",
-      preprocessing: { actions: [{ type: "none" }] },
-      embedding: { type: "patch", patchLen, stride, dModel },
-      backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 2, dropout: 0.1, ffnMult: 4 },
-      fusion: { type: "temporal", channelMode: "independent" },
-      predictionHead: { type: "linear", outputDistribution: "point" },
-    }),
   ]
 
   if (!task.runtime.bridgeOnly) {

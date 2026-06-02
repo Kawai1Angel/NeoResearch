@@ -7,7 +7,7 @@ import os from "os"
 import path from "path"
 import { deflateSync } from "zlib"
 import z from "zod"
-import { and, desc, eq, inArray, isNull, lt, ne, Database, NotFoundError } from "@/storage"
+import { and, desc, eq, inArray, notInArray, isNull, lt, ne, Database, NotFoundError } from "@/storage"
 import { Bus } from "@/bus"
 import { Instance } from "@/project/instance"
 import * as Process from "@/util/process"
@@ -76,9 +76,9 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { apiKeyFor, proposeLLMCandidate, requestNeoCastLLM, resolveNeoCastLLMConfig } from "./llm-proposal"
+import { apiKeyFor, extractJsonObject, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, usageToMetadata, type AuthJsonKeyResult } from "./llm-proposal"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
-import { analyzeIntentTaskWithLLM, type IntentAgentResult } from "./agents/intent-agent"
+import { analyzeIntentTask, analyzeIntentTaskWithLLM, interpretSlotModificationWithLLM, normalizeIntentSlotKeys, parseSlotInputsWithLLM, type IntentAgentResult } from "./agents/intent-agent"
 import {
   buildDatasetAnalysisReportMarkdown,
   type DatasetAnalysisSourceReport,
@@ -102,8 +102,11 @@ import {
   buildHypoPlannerResult,
   buildHypothesesYaml,
   extractEvidenceSummary,
+  generateHypotheses,
   type ExperimentPlan,
+  type HypoPlannerInput,
   type HypoPlannerResult,
+  type HypothesisObject,
 } from "./agents/hypo-planner-agent"
 import { buildNASAgentResult, summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
 import { summarizePublishAgent, type PublishAgentResult } from "./agents/publish-agent"
@@ -191,11 +194,19 @@ export interface RunFullPipelineResult {
   readonly publish: PublishAgentResult
 }
 
+export interface ResearchLLMStatus {
+  readonly status: "ready" | "not_configured" | "env_var"
+  readonly provider: string
+  readonly model: string
+  readonly source: "env_var" | "auth_json" | "unconfigured"
+}
+
 const PipelineWorkflowPhases = [
   "intent_gathering",
   "data_analysis",
   "hypo_planning",
   "searching",
+  "nas_budget_extended",
   "reflection",
   "publishing",
 ] as const
@@ -365,6 +376,12 @@ function buildIntentCheckpointReason(task: ResearchTask) {
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
   const metadata = recordValue(spec.metadata)
+  // intentSlots holds values typed by the user (or LLM-parsed). Use them as fallback when
+  // canonical fields are not yet set (e.g. natural-language input without a configured API key).
+  const intentSlots = recordValue(metadata.intentSlots)
+  function slotOr(canonical: unknown, slotKey: string) {
+    return canonical !== undefined && canonical !== null ? canonical : intentSlots[slotKey]
+  }
   return [
     "## 需求交流确认完成后，才能结束 Intent Agent",
     "",
@@ -372,15 +389,23 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Intent signature: ${intentCheckpointSignature(task)}`,
     `Interaction mode: ${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `Task: ${task.title}`,
-    `Dataset: ${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
-    `Targets: ${compactIntentValue(dataset.targetCols)}`,
-    `Context length: ${compactIntentValue(spec.contextLength)}`,
-    `Prediction lengths: ${compactIntentValue(spec.predictionLengths)}`,
-    `Primary metric: ${compactIntentValue(objective.primaryMetric)}`,
+    `Dataset: ${compactIntentValue(slotOr(dataset.path ?? dataset.loaderID, "data_source"))}`,
+    `Targets: ${compactIntentValue(slotOr(dataset.targetCols, "target_columns"))}`,
+    `Forecast object: ${compactIntentValue(intentSlots.forecast_object ?? spec.forecastObject)}`,
+    `Context length: ${compactIntentValue(slotOr(spec.contextLength, "lookback_window"))}`,
+    `Prediction lengths: ${compactIntentValue(slotOr(spec.predictionLengths, "prediction_horizon"))}`,
+    `Time grain: ${compactIntentValue(intentSlots.time_grain ?? spec.timeGrain ?? spec.frequency)}`,
+    `Exogenous variables: ${compactIntentValue(intentSlots.exogenous_variables ?? dataset.exogenousCols)}`,
+    `Primary metric: ${compactIntentValue(slotOr(objective.primaryMetric, "primary_metric"))}`,
+    `Error preferences: ${compactIntentValue(intentSlots.error_preferences ?? objective.errorPreferences)}`,
+    `Latency budget: ${compactIntentValue(intentSlots.latency_budget ?? budget.latencyBudget)}`,
+    `Parameter budget: ${compactIntentValue(intentSlots.parameter_budget ?? budget.parameterBudget)}`,
+    `Interpretability: ${compactIntentValue(intentSlots.interpretability ?? spec.interpretability)}`,
+    `Deployment target: ${compactIntentValue(intentSlots.deployment_target ?? spec.deploymentTarget)}`,
     `Budget max runs: ${compactIntentValue(budget.maxRuns)}`,
-    `Business context: ${compactIntentValue(metadata.businessContext ?? metadata.business_context)}`,
+    `Business context: ${compactIntentValue(intentSlots.business_context ?? metadata.businessContext ?? metadata.business_context)}`,
     "",
-    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并更新 taskSpec/intent slots 后重新运行。",
+    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并逐一修改 slots 后重新确认。",
   ].join("\n")
 }
 
@@ -663,6 +688,7 @@ function recoverHypoPlannerResultFromPlan(input: {
     plan: input.plan,
     hypothesesYaml: buildHypothesesYaml(input.plan),
     evidenceSummary,
+    llm: { status: "skipped" as const },
   }
   return {
     ...partial,
@@ -1462,13 +1488,26 @@ function renderResearchReportMarkdown(input: {
   ]
 
   if (champion) {
+    const refTestRun = runs.find(
+      (r) => r.candidateID === champion.candidateID && r.stage === "ref_test" && r.status === "succeeded",
+    )
     lines.push(
       `- Candidate ID: ${champion.candidateID}`,
       `- Run ID: ${champion.runID}`,
-      `- Primary metric: ${formatMetricValue(champion.primaryMetric)}`,
+      `- Primary metric (val_avg_mse): ${formatMetricValue(champion.primaryMetric)}`,
       `- Utility: ${formatMetricValue(champion.utility)}`,
       `- Accepted at: ${new Date(champion.acceptedAt).toISOString()}`,
     )
+    if (refTestRun !== undefined) {
+      const m = refTestRun.metrics as Record<string, unknown>
+      lines.push("", "### Reference Test Results", "")
+      lines.push(`- Run ID: ${refTestRun.id}`)
+      for (const key of Object.keys(m).sort()) {
+        if (key.startsWith("ref_test_") && typeof m[key] === "number") {
+          lines.push(`- ${key}: ${formatMetricValue(m[key] as number)}`)
+        }
+      }
+    }
   } else {
     lines.push("- None")
   }
@@ -2299,64 +2338,15 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
 }
 
 // Known opencode provider → OpenAI-compat base URL mapping for neo-cast LLM bridge.
-const OPENCODE_PROVIDER_BASE_URLS: Record<string, string> = {
-  zhipuai: "https://open.bigmodel.cn/api/paas/v4",
-  "zhipuai-coding-plan": "https://open.bigmodel.cn/api/paas/v4",
-  openai: "https://api.openai.com/v1",
-  anthropic: "", // handled separately via ANTHROPIC_API_KEY env path
-}
 
-// Default model names to use when neo-cast config doesn't specify one and we fall back to auth.json key.
-const OPENCODE_PROVIDER_DEFAULT_MODELS: Record<string, string> = {
-  zhipuai: "glm-4-flash",
-  "zhipuai-coding-plan": "glm-4-flash",
-  openai: "gpt-4o-mini",
-}
-
-interface AuthJsonKeyResult {
-  readonly key: string
-  readonly baseURL: string
-  readonly model: string
-}
-
-// Reads opencode's auth.json and returns the first usable API key with provider metadata.
-// This bridges the gap between "Configure API Key" (opencode provider auth) and neo-cast env vars.
-async function resolveApiKeyFromAuthJson(): Promise<AuthJsonKeyResult | undefined> {
-  if (process.env.OPENCODE_TEST_HOME) return undefined
-  const candidates = [
-    process.env.XDG_DATA_HOME ? path.join(process.env.XDG_DATA_HOME, "neo-research", "auth.json") : undefined,
-    path.join(os.homedir(), ".local", "share", "neo-research", "auth.json"),
-    path.join(os.homedir(), ".local", "share", "opencode", "auth.json"),
-  ].filter((p): p is string => p !== undefined)
-
-  for (const authPath of candidates) {
-    try {
-      const raw = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>
-      // Priority order: anthropic → openai → zhipuai → others
-      const priority = ["anthropic", "openai", ...Object.keys(OPENCODE_PROVIDER_BASE_URLS)]
-      const order = [...new Set(priority)]
-      for (const providerID of order) {
-        const entry = raw[providerID]
-        if (!entry || typeof entry !== "object") continue
-        const rec = entry as Record<string, unknown>
-        if (rec.type !== "api" || typeof rec.key !== "string" || !rec.key) continue
-        const baseURL = OPENCODE_PROVIDER_BASE_URLS[providerID] ?? ""
-        const model = OPENCODE_PROVIDER_DEFAULT_MODELS[providerID] ?? "gpt-4o-mini"
-        return { key: rec.key, baseURL, model }
-      }
-    } catch {
-      // file missing or unreadable — try next candidate
-    }
-  }
-  return undefined
-}
 
 async function generateLLMQualitativeAnalysis(
   task: ResearchTask,
   fingerprint: JsonRecord,
   context: DatasetAnalysisContext,
   workspaceRoot: string,
-): Promise<string | undefined> {
+  onDelta?: (delta: string) => void,
+): Promise<{ text: string; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
     const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -2368,14 +2358,154 @@ async function generateLLMQualitativeAnalysis(
       const authEntry = await resolveApiKeyFromAuthJson()
       if (!authEntry) return undefined
       apiKey = authEntry.key
-      effectiveConfig = { ...config, provider: "openai-compatible", ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}) }
+      const isAnthropicNative = !authEntry.baseURL
+      effectiveConfig = {
+        ...config,
+        provider: isAnthropicNative ? "anthropic" : "openai-compatible",
+        model: isAnthropicNative ? config.model : authEntry.model,
+        ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
+      }
     }
     const system = buildQualitativeSystemPrompt()
     const user = buildQualitativeUserPrompt(task, fingerprint, context)
-    // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
-    const llmPromise = requestNeoCastLLM(effectiveConfig, apiKey, system, user)
-    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
+    const llmPromise = onDelta
+      ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
+      : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
+    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
     return await Promise.race([llmPromise, timeoutPromise])
+  } catch {
+    return undefined
+  }
+}
+
+function buildHypoPlannerSystemPrompt(): string {
+  return [
+    "You are the NeoResearch HypoPlanner agent for time series forecasting (TSF) model search.",
+    "Language policy: 用中文表达 statement、motivation、risk 等自然语言字段；保留 JSON 字段名、backbone 类型名、预处理类型名等技术术语的英文原文。",
+    "Task: Given dataset analysis evidence, run history, and reflection memory, produce 3–6 testable research hypotheses to guide the next phase of model search.",
+    "Output: exactly one JSON object: { \"hypotheses\": [...] }. No markdown fences. No prose outside JSON.",
+    "Each hypothesis object must have these fields:",
+    "  id: string (\"H1\", \"H2\", ...)",
+    "  statement: string (一句话说明该假设的核心思想)",
+    "  motivation: string[] (来自数据特征、历史结果或记忆的支持证据)",
+    "  suggestedBackbones: string[] (subset of: linear | mlp | transformer | dlinear | tcn | nbeats | timesnet | rnn | ssm | mixer)",
+    "  suggestedPreprocessing: string[] (subset of: none | instance_norm | series_decomposition | seasonal_differencing | missing_mask | sample_reweighting)",
+    "  priority: \"high\" | \"medium\" | \"low\"",
+    "  risk: string (主要风险或局限)",
+    "  testable: true | false",
+    "Rules:",
+    "- Order hypotheses by priority (high first).",
+    "- Each hypothesis must be distinct, concrete, and directly testable.",
+    "- Do not repeat backbone/preprocessing combinations already confirmed as failures in memory.",
+    "- The draftHypotheses field contains rule-derived starting points; you may refine, replace, or extend them.",
+  ].join("\n")
+}
+
+function buildHypoPlannerUserPrompt(
+  task: ResearchTask,
+  dataAnalysis: DataAnalysisAgentResult,
+  runs: readonly ResearchRun[],
+  memory: readonly ResearchMemory[],
+  draftHypotheses: readonly HypothesisObject[],
+): string {
+  const spec = recordValue(task.taskSpec)
+  const profile = {
+    ...recordValue(recordValue(recordValue(task.taskSpec).metadata).datasetProfile),
+    ...recordValue(spec.datasetProfile),
+  }
+  const succeeded = runs.filter((r) => r.status === "succeeded")
+  const bestMetric = succeeded
+    .map((r) => (typeof r.metrics?.val_avg_mse === "number" ? r.metrics.val_avg_mse : undefined))
+    .filter((v): v is number => v !== undefined)
+    .sort((a, b) => a - b)[0]
+  return JSON.stringify(
+    {
+      task: {
+        id: task.id,
+        title: task.title,
+        objective: task.objective,
+        budget: task.budget,
+      },
+      datasetProfile: profile,
+      searchBiases: dataAnalysis.searchBiases,
+      runSummary: {
+        succeeded: runs.filter((r) => r.status === "succeeded").length,
+        failed: runs.filter((r) => r.status === "failed").length,
+        rejected: runs.filter((r) => r.status === "rejected").length,
+        bestMetric: bestMetric ?? null,
+      },
+      memoryLessons: memory.slice(-8).map((m) => ({ outcome: m.outcome, lesson: m.lesson })),
+      draftHypotheses,
+      instruction:
+        "Based on the evidence above, return a refined and enriched hypothesis list. Preserve high-quality draft hypotheses but improve specificity and motivation. Add new hypotheses if the evidence suggests unexplored directions.",
+    },
+    null,
+    2,
+  )
+}
+
+function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
+  const rec = recordValue(raw)
+  if (Object.keys(rec).length === 0) return undefined
+  const id = typeof rec.id === "string" && rec.id.trim() ? rec.id.trim() : undefined
+  const statement = typeof rec.statement === "string" && rec.statement.trim() ? rec.statement.trim() : undefined
+  const priority = rec.priority === "high" || rec.priority === "medium" || rec.priority === "low" ? rec.priority : undefined
+  if (!id || !statement || !priority) return undefined
+  const filterStrings = (value: unknown) =>
+    Array.isArray(value)
+      ? (value as unknown[]).filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+      : []
+  const motivation = filterStrings(rec.motivation)
+  const suggestedBackbones = filterStrings(rec.suggestedBackbones)
+  const suggestedPreprocessing = filterStrings(rec.suggestedPreprocessing)
+  const risk = typeof rec.risk === "string" ? rec.risk : ""
+  const testable = typeof rec.testable === "boolean" ? rec.testable : true
+  return { id, statement, motivation, suggestedBackbones, suggestedPreprocessing, priority, risk, testable }
+}
+
+async function generateLLMHypotheses(
+  task: ResearchTask,
+  dataAnalysis: DataAnalysisAgentResult,
+  runs: readonly ResearchRun[],
+  memory: readonly ResearchMemory[],
+  draftHypotheses: readonly HypothesisObject[],
+  workspaceRoot: string,
+  onDelta?: (delta: string) => void,
+): Promise<{ hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
+  try {
+    const runtime = recordValue(recordValue(task.taskSpec).runtime)
+    const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
+    const config = await resolveNeoCastLLMConfig({ workspaceRoot, neoCastProjectRoot })
+    let apiKey = apiKeyFor(config)
+    let effectiveConfig = config
+    if (!apiKey) {
+      const authEntry = await resolveApiKeyFromAuthJson()
+      if (!authEntry) return undefined
+      apiKey = authEntry.key
+      const isAnthropicNative = !authEntry.baseURL
+      effectiveConfig = {
+        ...config,
+        provider: isAnthropicNative ? "anthropic" : "openai-compatible",
+        model: isAnthropicNative ? config.model : authEntry.model,
+        ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
+      }
+    }
+    const system = buildHypoPlannerSystemPrompt()
+    const user = buildHypoPlannerUserPrompt(task, dataAnalysis, runs, memory, draftHypotheses)
+    const llmPromise = onDelta
+      ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
+      : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
+    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
+    const result = await Promise.race([llmPromise, timeoutPromise])
+    if (!result) return undefined
+    const parsed = extractJsonObject(result.text)
+    const parsedRec = recordValue(parsed)
+    if (!Array.isArray(parsedRec.hypotheses)) return undefined
+    const validated = (parsedRec.hypotheses as unknown[])
+      .map(validateLLMHypothesisItem)
+      .filter((h): h is HypothesisObject => h !== undefined)
+      .slice(0, 8)
+    return validated.length > 0 ? { hypotheses: validated, usage: result.usage } : undefined
   } catch {
     return undefined
   }
@@ -2461,7 +2591,13 @@ async function generateLLMReflectionSynthesis(
     const authEntry = await resolveApiKeyFromAuthJson()
     if (!authEntry) return { ...result, llm: { status: "not_configured" } }
     apiKey = authEntry.key
-    effectiveConfig = { ...config, provider: "openai-compatible", ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}) }
+    const isAnthropicNative = !authEntry.baseURL
+    effectiveConfig = {
+      ...config,
+      provider: isAnthropicNative ? "anthropic" : "openai-compatible",
+      model: isAnthropicNative ? config.model : authEntry.model,
+      ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
+    }
   }
   try {
     const system = buildReflectionLLMSystemPrompt()
@@ -2469,12 +2605,21 @@ async function generateLLMReflectionSynthesis(
     // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
     const llmPromise = requestNeoCastLLM(effectiveConfig, apiKey, system, user)
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
-    const text = await Promise.race([llmPromise, timeoutPromise])
-    if (text === undefined) return { ...result, llm: { status: "failed" } }
-    return { ...result, llm: { status: "used", model: effectiveConfig.model, text } }
+    const llmResult = await Promise.race([llmPromise, timeoutPromise])
+    if (llmResult === undefined) return { ...result, llm: { status: "failed" } }
+    return { ...result, llm: { status: "used", model: effectiveConfig.model, text: llmResult.text, usage: llmResult.usage } }
   } catch {
     return { ...result, llm: { status: "failed" } }
   }
+}
+
+function buildReflectionMemoryLesson(result: ReflectionAgentResult): string {
+  const a = result.analysis
+  const parts: string[] = [`[reflection] ${a.decision}: ${a.decisionReason}`]
+  if (a.bestMetric !== undefined) parts.push(`best ${a.primaryMetricName}=${a.bestMetric}`)
+  if (a.nextHypotheses.length > 0) parts.push(`next: ${a.nextHypotheses.map((h) => h.title).join("; ")}`)
+  if (result.llm.status === "used" && result.llm.text) parts.push(`llm: ${result.llm.text.slice(0, 300)}`)
+  return parts.join(" | ")
 }
 
 function buildDatasetAnalysisReports(
@@ -3146,6 +3291,7 @@ export interface Interface {
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
   readonly answerIntentQuestion: (input: AnswerIntentInput) => Effect.Effect<IntentAgentResult>
+  readonly interpretAndApplySlotModification: (input: { taskID: ResearchTaskID; message: string }) => Effect.Effect<IntentAgentResult>
   readonly runDataAnalysisAgent: (input: ProfileTaskInput) => Effect.Effect<DataAnalysisAgentResult>
   readonly runHypoPlannerAgent: (input: {
     readonly taskID: ResearchTaskID
@@ -3157,6 +3303,7 @@ export interface Interface {
   readonly runReflectionAgent: (input: ReflectionAgentInput) => Effect.Effect<ReflectionAgentResult>
   readonly runPublishAgent: (input: ExportTaskArtifactInput) => Effect.Effect<PublishAgentResult>
   readonly runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult>
+  readonly getResearchLLMStatus: () => Effect.Effect<ResearchLLMStatus>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Research") {}
@@ -3575,6 +3722,27 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const approval = mapApproval(row)
       yield* writeGovernanceLogArtifact(approval)
       yield* bus.publish(Event.ApprovalUpdated, { approval })
+
+      // When the user rejects an intent checkpoint, reset the task to "idle" and mark it as
+      // pending review so the TUI can guide the user through slot modification.
+      if (
+        input.status === "rejected" &&
+        row.kind === "protocol" &&
+        row.reason.includes("[checkpoint:intent_confirmed]")
+      ) {
+        const taskForReset = yield* getTask(row.task_id)
+        const existingSpec = taskForReset.taskSpec
+        const existingMeta =
+          typeof existingSpec.metadata === "object" && existingSpec.metadata !== null && !Array.isArray(existingSpec.metadata)
+            ? (existingSpec.metadata as Record<string, unknown>)
+            : {}
+        yield* updateTaskSpec({
+          taskID: row.task_id as ResearchTaskID,
+          taskSpec: { ...existingSpec, metadata: { ...existingMeta, intentPendingReview: true } } as JsonRecord,
+        })
+        yield* updateTaskStatus({ taskID: row.task_id as ResearchTaskID, status: "idle" })
+      }
+
       return approval
     })
 
@@ -3594,7 +3762,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         const recipeID = candidateRecipeID(proposal.candidateSpec)
         if (recipeID && existingRecipeIDs.has(recipeID)) continue
         const approvalStatus =
-          task.mode === "autonomous" && proposal.riskLevel === "low" ? "auto_approved" : proposal.approvalStatus
+          task.mode === "autonomous" ? "auto_approved" : proposal.approvalStatus
         const candidate = yield* createCandidate({
           taskID: task.id,
           domainID: task.domainID,
@@ -3631,7 +3799,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           d
             .select({ id: ResearchRunTable.id })
             .from(ResearchRunTable)
-            .where(and(eq(ResearchRunTable.task_id, task.id), ne(ResearchRunTable.stage, "profile")))
+            .where(and(eq(ResearchRunTable.task_id, task.id), notInArray(ResearchRunTable.stage, ["profile", "ref_test", "blind_test"])))
             .all(),
         ).pipe(Effect.map((rows) => rows.length))
         if (used >= maxRuns) {
@@ -3828,32 +3996,38 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       }
 
       if (stageRequiresDomainActionApproval(stage) && candidateUsesNativeDomainAction(candidate.candidateSpec)) {
-        const approval = yield* db((d) =>
-          d
-            .select({ id: ResearchApprovalTable.id })
-            .from(ResearchApprovalTable)
-            .where(
-              and(
-                eq(ResearchApprovalTable.task_id, task.id),
-                eq(ResearchApprovalTable.candidate_id, candidate.id),
-                eq(ResearchApprovalTable.kind, "domain_action"),
-                eq(ResearchApprovalTable.status, "approved"),
-              ),
-            )
-            .get(),
-        )
-        if (!approval) {
-          yield* ensurePendingApproval({
-            taskID: task.id,
-            candidateID: candidate.id,
-            kind: "domain_action",
-            reason: `Approve native TimeRecipe actions before ${stage} execution.`,
-          })
-          throw new ApprovalRequiredError({
-            taskID: task.id,
-            candidateID: candidate.id,
-            kind: "domain_action",
-          })
+        // Autonomous mode: native domain actions are implicitly approved along with the candidate
+        const candidateAutoApproved =
+          task.mode === "autonomous" &&
+          (candidate.approvalStatus === "auto_approved" || candidate.approvalStatus === "approved")
+        if (!candidateAutoApproved) {
+          const approval = yield* db((d) =>
+            d
+              .select({ id: ResearchApprovalTable.id })
+              .from(ResearchApprovalTable)
+              .where(
+                and(
+                  eq(ResearchApprovalTable.task_id, task.id),
+                  eq(ResearchApprovalTable.candidate_id, candidate.id),
+                  eq(ResearchApprovalTable.kind, "domain_action"),
+                  eq(ResearchApprovalTable.status, "approved"),
+                ),
+              )
+              .get(),
+          )
+          if (!approval) {
+            yield* ensurePendingApproval({
+              taskID: task.id,
+              candidateID: candidate.id,
+              kind: "domain_action",
+              reason: `Approve native TimeRecipe actions before ${stage} execution.`,
+            })
+            throw new ApprovalRequiredError({
+              taskID: task.id,
+              candidateID: candidate.id,
+              kind: "domain_action",
+            })
+          }
         }
       }
 
@@ -3985,7 +4159,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const candidate = yield* getCandidateForTask(input.taskID, input.candidateID)
       assertCandidateApproved(task.id, candidate)
       const status = input.status ?? "queued"
-      yield* ensureRunBudget(task, status, candidate)
+      if (input.stage !== "ref_test" && input.stage !== "blind_test") {
+        yield* ensureRunBudget(task, status, candidate)
+      }
       yield* ensureRunApprovalGates(task, candidate, input.stage)
       const time = nowTime()
       const row = yield* db((d) =>
@@ -4437,7 +4613,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         artifactRefs.push(artifact.id)
       }
 
-      const succeeded = execution.exitCode === 0
+      const runnerTrainingSucceeded = execution.records.some(
+        (r) => r["event"] === "done" && r["status"] === "success",
+      )
+      const succeeded = execution.exitCode === 0 || runnerTrainingSucceeded
       const task = yield* getTask(running.taskID)
       const reproducibility = succeeded
         ? yield* Effect.promise(() => buildReproducibilitySeal(task, prepared.runPlan, Instance.directory))
@@ -4580,6 +4759,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       }
       const designMetadata = input.managerTrace.find((step) => step.role === "design")?.metadata
       const librarianMetadata = input.managerTrace.find((step) => step.role === "librarian")?.metadata
+      const designModelDesignerResult =
+        designMetadata && typeof designMetadata === "object" && !Array.isArray(designMetadata)
+          ? (designMetadata.modelDesignerResult as Record<string, unknown> | undefined)
+          : undefined
       yield* Effect.promise(async () => {
         await mkdir(dir, { recursive: true })
         await writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, "utf8")
@@ -4602,6 +4785,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             : {}),
           ...(typeof librarianMetadata?.memoryWriteOutcome === "string"
             ? { memoryWriteOutcome: librarianMetadata.memoryWriteOutcome }
+            : {}),
+          ...(typeof designMetadata?.llmStatus === "string" ? { llmStatus: designMetadata.llmStatus } : {}),
+          ...(typeof designMetadata?.llmModel === "string" ? { llmModel: designMetadata.llmModel } : {}),
+          ...(typeof designMetadata?.llmProvider === "string" ? { llmProvider: designMetadata.llmProvider } : {}),
+          ...(typeof designMetadata?.llmError === "string" ? { llmError: designMetadata.llmError } : {}),
+          ...(typeof designModelDesignerResult?.hypothesis === "string" && designModelDesignerResult.hypothesis
+            ? { llmHypothesis: designModelDesignerResult.hypothesis }
+            : {}),
+          ...(typeof designMetadata?.recipeID === "string" && designMetadata.recipeID
+            ? { llmRecipeID: designMetadata.recipeID }
             : {}),
         },
       })
@@ -4756,23 +4949,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
         const hypothesisTitles = reflection.analysis.nextHypotheses.map((h) => h.title)
         if (hypothesisTitles.length > 0) {
-          const existingMeta =
-            typeof input.task.taskSpec.metadata === "object" &&
-            input.task.taskSpec.metadata !== null &&
-            !Array.isArray(input.task.taskSpec.metadata)
-              ? (input.task.taskSpec.metadata as Record<string, unknown>)
-              : {}
-          const updatedTaskSpec = {
-            ...input.task.taskSpec,
-            metadata: {
-              ...existingMeta,
-              reflectionHypotheses: hypothesisTitles,
-            },
+          // Read fresh from DB so we preserve workflow state (updateTaskSpec would strip it).
+          const freshTask = yield* getTask(input.task.id)
+          const freshMeta = recordValue(freshTask.taskSpec.metadata)
+          const nextTaskSpec = {
+            ...freshTask.taskSpec,
+            metadata: { ...freshMeta, reflectionHypotheses: hypothesisTitles } as unknown as JsonRecord,
           }
-          yield* updateTaskSpec({
-            taskID: input.task.id,
-            taskSpec: updatedTaskSpec as JsonRecord,
-          })
+          const reflRow = yield* db((d) =>
+            d
+              .update(ResearchTaskTable)
+              .set({ task_spec: nextTaskSpec, time_updated: Date.now() })
+              .where(and(eq(ResearchTaskTable.id, input.task.id), eq(ResearchTaskTable.project_id, Instance.project.id)))
+              .returning()
+              .get(),
+          )
+          if (reflRow) yield* bus.publish(Event.TaskUpdated, { task: mapTask(reflRow) })
         }
       }
 
@@ -4911,12 +5103,35 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                   utility: champion.utility,
                 },
         }
+        const dataAnalysisMarkdown = buildDatasetAnalysisReportMarkdown({
+          task,
+          fingerprint: taskFingerprintWithExploration,
+        })
+        const hypoPlanMarkdown = hypothesisPlan !== undefined
+          ? buildHypothesesYaml(hypothesisPlan)
+          : undefined
+        const previousReflectionMarkdown = reflectionHypotheses.length > 0
+          ? yield* Effect.gen(function* () {
+              const artifacts = yield* listArtifacts(task.id)
+              const notesArtifact = artifacts.find((item) => item.kind === "reflection_notes_md")
+              if (!notesArtifact) return undefined
+              const contentPath = filePathFromURI(notesArtifact.uri)
+              if (!contentPath) return undefined
+              return yield* Effect.promise(async () => {
+                try { return await readFile(contentPath, "utf8") }
+                catch { return undefined }
+              })
+            }).pipe(Effect.orElseSucceed(() => undefined as string | undefined))
+          : undefined
         const authJsonKey = yield* Effect.promise(() => resolveApiKeyFromAuthJson())
         const llmResult = yield* Effect.promise(() =>
           proposeLLMCandidate({
             task,
             proposalContext,
             workspaceRoot: Instance.directory,
+            dataAnalysisMarkdown,
+            ...(hypoPlanMarkdown ? { hypoPlanMarkdown } : {}),
+            ...(previousReflectionMarkdown ? { previousReflectionMarkdown } : {}),
             ...(authJsonKey ? { authJsonKey } : {}),
           }),
         )
@@ -4944,7 +5159,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           proposalCreated = true
           selectionSource = "domain_proposal"
           const approvalStatus =
-            task.mode === "autonomous" && proposal.riskLevel === "low" ? "auto_approved" : proposal.approvalStatus
+            task.mode === "autonomous" ? "auto_approved" : proposal.approvalStatus
           candidate = yield* createCandidate({
             taskID: task.id,
             domainID: task.domainID,
@@ -5026,6 +5241,24 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           },
         ),
       )
+      yield* bus.publish(Event.ModelDesignerCompleted, {
+        taskID: task.id,
+        agent: "ModelDesignerAgent",
+        stage: "design",
+        status: "completed",
+        metadata: {
+          candidateID: candidate.id,
+          candidateSpec: candidate.candidateSpec,
+          recipeID: selectedRecipeID ?? null,
+          selectionSource,
+          generatedBy: candidate.generatedBy,
+          riskLevel: candidate.riskLevel,
+          ...llmMetadata,
+          ...(typeof modelDesignerResult.hypothesis === "string" && modelDesignerResult.hypothesis
+            ? { llmHypothesis: modelDesignerResult.hypothesis }
+            : {}),
+        },
+      })
       managerTrace.push(
         managerStep(
           "coder",
@@ -5418,42 +5651,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             noImproveStreak = 0
           } else {
             noImproveStreak += 1
-            // Mid-loop reflection: after every 3 consecutive no-improve iterations, derive fresh
-            // hypotheses and persist them to taskSpec so the next iteration picks them up.
-            if (noImproveStreak % 3 === 0) {
-              yield* Effect.gen(function* () {
-                const currentTask = yield* getTask(input.taskID)
-                const allRuns = yield* listRuns(input.taskID)
-                const allCandidates = yield* listCandidates(input.taskID)
-                const midAnalysis = analyzeReflection({
-                  task: currentTask,
-                  runs: allRuns,
-                  candidates: allCandidates,
-                  stoppedReason: undefined,
-                })
-                const hypothesisTitles = midAnalysis.nextHypotheses.map((h) => h.title)
-                if (hypothesisTitles.length > 0) {
-                  const existingMeta = recordValue(currentTask.taskSpec.metadata)
-                  yield* updateTaskSpec({
-                    taskID: input.taskID,
-                    taskSpec: {
-                      ...currentTask.taskSpec,
-                      metadata: { ...existingMeta, reflectionHypotheses: hypothesisTitles },
-                    } as JsonRecord,
-                  })
-                }
-              }).pipe(
-                Effect.catchCause((cause) =>
-                  bus.publish(Event.ReflectionAgentFailed, {
-                    taskID: input.taskID,
-                    agent: "ReflectionAgent",
-                    stage: "mid_loop_reflection",
-                    status: "failed",
-                    metadata: errorMetadata(Cause.squash(cause)),
-                  }),
-                ),
-              )
-            }
           }
           const targetReached =
             targetMetricValue !== undefined &&
@@ -5463,6 +5660,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "plateau" })
           }
         }
+        // Per-iteration reflection: run after every TrainEval, LLM-augmented, non-blocking.
+        yield* runReflectionAgent({ taskID: input.taskID }).pipe(Effect.catchCause(() => Effect.void))
         if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
           return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "time_budget_exhausted" })
         }
@@ -5734,6 +5933,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         const experimentsDirectory = path.join(directory, "experiments")
         const modelDirectory = path.join(directory, "model")
         const traceDirectory = path.join(directory, "trace")
+        const refTestDirectory = path.join(directory, "ref_test")
         const reportPath = path.join(reportDirectory, "research-report.md")
         const finalReportPath = path.join(reportsDirectory, "final_report.md")
         const releasePackagePath = path.join(releaseArtifactsDirectory, "release_package.md")
@@ -5751,8 +5951,28 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         const championRun = champion === undefined ? undefined : runs.find((run) => run.id === champion.runID)
         const championReproducibility =
           championRun === undefined ? {} : recordValue(recordValue(championRun.resourceUsage).reproducibility)
+        const championRefTestRun =
+          champion === undefined
+            ? undefined
+            : runs.find(
+                (r) => r.candidateID === champion.candidateID && r.stage === "ref_test" && r.status === "succeeded",
+              )
+        const championRefTestMetrics =
+          championRefTestRun === undefined
+            ? undefined
+            : Object.fromEntries(
+                Object.entries(championRefTestRun.metrics as Record<string, unknown>).filter(
+                  ([k, v]) => k.startsWith("ref_test_") && typeof v === "number",
+                ),
+              )
         const championArtifactDir =
           championRunnerArtifact === undefined ? undefined : filePathFromURI(championRunnerArtifact.uri)
+        const championRefTestRunnerArtifact =
+          championRefTestRun === undefined
+            ? undefined
+            : artifacts.find((artifact) => artifact.kind === "runner_artifact" && artifact.runID === championRefTestRun.id)
+        const championRefTestArtifactDir =
+          championRefTestRunnerArtifact === undefined ? undefined : filePathFromURI(championRefTestRunnerArtifact.uri)
         const copiedFiles: Record<string, string> = {
           report: "report/research-report.md",
           finalReport: "reports/final_report.md",
@@ -5773,6 +5993,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           ["nas_leaderboard_md", experimentsDirectory, "leaderboard.md", "leaderboard"],
           ["nas_evaluation_result_md", experimentsDirectory, "evaluation_result.md", "evaluationResult"],
           ["nas_reflection_notes_md", experimentsDirectory, "reflection_notes.md", "reflectionNotes"],
+          ["reflection_notes_md", experimentsDirectory, "final_reflection.md", "finalReflection"],
+          ["next_experiment_plan_md", experimentsDirectory, "next_experiment_plan.md", "nextExperimentPlan"],
+          ["failure_log_md", experimentsDirectory, "failure_log.md", "failureLog"],
           ["nas_best_model_py", modelDirectory, "best_model.py", "bestModelPy"],
           ["nas_training_script_py", modelDirectory, "training_script.py", "trainingScript"],
         ] as const
@@ -5801,6 +6024,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           await mkdir(experimentsDirectory, { recursive: true })
           await mkdir(modelDirectory, { recursive: true })
           await mkdir(traceDirectory, { recursive: true })
+          await mkdir(refTestDirectory, { recursive: true })
           await writeFile(reportPath, `${sections.join("\n\n")}\n`, "utf8")
           await writeFile(finalReportPath, `${sections.join("\n\n")}\n`, "utf8")
           await writeFile(runsPath, `${JSON.stringify(runs, null, 2)}\n`, "utf8")
@@ -5831,6 +6055,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             await cp(source, target, { force: true })
             copiedFiles[manifestKey] = `${path.basename(targetDirectory)}/${filename}`
           }
+          if (championRefTestArtifactDir !== undefined) {
+            for (const filename of ["ref_test_metrics.json", "eval_report.md"] as const) {
+              const source = path.join(championRefTestArtifactDir, filename)
+              if (!existsSync(source)) continue
+              await cp(source, path.join(refTestDirectory, filename), { force: true })
+              copiedFiles[filename === "ref_test_metrics.json" ? "refTestMetrics" : "refTestEvalReport"] =
+                `ref_test/${filename}`
+            }
+          }
           const loopArtifacts = artifacts.filter((artifact) => artifact.kind === "research_autonomous_loop_json")
           for (const artifact of loopArtifacts) {
             const source = filePathFromURI(artifact.uri)
@@ -5859,6 +6092,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
                     runID: champion.runID,
                     primaryMetric: champion.primaryMetric,
                     utility: champion.utility,
+                    ...(championRefTestMetrics === undefined ? {} : { refTestMetrics: championRefTestMetrics }),
                   },
             counts: {
               candidates: candidates.length,
@@ -5933,7 +6167,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       return { artifact, path: outputPath }
     })
 
-    const profileTask = Effect.fn("Research.profileTask")(function* (input: ProfileTaskInput) {
+    const profileTask = Effect.fn("Research.profileTask")(function* (
+      input: ProfileTaskInput & { readonly _onDeltaQualitative?: (delta: string) => void },
+    ) {
       const task = yield* getTask(input.taskID)
       const fingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
       const root = runnerPath(Instance.directory, input.outputDir ?? ".neo-research/profile")
@@ -6032,9 +6268,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const analysisDirectory = path.join(Instance.directory, ".neo-research", "sessions", task.id, "analysis")
       const analysisContext = yield* Effect.promise(() => buildDatasetAnalysisContext(task, fingerprint as JsonRecord))
       const llmQualitative = yield* Effect.promise(() =>
-        generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory),
+        generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory, input._onDeltaQualitative),
       )
-      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative)
+      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative?.text)
       const analysisArtifacts: ResearchArtifact[] = []
       for (const item of analysisFiles) {
         const reportPath = path.join(analysisDirectory, item.filename)
@@ -6119,6 +6355,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           profileArtifactID: artifact.id,
           sourceArtifactIDs: analysisArtifacts.map((item) => item.id),
           plotArtifactIDs: plotArtifacts.map((item) => item.id),
+          llmStatus: llmQualitative !== undefined ? "used" : "skipped",
+          ...(llmQualitative !== undefined
+            ? { llmPreview: llmQualitative.text.split("\n").filter((l) => l.trim().length > 0).slice(0, 5).join("\n") }
+            : {}),
+          ...(llmQualitative?.usage && llmQualitative.usage.inputTokens > 0 ? usageToMetadata(llmQualitative.usage) : {}),
         },
       })
       analysisArtifacts.push(dataAnalysisArtifact)
@@ -6223,17 +6464,139 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        typeof existingMeta.intentSlots === "object" && existingMeta.intentSlots !== null && !Array.isArray(existingMeta.intentSlots)
 	          ? (existingMeta.intentSlots as Record<string, unknown>)
 	          : {}
-	      const mergedSlots = { ...existingIntentSlots, ...input.slots }
+	      // Parse natural-language slot answers into typed values via a single LLM call when needed.
+	      // Falls back to the raw string if no API key is configured or parsing fails.
+	      const currentClarifyingQuestions = analyzeIntentTask({ task }).clarifyingQuestions
+	      const parsedInputSlots = yield* Effect.promise(() =>
+	        parseSlotInputsWithLLM({
+	          slots: input.slots as Record<string, unknown>,
+	          clarifyingQuestions: currentClarifyingQuestions,
+	          workspaceRoot: Instance.directory,
+	        }),
+	      )
+	      const mergedSlots = { ...existingIntentSlots, ...normalizeIntentSlotKeys(parsedInputSlots) }
+	      // Propagate resolved intent slots back to canonical taskSpec fields so that downstream
+	      // TSF parsing (TSFTaskSpec.parse) and checkpoint display both pick up the right values.
+	      const existingDataset =
+	        typeof task.taskSpec.dataset === "object" && task.taskSpec.dataset !== null && !Array.isArray(task.taskSpec.dataset)
+	          ? (task.taskSpec.dataset as Record<string, unknown>)
+	          : {}
+	      const datasetOverrides: Record<string, unknown> = {}
+	      const canonicalOverrides: Record<string, unknown> = {}
+	      const targetCols = (() => {
+	        const raw = mergedSlots.target_columns
+	        if (Array.isArray(raw) && (raw as unknown[]).length > 0) return raw as string[]
+	        if (typeof raw === "string" && raw.trim().length > 0)
+	          return raw.trim().split(/\s*,\s*/).filter((s) => s.length > 0)
+	        return undefined
+	      })()
+	      if (targetCols !== undefined) datasetOverrides.targetCols = targetCols
+	      const dataSource =
+	        typeof mergedSlots.data_source === "string" && mergedSlots.data_source.trim().length > 0
+	          ? mergedSlots.data_source.trim()
+	          : undefined
+	      if (dataSource !== undefined) datasetOverrides.path = dataSource
+	      const lookbackWindow = (() => {
+	        const raw = mergedSlots.lookback_window
+	        if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw
+	        if (typeof raw === "string") { const n = Number(raw.trim()); if (Number.isFinite(n) && n > 0) return n }
+	        return undefined
+	      })()
+	      if (lookbackWindow !== undefined) canonicalOverrides.contextLength = lookbackWindow
+	      const predictionHorizon = (() => {
+	        const raw = mergedSlots.prediction_horizon
+	        if (Array.isArray(raw) && (raw as unknown[]).length > 0) return raw as number[]
+	        if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return [raw]
+	        if (typeof raw === "string" && raw.trim().length > 0) {
+	          const parts = raw.trim().split(/\s*,\s*/).map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0)
+	          if (parts.length > 0) return parts
+	        }
+	        return undefined
+	      })()
+	      if (predictionHorizon !== undefined) canonicalOverrides.predictionLengths = predictionHorizon
+	      const timeGrain =
+	        typeof mergedSlots.time_grain === "string" && mergedSlots.time_grain.trim().length > 0
+	          ? mergedSlots.time_grain.trim()
+	          : undefined
+	      if (timeGrain !== undefined) canonicalOverrides.timeGrain = timeGrain
+	      const updatedDataset =
+	        Object.keys(datasetOverrides).length > 0 ? { ...existingDataset, ...datasetOverrides } : existingDataset
+	      // Clear intentPendingReview flag — the user has answered a slot, review cycle continues
+	      // via the normal missing-slot flow; flag will be gone once pipeline advances.
+	      const { intentPendingReview: _drop, ...cleanedMeta } = existingMeta as Record<string, unknown> & { intentPendingReview?: unknown }
 	      const updatedTaskSpec = {
 	        ...task.taskSpec,
-	        metadata: { ...existingMeta, intentSlots: mergedSlots },
+	        ...canonicalOverrides,
+	        dataset: updatedDataset,
+	        metadata: { ...cleanedMeta, intentSlots: mergedSlots },
 	      }
 	      yield* updateTaskSpec({ taskID: input.taskID, taskSpec: updatedTaskSpec as JsonRecord })
 	      const result = yield* runIntentAgent(input.taskID)
-	      if (result.missingFields.length === 0 && task.status === "paused") {
+	      // Use rule-based analysis (not LLM inferences) to decide whether to advance the pipeline.
+	      // The LLM in analyzeIntentTaskWithLLM may infer slot values that are not persisted to the DB,
+	      // causing result.missingFields to be empty even when the user hasn't answered all questions.
+	      const taskAfterSlot = yield* getTask(input.taskID)
+	      const ruleBasedCheck = analyzeIntentTask({ task: taskAfterSlot })
+	      if (ruleBasedCheck.missingFields.length === 0) {
+	        // All slots genuinely satisfied in the DB — advance the pipeline.
+	        // PipelineBlockedError means the pipeline paused at a checkpoint, which is expected.
+	        yield* runFullPipeline({ taskID: input.taskID }).pipe(
+	          Effect.catch((error: unknown) =>
+	            error instanceof PipelineBlockedError ? Effect.void : Effect.fail(error as never),
+	          ),
+	        )
+	      } else {
+	        // More slots still need user answers; reset status so the cockpit slot-fill path stays active.
 	        yield* updateTaskStatus({ taskID: input.taskID, status: "idle" })
 	      }
 	      return result
+	    })
+
+	    const interpretAndApplySlotModification = Effect.fn("Research.interpretAndApplySlotModification")(function* (input: {
+	      taskID: ResearchTaskID
+	      message: string
+	    }) {
+	      const task = yield* getTask(input.taskID)
+	      // Build currentSlots from the fully-merged intent spec so the LLM sees all slot values,
+	      // not just the subset stored in metadata.intentSlots (which may be empty on first reject).
+	      const base = analyzeIntentTask({ task })
+	      const s = base.intentSpec
+	      const currentSlots: Array<{ id: string; label: string; value?: string }> = [
+	        { id: "interaction_mode", label: "交互模式", value: s.interaction_mode },
+	        { id: "forecast_object", label: "预测对象", value: s.forecast_object },
+	        { id: "data_source", label: "数据来源", value: s.data_source },
+	        { id: "target_columns", label: "目标列", value: s.target_columns.length > 0 ? s.target_columns.join(", ") : undefined },
+	        { id: "lookback_window", label: "lookback window", value: s.lookback_window !== undefined ? String(s.lookback_window) : undefined },
+	        { id: "prediction_horizon", label: "预测 horizon", value: s.prediction_horizon.length > 0 ? s.prediction_horizon.join(", ") : undefined },
+	        { id: "time_grain", label: "时间粒度", value: s.time_grain },
+	        { id: "exogenous_variables", label: "外生变量", value: s.exogenous_variables !== undefined ? s.exogenous_variables.join(", ") : undefined },
+	        { id: "business_context", label: "业务背景", value: s.business_context },
+	        { id: "primary_metric", label: "主指标", value: s.primary_metric },
+	        { id: "secondary_metrics", label: "辅助指标", value: s.secondary_metrics.length > 0 ? s.secondary_metrics.join(", ") : undefined },
+	        { id: "error_preferences", label: "误差偏好", value: s.error_preferences },
+	        { id: "latency_budget", label: "延迟预算", value: s.latency_budget !== undefined ? String(s.latency_budget) : undefined },
+	        { id: "parameter_budget", label: "参数预算", value: s.parameter_budget !== undefined ? String(s.parameter_budget) : undefined },
+	        { id: "interpretability", label: "可解释性", value: s.interpretability },
+	        { id: "deployment_target", label: "部署目标", value: s.deployment_target },
+	      ]
+	      const llmResult = yield* Effect.promise(() =>
+	        interpretSlotModificationWithLLM({
+	          message: input.message,
+	          currentSlots,
+	          workspaceRoot: Instance.directory,
+	        }),
+	      )
+	      const llmMeta = {
+	        status: llmResult.status,
+	        provider: llmResult.provider,
+	        model: llmResult.model,
+	        ...(llmResult.error ? { error: llmResult.error } : {}),
+	      }
+	      if (llmResult.status !== "used" || Object.keys(llmResult.updates).length === 0) {
+	        return { ...analyzeIntentTask({ task }), llm: llmMeta }
+	      }
+	      const applied = yield* answerIntentQuestion({ taskID: input.taskID, slots: llmResult.updates as JsonRecord })
+	      return { ...applied, llm: llmMeta }
 	    })
 
 	    const runDataAnalysisAgent = Effect.fn("Research.runDataAnalysisAgent")(function* (input: ProfileTaskInput) {
@@ -6245,22 +6608,35 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        status: "started",
 	      })
 	      return yield* Effect.gen(function* () {
-	        const profile = yield* profileTask(input)
+	        const onDelta = (delta: string): void => {
+	          void Effect.runPromise(
+	            bus.publish(Event.DataAnalysisAgentStreamDelta, {
+	              taskID: input.taskID,
+	              agent: "DataAnalysisAgent",
+	              delta,
+	            }),
+	          ).catch(() => undefined)
+	        }
+	        const profile = yield* profileTask({ ...input, _onDeltaQualitative: onDelta })
 	        const task = yield* getTask(input.taskID)
 	        const artifacts = yield* listArtifacts(input.taskID)
 	        const artifact = artifacts.find(
 	          (item) => item.runID === profile.run.id && item.kind === "dataset_analysis_report",
 	        )
 	        if (!artifact) throw new Error(`Dataset analysis report was not created for task: ${input.taskID}`)
-	        const sourceArtifactIDs = artifacts
-	          .filter(
-	            (item) =>
-	              item.runID === profile.run.id &&
-	              (item.kind === "dataset_quantitative_analysis_markdown" ||
-	                item.kind === "dataset_qualitative_analysis_markdown" ||
-	                item.kind === "dataset_main_analysis_markdown"),
-	          )
-	          .map((item) => item.id)
+	        const sourceArtifacts = artifacts.filter(
+	          (item) =>
+	            item.runID === profile.run.id &&
+	            (item.kind === "dataset_quantitative_analysis_markdown" ||
+	              item.kind === "dataset_qualitative_analysis_markdown" ||
+	              item.kind === "dataset_main_analysis_markdown"),
+	        )
+	        const sourceArtifactIDs = sourceArtifacts.map((item) => item.id)
+	        const qualitativeArtifact = sourceArtifacts.find((item) => item.kind === "dataset_qualitative_analysis_markdown")
+	        const llmUsed = recordValue(qualitativeArtifact?.metadata).llmGenerated === true
+	        const qualitativeText = llmUsed && qualitativeArtifact?.uri.startsWith("file://")
+	          ? yield* Effect.promise(() => readFile(qualitativeArtifact!.uri.slice(7), "utf8").catch(() => undefined))
+	          : undefined
 	        const result = summarizeDataAnalysisAgent({
 	          task,
 	          fingerprint: profile.fingerprint,
@@ -6277,6 +6653,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            sourceArtifactCount: sourceArtifactIDs.length,
 	            warningCount: result.warningCount,
 	            searchBiases: [...result.searchBiases],
+	            llmStatus: llmUsed ? "used" : "skipped",
+	            ...(qualitativeText !== undefined
+	              ? { llmContent: qualitativeText }
+	              : {}),
 	          },
 	        })
 	        return result
@@ -6314,11 +6694,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        const task = yield* getTask(input.taskID)
 	        const runs = yield* listRuns(input.taskID)
 	        const memory = yield* listMemory(input.taskID)
+	        const draftHypotheses = generateHypotheses({ task, dataAnalysis: input.dataAnalysis, runs, memory })
+	        const onDeltaHypo = (delta: string): void => {
+	          void Effect.runPromise(
+	            bus.publish(Event.HypoPlannerAgentStreamDelta, {
+	              taskID: input.taskID,
+	              agent: "HypoPlannerAgent",
+	              delta,
+	            }),
+	          ).catch(() => undefined)
+	        }
+	        const llmHypothesesResult = yield* Effect.promise(() =>
+	          generateLLMHypotheses(task, input.dataAnalysis, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo),
+	        )
+	        const llmHypoUsage = llmHypothesesResult?.usage
 	        const result = buildHypoPlannerResult({
 	          task,
 	          dataAnalysis: input.dataAnalysis,
 	          runs,
 	          memory,
+	          llmHypotheses: llmHypothesesResult?.hypotheses,
 	        })
 	        const outputDir = path.join(
 	          Instance.directory,
@@ -6341,6 +6736,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            agent: "HypoPlannerAgent",
 	            hypothesisCount: result.plan.hypotheses.length,
 	            baselineStrategy: result.plan.baselineStrategy,
+	            llmStatus: result.llm.status,
+	            ...(result.llm.status === "used" && result.plan.hypotheses.length > 0
+	              ? {
+	                  llmPreview: result.plan.hypotheses
+	                    .map((h) => `${h.id}: ${h.statement}`)
+	                    .join("\n"),
+	                }
+	              : {}),
+	            ...(llmHypoUsage && llmHypoUsage.inputTokens > 0 ? usageToMetadata(llmHypoUsage) : {}),
 	          },
 	        })
 	        const yamlArtifact = yield* createArtifact({
@@ -6369,6 +6773,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            planArtifactID: planArtifact.id,
 	            yamlArtifactID: yamlArtifact.id,
 	            baselineStrategy: result.plan.baselineStrategy,
+	            llmStatus: result.llm.status,
+	            ...(result.llm.status === "used" && result.plan.hypotheses.length > 0
+	              ? {
+	                  llmPreview: result.plan.hypotheses
+	                    .map((h) => `${h.id}: ${h.statement}`)
+	                    .join("\n"),
+	                }
+	              : {}),
 	          },
 	        })
 	        return result
@@ -6646,11 +7058,48 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	          status: "completed",
 	          metadata: {
 	            ...baseMetadata,
+	            llmStatus: result.llm.status,
+	            ...(result.llm.status === "used" && result.llm.text
+	              ? { llmNarrative: result.llm.text.slice(0, 400) }
+	              : {}),
 	            reflectionNotesArtifactID: notesArtifact.id,
 	            nextExperimentPlanArtifactID: planArtifact.id,
 	            failureLogArtifactID: failureLogArtifact.id,
 	          },
 	        })
+	        // Persist reflection insights into experience memory so future iterations can learn from them.
+	        yield* createMemory({
+	          taskID: task.id,
+	          domainID: task.domainID,
+	          fingerprintSummary: {
+	            ...DomainRegistry.summarizeTask(task.domainID, task.taskSpec),
+	            taskID: task.id,
+	            domainID: task.domainID,
+	            primaryMetricName: result.analysis.primaryMetricName,
+	            direction: result.analysis.direction,
+	          },
+	          candidateSummary: {
+	            role: "reflection",
+	            decision: result.analysis.decision,
+	            decisionReason: result.analysis.decisionReason,
+	            plateauStreak: result.analysis.plateauStreak,
+	            succeededRuns: result.analysis.succeededRuns,
+	            failedRuns: result.analysis.failedRuns,
+	            bestMetric: result.analysis.bestMetric ?? null,
+	            nextHypotheses: result.analysis.nextHypotheses.map((h) => h.title),
+	            failureCategories: result.analysis.failures.map((f) => f.category),
+	            ...(result.llm.status === "used" && result.llm.text
+	              ? { llmNarrative: result.llm.text.slice(0, 400) }
+	              : {}),
+	          },
+	          outcome:
+	            result.analysis.effectiveChanges.length > 0
+	              ? "accepted"
+	              : result.analysis.decision === "request_human"
+	                ? "failed"
+	                : "rejected",
+	          lesson: buildReflectionMemoryLesson(result),
+	        }).pipe(Effect.catchCause(() => Effect.void))
 	        return result
 	      }).pipe(
 	        Effect.catchCause((cause) =>
@@ -6678,12 +7127,110 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        status: "started",
 	      })
 	      return yield* Effect.gen(function* () {
+        // Run ref_test on champion before export so the result lands in the report.
+        const publishChampion = yield* getChampion(input.taskID)
+        if (publishChampion !== undefined) {
+          const existingRuns = yield* listRuns(input.taskID)
+          const hasRefTest = existingRuns.some(
+            (r) =>
+              r.candidateID === publishChampion.candidateID &&
+              r.stage === "ref_test" &&
+              r.status === "succeeded",
+          )
+          if (!hasRefTest) {
+            yield* Effect.gen(function* () {
+              const pendingApprovals = yield* listApprovals({
+                taskID: input.taskID,
+                status: "pending",
+              })
+              const existingPending = pendingApprovals.find(
+                (a) => a.kind === "ref_test" && a.candidateID === publishChampion.candidateID,
+              )
+              const approval =
+                existingPending !== undefined
+                  ? existingPending
+                  : yield* createApproval({
+                      taskID: input.taskID,
+                      candidateID: publishChampion.candidateID,
+                      kind: "ref_test",
+                      reason: "Auto-approved by PublishAgent for final reference test evaluation.",
+                    })
+              yield* replyApproval({
+                approvalID: approval.id,
+                status: "approved",
+                replyMessage: "Auto-approved by PublishAgent.",
+              })
+              yield* executeRun({
+                taskID: input.taskID,
+                candidateID: publishChampion.candidateID,
+                stage: "ref_test",
+                description: "Final reference test by PublishAgent.",
+              })
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  const error = Cause.squash(cause)
+                  yield* bus.publish(Event.PublishAgentFailed, {
+                    taskID: input.taskID,
+                    agent: "PublishAgent",
+                    stage: "publishing",
+                    status: "failed",
+                    metadata: {
+                      ...errorMetadata(error),
+                      refTestSkipped: true,
+                      reason: "ref_test failed and was skipped; export will proceed without ref_test metrics.",
+                    },
+                  })
+                }),
+              ),
+            )
+          }
+        }
 	        const exportResult = yield* exportTaskArtifact({
 	          ...input,
 	          kind: input.kind ?? "model_export_package",
 	        })
 	        const result = summarizePublishAgent({ taskID: input.taskID, exportResult })
 	        yield* updateTaskStatus({ taskID: input.taskID, status: "completed" })
+	        const finalChampion = yield* getChampion(input.taskID)
+	        const finalChampionCandidate =
+	          finalChampion !== undefined
+	            ? yield* getCandidateForTask(input.taskID, finalChampion.candidateID).pipe(
+	                Effect.orElseSucceed((): ResearchCandidate | undefined => undefined),
+	              )
+	            : undefined
+	        const spec =
+	          finalChampionCandidate !== undefined
+	            ? (finalChampionCandidate.candidateSpec as Record<string, unknown>)
+	            : undefined
+	        const backboneType =
+	          spec?.backbone && typeof spec.backbone === "object" && !Array.isArray(spec.backbone)
+	            ? ((spec.backbone as Record<string, unknown>).type as string | undefined)
+	            : undefined
+	        const embeddingType =
+	          spec?.embedding && typeof spec.embedding === "object" && !Array.isArray(spec.embedding)
+	            ? ((spec.embedding as Record<string, unknown>).type as string | undefined)
+	            : undefined
+	        const recipeIDStr =
+	          spec?.recipeID !== undefined && spec.recipeID !== null ? String(spec.recipeID) : undefined
+	        const finalRuns = finalChampion !== undefined ? yield* listRuns(input.taskID) : []
+	        const finalRefTestRun =
+	          finalChampion !== undefined
+	            ? finalRuns.find(
+	                (r) =>
+	                  r.candidateID === finalChampion.candidateID &&
+	                  r.stage === "ref_test" &&
+	                  r.status === "succeeded",
+	              )
+	            : undefined
+	        const finalRefTestMetrics: Record<string, number> | undefined =
+	          finalRefTestRun !== undefined
+	            ? Object.fromEntries(
+	                Object.entries(finalRefTestRun.metrics as Record<string, unknown>)
+	                  .filter(([k, v]) => k.startsWith("ref_test_") && typeof v === "number")
+	                  .map(([k, v]) => [k, v as number]),
+	              )
+	            : undefined
 	        yield* bus.publish(Event.PublishAgentCompleted, {
 	          taskID: input.taskID,
 	          agent: "PublishAgent",
@@ -6693,6 +7240,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            artifactID: result.artifact.id,
 	            kind: result.artifact.kind,
 	            path: result.path,
+	            ...(finalChampion !== undefined
+	              ? {
+	                  championCandidateID: String(finalChampion.candidateID),
+	                  championPrimaryMetric: finalChampion.primaryMetric,
+	                  championUtility: finalChampion.utility,
+	                }
+	              : {}),
+	            ...(finalRefTestMetrics !== undefined ? { refTestMetrics: finalRefTestMetrics } : {}),
+	            ...(recipeIDStr !== undefined ? { recipeID: recipeIDStr } : {}),
+	            ...(embeddingType !== undefined ? { embeddingType } : {}),
+	            ...(backboneType !== undefined ? { backboneType } : {}),
 	          },
 	        })
 	        return result
@@ -6935,17 +7493,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         workflow.lastCheckpoint === "requirements_confirmed" ||
         workflow.completedPhases.some((phase) => phase !== "intent_gathering")
       if (!intentAlreadyConfirmed && !workflow.completedPhases.includes("intent_gathering")) {
-        const intentCheckpoint = yield* ensureIntentCheckpoint({
-          task,
-          reason: buildIntentCheckpointReason(task),
-        })
-        if (intentCheckpoint.status === "pending") {
-          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
-          throw new PipelineBlockedError({
-            taskID: input.taskID,
-            reason: "human_checkpoint_required",
-            checkpointPhase: "intent_confirmed",
+        // Both companion and socratic modes pause for human confirmation after intent gathering.
+        if (intent.intentSpec.interaction_mode === "companion" || intent.intentSpec.interaction_mode === "socratic") {
+          const intentCheckpoint = yield* ensureIntentCheckpoint({
+            task,
+            reason: buildIntentCheckpointReason(task),
           })
+          if (intentCheckpoint.status === "pending") {
+            yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+            throw new PipelineBlockedError({
+              taskID: input.taskID,
+              reason: "human_checkpoint_required",
+              checkpointPhase: "intent_confirmed",
+            })
+          }
         }
         yield* updateTaskWorkflow({
           taskID: input.taskID,
@@ -6991,7 +7552,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
       const currentTask = yield* getTask(input.taskID)
       const currentWorkflow = workflowMetadataFromTask(currentTask)
-      const shouldRunSearchSpaceCheckpoint = intent.intentSpec.interaction_mode === "companion" && !currentWorkflow.completedPhases.includes("searching")
+      const shouldRunSearchSpaceCheckpoint = (intent.intentSpec.interaction_mode === "companion" || intent.intentSpec.interaction_mode === "socratic") && !currentWorkflow.completedPhases.includes("searching")
       if (shouldRunSearchSpaceCheckpoint) {
         const fingerprint = DomainRegistry.summarizeTask(currentTask.domainID, currentTask.taskSpec)
         const biases = (Array.isArray(fingerprint.searchBiases) ? fingerprint.searchBiases : []).join(", ") || "none"
@@ -6999,7 +7560,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         const baselineList = baselines
           .map((b) => {
             const spec = b.candidateSpec as Record<string, unknown>
-            return `- ${typeof spec.recipeID === "string" ? spec.recipeID : "candidate"}: ${b.rationale?.slice(0, 80) ?? ""}`
+            const recipeID = typeof spec.recipeID === "string" ? spec.recipeID : "candidate"
+            const emb =
+              spec.embedding && typeof spec.embedding === "object" && !Array.isArray(spec.embedding)
+                ? ((spec.embedding as Record<string, unknown>).type as string | undefined)
+                : undefined
+            const bb =
+              spec.backbone && typeof spec.backbone === "object" && !Array.isArray(spec.backbone)
+                ? ((spec.backbone as Record<string, unknown>).type as string | undefined)
+                : undefined
+            const arch = [emb ?? "none", bb].filter(Boolean).join("+")
+            const rationale = b.rationale?.slice(0, 90) ?? ""
+            return `- ${recipeID} (${arch}): ${rationale}`
           })
           .join("\n")
         const ssCheckpoint = yield* ensureHumanCheckpoint({
@@ -7033,7 +7605,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         })
       }
 
-      const nas = currentWorkflow.completedPhases.includes("searching")
+      let nas = currentWorkflow.completedPhases.includes("searching")
         ? yield* recoverNAS(currentTask)
         : yield* Effect.gen(function* () {
             const nasTask = yield* getTask(input.taskID)
@@ -7061,8 +7633,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             return result
           })
 
-      if (intent.intentSpec.interaction_mode === "companion") {
-        if (nas.loop.stoppedReason === "max_iterations") {
+      if (intent.intentSpec.interaction_mode === "companion" || intent.intentSpec.interaction_mode === "socratic") {
+        const nasAlreadyExtended = currentWorkflow.completedPhases.includes("nas_budget_extended")
+        if (!nasAlreadyExtended && nas.loop.stoppedReason === "max_iterations") {
           const budgetCheckpoint = yield* ensureHumanCheckpoint({
             taskID: input.taskID,
             phase: "experiment_budget_extended",
@@ -7072,9 +7645,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               `**完成迭代：** ${nas.iterationCount} 轮`,
               `**成功运行：** ${nas.succeededCount}，**失败：** ${nas.failedCount}`,
               "",
+              nas.leaderboardMarkdown.replace(/^# Leaderboard/, "### 当前工作区实验结果"),
               "**建议操作：** approve 继续搜索（将增加 maxIterations），reject 接受当前结果。",
             ].join("\n"),
           })
+          yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "experiment_budget_extended" })
           if (budgetCheckpoint.status === "pending") {
             yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
             throw new PipelineBlockedError({
@@ -7083,7 +7658,21 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               checkpointPhase: "experiment_budget_extended",
             })
           }
-          yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "experiment_budget_extended" })
+          if (budgetCheckpoint.status === "approved") {
+            nas = yield* runNASAgent({
+              taskID: input.taskID,
+              stage: input.stage,
+              description: input.description,
+              maxIterations: (input.maxIterations ?? 10) + 5,
+              targetMetricValue: input.targetMetricValue,
+              minRelativeImprovement: input.minRelativeImprovement,
+              maxNoImprove: input.maxNoImprove,
+              timeBudgetSeconds: input.timeBudgetSeconds,
+              maxCrashStreak: input.maxCrashStreak ?? 3,
+              explorationRate: input.explorationRate,
+            })
+            yield* markWorkflowPhase("nas_budget_extended")
+          }
         }
         const champion = yield* getChampion(input.taskID)
         const finalCheckpoint = yield* ensureHumanCheckpoint({
@@ -7095,14 +7684,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             champion
               ? [
                   `**当前 Champion：** ${champion.candidateID}`,
-                  `**Primary metric：** ${champion.primaryMetric}`,
-                  `**Utility score：** ${champion.utility}`,
+                  `**Primary metric：** ${champion.primaryMetric.toFixed(4)}`,
+                  `**Utility score：** ${champion.utility.toFixed(3)}`,
                 ].join("\n")
               : "**当前无 Champion**（所有 run 均未成功）",
+            "",
+            nas.leaderboardMarkdown.replace(/^# Leaderboard/m, "### 验证集排行榜（所有候选模型）"),
             "",
             "**建议操作：** approve 接受此模型并进入反思与发布阶段，reject 中止发布。",
           ].join("\n"),
         })
+        yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
         if (finalCheckpoint.status === "pending") {
           yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
           throw new PipelineBlockedError({
@@ -7111,7 +7703,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             checkpointPhase: "final_model_selection",
           })
         }
-        yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
       }
 
       const reflection = currentWorkflow.completedPhases.includes("reflection")
@@ -7122,7 +7713,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             stoppedReason: nas.loop.stoppedReason,
           })
 
-      if (reflection.analysis.decision === "request_human") {
+      if (reflection.analysis.decision === "request_human" && !currentWorkflow.completedPhases.includes("reflection")) {
+        yield* markWorkflowPhase("reflection")
         yield* ensurePendingApproval({
           taskID: input.taskID,
           kind: "protocol",
@@ -7170,6 +7762,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           })
         }
         yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "report_release" })
+        yield* updateTaskStatus({ taskID: input.taskID, status: "completed" })
       }
 
       const completed = yield* getTask(input.taskID)
@@ -7304,6 +7897,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       runAutonomousLoop,
       runIntentAgent,
       answerIntentQuestion,
+      interpretAndApplySlotModification,
       runDataAnalysisAgent,
       runHypoPlannerAgent,
       runNASAgent,
@@ -7311,6 +7905,34 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       runReflectionAgent,
       runPublishAgent,
       runFullPipeline,
+      getResearchLLMStatus: Effect.fn("Research.getResearchLLMStatus")(function* () {
+        const config = yield* Effect.promise(() => resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory }))
+        const envKey = apiKeyFor(config)
+        if (envKey) {
+          return {
+            status: "ready",
+            provider: config.provider,
+            model: config.model,
+            source: "env_var",
+          } satisfies ResearchLLMStatus
+        }
+        const authEntry = yield* Effect.promise(() => resolveApiKeyFromAuthJson())
+        if (authEntry) {
+          const isAnthropicNative = !authEntry.baseURL
+          return {
+            status: "ready",
+            provider: isAnthropicNative ? "anthropic" : "openai-compatible",
+            model: isAnthropicNative ? config.model : authEntry.model,
+            source: "auth_json",
+          } satisfies ResearchLLMStatus
+        }
+        return {
+          status: "not_configured",
+          provider: config.provider,
+          model: config.model,
+          source: "unconfigured",
+        } satisfies ResearchLLMStatus
+      }),
       createRun,
       updateRunStatus,
       listRuns,

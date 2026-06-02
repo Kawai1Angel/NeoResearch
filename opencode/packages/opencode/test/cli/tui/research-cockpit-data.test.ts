@@ -1475,18 +1475,18 @@ describe("research cockpit data helpers", () => {
       ],
     )
     expect(result.active).toBe(true)
-    expect(result.missingSlots).toEqual(["dataset.path", "dataset.targetCols"])
+    expect(result.missingSlots).toEqual(["data_source", "target_columns"])
     expect(result.nextQuestion).toBe("NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
     expect(result.questionCount).toBe(2)
     expect(result.slots).toHaveLength(15)
-    expect(result.slots.find((s) => s.id === "dataset.path")).toMatchObject({
-      id: "dataset.path",
+    expect(result.slots.find((s) => s.id === "data_source")).toMatchObject({
+      id: "data_source",
       label: "CSV 数据集路径",
       question: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
       status: "missing",
     })
-    expect(result.slots.find((s) => s.id === "dataset.targetCols")).toMatchObject({
-      id: "dataset.targetCols",
+    expect(result.slots.find((s) => s.id === "target_columns")).toMatchObject({
+      id: "target_columns",
       label: "目标列",
       question: "需要预测哪些目标列？",
       status: "missing",
@@ -1496,8 +1496,8 @@ describe("research cockpit data helpers", () => {
       status: "filled",
       value: "socratic",
     })
-    expect(result.slots.find((s) => s.id === "objective.secondaryMetrics")).toMatchObject({
-      id: "objective.secondaryMetrics",
+    expect(result.slots.find((s) => s.id === "secondary_metrics")).toMatchObject({
+      id: "secondary_metrics",
       required: false,
       status: "filled",
     })
@@ -1519,24 +1519,24 @@ describe("research cockpit data helpers", () => {
     )
     expect(result.active).toBe(false)
     expect(result.slots).toHaveLength(15)
-    expect(result.missingSlots).toContain("objective.primaryMetric")
-    expect(result.missingSlots).not.toContain("dataset.path")
-    expect(result.missingSlots).not.toContain("dataset.targetCols")
-    expect(result.missingSlots).not.toContain("predictionLengths")
+    expect(result.missingSlots).toContain("primary_metric")
+    expect(result.missingSlots).not.toContain("data_source")
+    expect(result.missingSlots).not.toContain("target_columns")
+    expect(result.missingSlots).not.toContain("prediction_horizon")
     expect(result.missingSlots).not.toContain("interaction_mode")
-    expect(result.slots.find((s) => s.id === "dataset.path")).toMatchObject({
+    expect(result.slots.find((s) => s.id === "data_source")).toMatchObject({
       status: "filled",
       value: "/tmp/ETTh1.csv",
     })
-    expect(result.slots.find((s) => s.id === "dataset.targetCols")).toMatchObject({
+    expect(result.slots.find((s) => s.id === "target_columns")).toMatchObject({
       status: "filled",
       value: "OT",
     })
-    expect(result.slots.find((s) => s.id === "predictionLengths")).toMatchObject({
+    expect(result.slots.find((s) => s.id === "prediction_horizon")).toMatchObject({
       status: "filled",
       value: "24",
     })
-    expect(result.slots.find((s) => s.id === "objective.primaryMetric")).toMatchObject({
+    expect(result.slots.find((s) => s.id === "primary_metric")).toMatchObject({
       label: "主指标",
       question: "模型搜索应该优化哪个验证指标？",
       status: "missing",

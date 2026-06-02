@@ -183,7 +183,13 @@ function collectedIntentSlots(task: ResearchTask) {
   const metaIntentSlots = recordValue(metadata.intentSlots)
   const mergedSlots = { ...intentSlots, ...metaIntentSlots }
   const interactionMode = interactionModeForTask(task)
-  const targetColumns = stringArray(firstKnown(dataset.targetCols, mergedSlots.target_columns))
+  const targetColumns = (() => {
+    const raw = firstKnown(dataset.targetCols, mergedSlots.target_columns)
+    if (Array.isArray(raw)) return stringArray(raw)
+    if (typeof raw === "string" && raw.trim().length > 0)
+      return raw.trim().split(/\s*,\s*/).filter((s) => s.length > 0)
+    return []
+  })()
   const exogenousVariables = firstKnown(
     mergedSlots.exogenous_variables,
     dataset.exogenousCols,
@@ -698,7 +704,7 @@ export async function analyzeIntentTaskWithLLM(input: {
     })
   }
   try {
-    const text = await requestNeoCastLLM(config, apiKey, llmSystemPrompt(), llmPrompt({ task: input.task, base }))
+    const { text } = await requestNeoCastLLM(config, apiKey, llmSystemPrompt(), llmPrompt({ task: input.task, base }))
     const payload = extractJsonObject(text)
     return buildResult({
       task: input.task,
@@ -721,5 +727,132 @@ export async function analyzeIntentTaskWithLLM(input: {
         error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
       },
     })
+  }
+}
+
+// Canonical snake_case names for all 16 intent slots.
+const SLOT_KEY_ALIASES: Record<string, string> = {
+  interactionMode: "interaction_mode",
+  forecastObject: "forecast_object",
+  dataSource: "data_source",
+  targetColumns: "target_columns",
+  lookbackWindow: "lookback_window",
+  predictionHorizon: "prediction_horizon",
+  timeGrain: "time_grain",
+  exogenousVariables: "exogenous_variables",
+  businessContext: "business_context",
+  primaryMetric: "primary_metric",
+  secondaryMetrics: "secondary_metrics",
+  errorPreferences: "error_preferences",
+  latencyBudget: "latency_budget",
+  parameterBudget: "parameter_budget",
+  deploymentTarget: "deployment_target",
+}
+
+export function normalizeIntentSlotKeys(slots: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(slots)) {
+    const canonical = SLOT_KEY_ALIASES[key] ?? key
+    result[canonical] = value
+  }
+  return result
+}
+
+function coerceSlotValue(value: unknown): unknown {
+  if (typeof value !== "string") return value
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return trimmed
+  const num = Number(trimmed)
+  if (Number.isFinite(num)) return num
+  // comma-separated numbers → number array
+  if (/^\d[\d\s,]*\d$/.test(trimmed)) {
+    const parts = trimmed.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n))
+    if (parts.length > 1) return parts
+  }
+  return trimmed
+}
+
+export async function parseSlotInputsWithLLM(input: {
+  readonly slots: Record<string, unknown>
+  readonly clarifyingQuestions: readonly string[]
+  readonly workspaceRoot: string
+}): Promise<Record<string, unknown>> {
+  // Lightweight coercion (no LLM needed for simple numeric / array values)
+  const coerced: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(input.slots)) {
+    coerced[key] = coerceSlotValue(value)
+  }
+  const config = await resolveNeoCastLLMConfig({ workspaceRoot: input.workspaceRoot })
+  const apiKey = apiKeyFor(config)
+  if (!apiKey) return coerced
+  try {
+    const system = [
+      "You are a slot-value parser for a time-series forecasting intent system.",
+      "Given a map of slot IDs to raw user answers, parse each value into a typed JSON value.",
+      "Rules: parse bare numbers as JSON numbers; comma-separated numbers as JSON arrays of numbers;",
+      "       lists / bracket notation as JSON arrays; everything else as a string.",
+      "Return exactly one JSON object mapping slot IDs to parsed values.",
+      "Only include slots that have non-empty, meaningful values.",
+    ].join("\n")
+    const user = JSON.stringify(
+      { slots: input.slots, clarifyingQuestions: input.clarifyingQuestions },
+      null,
+      2,
+    )
+    const { text } = await requestNeoCastLLM(config, apiKey, system, user)
+    const parsed = extractJsonObject(text)
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { ...coerced, ...recordValue(parsed) }
+    }
+  } catch {
+    // fall through to coerced result
+  }
+  return coerced
+}
+
+export async function interpretSlotModificationWithLLM(input: {
+  readonly message: string
+  readonly currentSlots: readonly { id: string; label: string; value?: string }[]
+  readonly workspaceRoot: string
+}): Promise<{
+  readonly status: "disabled" | "not_configured" | "used" | "failed"
+  readonly provider?: string
+  readonly model?: string
+  readonly error?: string
+  readonly updates: Record<string, unknown>
+}> {
+  const config = await resolveNeoCastLLMConfig({ workspaceRoot: input.workspaceRoot })
+  const apiKey = apiKeyFor(config)
+  if (!apiKey) return { status: "not_configured", provider: config.provider, model: config.model, updates: {} }
+  const system = [
+    "You are a slot-update interpreter for a time-series forecasting research system.",
+    "The user sent a natural-language message (Chinese or English) expressing intent to modify research parameters.",
+    "Given the current slot values and the message, determine which slots should be updated.",
+    "Return exactly one JSON object: { \"updates\": { \"slot_id\": new_value, ... } }.",
+    "Only include slots the user clearly wants to change. Values must be typed (numbers, arrays, or strings).",
+    "Do not invent values not implied by the message.",
+  ].join("\n")
+  const user = JSON.stringify(
+    {
+      message: input.message,
+      currentSlots: input.currentSlots.map((s) => ({ id: s.id, label: s.label, currentValue: s.value ?? null })),
+    },
+    null,
+    2,
+  )
+  try {
+    const { text } = await requestNeoCastLLM(config, apiKey, system, user)
+    const parsed = extractJsonObject(text)
+    const record = recordValue(parsed)
+    const updates = recordValue(firstKnown(record.updates, record.slots, record.changes))
+    return { status: "used", provider: config.provider, model: config.model, updates }
+  } catch (error) {
+    return {
+      status: "failed",
+      provider: config.provider,
+      model: config.model,
+      error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+      updates: {},
+    }
   }
 }
