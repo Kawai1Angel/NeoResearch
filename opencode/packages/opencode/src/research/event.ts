@@ -54,6 +54,12 @@ export class ResearchAgentStreamDelta extends Schema.Class<ResearchAgentStreamDe
   delta: Schema.String,
 }) {}
 
+export class ResearchCheckpointAutoApproved extends Schema.Class<ResearchCheckpointAutoApproved>("ResearchCheckpointAutoApproved")({
+  taskID: ResearchTaskID,
+  phase: Schema.String,
+  reason: Schema.String,
+}) {}
+
 export class ResearchRunnerProgressLine extends Schema.Class<ResearchRunnerProgressLine>("ResearchRunnerProgressLine")({
   taskID: ResearchTaskID,
   runID: Schema.String,
@@ -102,4 +108,5 @@ export const Event = {
   RunVerified: BusEvent.define("research.run.verified", ResearchAgentStageChanged),
   RunRejectedByVerifier: BusEvent.define("research.run.rejected_by_verifier", ResearchAgentStageChanged),
   ModelDesignerCompleted: BusEvent.define("research.agent.modelDesigner.completed", ResearchAgentStageChanged),
+  CheckpointAutoApproved: BusEvent.define("research.checkpoint.auto_approved", ResearchCheckpointAutoApproved),
 }

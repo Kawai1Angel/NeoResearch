@@ -410,6 +410,35 @@ export const ResearchRoutes = lazy(() =>
           return result
         }),
     )
+    .post(
+      "/tasks/:taskID/intent/modify",
+      describeRoute({
+        summary: "Modify intent slots via natural language",
+        description: "Interpret a natural-language modification message and apply the resulting slot updates to the research task intent spec.",
+        operationId: "research.tasks.modifyIntent",
+        responses: {
+          200: {
+            description: "Updated intent agent result",
+            content: {
+              "application/json": {
+                schema: resolver(Research.JsonRecord.zod),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator("json", z.object({ message: z.string() })),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.modifyIntent", c, function* () {
+          const svc = yield* Research.Service
+          return yield* svc.interpretAndApplySlotModification({
+            taskID: c.req.valid("param").taskID,
+            message: c.req.valid("json").message,
+          })
+        }),
+    )
     .patch(
       "/tasks/:taskID/status",
       describeRoute({

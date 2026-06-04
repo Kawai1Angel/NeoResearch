@@ -1,5 +1,6 @@
 # Local scratch directory; do not ignore src/research or test/research.
 /research
+/dataset
 dist
 dist-*
 gen

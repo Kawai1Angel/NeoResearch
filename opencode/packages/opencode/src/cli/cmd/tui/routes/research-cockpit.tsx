@@ -1774,6 +1774,23 @@ export function ResearchCockpit() {
         }
       }
     }
+    if (researchPayload.type === "research.checkpoint.auto_approved") {
+      const data = researchPayload.properties as { taskID?: string; phase?: string; reason?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const phase = data?.phase ?? "checkpoint"
+      const reasonLines = (data?.reason ?? "")
+        .split("\n")
+        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+      setDesignLLMLines((prev) => [
+        ...prev,
+        { id: ++streamEventID, taskID, text: `[Checkpoint:${phase}] ✓ auto-approved`, tone: "muted" as const },
+        ...reasonLines.map((l) => ({ id: ++streamEventID, taskID, text: `  ${l}`, tone: "muted" as const })),
+      ])
+      setRefresh((value) => value + 1)
+      return
+    }
     if (!shouldRefreshResearchCockpitOnEvent(researchPayload)) return
     setRefresh((value) => value + 1)
   })
@@ -3893,12 +3910,15 @@ export function ResearchCockpit() {
           })
           .filter((item): item is { id: string; text: string; tone: "muted" | "warning" } => item !== undefined)
       : []
-    if (run && (run.status !== "running" || liveRunnerLines.length === 0)) {
+    const approval = pendingApproval()
+    const isFinalModelSelectionPending =
+      !!approval && /\[checkpoint:final_model_selection\]/.test(approval.reason)
+    if (run && !isFinalModelSelectionPending && (run.status !== "running" || liveRunnerLines.length === 0)) {
       for (const item of persistedRunnerLines) {
         lines.push({ id: item.id, text: item.text, tone: item.tone })
       }
     }
-    if (run?.status === "running") {
+    if (run?.status === "running" && !isFinalModelSelectionPending) {
       for (const item of liveRunnerLines) {
         lines.push({ id: `runner-${item.id}`, text: item.text, tone: item.tone })
       }
@@ -3919,7 +3939,6 @@ export function ResearchCockpit() {
         })
       }
     }
-    const approval = pendingApproval()
     const clarification = socraticClarification()
     if (clarification.active) {
       // Socratic clarification takes highest priority — must resolve slots before pipeline can proceed

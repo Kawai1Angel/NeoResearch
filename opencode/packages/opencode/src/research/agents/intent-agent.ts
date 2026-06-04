@@ -1,5 +1,5 @@
 import type { JsonRecord, ResearchTask, ResearchTaskID } from "../schema"
-import { apiKeyFor, extractJsonObject, requestNeoCastLLM, resolveNeoCastLLMConfig } from "../llm-proposal"
+import { extractJsonObject, requestNeoCastLLM, resolveEffectiveLLMConfig } from "../llm-proposal"
 
 export type IntentInteractionMode = "socratic" | "companion"
 
@@ -687,22 +687,14 @@ export async function analyzeIntentTaskWithLLM(input: {
 }): Promise<IntentAgentResult> {
   const base = analyzeIntentTask({ task: input.task })
   if (!shouldUseLLM(input.task)) return base
-  const config = await resolveNeoCastLLMConfig({ workspaceRoot: input.workspaceRoot })
-  const apiKey = apiKeyFor(config)
-  if (!apiKey) {
+  const resolved = await resolveEffectiveLLMConfig({ workspaceRoot: input.workspaceRoot })
+  if (!resolved) {
     return buildResult({
       task: input.task,
-      llm: {
-        status: "not_configured",
-        provider: config.provider,
-        model: config.model,
-        error:
-          config.provider === "anthropic"
-            ? "ANTHROPIC_API_KEY is not set"
-            : "NEO_CAST_LLM_API_KEY, OPENAI_API_KEY, or AIGCBEST_API_KEY is not set",
-      },
+      llm: { status: "not_configured" },
     })
   }
+  const { apiKey, config } = resolved
   try {
     const { text } = await requestNeoCastLLM(config, apiKey, llmSystemPrompt(), llmPrompt({ task: input.task, base }))
     const payload = extractJsonObject(text)
@@ -782,9 +774,9 @@ export async function parseSlotInputsWithLLM(input: {
   for (const [key, value] of Object.entries(input.slots)) {
     coerced[key] = coerceSlotValue(value)
   }
-  const config = await resolveNeoCastLLMConfig({ workspaceRoot: input.workspaceRoot })
-  const apiKey = apiKeyFor(config)
-  if (!apiKey) return coerced
+  const resolved = await resolveEffectiveLLMConfig({ workspaceRoot: input.workspaceRoot })
+  if (!resolved) return coerced
+  const { apiKey, config } = resolved
   try {
     const system = [
       "You are a slot-value parser for a time-series forecasting intent system.",
@@ -821,9 +813,9 @@ export async function interpretSlotModificationWithLLM(input: {
   readonly error?: string
   readonly updates: Record<string, unknown>
 }> {
-  const config = await resolveNeoCastLLMConfig({ workspaceRoot: input.workspaceRoot })
-  const apiKey = apiKeyFor(config)
-  if (!apiKey) return { status: "not_configured", provider: config.provider, model: config.model, updates: {} }
+  const resolved = await resolveEffectiveLLMConfig({ workspaceRoot: input.workspaceRoot })
+  if (!resolved) return { status: "not_configured", updates: {} }
+  const { apiKey, config } = resolved
   const system = [
     "You are a slot-update interpreter for a time-series forecasting research system.",
     "The user sent a natural-language message (Chinese or English) expressing intent to modify research parameters.",

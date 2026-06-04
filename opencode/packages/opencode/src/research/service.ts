@@ -7552,8 +7552,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
       const currentTask = yield* getTask(input.taskID)
       const currentWorkflow = workflowMetadataFromTask(currentTask)
-      const shouldRunSearchSpaceCheckpoint = (intent.intentSpec.interaction_mode === "companion" || intent.intentSpec.interaction_mode === "socratic") && !currentWorkflow.completedPhases.includes("searching")
-      if (shouldRunSearchSpaceCheckpoint) {
+      const isSocratic = intent.intentSpec.interaction_mode === "socratic"
+      const shouldRunSearchSpaceCheckpoint = intent.intentSpec.interaction_mode === "companion" && !currentWorkflow.completedPhases.includes("searching")
+      const shouldEmitSocraticSearchSpace = isSocratic && !currentWorkflow.completedPhases.includes("searching")
+      if (shouldRunSearchSpaceCheckpoint || shouldEmitSocraticSearchSpace) {
         const fingerprint = DomainRegistry.summarizeTask(currentTask.domainID, currentTask.taskSpec)
         const biases = (Array.isArray(fingerprint.searchBiases) ? fingerprint.searchBiases : []).join(", ") || "none"
         const baselines = DomainRegistry.buildBaselines(currentTask.domainID, currentTask.taskSpec)
@@ -7574,35 +7576,44 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             return `- ${recipeID} (${arch}): ${rationale}`
           })
           .join("\n")
-        const ssCheckpoint = yield* ensureHumanCheckpoint({
-          taskID: input.taskID,
-          phase: "search_space_confirmed",
-          reason: [
-            "## 搜索空间已确认，等待确认后开始模型搜索",
-            "",
-            "**搜索偏置：** " + biases,
-            "",
-            "**计划 Baseline 方案：**",
-            baselineList,
-            "",
-            "**建议操作：** 确认搜索方向正确后 approve，或 reject 并调整 taskSpec 后重新运行。",
-          ].join("\n"),
-        })
-        if (ssCheckpoint.status === "pending") {
-          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
-          throw new PipelineBlockedError({
+        const ssReason = [
+          "## 搜索空间已确认，等待确认后开始模型搜索",
+          "",
+          "**搜索偏置：** " + biases,
+          "",
+          "**计划 Baseline 方案：**",
+          baselineList,
+          "",
+          "**建议操作：** 确认搜索方向正确后 approve，或 reject 并调整 taskSpec 后重新运行。",
+        ].join("\n")
+        if (shouldRunSearchSpaceCheckpoint) {
+          const ssCheckpoint = yield* ensureHumanCheckpoint({
             taskID: input.taskID,
-            reason: "human_checkpoint_required",
-            checkpointPhase: "search_space_confirmed",
+            phase: "search_space_confirmed",
+            reason: ssReason,
+          })
+          if (ssCheckpoint.status === "pending") {
+            yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+            throw new PipelineBlockedError({
+              taskID: input.taskID,
+              reason: "human_checkpoint_required",
+              checkpointPhase: "search_space_confirmed",
+            })
+          }
+          yield* updateTaskWorkflow({
+            taskID: input.taskID,
+            completedPhases: currentWorkflow.completedPhases.includes("searching")
+              ? currentWorkflow.completedPhases
+              : [...currentWorkflow.completedPhases, "searching"],
+            lastCheckpoint: "search_space_confirmed",
+          })
+        } else {
+          yield* bus.publish(Event.CheckpointAutoApproved, {
+            taskID: input.taskID,
+            phase: "search_space_confirmed",
+            reason: ssReason,
           })
         }
-        yield* updateTaskWorkflow({
-          taskID: input.taskID,
-          completedPhases: currentWorkflow.completedPhases.includes("searching")
-            ? currentWorkflow.completedPhases
-            : [...currentWorkflow.completedPhases, "searching"],
-          lastCheckpoint: "search_space_confirmed",
-        })
       }
 
       let nas = currentWorkflow.completedPhases.includes("searching")
@@ -7633,7 +7644,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             return result
           })
 
-      if (intent.intentSpec.interaction_mode === "companion" || intent.intentSpec.interaction_mode === "socratic") {
+      if (intent.intentSpec.interaction_mode === "companion") {
         const nasAlreadyExtended = currentWorkflow.completedPhases.includes("nas_budget_extended")
         if (!nasAlreadyExtended && nas.loop.stoppedReason === "max_iterations") {
           const budgetCheckpoint = yield* ensureHumanCheckpoint({
@@ -7703,6 +7714,55 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             checkpointPhase: "final_model_selection",
           })
         }
+      }
+      if (intent.intentSpec.interaction_mode === "socratic") {
+        const nasAlreadyExtended = currentWorkflow.completedPhases.includes("nas_budget_extended")
+        if (!nasAlreadyExtended && nas.loop.stoppedReason === "max_iterations") {
+          yield* bus.publish(Event.CheckpointAutoApproved, {
+            taskID: input.taskID,
+            phase: "experiment_budget_extended",
+            reason: [
+              "## NAS 搜索已达迭代上限（Socratic 模式自动继续）",
+              "",
+              `**完成迭代：** ${nas.iterationCount} 轮`,
+              `**成功运行：** ${nas.succeededCount}，**失败：** ${nas.failedCount}`,
+              "",
+              nas.leaderboardMarkdown.replace(/^# Leaderboard/, "### 当前工作区实验结果"),
+            ].join("\n"),
+          })
+          nas = yield* runNASAgent({
+            taskID: input.taskID,
+            stage: input.stage,
+            description: input.description,
+            maxIterations: (input.maxIterations ?? 10) + 5,
+            targetMetricValue: input.targetMetricValue,
+            minRelativeImprovement: input.minRelativeImprovement,
+            maxNoImprove: input.maxNoImprove,
+            timeBudgetSeconds: input.timeBudgetSeconds,
+            maxCrashStreak: input.maxCrashStreak ?? 3,
+            explorationRate: input.explorationRate,
+          })
+          yield* markWorkflowPhase("nas_budget_extended")
+        }
+        const champion = yield* getChampion(input.taskID)
+        yield* bus.publish(Event.CheckpointAutoApproved, {
+          taskID: input.taskID,
+          phase: "final_model_selection",
+          reason: [
+            "## 模型搜索完成（Socratic 模式自动确认）",
+            "",
+            champion
+              ? [
+                  `**当前 Champion：** ${champion.candidateID}`,
+                  `**Primary metric：** ${champion.primaryMetric.toFixed(4)}`,
+                  `**Utility score：** ${champion.utility.toFixed(3)}`,
+                ].join("\n")
+              : "**当前无 Champion**（所有 run 均未成功）",
+            "",
+            nas.leaderboardMarkdown.replace(/^# Leaderboard/m, "### 验证集排行榜（所有候选模型）"),
+          ].join("\n"),
+        })
+        yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
       }
 
       const reflection = currentWorkflow.completedPhases.includes("reflection")
