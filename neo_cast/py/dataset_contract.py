@@ -201,6 +201,10 @@ def safe_task_id(value: str) -> str:
     return normalized[:64]
 
 
+def train_data_path(data_root: Path, task_id: str) -> Path:
+    return data_root / f"{safe_task_id(task_id)}_train.csv"
+
+
 def visible_data_path(data_root: Path, task_id: str) -> Path:
     return data_root / f"{safe_task_id(task_id)}_visible.csv"
 

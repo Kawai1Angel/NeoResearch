@@ -11,4 +11,5 @@ export {
   ResearchMemoryTable,
   ResearchApprovalTable,
   ResearchChampionTable,
+  ResearchHypothesisTable,
 } from "../research/research.sql"

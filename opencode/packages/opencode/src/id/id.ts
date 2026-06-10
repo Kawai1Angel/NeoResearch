@@ -19,6 +19,7 @@ const prefixes = {
   researchArtifact: "rart",
   researchMemory: "rmem",
   researchApproval: "rapr",
+  researchHypothesis: "rhyp",
 } as const
 
 export function schema(prefix: keyof typeof prefixes) {

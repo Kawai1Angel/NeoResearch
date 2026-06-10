@@ -7,19 +7,7 @@ import {
   extractEvidenceSummary,
   generateHypotheses,
 } from "../../src/research/agents/hypo-planner-agent"
-import type { DataAnalysisAgentResult } from "../../src/research/agents/data-analysis-agent"
-import type { ResearchArtifact, ResearchMemory, ResearchRun, ResearchTask } from "../../src/research/schema"
-
-function artifact(): ResearchArtifact {
-  return {
-    id: "rart_data_analysis",
-    taskID: "rtsk_hypo",
-    kind: "dataset_analysis_report",
-    uri: "file:///tmp/data_analysis_summary.md",
-    metadata: { format: "markdown" },
-    time: { created: 1, updated: 1 },
-  } as unknown as ResearchArtifact
-}
+import type { ResearchMemory, ResearchRun, ResearchTask } from "../../src/research/schema"
 
 function task(extraSpec: Record<string, unknown> = {}, extraBudget: Record<string, unknown> = {}): ResearchTask {
   return {
@@ -46,15 +34,14 @@ function task(extraSpec: Record<string, unknown> = {}, extraBudget: Record<strin
   } as unknown as ResearchTask
 }
 
-function dataAnalysis(searchBiases: readonly string[] = ["seasonal", "cross_var_correlated"]): DataAnalysisAgentResult {
-  return {
-    agent: "DataAnalysisAgent",
-    taskID: "rtsk_hypo" as ResearchTask["id"],
-    artifact: artifact(),
-    sourceArtifactIDs: ["rart_quant", "rart_main"] as never,
-    searchBiases,
-    warningCount: 1,
-  }
+function dataAnalysisSummary(biases: readonly string[] = ["seasonal", "cross_var_correlated"]): string {
+  return [
+    "# Dataset Analysis Summary",
+    "",
+    `Search biases detected: ${biases.join(", ") || "none"}`,
+    "1 warning",
+    "2 source artifacts",
+  ].join("\n")
 }
 
 function run(input: { id: string; status: ResearchRun["status"]; metric?: number; error?: string }): ResearchRun {
@@ -85,10 +72,9 @@ function memory(lesson: string): ResearchMemory {
   } as unknown as ResearchMemory
 }
 
-test("extractEvidenceSummary condenses data-analysis handoff signals", () => {
-  const summary = extractEvidenceSummary(dataAnalysis(["seasonal", "missing_values"]))
-  expect(summary).toContain("DataAnalysisAgent")
-  expect(summary).toContain("rart_data_analysis")
+test("extractEvidenceSummary truncates and returns the data analysis markdown", () => {
+  const input = dataAnalysisSummary(["seasonal", "missing_values"])
+  const summary = extractEvidenceSummary(input)
   expect(summary).toContain("seasonal")
   expect(summary).toContain("missing_values")
   expect(summary).toContain("1 warning")
@@ -98,7 +84,7 @@ test("extractEvidenceSummary condenses data-analysis handoff signals", () => {
 test("generateHypotheses creates prioritized seasonal, trend, and channel hypotheses from task evidence", () => {
   const hypotheses = generateHypotheses({
     task: task(),
-    dataAnalysis: dataAnalysis(["seasonal", "cross_var_correlated"]),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "cross_var_correlated"]),
     runs: [],
     memory: [],
   })
@@ -118,7 +104,7 @@ test("generateHypotheses creates prioritized seasonal, trend, and channel hypoth
 test("generateHypotheses includes history and memory evidence in motivations", () => {
   const hypotheses = generateHypotheses({
     task: task({ searchBiases: ["distribution_shift"] }),
-    dataAnalysis: dataAnalysis(["distribution_shift"]),
+    dataAnalysisSummary: dataAnalysisSummary(["distribution_shift"]),
     runs: [
       run({ id: "rrun_ok", status: "succeeded", metric: 0.42 }),
       run({ id: "rrun_nan", status: "failed", error: "loss became nan" }),
@@ -136,7 +122,7 @@ test("generateHypotheses includes history and memory evidence in motivations", (
 test("generateHypotheses falls back to a baseline-control hypothesis without profile signals", () => {
   const hypotheses = generateHypotheses({
     task: task({ datasetProfile: {}, searchBiases: [] }, { maxRuns: 1 }),
-    dataAnalysis: dataAnalysis([]),
+    dataAnalysisSummary: dataAnalysisSummary([]),
     runs: [],
     memory: [],
   })
@@ -153,7 +139,7 @@ test("generateHypotheses falls back to a baseline-control hypothesis without pro
 test("buildExperimentPlan derives stop conditions and deduplicated search biases", () => {
   const hypotheses = generateHypotheses({
     task: task(),
-    dataAnalysis: dataAnalysis(["seasonal", "trend"]),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
     runs: [],
     memory: [],
   })
@@ -173,7 +159,7 @@ test("buildExperimentPlan derives stop conditions and deduplicated search biases
 test("buildHypoPlannerResult emits markdown and yaml artifacts from the same plan", () => {
   const result = buildHypoPlannerResult({
     task: task(),
-    dataAnalysis: dataAnalysis(["seasonal", "trend"]),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
     runs: [],
     memory: [],
   })
@@ -191,14 +177,14 @@ test("buildHypoPlannerResult emits markdown and yaml artifacts from the same pla
 test("markdown and yaml builders render stable hypothesis IDs and suggested backbones", () => {
   const hypotheses = generateHypotheses({
     task: task(),
-    dataAnalysis: dataAnalysis(["seasonal"]),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal"]),
     runs: [],
     memory: [],
   })
   const plan = buildExperimentPlan({ hypotheses, task: task() })
   const result = buildHypoPlannerResult({
     task: task(),
-    dataAnalysis: dataAnalysis(["seasonal"]),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal"]),
     runs: [],
     memory: [],
   })

@@ -60,6 +60,23 @@ export interface ReflectionAnalysis {
   readonly decisionReason: string
 }
 
+export interface ReflectionLLMAnalysis {
+  /** Training process health: convergence, train/val gap, loss stability, whether results are trustworthy. */
+  readonly trainingHealthAssessment: string
+  /** Hypothesis validation: was the original hypothesis supported or refuted by the results? */
+  readonly hypothesisValidation: string
+  /** Attribution analysis: why did performance improve or degrade? */
+  readonly attributionAnalysis: string
+  /** Historical comparison: how does this iteration fit into the overall research trajectory? */
+  readonly historicalComparison: string
+  /** Model design reflection: which architecture or training choices should be revisited? */
+  readonly modelDesignReflection: string
+  /** Next-step recommendation: continue, modify, abandon, or change direction — and why. */
+  readonly nextStepRecommendation: string
+  /** Distillable memory: a self-contained summary (proposal + likely issues) for downstream agents. */
+  readonly distillableMemory: string
+}
+
 export interface ReflectionAgentResult {
   readonly agent: "ReflectionAgent"
   readonly taskID: ResearchTaskID
@@ -71,6 +88,7 @@ export interface ReflectionAgentResult {
     readonly status: "disabled" | "not_configured" | "used" | "failed"
     readonly model?: string
     readonly text?: string
+    readonly structured?: ReflectionLLMAnalysis
     readonly error?: string
     readonly usage?: LLMTokenUsage
   }
@@ -268,7 +286,7 @@ function decide(input: {
     decision: "continue",
     reason: hypothesesCount > 0
       ? "存在新的可执行假设，建议继续执行 next_experiment_plan 中的下一步。"
-      : "尚未达停止条件，建议沿用现有搜索策略继续。",
+      : "",
   }
 }
 

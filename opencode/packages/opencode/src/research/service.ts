@@ -1,6 +1,6 @@
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
-import { cp, mkdir, readFile, writeFile } from "fs/promises"
+import { cp, mkdir, readdir, readFile, writeFile } from "fs/promises"
 import { existsSync, openSync, readSync, closeSync } from "fs"
 import { createHash } from "crypto"
 import os from "os"
@@ -16,6 +16,7 @@ import {
   ResearchArtifactTable,
   ResearchCandidateTable,
   ResearchChampionTable,
+  ResearchHypothesisTable,
   ResearchMemoryTable,
   ResearchRunTable,
   ResearchTaskTable,
@@ -51,6 +52,7 @@ import {
   ResearchCandidate,
   ResearchCandidateID,
   ResearchChampion,
+  ResearchHypothesisID,
   ResearchMemory,
   ResearchMemoryID,
   ResearchRun,
@@ -61,6 +63,7 @@ import {
   ResearchTaskID,
   SetChampionInput,
   UpdateTaskSpecInput,
+  UpdateTaskBudgetInput,
   UpdateRunStatusInput,
   UpdateTaskStatusInput,
 } from "./schema"
@@ -117,6 +120,7 @@ import {
   summarizeReflectionAgent,
   type ReflectionAgentResult,
   type ReflectionAnalysis,
+  type ReflectionLLMAnalysis,
 } from "./agents/reflection-agent"
 import {
   evaluateRun as evaluateRunWithVerifiers,
@@ -133,6 +137,7 @@ type ResearchRunRow = typeof ResearchRunTable.$inferSelect
 type ResearchArtifactRow = typeof ResearchArtifactTable.$inferSelect
 type ResearchMemoryRow = typeof ResearchMemoryTable.$inferSelect
 type ResearchChampionRow = typeof ResearchChampionTable.$inferSelect
+type ResearchHypothesisRow = typeof ResearchHypothesisTable.$inferSelect
 
 export interface SeedBaselinesResult {
   readonly candidates: ResearchCandidate[]
@@ -442,6 +447,49 @@ interface RunnerProgressFields {
   readonly elapsedS?: number
 }
 
+interface TrainingCurvePoint {
+  readonly epoch: number
+  readonly valLoss: number
+  readonly horizon?: number
+  readonly elapsedS?: number
+}
+
+async function extractTrainingCurve(filePath: string, maxPoints = 60): Promise<TrainingCurvePoint[]> {
+  let raw: string
+  try {
+    raw = await readFile(filePath, "utf8")
+  } catch {
+    return []
+  }
+  const points: TrainingCurvePoint[] = []
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue
+    try {
+      const r = JSON.parse(line) as Record<string, unknown>
+      const epoch = finiteNumber(r.epoch)
+      const valLoss = finiteNumber(r.val_loss) ?? finiteNumber(r.valLoss)
+      if (epoch === undefined || valLoss === undefined) continue
+      points.push({
+        epoch,
+        valLoss,
+        ...(finiteNumber(r.horizon) !== undefined ? { horizon: finiteNumber(r.horizon)! } : {}),
+        ...(finiteNumber(r.elapsed_s) !== undefined ? { elapsedS: finiteNumber(r.elapsed_s)! } : {}),
+        ...(finiteNumber(r.elapsedS) !== undefined ? { elapsedS: finiteNumber(r.elapsedS)! } : {}),
+      })
+    } catch {
+      // skip unparseable lines
+    }
+  }
+  if (points.length <= maxPoints) return points
+  // Sample: always keep first and last; pick evenly-spaced indices in between.
+  const step = (points.length - 1) / (maxPoints - 1)
+  const sampled: TrainingCurvePoint[] = []
+  for (let i = 0; i < maxPoints; i++) {
+    sampled.push(points[Math.round(i * step)]!)
+  }
+  return sampled
+}
+
 function parseProgressLine(line: string): RunnerProgressFields {
   try {
     const parsed = JSON.parse(line)
@@ -676,12 +724,53 @@ function experimentPlanFromMetadata(value: unknown): ExperimentPlan | undefined 
   return Array.isArray(record.hypotheses) ? (value as ExperimentPlan) : undefined
 }
 
+function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
+  const priority = row.priority
+  return {
+    id: row.hypo_id,
+    statement: row.statement,
+    motivation: Array.isArray(row.motivation) ? (row.motivation as string[]) : [],
+    expectedOutcome: row.expected_outcome,
+    suggestedBackbones: Array.isArray(row.suggested_backbones) ? (row.suggested_backbones as string[]) : [],
+    suggestedPreprocessing: Array.isArray(row.suggested_preprocessing) ? (row.suggested_preprocessing as string[]) : [],
+    priority: priority === "high" || priority === "medium" || priority === "low" ? priority : "medium",
+    risk: row.risk,
+    testable: row.testable,
+  }
+}
+
+function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly HypothesisObject[]): ExperimentPlan | undefined {
+  if (hypotheses.length === 0) return undefined
+  const metadata = recordValue(task.taskSpec.metadata)
+  const baselineStrategy =
+    typeof metadata.baselineStrategy === "string" ? metadata.baselineStrategy : "domain_baselines_first"
+  const searchBiases = Array.isArray(metadata.searchBiases)
+    ? (metadata.searchBiases as unknown[]).filter((x): x is string => typeof x === "string")
+    : []
+  const stopCond = recordValue(metadata.stopConditions)
+  const maxTrials = typeof stopCond.maxTrials === "number" ? Math.max(1, stopCond.maxTrials) : 50
+  const noImprovementRounds =
+    typeof stopCond.noImprovementRounds === "number" ? Math.max(1, stopCond.noImprovementRounds) : 20
+  const targetMetricValue =
+    typeof stopCond.targetMetricValue === "number" ? stopCond.targetMetricValue : undefined
+  return {
+    hypotheses,
+    baselineStrategy,
+    searchBiases,
+    stopConditions: {
+      maxTrials,
+      noImprovementRounds,
+      ...(targetMetricValue !== undefined ? { targetMetricValue } : {}),
+    },
+  }
+}
+
 function recoverHypoPlannerResultFromPlan(input: {
   readonly task: ResearchTask
-  readonly dataAnalysis: DataAnalysisAgentResult
+  readonly dataAnalysisSummary: string
   readonly plan: ExperimentPlan
 }): HypoPlannerResult {
-  const evidenceSummary = extractEvidenceSummary(input.dataAnalysis)
+  const evidenceSummary = extractEvidenceSummary(input.dataAnalysisSummary)
   const partial = {
     agent: "HypoPlannerAgent" as const,
     taskID: input.task.id,
@@ -943,9 +1032,9 @@ function isMeaningfulMetricImprovement(
 
 function autonomousLoopMaxIterations(inputValue: unknown, task: ResearchTask) {
   const requested = integerPolicyValue(inputValue)
-  if (requested !== undefined) return Math.max(1, Math.min(requested, 50))
+  if (requested !== undefined) return Math.max(1, Math.min(requested, 200))
   const budgetMaxRuns = maxRunsLimit(task.budget)
-  return Math.max(1, Math.min(Math.max(budgetMaxRuns ?? 10, 10), 50))
+  return Math.max(1, Math.min(Math.max(budgetMaxRuns ?? 50, 50), 200))
 }
 
 function artifactDirsFromRecords(records: Record<string, unknown>[]) {
@@ -1711,11 +1800,26 @@ function datasetTargetColumns(task: ResearchTask, header: readonly string[]) {
   return header.slice(1)
 }
 
+function taskTrainDataPath(task: ResearchTask): string | undefined {
+  const taskSpec = recordValue(task.taskSpec)
+  const runtime = recordValue(taskSpec.runtime)
+  const dataset = recordValue(taskSpec.dataset)
+  const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
+  const loaderID = typeof dataset.loaderID === "string" ? dataset.loaderID.trim() : ""
+  if (!root || !loaderID) return undefined
+  const safeID = loaderID.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 64)
+  return path.join(root, ".neo-cast", "dataset", `${safeID}_train.csv`)
+}
+
 async function loadDatasetSeriesMatrix(task: ResearchTask): Promise<DatasetSeriesMatrix | undefined> {
   const dataset = taskDatasetSpec(task)
-  if (typeof dataset.path !== "string" || dataset.path.length === 0) return undefined
-  const datasetPath = path.isAbsolute(dataset.path) ? dataset.path : path.join(Instance.directory, dataset.path)
-  if (!existsSync(datasetPath)) return undefined
+  const trainPath = taskTrainDataPath(task)
+  const resolvedTrainPath = trainPath && existsSync(trainPath) ? trainPath : undefined
+  const rawPath = typeof dataset.path === "string" && dataset.path.length > 0
+    ? (path.isAbsolute(dataset.path) ? dataset.path : path.join(Instance.directory, dataset.path))
+    : undefined
+  const datasetPath = resolvedTrainPath ?? rawPath
+  if (!datasetPath || !existsSync(datasetPath)) return undefined
   const text = await readFile(datasetPath, "utf8")
   const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0)
   if (lines.length < 3) return undefined
@@ -2180,9 +2284,6 @@ function renderDatasetQualitativeAnalysis(
 ) {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
   const dataset = taskDatasetSpec(task)
-  const biases = Array.isArray(recordValue(fingerprint).searchBiases)
-    ? (recordValue(fingerprint).searchBiases as unknown[]).filter((item): item is string => typeof item === "string")
-    : []
   const lines = [
     "# Qualitative Sub-Agent Data Analysis",
     "",
@@ -2218,7 +2319,6 @@ function renderDatasetQualitativeAnalysis(
       "",
     )
   }
-  lines.push("## Search Priors", "", biases.length === 0 ? "- No explicit search bias detected." : `- ${biases.join(", ")}`)
   return `${lines.join("\n")}\n`
 }
 
@@ -2273,21 +2373,32 @@ function buildQualitativeSystemPrompt(): string {
     "You are the NeoResearch qualitative data analyst for time series forecasting.",
     "Language policy: 用中文写领域解读、业务机制、风险分析、建模建议；保留英文的技术术语、指标名和模块名。",
     "Task: Interpret the provided time series dataset statistics from a domain and business perspective.",
-    "Output format: Return exactly two markdown sections as plain text (no code blocks, no JSON):",
+    "Output format: Return exactly three markdown sections as plain text (no code blocks, no JSON):",
     "## Reading",
     "(2-4 bullet points: key statistical patterns and their implications for model design)",
     "## 领域解读",
     "(4-6 bullet points: 字段语义、业务机制、外部因素、潜在事件、风险、领域建模建议 — one bullet per aspect)",
-    "Do not include any other heading, section, or text outside these two sections.",
+    "## Search Preferences",
+    "(3-5 bullet points: concrete backbone/preprocessing search guidance derived directly from THIS dataset's statistics.",
+    " Each bullet must be a self-contained preference string in English, e.g. 'Prefer dlinear as a baseline given the strong trend component (trendVarianceShare > 0.6).'",
+    " These will replace the default library preferences in the hypothesis planner, so make them specific and data-driven.)",
+    "Do not include any other heading, section, or text outside these three sections.",
   ].join("\n")
+}
+
+function parseSearchPreferencesFromQualitative(text: string): string[] {
+  const sectionMatch = text.match(/##\s*Search Preferences\s*\n([\s\S]*?)(?:\n##|$)/)
+  if (!sectionMatch) return []
+  return sectionMatch[1]!
+    .split("\n")
+    .map((line) => line.replace(/^[-*•]\s*/, "").trim())
+    .filter((line) => line.length > 10)
+    .slice(0, 8)
 }
 
 function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext): string {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
   const dataset = taskDatasetSpec(task)
-  const biases = Array.isArray(fingerprint.searchBiases)
-    ? (fingerprint.searchBiases as unknown[]).filter((item): item is string => typeof item === "string")
-    : []
   return JSON.stringify(
     {
       task: {
@@ -2328,7 +2439,6 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
         crossLagLag: context.statistics.crossLag.lag,
         crossLagCorrelation: context.statistics.crossLag.correlation,
       },
-      searchBiasesAlreadyDetected: biases,
       instruction:
         "Analyze the dataset characteristics and provide qualitative domain insights for guiding TSF model search.",
     },
@@ -2346,7 +2456,7 @@ async function generateLLMQualitativeAnalysis(
   context: DatasetAnalysisContext,
   workspaceRoot: string,
   onDelta?: (delta: string) => void,
-): Promise<{ text: string; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
+): Promise<{ text: string; usage: import("./llm-proposal").LLMTokenUsage; searchPreferences: string[] } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
     const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -2372,7 +2482,9 @@ async function generateLLMQualitativeAnalysis(
       ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
-    return await Promise.race([llmPromise, timeoutPromise])
+    const result = await Promise.race([llmPromise, timeoutPromise])
+    if (!result) return undefined
+    return { ...result, searchPreferences: parseSearchPreferencesFromQualitative(result.text) }
   } catch {
     return undefined
   }
@@ -2381,63 +2493,169 @@ async function generateLLMQualitativeAnalysis(
 function buildHypoPlannerSystemPrompt(): string {
   return [
     "You are the NeoResearch HypoPlanner agent for time series forecasting (TSF) model search.",
-    "Language policy: 用中文表达 statement、motivation、risk 等自然语言字段；保留 JSON 字段名、backbone 类型名、预处理类型名等技术术语的英文原文。",
-    "Task: Given dataset analysis evidence, run history, and reflection memory, produce 3–6 testable research hypotheses to guide the next phase of model search.",
-    "Output: exactly one JSON object: { \"hypotheses\": [...] }. No markdown fences. No prose outside JSON.",
+    "Language policy: 用中文表达 statement、motivation、expectedOutcome、risk 等自然语言字段；保留 JSON 字段名、backbone 类型名、预处理类型名等技术术语的英文原文。",
+    "",
+    "## Input sections you will receive",
+    "1. taskDefinition — research objective, evaluation metric, and budget constraints.",
+    "2. dataAnalysis — dataset profile with statistical features (seasonality, trend, missing rate, horizon/context ratio, cross-variate correlation, etc.).",
+    "3. methodLibrary — available ModelRecipe components (backbones, preprocessing, embedding, fusion, head) with their phase eligibility and design preferences.",
+    "4. previousReflection — lessons and hypotheses from prior search windows (empty on first iteration).",
+    "",
+    "## Output",
+    "Return exactly one JSON object: { \"hypotheses\": [...] }. No markdown fences. No prose outside JSON.",
     "Each hypothesis object must have these fields:",
     "  id: string (\"H1\", \"H2\", ...)",
     "  statement: string (一句话说明该假设的核心思想)",
-    "  motivation: string[] (来自数据特征、历史结果或记忆的支持证据)",
-    "  suggestedBackbones: string[] (subset of: linear | mlp | transformer | dlinear | tcn | nbeats | timesnet | rnn | ssm | mixer)",
-    "  suggestedPreprocessing: string[] (subset of: none | instance_norm | series_decomposition | seasonal_differencing | missing_mask | sample_reweighting)",
+    "  motivation: string[] (来自数据特征、历史结果或反思记忆的支持证据，至少引用一个具体数值或事实)",
+    "  expectedOutcome: string (预期结果：哪个指标会如何变化，量化或半定量描述)",
+    "  suggestedBackbones: string[] (subset of allowed backbones listed in methodLibrary)",
+    "  suggestedPreprocessing: string[] (subset of allowed preprocessing listed in methodLibrary)",
     "  priority: \"high\" | \"medium\" | \"low\"",
     "  risk: string (主要风险或局限)",
     "  testable: true | false",
-    "Rules:",
-    "- Order hypotheses by priority (high first).",
-    "- Each hypothesis must be distinct, concrete, and directly testable.",
-    "- Do not repeat backbone/preprocessing combinations already confirmed as failures in memory.",
-    "- The draftHypotheses field contains rule-derived starting points; you may refine, replace, or extend them.",
+    "",
+    "## Rules",
+    "- Produce 3–6 hypotheses ordered by priority (high first).",
+    "- Each hypothesis must be distinct, concrete, and directly testable within the current phase.",
+    "- Do not repeat backbone/preprocessing combinations already confirmed as failures in previousReflection.",
+    "- Ground motivation in specific values from dataAnalysis or outcomes from previousReflection.",
+    "- expectedOutcome must reference val_avg_mse or a named metric and state the anticipated direction or magnitude of change.",
+    "- Generate hypotheses independently from the four input sections; do not rely on any external draft.",
   ].join("\n")
+}
+
+const MODEL_RECIPE_LIBRARY = {
+  description: "NeoResearch TSF ModelRecipe components available for hypothesis design.",
+  preferences: [
+    "Prefer dlinear or linear as low-variance baselines before committing to higher-capacity backbones.",
+    "Use series_decomposition or instance_norm preprocessing when seasonality or trend strength is detected.",
+    "Patch embedding works well with transformer and mlp backbones; avoid patch with dlinear/tcn/nbeats/timesnet.",
+    "Channel-mixing fusion (feature, temporal_then_feature) is only meaningful when cross-variate correlation is confirmed.",
+    "For missing data, include missing_mask in preprocessing before testing any backbone.",
+    "sample_reweighting is useful under distribution shift but should be validated against time-ordered splits.",
+  ],
+  backbones: {
+    linear: "Single linear projection per horizon; lowest variance, good baseline.",
+    mlp: "Multi-layer perceptron; moderate capacity, patch-friendly.",
+    transformer: "Self-attention over patch tokens; high capacity, requires sufficient data.",
+    dlinear: "Decomposed linear (trend + seasonal split); strong on ETT-style benchmarks.",
+    tcn: "Temporal convolutional network; effective for local temporal patterns.",
+    nbeats: "Basis expansion with interpretable blocks; strong for seasonal/trend decomposition.",
+    timesnet: "2D temporal convolution via FFT reshape; good for multi-period series.",
+    rnn: "Recurrent sequence model; handles irregular sampling but slower to train.",
+    ssm: "State-space model; efficient long-range modeling with linear complexity.",
+    mixer: "MLP-Mixer over time and channel dimensions; fast channel-mixing alternative.",
+  },
+  preprocessing: {
+    none: "No preprocessing; suitable for already-normalized inputs.",
+    instance_norm: "Per-instance normalization; reduces distribution shift within a sequence.",
+    series_decomposition: "Trend-seasonal decomposition; feeds separated components to backbone.",
+    seasonal_differencing: "Removes periodic trend via seasonal differencing; phase2+.",
+    missing_mask: "Binary mask features for missing values; required when missingRate > 0.",
+    sample_reweighting: "Reweight training samples by recency or quality; phase2+.",
+  },
+}
+
+function buildTaskDefinition(task: ResearchTask): Record<string, unknown> {
+  const spec = recordValue(task.taskSpec)
+  const dataset = recordValue(spec.dataset)
+  const objective = recordValue(task.objective)
+  const budget = recordValue(task.budget)
+  const metadata = recordValue(spec.metadata)
+  const intentSlots = recordValue(metadata.intentSlots)
+  function slotOr(canonical: unknown, slotKey: string) {
+    return canonical !== undefined && canonical !== null ? canonical : intentSlots[slotKey]
+  }
+  return {
+    id: task.id,
+    title: task.title,
+    forecastObject: intentSlots.forecast_object ?? spec.forecastObject,
+    dataset: {
+      source: slotOr(dataset.path ?? dataset.loaderID, "data_source"),
+      targetCols: slotOr(dataset.targetCols, "target_columns"),
+      exogenousCols: intentSlots.exogenous_variables ?? dataset.exogenousCols,
+    },
+    contextLength: slotOr(spec.contextLength, "lookback_window"),
+    predictionLengths: slotOr(spec.predictionLengths, "prediction_horizon"),
+    timeGrain: intentSlots.time_grain ?? spec.timeGrain ?? spec.frequency,
+    objective: {
+      primaryMetric: slotOr(objective.primaryMetric, "primary_metric"),
+      direction: objective.direction,
+      errorPreferences: intentSlots.error_preferences ?? objective.errorPreferences,
+    },
+    budget: {
+      maxRuns: budget.maxRuns,
+      latencyBudget: intentSlots.latency_budget ?? budget.latencyBudget,
+      parameterBudget: intentSlots.parameter_budget ?? budget.parameterBudget,
+    },
+    interpretability: intentSlots.interpretability ?? spec.interpretability,
+    deploymentTarget: intentSlots.deployment_target ?? spec.deploymentTarget,
+    businessContext: intentSlots.business_context ?? metadata.businessContext ?? metadata.business_context,
+  }
 }
 
 function buildHypoPlannerUserPrompt(
   task: ResearchTask,
-  dataAnalysis: DataAnalysisAgentResult,
+  dataAnalysisSummary: string,
   runs: readonly ResearchRun[],
   memory: readonly ResearchMemory[],
-  draftHypotheses: readonly HypothesisObject[],
+  existingHypotheses: readonly { statement: string; status: string }[],
+  latestReflection: LatestReflectionSummary,
+  llmSearchPreferences?: string[],
 ): string {
-  const spec = recordValue(task.taskSpec)
-  const profile = {
-    ...recordValue(recordValue(recordValue(task.taskSpec).metadata).datasetProfile),
-    ...recordValue(spec.datasetProfile),
-  }
-  const succeeded = runs.filter((r) => r.status === "succeeded")
-  const bestMetric = succeeded
-    .map((r) => (typeof r.metrics?.val_avg_mse === "number" ? r.metrics.val_avg_mse : undefined))
-    .filter((v): v is number => v !== undefined)
-    .sort((a, b) => a - b)[0]
+  const primaryMetricName = typeof (task.objective as Record<string, unknown>)?.primaryMetric === "string"
+    ? (task.objective as Record<string, unknown>).primaryMetric as string
+    : "val_avg_mse"
+  const triedConfigurations = runs
+    .filter((r) => r.status === "succeeded" || r.status === "failed")
+    .map((r) => {
+      const metrics = r.metrics as Record<string, unknown> | null | undefined
+      const metricVal = metrics ? metrics[primaryMetricName] : undefined
+      return {
+        runID: r.id,
+        status: r.status,
+        ...(typeof metricVal === "number" ? { [primaryMetricName]: metricVal } : {}),
+        ...(r.error ? { error: r.error.slice(0, 120) } : {}),
+      }
+    })
+  const recentMemoryLessons = memory.slice(-8).map((m) => {
+    const cs = recordValue(m.candidateSummary)
+    const actions = recordValue(cs.candidateActions)
+    return {
+      outcome: m.outcome,
+      lesson: m.lesson,
+      ...(Object.keys(actions).length > 0 ? { modelDesign: actions } : {}),
+      ...(typeof cs.primaryMetric === "number" ? { primaryMetric: cs.primaryMetric } : {}),
+      ...(typeof cs.recipeID === "string" ? { recipeID: cs.recipeID } : {}),
+    }
+  })
   return JSON.stringify(
     {
-      task: {
-        id: task.id,
-        title: task.title,
-        objective: task.objective,
-        budget: task.budget,
-      },
-      datasetProfile: profile,
-      searchBiases: dataAnalysis.searchBiases,
-      runSummary: {
-        succeeded: runs.filter((r) => r.status === "succeeded").length,
-        failed: runs.filter((r) => r.status === "failed").length,
-        rejected: runs.filter((r) => r.status === "rejected").length,
-        bestMetric: bestMetric ?? null,
-      },
-      memoryLessons: memory.slice(-8).map((m) => ({ outcome: m.outcome, lesson: m.lesson })),
-      draftHypotheses,
+      taskDefinition: buildTaskDefinition(task),
+      dataAnalysis: dataAnalysisSummary,
+      methodLibrary: llmSearchPreferences && llmSearchPreferences.length > 0
+        ? { ...MODEL_RECIPE_LIBRARY, preferences: llmSearchPreferences }
+        : MODEL_RECIPE_LIBRARY,
+      previousReflection: latestReflection
+        ? {
+            decision: latestReflection.decision,
+            decisionReason: latestReflection.decisionReason,
+            suggestedNextHypotheses: latestReflection.nextHypotheses,
+            reflectionNotes: latestReflection.reflectionNotesMarkdown,
+          }
+        : null,
+      memoryLessons: recentMemoryLessons.length > 0 ? recentMemoryLessons : null,
+      triedConfigurations: triedConfigurations.length > 0 ? triedConfigurations : null,
+      existingHypotheses: existingHypotheses.length > 0
+        ? existingHypotheses.map((h) => ({ statement: h.statement, status: h.status }))
+        : null,
       instruction:
-        "Based on the evidence above, return a refined and enriched hypothesis list. Preserve high-quality draft hypotheses but improve specificity and motivation. Add new hypotheses if the evidence suggests unexplored directions.",
+        "Review existingHypotheses in light of previousReflection and produce an updated hypothesis list. " +
+        "For each existing hypothesis: retain it if the reflection does not contradict it, refine its statement/expectedOutcome if reflection provides new evidence, or drop it if reflection confirms it is exhausted or refuted. " +
+        "Then add new hypotheses for directions suggested in previousReflection.suggestedNextHypotheses that are not already covered. " +
+        "If previousReflection is null, generate a fresh list grounded in dataAnalysis. " +
+        "Ground each hypothesis's motivation in specific values from dataAnalysis or outcomes from previousReflection. " +
+        "Set expectedOutcome to a concrete, metric-referenced prediction.",
     },
     null,
     2,
@@ -2456,21 +2674,40 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
       ? (value as unknown[]).filter((s): s is string => typeof s === "string" && s.trim().length > 0)
       : []
   const motivation = filterStrings(rec.motivation)
+  const expectedOutcome = typeof rec.expectedOutcome === "string" ? rec.expectedOutcome : ""
   const suggestedBackbones = filterStrings(rec.suggestedBackbones)
   const suggestedPreprocessing = filterStrings(rec.suggestedPreprocessing)
   const risk = typeof rec.risk === "string" ? rec.risk : ""
   const testable = typeof rec.testable === "boolean" ? rec.testable : true
-  return { id, statement, motivation, suggestedBackbones, suggestedPreprocessing, priority, risk, testable }
+  return { id, statement, motivation, expectedOutcome, suggestedBackbones, suggestedPreprocessing, priority, risk, testable }
+}
+
+type LatestReflectionSummary = {
+  nextHypotheses: Array<{ title: string; rationale: string; expectedSignal: string }>
+  reflectionNotesMarkdown: string
+  decision: string
+  decisionReason: string
+} | null
+
+async function loadLLMSearchPreferences(workspaceRoot: string, taskID: string): Promise<string[] | undefined> {
+  try {
+    const prefPath = path.join(workspaceRoot, ".neo-research", "sessions", taskID, "analysis", "search_preferences.json")
+    const raw = await readFile(prefPath, "utf8")
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as unknown[]).filter((s): s is string => typeof s === "string") : undefined
+  } catch { return undefined }
 }
 
 async function generateLLMHypotheses(
   task: ResearchTask,
-  dataAnalysis: DataAnalysisAgentResult,
+  dataAnalysisSummary: string,
   runs: readonly ResearchRun[],
   memory: readonly ResearchMemory[],
   draftHypotheses: readonly HypothesisObject[],
   workspaceRoot: string,
   onDelta?: (delta: string) => void,
+  existingHypotheses?: readonly { statement: string; status: string }[],
+  latestReflection?: LatestReflectionSummary,
 ): Promise<{ hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
@@ -2490,8 +2727,9 @@ async function generateLLMHypotheses(
         ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
       }
     }
+    const llmSearchPreferences = await loadLLMSearchPreferences(workspaceRoot, task.id)
     const system = buildHypoPlannerSystemPrompt()
-    const user = buildHypoPlannerUserPrompt(task, dataAnalysis, runs, memory, draftHypotheses)
+    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences)
     const llmPromise = onDelta
       ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
@@ -2511,70 +2749,145 @@ async function generateLLMHypotheses(
   }
 }
 
+interface ReflectionLLMContext {
+  /** Objective statement derived from the task (metric name + direction + target). */
+  readonly taskObjective: string
+  /** Rationale of the most recent candidate — encodes the hypothesis being tested. */
+  readonly currentHypothesis?: string
+  /** candidateSpec JSON of the most recent candidate (architecture + training recipe). */
+  readonly experimentDesign?: unknown
+  /** Training curve: ordered array of { epoch, valLoss, horizon?, elapsedS? } data points. */
+  readonly trainingCurve: readonly TrainingCurvePoint[]
+  /** Lessons from the two most recent distinct memory entries. */
+  readonly recentMemories: readonly string[]
+  /** Lesson from the memory entry that recorded the all-time best metric. */
+  readonly bestMemoryLesson?: string
+}
+
 function buildReflectionLLMSystemPrompt(): string {
   return [
-    "You are the NeoResearch reflection assistant for time series forecasting (TSF) research.",
-    "Language policy: write in English; keep technical terms, metric names, and module names in English.",
-    "Task: Given a structured analysis of a TSF model-search window, write a concise narrative reflection.",
-    "Output format: Return exactly three paragraphs of plain prose (no headings, no bullet points, no code blocks):",
-    "Paragraph 1: Plain-language summary of what happened in this search window (runs, outcomes, best metric).",
-    "Paragraph 2: What worked and what did not — effective changes, failures, and plateau observations.",
-    "Paragraph 3: What the agent recommends next and why, based on the hypotheses and decision.",
-    "Keep the total length to 150-250 words. Do not add any text outside the three paragraphs.",
+    "You are the NeoResearch ReflectionAgent for time series forecasting (TSF) research.",
+    "Language policy: write in English; keep all technical terms, metric names, and module names in English.",
+    "",
+    "Your role: conduct a rigorous, structured post-experiment reflection for a single TSF NAS iteration.",
+    "You receive: the research objective, the original hypothesis this experiment was designed to test,",
+    "the model architecture and training configuration (experiment design), quantitative results,",
+    "a training curve (ordered array of { epoch, valLoss } data points), and a summary of relevant historical experiments.",
+    "",
+    "Output format: Return a single JSON object with EXACTLY these 7 keys. Each value is a concise",
+    "string (1-4 sentences). Do not add any text outside the JSON object.",
+    "",
+    "  trainingHealthAssessment  — Did training proceed normally? Use the trainingCurve array to assess:",
+    "    did valLoss converge (monotonically decreasing or stabilized); was there oscillation or divergence;",
+    "    was the best val point consistent with final performance; were there NaN or crash signals.",
+    "    Conclude whether the experiment provides credible evidence for or against the hypothesis.",
+    "",
+    "  hypothesisValidation  — Was the original hypothesis supported by the results? State yes/no/partial",
+    "    and explain what the evidence shows.",
+    "",
+    "  attributionAnalysis  — What caused the performance to improve or degrade? Identify the specific",
+    "    architectural or training factors responsible.",
+    "",
+    "  historicalComparison  — How does this iteration fit into the overall research trajectory?",
+    "    Compare with the best known result and recent experiments.",
+    "",
+    "  modelDesignReflection  — Which aspects of the architecture, training scheme, or data processing",
+    "    should be revisited, and why?",
+    "",
+    "  nextStepRecommendation  — Recommend: continue with the current direction, modify the approach,",
+    "    abandon this hypothesis, or pivot to a new direction. State which and explain why.",
+    "",
+    "  distillableMemory  — A self-contained summary for future agents: what was tried, what the outcome",
+    "    was, what modification is proposed, and what risks or failure modes to watch for.",
   ].join("\n")
 }
 
-function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis): string {
+function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: ReflectionLLMContext): string {
   return JSON.stringify(
     {
-      primaryMetricName: analysis.primaryMetricName,
-      direction: analysis.direction,
-      bestMetric: analysis.bestMetric ?? null,
-      bestRunID: analysis.bestRunID ?? null,
-      latestMetric: analysis.latestMetric ?? null,
-      latestDelta: analysis.latestDelta ?? null,
-      succeededRuns: analysis.succeededRuns,
-      failedRuns: analysis.failedRuns,
-      rejectedRuns: analysis.rejectedRuns,
-      plateauStreak: analysis.plateauStreak,
-      effectiveChanges: analysis.effectiveChanges.map((item) => ({
-        candidateID: item.candidateID,
-        runID: item.runID,
-        metricValue: item.metricValue,
-        delta: item.delta,
-        summary: item.summary,
-      })),
-      ineffectiveChanges: analysis.ineffectiveChanges.map((item) => ({
-        candidateID: item.candidateID,
-        runID: item.runID,
-        metricValue: item.metricValue,
-        delta: item.delta,
-        summary: item.summary,
-      })),
-      failures: analysis.failures.map((item) => ({
-        runID: item.runID,
-        candidateID: item.candidateID ?? null,
-        category: item.category,
-        summary: item.summary,
-      })),
-      nextHypotheses: analysis.nextHypotheses.map((item) => ({
-        title: item.title,
-        rationale: item.rationale,
-        expectedSignal: item.expectedSignal,
-      })),
+      taskObjective: context.taskObjective,
+      originalHypothesis: context.currentHypothesis ?? null,
+      experimentDesign: context.experimentDesign ?? null,
+      experimentResults: {
+        primaryMetricName: analysis.primaryMetricName,
+        direction: analysis.direction,
+        bestMetric: analysis.bestMetric ?? null,
+        bestRunID: analysis.bestRunID ?? null,
+        latestMetric: analysis.latestMetric ?? null,
+        latestDelta: analysis.latestDelta ?? null,
+        succeededRuns: analysis.succeededRuns,
+        failedRuns: analysis.failedRuns,
+        rejectedRuns: analysis.rejectedRuns,
+        plateauStreak: analysis.plateauStreak,
+        effectiveChanges: analysis.effectiveChanges.map((item) => ({
+          candidateID: item.candidateID,
+          runID: item.runID,
+          metricValue: item.metricValue,
+          delta: item.delta,
+          summary: item.summary,
+        })),
+        ineffectiveChanges: analysis.ineffectiveChanges.map((item) => ({
+          candidateID: item.candidateID,
+          runID: item.runID,
+          metricValue: item.metricValue,
+          delta: item.delta,
+          summary: item.summary,
+        })),
+        failures: analysis.failures.map((item) => ({
+          runID: item.runID,
+          candidateID: item.candidateID ?? null,
+          category: item.category,
+          summary: item.summary,
+        })),
+      },
+      trainingCurve: context.trainingCurve.length > 0 ? context.trainingCurve : null,
+      historicalExperimentMemory: {
+        recentLessons: context.recentMemories,
+        bestResultLesson: context.bestMemoryLesson ?? null,
+      },
       decision: analysis.decision,
       decisionReason: analysis.decisionReason,
-      instruction:
-        "Write a narrative reflection summary (3 paragraphs) describing what happened, what worked/failed, and what to do next.",
     },
     null,
     2,
   )
 }
 
+function parseReflectionLLMStructured(text: string): ReflectionLLMAnalysis | undefined {
+  try {
+    const jsonMatch = text.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) return undefined
+    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>
+    const str = (key: string) => (typeof parsed[key] === "string" && parsed[key] ? parsed[key] as string : undefined)
+    const trainingHealthAssessment = str("trainingHealthAssessment")
+    const hypothesisValidation = str("hypothesisValidation")
+    const attributionAnalysis = str("attributionAnalysis")
+    const historicalComparison = str("historicalComparison")
+    const modelDesignReflection = str("modelDesignReflection")
+    const nextStepRecommendation = str("nextStepRecommendation")
+    const distillableMemory = str("distillableMemory")
+    if (
+      !trainingHealthAssessment || !hypothesisValidation || !attributionAnalysis ||
+      !historicalComparison || !modelDesignReflection || !nextStepRecommendation || !distillableMemory
+    ) return undefined
+    return {
+      trainingHealthAssessment,
+      hypothesisValidation,
+      attributionAnalysis,
+      historicalComparison,
+      modelDesignReflection,
+      nextStepRecommendation,
+      distillableMemory,
+    }
+  } catch {
+    return undefined
+  }
+}
+
 async function generateLLMReflectionSynthesis(
   task: ResearchTask,
   result: ReflectionAgentResult,
+  context: ReflectionLLMContext,
 ): Promise<ReflectionAgentResult> {
   const runtime = recordValue(recordValue(task.taskSpec).runtime)
   const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -2601,13 +2914,23 @@ async function generateLLMReflectionSynthesis(
   }
   try {
     const system = buildReflectionLLMSystemPrompt()
-    const user = buildReflectionLLMUserPrompt(result.analysis)
+    const user = buildReflectionLLMUserPrompt(result.analysis, context)
     // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
     const llmPromise = requestNeoCastLLM(effectiveConfig, apiKey, system, user)
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
     const llmResult = await Promise.race([llmPromise, timeoutPromise])
     if (llmResult === undefined) return { ...result, llm: { status: "failed" } }
-    return { ...result, llm: { status: "used", model: effectiveConfig.model, text: llmResult.text, usage: llmResult.usage } }
+    const structured = parseReflectionLLMStructured(llmResult.text)
+    return {
+      ...result,
+      llm: {
+        status: "used",
+        model: effectiveConfig.model,
+        text: llmResult.text,
+        structured,
+        usage: llmResult.usage,
+      },
+    }
   } catch {
     return { ...result, llm: { status: "failed" } }
   }
@@ -2618,7 +2941,11 @@ function buildReflectionMemoryLesson(result: ReflectionAgentResult): string {
   const parts: string[] = [`[reflection] ${a.decision}: ${a.decisionReason}`]
   if (a.bestMetric !== undefined) parts.push(`best ${a.primaryMetricName}=${a.bestMetric}`)
   if (a.nextHypotheses.length > 0) parts.push(`next: ${a.nextHypotheses.map((h) => h.title).join("; ")}`)
-  if (result.llm.status === "used" && result.llm.text) parts.push(`llm: ${result.llm.text.slice(0, 300)}`)
+  if (result.llm.status === "used" && result.llm.structured) {
+    parts.push(`memory: ${result.llm.structured.distillableMemory.slice(0, 400)}`)
+  } else if (result.llm.status === "used" && result.llm.text) {
+    parts.push(`llm: ${result.llm.text.slice(0, 300)}`)
+  }
   return parts.join(" | ")
 }
 
@@ -3266,6 +3593,7 @@ export interface Interface {
   readonly getTask: (taskID: ResearchTaskID) => Effect.Effect<ResearchTask>
   readonly updateTaskStatus: (input: UpdateTaskStatusInput) => Effect.Effect<ResearchTask>
   readonly updateTaskSpec: (input: UpdateTaskSpecInput) => Effect.Effect<ResearchTask>
+  readonly updateTaskBudget: (input: UpdateTaskBudgetInput) => Effect.Effect<ResearchTask>
   readonly createCandidate: (input: CreateCandidateInput) => Effect.Effect<ResearchCandidate>
   readonly listCandidates: (taskID: ResearchTaskID) => Effect.Effect<ResearchCandidate[]>
   readonly createRun: (input: CreateRunInput) => Effect.Effect<ResearchRun>
@@ -3295,7 +3623,6 @@ export interface Interface {
   readonly runDataAnalysisAgent: (input: ProfileTaskInput) => Effect.Effect<DataAnalysisAgentResult>
   readonly runHypoPlannerAgent: (input: {
     readonly taskID: ResearchTaskID
-    readonly dataAnalysis: DataAnalysisAgentResult
     readonly outputDir?: string
   }) => Effect.Effect<HypoPlannerResult>
   readonly runNASAgent: (input: AutonomousLoopInput) => Effect.Effect<NASAgentResult>
@@ -3480,6 +3807,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       return task
     })
 
+    const updateTaskBudget = Effect.fn("Research.updateTaskBudget")(function* (input: UpdateTaskBudgetInput) {
+      const projectID = Instance.project.id
+      const row = yield* db((d) =>
+        d
+          .update(ResearchTaskTable)
+          .set({ budget: input.budget, time_updated: Date.now() })
+          .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, projectID)))
+          .returning()
+          .get(),
+      )
+      if (!row) throw missing("Research task", input.taskID)
+      const task = mapTask(row)
+      yield* bus.publish(Event.TaskUpdated, { task })
+      return task
+    })
+
     const updateTaskWorkflow = Effect.fn("Research.updateTaskWorkflow")(function* (input: {
       taskID: ResearchTaskID
       completedPhases?: readonly PipelineWorkflowPhase[]
@@ -3523,7 +3866,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         ...task.taskSpec,
         metadata: {
           ...metadata,
-          hypothesisPlan: input.hypothesisPlan,
+          baselineStrategy: input.hypothesisPlan.baselineStrategy,
+          searchBiases: input.hypothesisPlan.searchBiases,
+          stopConditions: input.hypothesisPlan.stopConditions,
         } as unknown as JsonRecord,
       }
       const row = yield* db((d) =>
@@ -3538,6 +3883,35 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           .get(),
       )
       if (!row) throw missing("Research task", input.taskID)
+      yield* db((d) =>
+        d.delete(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.task_id, input.taskID)).run(),
+      )
+      if (input.hypothesisPlan.hypotheses.length > 0) {
+        const time = nowTime()
+        yield* db((d) =>
+          d
+            .insert(ResearchHypothesisTable)
+            .values(
+              input.hypothesisPlan.hypotheses.map((h) => ({
+                id: ResearchHypothesisID.ascending(),
+                task_id: input.taskID,
+                hypo_id: h.id,
+                statement: h.statement,
+                motivation: [...h.motivation],
+                expected_outcome: h.expectedOutcome,
+                suggested_backbones: [...h.suggestedBackbones],
+                suggested_preprocessing: [...h.suggestedPreprocessing],
+                priority: h.priority,
+                risk: h.risk,
+                testable: h.testable,
+                status: "pending" as const,
+                time_created: time.created,
+                time_updated: time.updated,
+              })),
+            )
+            .run(),
+        )
+      }
       const updated = mapTask(row)
       yield* bus.publish(Event.TaskUpdated, { task: updated })
       return updated
@@ -3583,6 +3957,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           .all(),
       )
       return rows.map(mapCandidate)
+    })
+
+    const listHypotheses = Effect.fn("Research.listHypotheses")(function* (taskID: ResearchTaskID) {
+      const rows = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchHypothesisTable)
+          .where(eq(ResearchHypothesisTable.task_id, taskID))
+          .orderBy(ResearchHypothesisTable.time_created)
+          .all(),
+      )
+      return rows.map(mapHypothesisRow)
     })
 
     const createApproval = Effect.fn("Research.createApproval")(function* (input: CreateApprovalInput) {
@@ -4593,7 +4979,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             runnerKind: prepared.runPlan.runnerKind,
             stage: prepared.runPlan.stage,
             lineCount: persistedProgressLines.length,
-            previewLines: persistedProgressLines.slice(-30),
+            previewLines: persistedProgressLines.slice(-500),
           },
         })
         artifactRefs.push(progressArtifact.id)
@@ -4947,25 +5333,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           ),
         )
 
-        const hypothesisTitles = reflection.analysis.nextHypotheses.map((h) => h.title)
-        if (hypothesisTitles.length > 0) {
-          // Read fresh from DB so we preserve workflow state (updateTaskSpec would strip it).
-          const freshTask = yield* getTask(input.task.id)
-          const freshMeta = recordValue(freshTask.taskSpec.metadata)
-          const nextTaskSpec = {
-            ...freshTask.taskSpec,
-            metadata: { ...freshMeta, reflectionHypotheses: hypothesisTitles } as unknown as JsonRecord,
-          }
-          const reflRow = yield* db((d) =>
-            d
-              .update(ResearchTaskTable)
-              .set({ task_spec: nextTaskSpec, time_updated: Date.now() })
-              .where(and(eq(ResearchTaskTable.id, input.task.id), eq(ResearchTaskTable.project_id, Instance.project.id)))
-              .returning()
-              .get(),
-          )
-          if (reflRow) yield* bus.publish(Event.TaskUpdated, { task: mapTask(reflRow) })
-        }
       }
 
       return {
@@ -4984,14 +5351,36 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const forceExplore = input.forceExplore === true
       const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
 
-      const existingMeta =
-        typeof task.taskSpec.metadata === "object" && task.taskSpec.metadata !== null && !Array.isArray(task.taskSpec.metadata)
-          ? (task.taskSpec.metadata as Record<string, unknown>)
-          : {}
-      const reflectionHypotheses = Array.isArray(existingMeta.reflectionHypotheses)
-        ? (existingMeta.reflectionHypotheses as string[])
-        : []
-      const hypothesisPlan = experimentPlanFromMetadata(existingMeta.hypothesisPlan)
+      const latestReflection = yield* Effect.promise(async () => {
+        try {
+          const sessionsDir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID)
+          const entries = await readdir(sessionsDir, { withFileTypes: true })
+          const reflectDirs = entries
+            .filter((e) => e.isDirectory() && e.name.startsWith("reflect_"))
+            .map((e) => e.name)
+            .sort()
+            .reverse()
+          for (const dirName of reflectDirs) {
+            const jsonPath = path.join(sessionsDir, dirName, "reflection_result.json")
+            try {
+              const raw = await readFile(jsonPath, "utf8")
+              return JSON.parse(raw) as {
+                nextHypotheses: Array<{ title: string; rationale: string; expectedSignal: string }>
+                reflectionNotesMarkdown: string
+              }
+            } catch {
+              continue
+            }
+          }
+        } catch {
+          // sessions dir doesn't exist yet — first iteration
+        }
+        return null
+      })
+      const reflectionHypotheses = latestReflection?.nextHypotheses.map((h) => h.title) ?? []
+      const previousReflectionNotesMarkdown = latestReflection?.reflectionNotesMarkdown
+      const hypotheses = yield* listHypotheses(input.taskID)
+      const hypothesisPlan = experimentPlanFromDB(task, hypotheses)
       const selectedHypothesis = selectHypothesisForDesign(hypothesisPlan)
 
       const taskFingerprint = buildModelDesignerTaskFingerprint({
@@ -5110,19 +5499,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         const hypoPlanMarkdown = hypothesisPlan !== undefined
           ? buildHypothesesYaml(hypothesisPlan)
           : undefined
-        const previousReflectionMarkdown = reflectionHypotheses.length > 0
-          ? yield* Effect.gen(function* () {
-              const artifacts = yield* listArtifacts(task.id)
-              const notesArtifact = artifacts.find((item) => item.kind === "reflection_notes_md")
-              if (!notesArtifact) return undefined
-              const contentPath = filePathFromURI(notesArtifact.uri)
-              if (!contentPath) return undefined
-              return yield* Effect.promise(async () => {
-                try { return await readFile(contentPath, "utf8") }
-                catch { return undefined }
-              })
-            }).pipe(Effect.orElseSucceed(() => undefined as string | undefined))
-          : undefined
+        const previousReflectionMarkdown: string | undefined =
+          previousReflectionNotesMarkdown && previousReflectionNotesMarkdown.length > 0
+            ? previousReflectionNotesMarkdown
+            : undefined
         const authJsonKey = yield* Effect.promise(() => resolveApiKeyFromAuthJson())
         const llmResult = yield* Effect.promise(() =>
           proposeLLMCandidate({
@@ -5662,8 +6042,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         }
         // Per-iteration reflection: run after every TrainEval, LLM-augmented, non-blocking.
         yield* runReflectionAgent({ taskID: input.taskID }).pipe(Effect.catchCause(() => Effect.void))
+        // Check loop-end conditions after reflection. If any stop condition is already met,
+        // there is no next iteration — skip HypoPlanner and finish immediately.
         if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
           return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "time_budget_exhausted" })
+        }
+        const isLastIteration = index === maxIterations - 1
+        if (!isLastIteration) {
+          const nextIterBlockedReason = yield* getAutonomousLoopStopReason(task)
+          if (nextIterBlockedReason) {
+            return yield* finishAutonomousLoop({ task, iterations, stoppedReason: nextIterBlockedReason })
+          }
+          // Next iteration will run: refresh hypotheses, then restore searching status.
+          yield* runHypoPlannerAgent({ taskID: input.taskID }).pipe(Effect.catchCause(() => Effect.void))
+          yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
         }
       }
       return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "max_iterations" })
@@ -6271,6 +6663,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory, input._onDeltaQualitative),
       )
       const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative?.text)
+      if (llmQualitative?.searchPreferences && llmQualitative.searchPreferences.length > 0) {
+        yield* Effect.promise(async () => {
+          await mkdir(analysisDirectory, { recursive: true })
+          await writeFile(
+            path.join(analysisDirectory, "search_preferences.json"),
+            JSON.stringify(llmQualitative.searchPreferences),
+            "utf8",
+          )
+        })
+      }
       const analysisArtifacts: ResearchArtifact[] = []
       for (const item of analysisFiles) {
         const reportPath = path.join(analysisDirectory, item.filename)
@@ -6678,9 +7080,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	      )
 	    })
 
+    const loadDataAnalysisSummary = (taskID: ResearchTaskID) =>
+      Effect.gen(function* () {
+        const artifacts = yield* listArtifacts(taskID)
+        const artifact = artifacts.find((a) => a.kind === "dataset_analysis_report")
+        if (!artifact) return ""
+        const filePath = artifact.uri.startsWith("file://") ? artifact.uri.slice(7) : undefined
+        if (!filePath) return ""
+        return yield* Effect.promise(() => readFile(filePath, "utf8").catch(() => ""))
+      })
+
 	    const runHypoPlannerAgent = Effect.fn("Research.runHypoPlannerAgent")(function* (input: {
 	      readonly taskID: ResearchTaskID
-	      readonly dataAnalysis: DataAnalysisAgentResult
 	      readonly outputDir?: string
 	    }) {
 	      yield* updateTaskStatus({ taskID: input.taskID, status: "hypo_planning" })
@@ -6694,7 +7105,35 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        const task = yield* getTask(input.taskID)
 	        const runs = yield* listRuns(input.taskID)
 	        const memory = yield* listMemory(input.taskID)
-	        const draftHypotheses = generateHypotheses({ task, dataAnalysis: input.dataAnalysis, runs, memory })
+	        const existingHypothesesRaw = yield* db((d) =>
+	          d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.task_id, input.taskID)).all(),
+	        )
+	        const existingHypotheses = existingHypothesesRaw.map((r) => ({ statement: r.statement, status: r.status }))
+	        const latestReflection = yield* Effect.promise(async () => {
+	          try {
+	            const sessionsDir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID)
+	            const entries = await readdir(sessionsDir, { withFileTypes: true })
+	            const reflectDirs = entries
+	              .filter((e) => e.isDirectory() && e.name.startsWith("reflect_"))
+	              .map((e) => e.name)
+	              .sort()
+	              .reverse()
+	            for (const dirName of reflectDirs) {
+	              try {
+	                const raw = await readFile(path.join(sessionsDir, dirName, "reflection_result.json"), "utf8")
+	                return JSON.parse(raw) as {
+	                  nextHypotheses: Array<{ title: string; rationale: string; expectedSignal: string }>
+	                  reflectionNotesMarkdown: string
+	                  decision: string
+	                  decisionReason: string
+	                }
+	              } catch { continue }
+	            }
+	          } catch { /* no sessions dir yet */ }
+	          return null
+	        })
+	        const dataAnalysisSummary = yield* loadDataAnalysisSummary(input.taskID)
+	        const draftHypotheses = generateHypotheses({ task, dataAnalysisSummary, runs, memory })
 	        const onDeltaHypo = (delta: string): void => {
 	          void Effect.runPromise(
 	            bus.publish(Event.HypoPlannerAgentStreamDelta, {
@@ -6705,12 +7144,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	          ).catch(() => undefined)
 	        }
 	        const llmHypothesesResult = yield* Effect.promise(() =>
-	          generateLLMHypotheses(task, input.dataAnalysis, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo),
+	          generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection),
 	        )
 	        const llmHypoUsage = llmHypothesesResult?.usage
 	        const result = buildHypoPlannerResult({
 	          task,
-	          dataAnalysis: input.dataAnalysis,
+	          dataAnalysisSummary,
 	          runs,
 	          memory,
 	          llmHypotheses: llmHypothesesResult?.hypotheses,
@@ -7006,6 +7445,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	        const runs = yield* listRuns(input.taskID)
 	        const candidates = yield* listCandidates(input.taskID)
 	        const champion = yield* getChampion(input.taskID)
+	        const artifacts = yield* listArtifacts(input.taskID)
+	        const memories = yield* listMemory(input.taskID)
 	        const baseResult = summarizeReflectionAgent({
 	          task,
 	          runs,
@@ -7013,24 +7454,101 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	          champion,
 	          stoppedReason: input.stoppedReason,
 	        })
+
+	        // Build richer LLM context from current candidate, training logs, and history.
+	        const orderedRuns = [...runs].sort((a, b) => a.time.created - b.time.created)
+	        const latestSucceededRun = [...orderedRuns].reverse().find((r) => r.status === "succeeded")
+	        const latestRun = orderedRuns[orderedRuns.length - 1]
+	        const latestRunForContext = latestSucceededRun ?? latestRun
+	        const latestCandidate = latestRunForContext?.candidateID
+	          ? candidates.find((c) => c.id === latestRunForContext.candidateID)
+	          : undefined
+	        const progressArtifact = latestRunForContext
+	          ? artifacts.find((a) => a.kind === "runner_progress_jsonl" && a.runID === latestRunForContext.id)
+	          : undefined
+	        const trainingCurve = yield* Effect.promise(async () => {
+	          if (!progressArtifact) return []
+	          const filePath = progressArtifact.uri.startsWith("file://")
+	            ? progressArtifact.uri.slice("file://".length)
+	            : progressArtifact.uri
+	          return extractTrainingCurve(filePath)
+	        })
+	        const sortedMemories = [...memories].sort((a, b) => b.time.created - a.time.created)
+	        const recentLessons = sortedMemories.slice(0, 2).map((m) => m.lesson)
+	        const reflDir = baseResult.analysis.direction
+	        let bestMemory: (typeof sortedMemories)[0] | undefined
+	        let bestMemoryMetric: number | undefined
+	        for (const m of sortedMemories) {
+	          const ms = recordValue(m.candidateSummary).bestMetric
+	          const mv = typeof ms === "number" && Number.isFinite(ms) ? ms : undefined
+	          if (mv === undefined) continue
+	          if (
+	            bestMemoryMetric === undefined ||
+	            (reflDir === "minimize" ? mv < bestMemoryMetric : mv > bestMemoryMetric)
+	          ) {
+	            bestMemoryMetric = mv
+	            bestMemory = m
+	          }
+	        }
+	        const objectiveRecord = recordValue(task.objective)
+	        const taskObjective = [
+	          `${reflDir === "minimize" ? "Minimize" : "Maximize"} ${baseResult.analysis.primaryMetricName}`,
+	          typeof objectiveRecord.targetMetricValue === "number"
+	            ? `target ≤ ${objectiveRecord.targetMetricValue}`
+	            : null,
+	          typeof objectiveRecord.description === "string" ? objectiveRecord.description : null,
+	        ].filter(Boolean).join(". ")
+	        const llmContext: ReflectionLLMContext = {
+	          taskObjective,
+	          currentHypothesis: latestCandidate?.rationale || undefined,
+	          experimentDesign: latestCandidate?.candidateSpec,
+	          trainingCurve,
+	          recentMemories: recentLessons,
+	          bestMemoryLesson:
+	            bestMemory &&
+	            bestMemory.id !== sortedMemories[0]?.id &&
+	            bestMemory.id !== sortedMemories[1]?.id
+	              ? bestMemory.lesson
+	              : undefined,
+	        }
+
 	        const result = yield* Effect.promise(() =>
-	          generateLLMReflectionSynthesis(task, baseResult).catch(() => ({
+	          generateLLMReflectionSynthesis(task, baseResult, llmContext).catch(() => ({
 	            ...baseResult,
 	            llm: { status: 'failed' as const },
 	          })),
 	        )
-	        const directory = path.join(
-	          runnerPath(Instance.directory, input.outputDir ?? ".neo-research/reflection"),
-	          task.id,
-	        )
+	        const reflectRunId = `reflect_${Date.now()}`
+	        const directory = input.outputDir
+	          ? path.join(runnerPath(Instance.directory, input.outputDir), task.id, reflectRunId)
+	          : path.join(Instance.directory, ".neo-research", "sessions", task.id, reflectRunId)
 	        const notesPath = path.join(directory, "reflection_notes.md")
 	        const planPath = path.join(directory, "next_experiment_plan.md")
 	        const failureLogPath = path.join(directory, "failure_log.md")
+	        const resultJsonPath = path.join(directory, "reflection_result.json")
 	        yield* Effect.promise(async () => {
 	          await mkdir(directory, { recursive: true })
 	          await writeFile(notesPath, result.reflectionNotesMarkdown, "utf8")
 	          await writeFile(planPath, result.nextExperimentPlanMarkdown, "utf8")
 	          await writeFile(failureLogPath, result.failureLogMarkdown, "utf8")
+	          await writeFile(
+	            resultJsonPath,
+	            JSON.stringify({
+	              reflectRunId,
+	              taskID: task.id,
+	              decision: result.analysis.decision,
+	              decisionReason: result.analysis.decisionReason,
+	              nextHypotheses: result.analysis.nextHypotheses,
+	              plateauStreak: result.analysis.plateauStreak,
+	              succeededRuns: result.analysis.succeededRuns,
+	              failedRuns: result.analysis.failedRuns,
+	              bestMetric: result.analysis.bestMetric ?? null,
+	              reflectionNotesMarkdown: result.reflectionNotesMarkdown,
+	              nextExperimentPlanMarkdown: result.nextExperimentPlanMarkdown,
+	              failureLogMarkdown: result.failureLogMarkdown,
+	            }, null, 2),
+	            "utf8",
+	          )
 	        })
 	        const baseMetadata = reflectionAgentMetadata(result)
 	        const notesArtifact = yield* createArtifact({
@@ -7060,7 +7578,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            ...baseMetadata,
 	            llmStatus: result.llm.status,
 	            ...(result.llm.status === "used" && result.llm.text
-	              ? { llmNarrative: result.llm.text.slice(0, 400) }
+	              ? { llmNarrative: result.llm.text }
 	              : {}),
 	            reflectionNotesArtifactID: notesArtifact.id,
 	            nextExperimentPlanArtifactID: planArtifact.id,
@@ -7089,7 +7607,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            nextHypotheses: result.analysis.nextHypotheses.map((h) => h.title),
 	            failureCategories: result.analysis.failures.map((f) => f.category),
 	            ...(result.llm.status === "used" && result.llm.text
-	              ? { llmNarrative: result.llm.text.slice(0, 400) }
+	              ? { llmNarrative: result.llm.text }
 	              : {}),
 	          },
 	          outcome:
@@ -7329,15 +7847,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           } satisfies DataAnalysisAgentResult
         })
 
-      const recoverHypoPlanning = (task: ResearchTask, dataAnalysis: DataAnalysisAgentResult) =>
+      const recoverHypoPlanning = (task: ResearchTask) =>
         Effect.gen(function* () {
-          const plan = experimentPlanFromMetadata(recordValue(task.taskSpec.metadata).hypothesisPlan)
+          const dataAnalysisSummary = yield* loadDataAnalysisSummary(task.id)
+          const hypotheses = yield* listHypotheses(task.id)
+          const plan = experimentPlanFromDB(task, hypotheses)
           if (plan !== undefined) {
-            return recoverHypoPlannerResultFromPlan({ task, dataAnalysis, plan })
+            return recoverHypoPlannerResultFromPlan({ task, dataAnalysisSummary, plan })
           }
           const runs = yield* listRuns(input.taskID)
           const memory = yield* listMemory(input.taskID)
-          return buildHypoPlannerResult({ task, dataAnalysis, runs, memory })
+          return buildHypoPlannerResult({ task, dataAnalysisSummary, runs, memory })
         })
 
       const recoverNAS = (task: ResearchTask) =>
@@ -7541,10 +8061,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const taskAfterDataAnalysis = yield* getTask(input.taskID)
       const workflowAfterDataAnalysis = workflowMetadataFromTask(taskAfterDataAnalysis)
       const hypoPlanning = workflowAfterDataAnalysis.completedPhases.includes("hypo_planning")
-        ? yield* recoverHypoPlanning(taskAfterDataAnalysis, dataAnalysis)
+        ? yield* recoverHypoPlanning(taskAfterDataAnalysis)
         : yield* runHypoPlannerAgent({
             taskID: input.taskID,
-            dataAnalysis,
             outputDir: input.outputDir === undefined ? undefined : path.join(input.outputDir, "hypotheses"),
           }).pipe(
             Effect.tap(() => markWorkflowPhase("hypo_planning")),
@@ -7556,9 +8075,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       const shouldRunSearchSpaceCheckpoint = intent.intentSpec.interaction_mode === "companion" && !currentWorkflow.completedPhases.includes("searching")
       const shouldEmitSocraticSearchSpace = isSocratic && !currentWorkflow.completedPhases.includes("searching")
       if (shouldRunSearchSpaceCheckpoint || shouldEmitSocraticSearchSpace) {
-        const fingerprint = DomainRegistry.summarizeTask(currentTask.domainID, currentTask.taskSpec)
-        const biases = (Array.isArray(fingerprint.searchBiases) ? fingerprint.searchBiases : []).join(", ") || "none"
         const baselines = DomainRegistry.buildBaselines(currentTask.domainID, currentTask.taskSpec)
+        const ssSearchPreferences = yield* Effect.promise(() => loadLLMSearchPreferences(Instance.directory, currentTask.id))
         const baselineList = baselines
           .map((b) => {
             const spec = b.candidateSpec as Record<string, unknown>
@@ -7576,11 +8094,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             return `- ${recipeID} (${arch}): ${rationale}`
           })
           .join("\n")
+        const ssPreferencesSection =
+          ssSearchPreferences && ssSearchPreferences.length > 0
+            ? ["**搜索偏好：**", ...ssSearchPreferences.map((p) => `- ${p}`), ""]
+            : []
         const ssReason = [
           "## 搜索空间已确认，等待确认后开始模型搜索",
           "",
-          "**搜索偏置：** " + biases,
-          "",
+          ...ssPreferencesSection,
           "**计划 Baseline 方案：**",
           baselineList,
           "",
@@ -7637,7 +8158,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               minRelativeImprovement: input.minRelativeImprovement,
               maxNoImprove: input.maxNoImprove,
               timeBudgetSeconds: input.timeBudgetSeconds,
-              maxCrashStreak: input.maxCrashStreak ?? 3,
+              maxCrashStreak: input.maxCrashStreak ?? 5,
               explorationRate: input.explorationRate,
             })
             yield* markWorkflowPhase("searching")
@@ -7674,12 +8195,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
               taskID: input.taskID,
               stage: input.stage,
               description: input.description,
-              maxIterations: (input.maxIterations ?? 10) + 5,
+              maxIterations: (input.maxIterations ?? 50) + 5,
               targetMetricValue: input.targetMetricValue,
               minRelativeImprovement: input.minRelativeImprovement,
               maxNoImprove: input.maxNoImprove,
               timeBudgetSeconds: input.timeBudgetSeconds,
-              maxCrashStreak: input.maxCrashStreak ?? 3,
+              maxCrashStreak: input.maxCrashStreak ?? 5,
               explorationRate: input.explorationRate,
             })
             yield* markWorkflowPhase("nas_budget_extended")
@@ -7734,12 +8255,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
             taskID: input.taskID,
             stage: input.stage,
             description: input.description,
-            maxIterations: (input.maxIterations ?? 10) + 5,
+            maxIterations: (input.maxIterations ?? 50) + 5,
             targetMetricValue: input.targetMetricValue,
             minRelativeImprovement: input.minRelativeImprovement,
             maxNoImprove: input.maxNoImprove,
             timeBudgetSeconds: input.timeBudgetSeconds,
-            maxCrashStreak: input.maxCrashStreak ?? 3,
+            maxCrashStreak: input.maxCrashStreak ?? 5,
             explorationRate: input.explorationRate,
           })
           yield* markWorkflowPhase("nas_budget_extended")
@@ -7944,6 +8465,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       getTask,
       updateTaskStatus,
       updateTaskSpec,
+      updateTaskBudget,
       createCandidate,
       listCandidates,
       createApproval,

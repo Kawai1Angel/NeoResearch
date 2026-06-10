@@ -2404,7 +2404,7 @@ export function buildDefaultTsfResearchTask(
       direction: "minimize",
     },
     budget: {
-      maxRuns: defaults.maxRuns ?? 12,
+      maxRuns: defaults.maxRuns ?? 200,
       maxParallel: 1,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
       parameterBudget: "prefer lightweight models under 2M parameters when accuracy is close",

@@ -50,6 +50,7 @@ from dataset_contract import (
     project_dataset_spec_path,
     ref_test_data_path,
     resolve_data_root,
+    train_data_path,
     visible_data_path,
     write_dataset_spec,
 )
@@ -65,6 +66,7 @@ ACTIVE_SPEC = load_dataset_spec(DATA_ROOT)
 DATASET = ACTIVE_SPEC.task_id
 TIMESTAMP_COL = ACTIVE_SPEC.timestamp_col
 FEATURE_COLUMNS = ACTIVE_SPEC.feature_columns
+TRAIN_DATA_PATH = train_data_path(DATA_ROOT, DATASET)
 VISIBLE_DATA_PATH = visible_data_path(DATA_ROOT, DATASET)
 REF_TEST_DATA_PATH = ref_test_data_path(DATA_ROOT, DATASET)
 DEFAULT_RAW_DATA_PATH = DATA_ROOT / "ETTh1.csv"
@@ -103,6 +105,7 @@ def _apply_spec(spec: DatasetSpec) -> None:
     global DATASET
     global TIMESTAMP_COL
     global FEATURE_COLUMNS
+    global TRAIN_DATA_PATH
     global VISIBLE_DATA_PATH
     global REF_TEST_DATA_PATH
     global NUM_CHANNELS
@@ -117,6 +120,7 @@ def _apply_spec(spec: DatasetSpec) -> None:
     DATASET = spec.task_id
     TIMESTAMP_COL = spec.timestamp_col
     FEATURE_COLUMNS = spec.feature_columns
+    TRAIN_DATA_PATH = train_data_path(DATA_ROOT, DATASET)
     VISIBLE_DATA_PATH = visible_data_path(DATA_ROOT, DATASET)
     REF_TEST_DATA_PATH = ref_test_data_path(DATA_ROOT, DATASET)
     NUM_CHANNELS = len(FEATURE_COLUMNS)
@@ -485,7 +489,7 @@ def materialize_visible_splits(
     df = df.iloc[: BORDER_TEST[1]].copy()
 
     if not force:
-        for path in (VISIBLE_DATA_PATH, REF_TEST_DATA_PATH):
+        for path in (TRAIN_DATA_PATH, VISIBLE_DATA_PATH, REF_TEST_DATA_PATH):
             if path.exists():
                 raise FileExistsError(
                     f"{path} already exists. Re-run with --force to overwrite prepared split files."
@@ -500,9 +504,11 @@ def materialize_visible_splits(
     profile_path = DATA_ROOT / f"{DATASET}_profile.json"
     profile_path.write_text(f"{json.dumps(prepared_profile, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
+    train_df = df.iloc[BORDER_TRAIN[0] : BORDER_TRAIN[1]].copy()
     visible_df = df.iloc[: BORDER_VAL[1]].copy()
     ref_test_df = df.iloc[BORDER_TEST[0] : BORDER_TEST[1]].copy()
 
+    train_df.to_csv(TRAIN_DATA_PATH, index=False)
     visible_df.to_csv(VISIBLE_DATA_PATH, index=False)
     ref_test_df.to_csv(REF_TEST_DATA_PATH, index=False)
 
@@ -510,6 +516,7 @@ def materialize_visible_splits(
     _VISIBLE_BUNDLE = None
 
     return {
+        "train": TRAIN_DATA_PATH,
         "visible": VISIBLE_DATA_PATH,
         "ref_test": REF_TEST_DATA_PATH,
         "profile": profile_path,

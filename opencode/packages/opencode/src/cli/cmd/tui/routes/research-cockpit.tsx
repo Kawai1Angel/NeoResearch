@@ -425,7 +425,8 @@ function progressRecordNumber(record: JsonRecord, key: string) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
-function formatRunnerProgressLine(data: RunnerProgressLineEvent) {
+function formatRunnerProgressLine(data: RunnerProgressLineEvent): string | null {
+  if (data.event === "batch_progress") return null
   if (data.event === "epoch_end") {
     return `epoch ${data.epoch ?? "?"} | h${data.horizon ?? "?"} | val_loss ${data.valLoss?.toFixed(4) ?? "?"}`
   }
@@ -540,7 +541,9 @@ const cockpitColors = {
 
 const promptEventHistoryLimit = 20
 const errorEventHistoryLimit = 10
-const runnerOutputBufferSize = 30
+// "full"-stage runs can emit far more than 30 epoch_end lines (up to 100 epochs x 4 horizons),
+// so a small ring buffer evicts the early training history before Reflection/HypoPlanner even run.
+const runnerOutputBufferSize = 500
 const neoResearchVersion = InstallationVersion === "local" ? packageJson.version : InstallationVersion
 const researchCockpitOnboardingFile = path.join(Global.Path.data, "onboarded.json")
 const researchCockpitOnboardingText = [
@@ -1422,6 +1425,7 @@ export function ResearchCockpit() {
       const task = selectedTask()
       if (task && typeof taskID === "string" && taskID !== task.id) return
       const text = formatRunnerProgressLine(data as RunnerProgressLineEvent)
+      if (text === null) return
       setRunnerOutputLines((lines) => [
         ...lines.slice(-(runnerOutputBufferSize - 1)),
         {
@@ -1522,15 +1526,10 @@ export function ResearchCockpit() {
             tone: "muted",
           })
         if (llmStatus === "used" && llmNarrative) {
-          for (const part of llmNarrative.split("\n\n").slice(0, 3)) {
+          for (const part of llmNarrative.split("\n\n")) {
             const trimmed = part.trim()
             if (trimmed)
-              newLines.push({
-                id: ++streamEventID,
-                taskID,
-                text: `  ${trimmed.length > 160 ? trimmed.slice(0, 157) + "..." : trimmed}`,
-                tone: "muted",
-              })
+              newLines.push({ id: ++streamEventID, taskID, text: `  ${trimmed}`, tone: "muted" })
           }
         }
       } else {
@@ -1620,12 +1619,20 @@ export function ResearchCockpit() {
           : llmStatus === "failed" ? "(LLM failed — heuristic hypotheses used)"
           : llmStatus === "skipped" ? "(heuristic — LLM not configured)"
           : undefined
-        setHypoPlannerStream((prev) => ({
-          id: prev?.id ?? ++streamEventID,
-          taskID,
-          text: hypothesisLines ?? prev?.text ?? "",
-          done: true,
-        }))
+        const finalText = hypothesisLines ?? hypoPlannerStream()?.text ?? ""
+        // Push HypoPlanner result into the chronological designLLMLines so it appears
+        // after Reflection output at the bottom — not above it in the fixed stream block.
+        const hypoNewLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
+        hypoNewLines.push({ id: ++streamEventID, taskID, text: "[HypoPlanner] 假设已更新", tone: "muted" })
+        if (finalText) {
+          for (const part of finalText.split("\n\n")) {
+            const trimmed = part.trim()
+            if (trimmed)
+              hypoNewLines.push({ id: ++streamEventID, taskID, text: `  ${trimmed}`, tone: "muted" })
+          }
+        }
+        setDesignLLMLines((prev) => [...prev, ...hypoNewLines])
+        setHypoPlannerStream(undefined)
         setLiveAgentEventStage(undefined)
         setRefresh((value) => value + 1)
         return
@@ -2522,7 +2529,7 @@ export function ResearchCockpit() {
         `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "full", maxIterations: 10, description: "resume pipeline: reflection & publish" }),
+          body: JSON.stringify({ stage: "full", maxIterations: 50, description: "resume pipeline: reflection & publish" }),
           signal,
         },
         600_000,
@@ -2572,7 +2579,7 @@ export function ResearchCockpit() {
           `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
           {
             method: "POST",
-            body: JSON.stringify({ stage: "full", maxIterations: 10, description: "cockpit companion pipeline" }),
+            body: JSON.stringify({ stage: "full", maxIterations: 50, description: "cockpit companion pipeline" }),
             signal,
           },
           600_000,
@@ -2586,7 +2593,7 @@ export function ResearchCockpit() {
         `/research/tasks/${encodeURIComponent(task.id)}/autonomous/loop`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "full", maxIterations: 10, description: "cockpit autonomous loop" }),
+          body: JSON.stringify({ stage: "full", maxIterations: 50, description: "cockpit autonomous loop" }),
           signal,
         },
       )
@@ -3233,7 +3240,7 @@ export function ResearchCockpit() {
           `/research/tasks/${encodeURIComponent(executableTask.id)}/pipeline`,
           {
             method: "POST",
-            body: JSON.stringify({ stage: "smoke", description: value, maxIterations: 10 }),
+            body: JSON.stringify({ stage: "smoke", description: value, maxIterations: 50 }),
           },
         )
         detail = `${eventDetail}; completed multi-agent pipeline`
@@ -3845,9 +3852,12 @@ export function ResearchCockpit() {
         }
       }
     }
+    // Keep all task-scoped runner lines (not filtered to latest run ID) so that epoch output
+    // from a just-completed run doesn't vanish the moment the next iteration starts.
+    // The merge-by-id logic places them correctly since runner IDs are lower than the next
+    // iteration's ModelDesigner ID (both use the same streamEventID counter).
     const liveRunnerLines = runnerOutputLines().filter((item) => {
       if (task && item.taskID && item.taskID !== task.id) return false
-      if (run && item.runID !== run.id) return false
       return true
     })
     const liveDesignLines = designLLMLines().filter((item) => !task || !item.taskID || item.taskID === task.id)
@@ -3862,8 +3872,14 @@ export function ResearchCockpit() {
         lines.push({ id: `da-stream-${daStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
       }
     }
+    // Initial-phase HypoPlanner (before any training): render alongside DA stream, before design lines.
     const hypoStream = hypoPlannerStream()
-    if (hypoStream && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
+    const hasCompletedTrainingRuns = taskRuns().some(
+      (r) =>
+        (r.stage === "low_fidelity" || r.stage === "full" || r.stage === "ref_test" || r.stage === "blind_test") &&
+        (r.status === "succeeded" || r.status === "failed"),
+    )
+    if (hypoStream && !hasCompletedTrainingRuns && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
       lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
       const hypoLines = compactStreamTextParts(hypoStream.text)
       for (let i = 0; i < hypoLines.length; i++) {
@@ -3873,17 +3889,9 @@ export function ResearchCockpit() {
         lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
       }
     }
-    for (const item of liveDesignLines) {
-      lines.push({ id: `design-live-${item.id}`, text: item.text, tone: item.tone })
-    }
     const traceArtifact = run
       ? taskArtifacts().find((artifact) => artifact.kind === "research_manager_trace_json" && artifact.runID === run.id)
       : undefined
-    if (liveDesignLines.length === 0) {
-      for (const item of formatResearchCockpitLLMDesignLines(traceArtifact)) {
-        lines.push({ id: item.id, text: item.text, tone: item.tone })
-      }
-    }
     const progressArtifact = run
       ? taskArtifacts().find((artifact) => artifact.kind === "runner_progress_jsonl" && artifact.runID === run.id)
       : undefined
@@ -3908,19 +3916,48 @@ export function ResearchCockpit() {
               tone: record.event === "timeout" ? ("warning" as const) : ("muted" as const),
             }
           })
-          .filter((item): item is { id: string; text: string; tone: "muted" | "warning" } => item !== undefined)
+          .filter((item): item is { id: string; text: string; tone: "muted" | "warning" } => item !== undefined && item.text !== null)
       : []
     const approval = pendingApproval()
     const isFinalModelSelectionPending =
       !!approval && /\[checkpoint:final_model_selection\]/.test(approval.reason)
-    if (run && !isFinalModelSelectionPending && (run.status !== "running" || liveRunnerLines.length === 0)) {
-      for (const item of persistedRunnerLines) {
+    // Merge design events and live runner epochs into one chronological stream.
+    // Both designLLMLines and runnerOutputLines share the same streamEventID counter,
+    // so sorting by numeric id faithfully interleaves ModelDesigner → epochs → Reflection → HypoPlanner.
+    const hasLiveRunnerData = liveRunnerLines.length > 0 && !isFinalModelSelectionPending
+    if (hasLiveRunnerData) {
+      const merged = [
+        ...liveDesignLines.map((item) => ({ sortId: item.id, id: `design-${item.id}`, text: item.text, tone: item.tone })),
+        ...liveRunnerLines.map((item) => ({ sortId: item.id, id: `runner-${item.id}`, text: item.text, tone: item.tone })),
+      ].sort((a, b) => a.sortId - b.sortId)
+      for (const item of merged) {
         lines.push({ id: item.id, text: item.text, tone: item.tone })
       }
+    } else {
+      // No live runner data: design lines in order, then persisted runner lines as epoch fallback
+      for (const item of liveDesignLines) {
+        lines.push({ id: `design-${item.id}`, text: item.text, tone: item.tone })
+      }
+      if (liveDesignLines.length === 0) {
+        for (const item of formatResearchCockpitLLMDesignLines(traceArtifact)) {
+          lines.push({ id: item.id, text: item.text, tone: item.tone })
+        }
+      }
+      if (run && !isFinalModelSelectionPending) {
+        for (const item of persistedRunnerLines) {
+          lines.push({ id: item.id, text: item.text, tone: item.tone })
+        }
+      }
     }
-    if (run?.status === "running" && !isFinalModelSelectionPending) {
-      for (const item of liveRunnerLines) {
-        lines.push({ id: `runner-${item.id}`, text: item.text, tone: item.tone })
+    // Active HypoPlanner stream (fires after Reflection, between iterations): appears at the bottom
+    if (hypoStream && hasCompletedTrainingRuns && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
+      lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
+      const hypoLines = compactStreamTextParts(hypoStream.text)
+      for (let i = 0; i < hypoLines.length; i++) {
+        lines.push({ id: `hypo-stream-${hypoStream.id}-${i}`, text: `  ${hypoLines[i]}`, tone: "muted" })
+      }
+      if (!hypoStream.done) {
+        lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
       }
     }
     if (run) {

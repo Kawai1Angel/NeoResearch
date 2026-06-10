@@ -769,7 +769,7 @@ describe("Research service", () => {
             "model_export_package",
           ]),
         )
-        expect((finalTask.taskSpec.metadata as Record<string, unknown>).hypothesisPlan).toBeDefined()
+        expect((finalTask.taskSpec.metadata as Record<string, unknown>).baselineStrategy).toBeDefined()
       },
     })
   })

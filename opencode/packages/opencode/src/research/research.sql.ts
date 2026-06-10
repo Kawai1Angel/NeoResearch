@@ -7,6 +7,7 @@ import type {
   ResearchApprovalID,
   ResearchArtifactID,
   ResearchCandidateID,
+  ResearchHypothesisID,
   ResearchMemoryID,
   ResearchRunID,
   ResearchTaskID,
@@ -157,6 +158,32 @@ export const ResearchApprovalTable = sqliteTable(
   (table) => [
     index("research_approval_task_idx").on(table.task_id),
     index("research_approval_status_idx").on(table.status),
+  ],
+)
+
+export const ResearchHypothesisTable = sqliteTable(
+  "research_hypothesis",
+  {
+    id: text().$type<ResearchHypothesisID>().primaryKey(),
+    task_id: text()
+      .$type<ResearchTaskID>()
+      .notNull()
+      .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+    hypo_id: text().notNull(),
+    statement: text().notNull(),
+    motivation: text({ mode: "json" }).notNull().$type<string[]>(),
+    expected_outcome: text().notNull(),
+    suggested_backbones: text({ mode: "json" }).notNull().$type<string[]>(),
+    suggested_preprocessing: text({ mode: "json" }).notNull().$type<string[]>(),
+    priority: text().notNull(),
+    risk: text().notNull(),
+    testable: integer({ mode: "boolean" }).notNull(),
+    status: text().notNull().default("pending"),
+    ...Timestamps,
+  },
+  (table) => [
+    index("research_hypothesis_task_idx").on(table.task_id),
+    index("research_hypothesis_status_idx").on(table.status),
   ],
 )
 

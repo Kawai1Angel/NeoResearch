@@ -63,6 +63,17 @@ export const ResearchApprovalID = Schema.String.annotate({ [ZodOverride]: Identi
 )
 export type ResearchApprovalID = Schema.Schema.Type<typeof ResearchApprovalID>
 
+export const ResearchHypothesisID = Schema.String.annotate({
+  [ZodOverride]: Identifier.schema("researchHypothesis"),
+}).pipe(
+  Schema.brand("ResearchHypothesisID"),
+  withStatics((s) => ({
+    ascending: (id?: string) => s.make(Identifier.ascending("researchHypothesis", id)),
+    zod: zod(s),
+  })),
+)
+export type ResearchHypothesisID = Schema.Schema.Type<typeof ResearchHypothesisID>
+
 export const JsonRecord = Schema.Record(Schema.String, Schema.Json)
   .annotate({
     [ZodOverride]: z.record(z.string(), z.unknown()) as z.ZodType<
@@ -298,6 +309,13 @@ export class UpdateTaskSpecInput extends Schema.Class<UpdateTaskSpecInput>("Rese
   taskID: ResearchTaskID,
   interactionMode: Schema.optional(ResearchInteractionMode),
   taskSpec: JsonRecord,
+}) {
+  static readonly zod = zod(this)
+}
+
+export class UpdateTaskBudgetInput extends Schema.Class<UpdateTaskBudgetInput>("ResearchUpdateTaskBudgetInput")({
+  taskID: ResearchTaskID,
+  budget: JsonRecord,
 }) {
   static readonly zod = zod(this)
 }

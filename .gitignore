@@ -13,6 +13,10 @@ dist/
 *.log
 *.tsbuildinfo
 
+# Datasets and prompt documents (local only)
+dataset/
+prompts/
+
 # Python local state
 .venv/
 __pycache__/

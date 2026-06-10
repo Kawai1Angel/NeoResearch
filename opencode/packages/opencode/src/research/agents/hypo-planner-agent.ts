@@ -1,10 +1,10 @@
-import type { DataAnalysisAgentResult } from "./data-analysis-agent"
 import type { JsonRecord, ResearchMemory, ResearchRun, ResearchTask, ResearchTaskID } from "../schema"
 
 export interface HypothesisObject {
   readonly id: string
   readonly statement: string
   readonly motivation: readonly string[]
+  readonly expectedOutcome: string
   readonly suggestedBackbones: readonly string[]
   readonly suggestedPreprocessing: readonly string[]
   readonly priority: "high" | "medium" | "low"
@@ -39,7 +39,7 @@ export interface HypoPlannerResult {
 
 export interface HypoPlannerInput {
   readonly task: ResearchTask
-  readonly dataAnalysis: DataAnalysisAgentResult
+  readonly dataAnalysisSummary: string
   readonly runs: readonly ResearchRun[]
   readonly memory: readonly ResearchMemory[]
   readonly llmHypotheses?: readonly HypothesisObject[]
@@ -51,6 +51,7 @@ interface HypothesisRule {
   readonly metricKeys: readonly string[]
   readonly suggestedBackbones: readonly string[]
   readonly suggestedPreprocessing: readonly string[]
+  readonly expectedOutcome: string
   readonly priority: "high" | "medium" | "low"
   readonly risk: string
 }
@@ -62,6 +63,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["seasonalityStrength", "acfMainPeriodStrength"],
     suggestedBackbones: ["dlinear", "nbeats", "patch_transformer"],
     suggestedPreprocessing: ["seasonal_decomposition", "per_series_normalization"],
+    expectedOutcome: "Decomposition-aware backbones should reduce val_avg_mse compared to non-seasonal baselines by better capturing periodic patterns.",
     priority: "high",
     risk: "The detected period may be weak or unstable across the evaluation horizon.",
   },
@@ -71,6 +73,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["trendStrength", "adfStatistic"],
     suggestedBackbones: ["dlinear", "linear", "mixer"],
     suggestedPreprocessing: ["detrend", "standard_scaling"],
+    expectedOutcome: "Detrending preprocessing combined with linear or mixer backbones should yield stable val_avg_mse with lower variance across horizon lengths.",
     priority: "high",
     risk: "Aggressive detrending can remove useful low-frequency signal.",
   },
@@ -80,6 +83,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["crossVarCorrelation"],
     suggestedBackbones: ["mixer", "patch_transformer", "tcn"],
     suggestedPreprocessing: ["channel_normalization", "correlation_screening"],
+    expectedOutcome: "Channel-mixing backbones should outperform independent-channel baselines by leveraging inter-variate dependencies.",
     priority: "high",
     risk: "Spurious channel correlations can overfit small validation windows.",
   },
@@ -89,6 +93,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["missingRate"],
     suggestedBackbones: ["linear", "dlinear", "mixer"],
     suggestedPreprocessing: ["forward_fill", "mask_features", "robust_scaling"],
+    expectedOutcome: "Imputation and masking should prevent training divergence, improving val_avg_mse compared to unmasked inputs.",
     priority: "medium",
     risk: "Imputation can leak future information if it is not restricted to causal context.",
   },
@@ -98,6 +103,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["distributionShift", "outlierRate"],
     suggestedBackbones: ["dlinear", "mixer", "linear"],
     suggestedPreprocessing: ["robust_scaling", "rolling_normalization", "time_ordered_validation"],
+    expectedOutcome: "Robust-scaling candidates should show smaller degradation between validation and reference-test MSE under distribution shift.",
     priority: "high",
     risk: "A short validation split may not represent the shifted test regime.",
   },
@@ -107,6 +113,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: [],
     suggestedBackbones: ["mixer", "patch_transformer", "tcn"],
     suggestedPreprocessing: ["quantile_targets", "calibration_check"],
+    expectedOutcome: "Distributional heads should achieve better calibration (CRPS/quantile coverage) while not degrading point-MSE by more than 5%.",
     priority: "medium",
     risk: "Distributional losses can improve calibration while worsening the primary point metric.",
   },
@@ -116,6 +123,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["horizonContextRatio"],
     suggestedBackbones: ["dlinear", "patch_transformer", "nbeats"],
     suggestedPreprocessing: ["multi_horizon_validation", "context_window_ablation"],
+    expectedOutcome: "Patch-based and low-frequency candidates should maintain lower MSE at horizon 336 and 720 compared to step-by-step recurrent alternatives.",
     priority: "medium",
     risk: "Long horizons can hide short-term errors behind averaged metrics.",
   },
@@ -125,6 +133,7 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["targetCount"],
     suggestedBackbones: ["mixer", "patch_transformer", "linear"],
     suggestedPreprocessing: ["per_channel_scaling", "target_correlation_audit"],
+    expectedOutcome: "Channel-mixing variants should improve val_avg_mse over per-channel baselines when cross-channel correlation is confirmed.",
     priority: "medium",
     risk: "Extra channel capacity may add noise when targets are weakly related.",
   },
@@ -180,8 +189,8 @@ function profileDerivedBiases(task: ResearchTask) {
   return unique(biases)
 }
 
-function orderedBiases(task: ResearchTask, dataAnalysis: DataAnalysisAgentResult) {
-  const explicit = unique([...dataAnalysis.searchBiases, ...taskSearchBiases(task)])
+function orderedBiases(task: ResearchTask) {
+  const explicit = taskSearchBiases(task)
   const source = explicit.length > 0 ? explicit : profileDerivedBiases(task)
   const known = hypothesisRules.map((rule) => rule.bias)
   return unique([
@@ -223,6 +232,7 @@ function fallbackHypothesis(input: HypoPlannerInput): HypothesisObject {
       ...historyMotivations(input.runs),
       ...memoryMotivations(input.memory),
     ],
+    expectedOutcome: "val_avg_mse should decrease below the naive baseline, providing a reliable reference point for subsequent search.",
     suggestedBackbones: ["linear", "dlinear"],
     suggestedPreprocessing: ["standard_scaling"],
     priority: "medium",
@@ -231,21 +241,13 @@ function fallbackHypothesis(input: HypoPlannerInput): HypothesisObject {
   }
 }
 
-export function extractEvidenceSummary(dataAnalysis: DataAnalysisAgentResult): string {
-  const biasText = dataAnalysis.searchBiases.length > 0 ? dataAnalysis.searchBiases.join(", ") : "none"
-  const warningText = `${dataAnalysis.warningCount} warning${dataAnalysis.warningCount === 1 ? "" : "s"}`
-  const sourceText = `${dataAnalysis.sourceArtifactIDs.length} source artifact${
-    dataAnalysis.sourceArtifactIDs.length === 1 ? "" : "s"
-  }`
-  return [
-    `DataAnalysisAgent artifact ${dataAnalysis.artifact.id} provides the current search handoff.`,
-    `Search biases: ${biasText}.`,
-    `Quality signals: ${warningText}; ${sourceText}.`,
-  ].join(" ")
+export function extractEvidenceSummary(dataAnalysisSummary: string): string {
+  const lines = dataAnalysisSummary.split("\n").filter((l) => l.trim().length > 0)
+  return lines.slice(0, 30).join("\n")
 }
 
 export function generateHypotheses(input: HypoPlannerInput): HypothesisObject[] {
-  const biases = orderedBiases(input.task, input.dataAnalysis)
+  const biases = orderedBiases(input.task)
   const rules = biases
     .map((bias) => hypothesisRules.find((rule) => rule.bias === bias))
     .filter((rule): rule is HypothesisRule => rule !== undefined)
@@ -261,6 +263,7 @@ export function generateHypotheses(input: HypoPlannerInput): HypothesisObject[] 
       ...historyMotivations(input.runs),
       ...memoryMotivations(input.memory),
     ]),
+    expectedOutcome: rule.expectedOutcome,
     suggestedBackbones: rule.suggestedBackbones,
     suggestedPreprocessing: rule.suggestedPreprocessing,
     priority: rule.priority,
@@ -323,10 +326,10 @@ export function buildExperimentPlan(input: {
     ...taskSearchBiases(input.task),
     ...hypothesisSearchBiases(input.hypotheses),
   ])
-  const maxTrials = Math.max(1, Math.floor(budgetNumber(input.task, "maxTrials", "maxRuns") ?? 12))
+  const maxTrials = Math.max(1, Math.floor(budgetNumber(input.task, "maxTrials", "maxRuns") ?? 50))
   const noImprovementRounds = Math.max(
     1,
-    Math.floor(budgetNumber(input.task, "noImprovementRounds", "maxNoImprove") ?? 3),
+    Math.floor(budgetNumber(input.task, "noImprovementRounds", "maxNoImprove") ?? 20),
   )
   const targetMetricValue = objectiveNumber(input.task, "targetMetricValue", "targetMetric")
   return {
@@ -373,6 +376,7 @@ export function buildHypothesesYaml(plan: ExperimentPlan): string {
       `    statement: ${yamlScalar(hypothesis.statement)}`,
       "    motivation:",
       ...yamlList(hypothesis.motivation, "      "),
+      `    expectedOutcome: ${yamlScalar(hypothesis.expectedOutcome)}`,
       "    suggestedBackbones:",
       ...yamlList(hypothesis.suggestedBackbones, "      "),
       "    suggestedPreprocessing:",
@@ -415,6 +419,7 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
       "",
       `- Priority: ${hypothesis.priority}`,
       `- Testable: ${hypothesis.testable ? "yes" : "no"}`,
+      `- Expected outcome: ${hypothesis.expectedOutcome}`,
       `- Suggested backbones: ${hypothesis.suggestedBackbones.join(", ")}`,
       `- Suggested preprocessing: ${hypothesis.suggestedPreprocessing.join(", ")}`,
       `- Risk: ${hypothesis.risk}`,
@@ -428,7 +433,7 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
 }
 
 export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResult {
-  const evidenceSummary = extractEvidenceSummary(input.dataAnalysis)
+  const evidenceSummary = extractEvidenceSummary(input.dataAnalysisSummary)
   const useLLMHypotheses = input.llmHypotheses !== undefined && input.llmHypotheses.length > 0
   const hypotheses = useLLMHypotheses ? [...input.llmHypotheses!] : generateHypotheses(input)
   const plan = buildExperimentPlan({ hypotheses, task: input.task })

@@ -376,6 +376,36 @@ export const ResearchRoutes = lazy(() =>
           })
         }),
     )
+    .patch(
+      "/tasks/:taskID/budget",
+      describeRoute({
+        summary: "Update research task budget",
+        description: "Merge-patch the budget for a research task (e.g. raise maxRuns for a long experiment).",
+        operationId: "research.tasks.updateBudget",
+        responses: {
+          200: {
+            description: "Updated research task",
+            content: {
+              "application/json": {
+                schema: resolver(Research.ResearchTask.zod),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator("json", z.object({ budget: Research.JsonRecord.zod })),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.updateBudget", c, function* () {
+          const svc = yield* Research.Service
+          const { budget } = c.req.valid("json")
+          return yield* svc.updateTaskBudget({
+            taskID: c.req.valid("param").taskID,
+            budget: budget as Research.JsonRecord,
+          })
+        }),
+    )
     .post(
       "/tasks/:taskID/intent/answer",
       describeRoute({
@@ -565,7 +595,7 @@ export const ResearchRoutes = lazy(() =>
         z.object({
           stage: Research.ExecutableRunStage.zod.optional(),
           description: z.string().optional(),
-          maxIterations: z.number().int().min(1).max(50).optional(),
+          maxIterations: z.number().int().min(1).max(200).optional(),
           targetMetricValue: z.number().optional(),
           minRelativeImprovement: z.number().min(0).optional(),
           maxNoImprove: z.number().int().min(0).optional(),
@@ -682,7 +712,7 @@ export const ResearchRoutes = lazy(() =>
         z.object({
           stage: Research.ExecutableRunStage.zod.optional(),
           description: z.string().optional(),
-          maxIterations: z.number().int().min(1).max(50).optional(),
+          maxIterations: z.number().int().min(1).max(200).optional(),
           targetMetricValue: z.number().optional(),
           minRelativeImprovement: z.number().min(0).optional(),
           maxNoImprove: z.number().int().min(0).optional(),

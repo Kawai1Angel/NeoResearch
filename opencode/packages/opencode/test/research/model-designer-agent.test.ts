@@ -1,13 +1,17 @@
 import { expect, test } from "bun:test"
 import {
   buildExistingFrontierRankings,
+  buildModelDesignerComponentLibrary,
+  buildModelDesignerProposalFromHypotheses,
   buildModelDesignerResult,
   buildModelDesignerTaskFingerprint,
   candidateAttemptStateFromRuns,
   selectHypothesisForDesign,
+  selectHypothesisFromList,
   selectModelDesignerCandidate,
+  type ModelDesignerInput,
 } from "../../src/research/agents/model-designer-agent"
-import type { ExperimentPlan } from "../../src/research/agents/hypo-planner-agent"
+import type { ExperimentPlan, HypothesisObject } from "../../src/research/agents/hypo-planner-agent"
 import type { JsonRecord, ResearchCandidate, ResearchRun, ResearchTask } from "../../src/research/schema"
 
 function candidate(input: {
@@ -74,6 +78,7 @@ function plan(): ExperimentPlan {
         id: "H1",
         statement: "seasonal structure needs decomposition.",
         motivation: ["seasonalityStrength=0.7"],
+        expectedOutcome: "val_avg_mse should decrease with decomposition-aware backbone.",
         suggestedBackbones: ["dlinear", "patch_transformer"],
         suggestedPreprocessing: ["seasonal_decomposition"],
         priority: "high",
@@ -84,6 +89,7 @@ function plan(): ExperimentPlan {
         id: "H2",
         statement: "low priority fallback.",
         motivation: [],
+        expectedOutcome: "val_avg_mse should not regress from the current best.",
         suggestedBackbones: ["linear"],
         suggestedPreprocessing: [],
         priority: "low",
@@ -228,4 +234,139 @@ test("buildModelDesignerResult records candidate identity, recipe, hypothesis, a
     approvalStatus: "auto_approved",
     selectionSource: "existing_frontier",
   })
+})
+
+const tsfActionRegistry = {
+  backbone: {
+    linear: { bridgeSupported: true },
+    mlp: { bridgeSupported: true },
+    transformer: { bridgeSupported: true },
+    dlinear: { bridgeSupported: false },
+    mixer: { bridgeSupported: false },
+  },
+  preprocessing: {
+    none: { bridgeSupported: true },
+    instance_norm: { bridgeSupported: true },
+    series_decomposition: { bridgeSupported: false },
+  },
+  embedding: {
+    none: { bridgeSupported: true },
+    patch: { bridgeSupported: true },
+  },
+  loss: {
+    mse: { bridgeSupported: true },
+    mae: { bridgeSupported: true },
+  },
+  optimizer: {
+    adam: { bridgeSupported: true },
+    adamw: { bridgeSupported: true },
+  },
+  scheduler: {
+    none: { bridgeSupported: true },
+    cosine: { bridgeSupported: true },
+  },
+}
+
+test("buildModelDesignerComponentLibrary returns all available components when bridgeOnly is false", () => {
+  const lib = buildModelDesignerComponentLibrary({ actionRegistry: tsfActionRegistry, bridgeOnly: false })
+  expect(lib.backbones).toContain("dlinear")
+  expect(lib.backbones).toContain("mixer")
+  expect(lib.preprocessing).toContain("series_decomposition")
+})
+
+test("buildModelDesignerComponentLibrary filters to bridgeSupported components when bridgeOnly is true", () => {
+  const lib = buildModelDesignerComponentLibrary({ actionRegistry: tsfActionRegistry, bridgeOnly: true })
+  expect(lib.backbones).toContain("linear")
+  expect(lib.backbones).not.toContain("dlinear")
+  expect(lib.preprocessing).not.toContain("series_decomposition")
+  expect(lib.preprocessing).toContain("instance_norm")
+})
+
+function hypothesisForDesign(overrides?: Partial<HypothesisObject>): HypothesisObject {
+  return {
+    id: "H1",
+    statement: "seasonal structure needs decomposition.",
+    motivation: ["seasonalityStrength=0.7"],
+    expectedOutcome: "val_avg_mse should decrease with decomposition-aware backbone.",
+    suggestedBackbones: ["dlinear", "mixer"],
+    suggestedPreprocessing: ["series_decomposition", "instance_norm"],
+    priority: "high",
+    risk: "period may drift",
+    testable: true,
+    ...overrides,
+  }
+}
+
+function designerInput(hypotheses: readonly HypothesisObject[], bridgeOnly = false): ModelDesignerInput {
+  const lib = buildModelDesignerComponentLibrary({ actionRegistry: tsfActionRegistry, bridgeOnly })
+  return {
+    task: task(),
+    dataAnalysisSummary: "seasonalityStrength=0.7, trendStrength=0.3",
+    hypotheses,
+    componentLibrary: lib,
+  }
+}
+
+test("selectHypothesisFromList returns undefined for an empty list", () => {
+  expect(selectHypothesisFromList([])).toBeUndefined()
+})
+
+test("selectHypothesisFromList picks the highest-priority testable hypothesis", () => {
+  const h1 = hypothesisForDesign({ id: "H1", priority: "low" })
+  const h2 = hypothesisForDesign({ id: "H2", priority: "high" })
+  const h3 = hypothesisForDesign({ id: "H3", priority: "medium" })
+  expect(selectHypothesisFromList([h1, h2, h3])?.id).toBe("H2")
+})
+
+test("selectHypothesisFromList skips non-testable hypotheses when testable ones exist", () => {
+  const nonTestable = hypothesisForDesign({ id: "H1", testable: false, priority: "high" })
+  const testable = hypothesisForDesign({ id: "H2", testable: true, priority: "low" })
+  expect(selectHypothesisFromList([nonTestable, testable])?.id).toBe("H2")
+})
+
+test("buildModelDesignerProposalFromHypotheses returns undefined for an empty hypothesis list", () => {
+  expect(buildModelDesignerProposalFromHypotheses(designerInput([]))).toBeUndefined()
+})
+
+test("buildModelDesignerProposalFromHypotheses selects the highest-priority hypothesis and picks matching backbone and preprocessing", () => {
+  const low = hypothesisForDesign({ id: "H_low", priority: "low" })
+  const high = hypothesisForDesign({ id: "H_high", priority: "high" })
+  const result = buildModelDesignerProposalFromHypotheses(designerInput([low, high]))
+  expect(result).toBeDefined()
+  expect(result!.selectedHypothesis.id).toBe("H_high")
+  const spec = result!.proposal.candidateSpec as Record<string, unknown>
+  expect((spec.backbone as Record<string, unknown>).type).toBe("dlinear")
+  expect(((spec.preprocessing as Record<string, unknown>).actions as Array<Record<string, unknown>>)[0]!.type).toBe(
+    "series_decomposition",
+  )
+})
+
+test("buildModelDesignerProposalFromHypotheses falls back to available components when suggestions are unavailable in bridgeOnly mode", () => {
+  const result = buildModelDesignerProposalFromHypotheses(designerInput([hypothesisForDesign()], true))
+  expect(result).toBeDefined()
+  const spec = result!.proposal.candidateSpec as Record<string, unknown>
+  const backboneType = (spec.backbone as Record<string, unknown>).type as string
+  expect(["linear", "mlp", "transformer"]).toContain(backboneType)
+  expect((spec.preprocessing as Record<string, unknown>).actions).toBeDefined()
+})
+
+test("buildModelDesignerProposalFromHypotheses embeds hypothesis id and statement in candidateSpec and rationale", () => {
+  const hypothesis = hypothesisForDesign()
+  const result = buildModelDesignerProposalFromHypotheses(designerInput([hypothesis]))!
+  const spec = result.proposal.candidateSpec as Record<string, unknown>
+  expect((spec.hypothesis as string).includes("H1")).toBe(true)
+  expect(result.proposal.rationale).toContain("H1")
+  expect(result.proposal.rationale).toContain(hypothesis.expectedOutcome)
+})
+
+test("buildModelDesignerProposalFromHypotheses assigns medium risk for high-priority hypothesis", () => {
+  const result = buildModelDesignerProposalFromHypotheses(designerInput([hypothesisForDesign({ priority: "high" })]))!
+  expect(result.proposal.riskLevel).toBe("medium")
+})
+
+test("buildModelDesignerProposalFromHypotheses assigns low risk for low-priority hypothesis", () => {
+  const result = buildModelDesignerProposalFromHypotheses(
+    designerInput([hypothesisForDesign({ priority: "low" })]),
+  )!
+  expect(result.proposal.riskLevel).toBe("low")
 })

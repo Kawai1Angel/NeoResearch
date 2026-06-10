@@ -154,9 +154,11 @@ def run_epoch(
     loss_fn,
     grad_clip: float | None,
     predict_fn=None,
+    on_batch=None,
+    batch_report_interval: int = 50,
 ) -> None:
     model.train()
-    for x, y in loader:
+    for batch_idx, (x, y) in enumerate(loader):
         x = x.to(device)
         y = y.to(device)
 
@@ -168,6 +170,9 @@ def run_epoch(
         if grad_clip is not None:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+
+        if on_batch is not None and (batch_idx + 1) % batch_report_interval == 0:
+            on_batch(batch_idx + 1)
 
 
 @torch.no_grad()
@@ -613,6 +618,9 @@ def train_models(
                 mark_timeout()
                 break
 
+            def _on_batch(batch_idx: int, _h: int = horizon, _e: int = epoch) -> None:
+                emit("batch_progress", horizon=_h, epoch=_e, batch=batch_idx, elapsed_s=round(time.time() - t_start, 1))
+
             run_epoch(
                 models[horizon],
                 train_loaders[horizon],
@@ -621,6 +629,7 @@ def train_models(
                 loss_fn,
                 grad_clip,
                 predict_fn,
+                on_batch=_on_batch,
             )
             val_loss = compute_val_loss(models[horizon], val_loaders[horizon], device, predict_fn)
             if schedulers[horizon] is not None:

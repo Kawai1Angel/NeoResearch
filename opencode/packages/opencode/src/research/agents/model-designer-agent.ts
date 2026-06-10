@@ -1,12 +1,116 @@
-import type { DomainCandidateRanking } from "../domain"
+import type { DomainCandidateProposal, DomainCandidateRanking } from "../domain"
 import type {
   JsonRecord,
   ResearchCandidate,
   ResearchCandidateID,
   ResearchRun,
+  ResearchTask,
   ResearchTaskID,
 } from "../schema"
 import type { ExperimentPlan, HypothesisObject } from "./hypo-planner-agent"
+
+export interface ModelDesignerComponentLibrary {
+  readonly backbones: readonly string[]
+  readonly preprocessing: readonly string[]
+  readonly embeddings: readonly string[]
+  readonly losses: readonly string[]
+  readonly optimizers: readonly string[]
+  readonly schedulers: readonly string[]
+}
+
+export interface ModelDesignerInput {
+  readonly task: ResearchTask
+  readonly dataAnalysisSummary: string
+  readonly hypotheses: readonly HypothesisObject[]
+  readonly componentLibrary: ModelDesignerComponentLibrary
+}
+
+export interface ModelDesignerHypothesisProposal {
+  readonly selectedHypothesis: HypothesisObject
+  readonly proposal: DomainCandidateProposal
+}
+
+export function buildModelDesignerComponentLibrary(input: {
+  readonly actionRegistry: Record<string, Record<string, { readonly bridgeSupported: boolean }>>
+  readonly bridgeOnly?: boolean
+}): ModelDesignerComponentLibrary {
+  function available(category: string): string[] {
+    const actions = input.actionRegistry[category] ?? {}
+    return Object.keys(actions).filter((name) => !input.bridgeOnly || (actions[name]?.bridgeSupported ?? false))
+  }
+  return {
+    backbones: available("backbone"),
+    preprocessing: available("preprocessing"),
+    embeddings: available("embedding"),
+    losses: available("loss"),
+    optimizers: available("optimizer"),
+    schedulers: available("scheduler"),
+  }
+}
+
+function firstAvailable(suggestions: readonly string[], available: readonly string[]): string | undefined {
+  return suggestions.find((s) => available.includes(s)) ?? (available.length > 0 ? available[0] : undefined)
+}
+
+function buildRationaleFromHypothesis(
+  hypothesis: HypothesisObject,
+  chosenBackbone: string,
+  chosenPreprocessing: string,
+): string {
+  const parts = [
+    `Hypothesis ${hypothesis.id}: ${hypothesis.statement}`,
+    `Selected backbone "${chosenBackbone}" and preprocessing "${chosenPreprocessing}" to test this hypothesis.`,
+    `Expected outcome: ${hypothesis.expectedOutcome}`,
+  ]
+  if (hypothesis.motivation.length > 0) {
+    parts.push(`Evidence: ${hypothesis.motivation.slice(0, 2).join(" ")}`)
+  }
+  if (hypothesis.risk) {
+    parts.push(`Risk: ${hypothesis.risk}`)
+  }
+  return parts.join(" ")
+}
+
+export function buildModelDesignerProposalFromHypotheses(
+  input: ModelDesignerInput,
+): ModelDesignerHypothesisProposal | undefined {
+  const { componentLibrary: lib } = input
+  const hypothesis = selectHypothesisFromList(input.hypotheses)
+  if (!hypothesis) return undefined
+
+  const backbone = firstAvailable(hypothesis.suggestedBackbones, lib.backbones)
+  const preprocessing = firstAvailable(hypothesis.suggestedPreprocessing, lib.preprocessing)
+  if (!backbone || !preprocessing) return undefined
+
+  const loss = lib.losses.includes("mse") ? "mse" : (lib.losses[0] ?? "mse")
+  const optimizer = lib.optimizers.includes("adamw") ? "adamw" : (lib.optimizers[0] ?? "adamw")
+  const scheduler = lib.schedulers.includes("cosine") ? "cosine" : (lib.schedulers[0] ?? "none")
+
+  const candidateSpec: JsonRecord = {
+    recipeVersion: "recipe_schema_v1",
+    hypothesis: `${hypothesis.id}: ${hypothesis.statement}`,
+    preprocessing: { actions: [{ type: preprocessing }] },
+    backbone: { type: backbone },
+    trainingStrategy: {
+      loss: { base: loss, horizonWeighting: "uniform" },
+      optimizer: { type: optimizer, lr: 0.001, weightDecay: 0 },
+      scheduler: { type: scheduler, warmupSteps: 0 },
+      regularization: { dropout: 0.1 },
+      budget: { maxEpochs: 30, timeBudgetS: 600, batchSize: 64, patience: 5, seed: 42 },
+    },
+  } as JsonRecord
+
+  return {
+    selectedHypothesis: hypothesis,
+    proposal: {
+      candidateSpec,
+      rationale: buildRationaleFromHypothesis(hypothesis, backbone, preprocessing),
+      riskLevel: hypothesis.priority === "high" ? "medium" : "low",
+      approvalStatus: "auto_approved",
+      generatedBy: "heuristic",
+    },
+  }
+}
 
 export type ModelDesignerSelectionSource = "existing_frontier" | "domain_proposal"
 export type ModelDesignerLLMStatus = "used" | "failed" | "disabled" | "invalid"
@@ -150,14 +254,18 @@ export function selectModelDesignerCandidate(input: {
   }
 }
 
-export function selectHypothesisForDesign(plan: ExperimentPlan | undefined): HypothesisObject | undefined {
-  if (plan === undefined || plan.hypotheses.length === 0) return undefined
+export function selectHypothesisFromList(hypotheses: readonly HypothesisObject[]): HypothesisObject | undefined {
+  if (hypotheses.length === 0) return undefined
   const priorityOrder: readonly HypothesisObject["priority"][] = ["high", "medium", "low"]
   for (const priority of priorityOrder) {
-    const hypothesis = plan.hypotheses.find((item) => item.testable && item.priority === priority)
+    const hypothesis = hypotheses.find((item) => item.testable && item.priority === priority)
     if (hypothesis !== undefined) return hypothesis
   }
-  return plan.hypotheses.find((item) => item.testable) ?? plan.hypotheses[0]
+  return hypotheses.find((item) => item.testable) ?? hypotheses[0]
+}
+
+export function selectHypothesisForDesign(plan: ExperimentPlan | undefined): HypothesisObject | undefined {
+  return plan === undefined ? undefined : selectHypothesisFromList(plan.hypotheses)
 }
 
 export function buildModelDesignerTaskFingerprint(input: {

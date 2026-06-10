@@ -1,5 +1,6 @@
 import z from "zod"
-import { readFileSync } from "fs"
+import { existsSync, readFileSync } from "fs"
+import path from "path"
 
 import {
   DomainRunStage,
@@ -1259,8 +1260,20 @@ function datasetProfileWarning(
   return { source: "dataset.path", path, code, message }
 }
 
+function safeTaskId(taskId: string): string {
+  return taskId.trim().replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 64)
+}
+
+function trainDataPath(task: TSFTaskSpec): string | undefined {
+  const root = task.runtime?.neoCastProjectRoot
+  if (typeof root !== "string" || root.length === 0) return undefined
+  return path.join(root, ".neo-cast", "dataset", `${safeTaskId(task.dataset.loaderID)}_train.csv`)
+}
+
 function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
-  const datasetPath = task.dataset.path
+  const trainPath = trainDataPath(task)
+  const usingTrainFile = Boolean(trainPath && existsSync(trainPath))
+  const datasetPath = usingTrainFile ? trainPath! : task.dataset.path
   if (!datasetPath) return {}
   let raw: string
   try {
@@ -1281,9 +1294,18 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
       warning: datasetProfileWarning(datasetPath, "dataset_empty", "Dataset profile requires a header and data rows."),
     }
   }
-  const MAX_PROFILE_ROWS = 5000
   const MAX_PROFILE_COLS = 20
-  const dataRows = rows.slice(1, MAX_PROFILE_ROWS + 1)
+  const MAX_PROFILE_ROWS_FALLBACK = 5000
+  const dataRows = usingTrainFile ? rows.slice(1) : rows.slice(1, MAX_PROFILE_ROWS_FALLBACK + 1)
+  let totalRowCount = dataRows.length
+  if (usingTrainFile && task.dataset.path) {
+    try {
+      const sourceRaw = readFileSync(task.dataset.path, "utf8")
+      totalRowCount = sourceRaw.split(/\r?\n/).filter((line) => line.trim().length > 0).length - 1
+    } catch {
+      // fallback to train row count
+    }
+  }
   const targetIndexes = task.dataset.targetCols
     .map((target) => header.indexOf(target))
     .filter((index) => index >= 0)
@@ -1326,7 +1348,7 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
 	    profile: {
 	      source: "dataset.path",
       path: datasetPath,
-      rowCount: dataRows.length,
+      rowCount: totalRowCount,
       targetCount: numericIndexes.length,
       numericColumnCount: numericIndexes.length,
       missingRate: roundProfileValue(missing / totalCells),
@@ -1382,8 +1404,10 @@ export function summarizeTSFTask(taskSpec: unknown): JsonRecord {
   const metadataProfile = datasetProfileFromFingerprint(task.metadata as JsonRecord)
   const datasetProfile = datasetProfileResult.profile ?? metadataProfile
   const metadataBiases = searchBiasList(task.metadata as JsonRecord)
+  const effectiveSeriesType =
+    task.dataset.targetCols.length === 1 ? "univariate" : task.seriesType
   const searchBiases = [
-    task.seriesType === "multivariate" ? "multivariate" : "univariate",
+    effectiveSeriesType === "multivariate" ? "multivariate" : "univariate",
     horizonContextRatio >= 1 ? "long_horizon" : "short_horizon",
     task.runtime.bridgeOnly ? "bridge_safe" : "full_recipe_space",
     task.forecastMode === "probabilistic" ? "probabilistic" : "point_forecast",
@@ -1394,7 +1418,7 @@ export function summarizeTSFTask(taskSpec: unknown): JsonRecord {
   return {
     taskType: task.taskType,
     forecastMode: task.forecastMode,
-    seriesType: task.seriesType,
+    seriesType: effectiveSeriesType,
     loaderID: task.dataset.loaderID,
     targetCount: task.dataset.targetCols.length,
     contextLength: task.contextLength,
