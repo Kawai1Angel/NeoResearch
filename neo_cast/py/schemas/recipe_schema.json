@@ -619,7 +619,8 @@
             },
             "warmup_steps": {
               "type": "integer",
-              "minimum": 0
+              "minimum": 0,
+              "description": "Number of leading epochs used for linear LR warmup (epoch granularity, not mini-batch steps). Must be < training_strategy.budget.max_epochs."
             },
             "factor": {
               "type": "number",

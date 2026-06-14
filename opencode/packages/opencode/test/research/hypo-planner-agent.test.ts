@@ -156,6 +156,118 @@ test("buildExperimentPlan derives stop conditions and deduplicated search biases
   })
 })
 
+test("buildExperimentPlan only sets referenceBaseline on the first call", () => {
+  const hypotheses = generateHypotheses({
+    task: task(),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
+    runs: [],
+    memory: [],
+  })
+
+  const firstCall = buildExperimentPlan({ hypotheses, task: task(), isFirstCall: true })
+  expect(firstCall.referenceBaseline).toBe("tsf_baseline_dlinear")
+
+  const laterCall = buildExperimentPlan({ hypotheses, task: task(), isFirstCall: false })
+  expect(laterCall.referenceBaseline).toBeUndefined()
+
+  const defaultCall = buildExperimentPlan({ hypotheses, task: task() })
+  expect(defaultCall.referenceBaseline).toBeUndefined()
+})
+
+test("selectReferenceBaseline picks DLinear for seasonal/trend-heavy datasets", () => {
+  const seasonalTask = task({
+    datasetProfile: { seasonalityStrength: 0.72, trendStrength: 0.41, crossVarCorrelation: 0.1 },
+    searchBiases: ["seasonal", "trend"],
+  })
+  const hypotheses = generateHypotheses({
+    task: seasonalTask,
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
+    runs: [],
+    memory: [],
+  })
+  const plan = buildExperimentPlan({
+    hypotheses,
+    task: seasonalTask,
+    isFirstCall: true,
+  })
+
+  expect(plan.referenceBaseline).toBe("tsf_baseline_dlinear")
+})
+
+test("selectReferenceBaseline picks iTransformer for cross-variate-correlated datasets", () => {
+  const crossVarTask = task({
+    datasetProfile: { seasonalityStrength: 0.1, trendStrength: 0.1, crossVarCorrelation: 0.66 },
+    searchBiases: ["cross_var_correlated"],
+  })
+  const hypotheses = generateHypotheses({
+    task: crossVarTask,
+    dataAnalysisSummary: dataAnalysisSummary(["cross_var_correlated"]),
+    runs: [],
+    memory: [],
+  })
+  const plan = buildExperimentPlan({
+    hypotheses,
+    task: crossVarTask,
+    isFirstCall: true,
+  })
+
+  expect(plan.referenceBaseline).toBe("tsf_baseline_itransformer")
+})
+
+test("selectReferenceBaseline falls back to PatchTST when no profile signal dominates", () => {
+  const hypotheses = generateHypotheses({
+    task: task({ datasetProfile: {}, searchBiases: [] }, { maxRuns: 1 }),
+    dataAnalysisSummary: dataAnalysisSummary([]),
+    runs: [],
+    memory: [],
+  })
+  const plan = buildExperimentPlan({
+    hypotheses,
+    task: task({ datasetProfile: {}, searchBiases: [] }),
+    isFirstCall: true,
+  })
+
+  expect(plan.referenceBaseline).toBe("tsf_baseline_patchtst")
+})
+
+test("selectReferenceBaseline picks the linear baseline for bridge-only tasks", () => {
+  const hypotheses = generateHypotheses({
+    task: task(),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
+    runs: [],
+    memory: [],
+  })
+  const plan = buildExperimentPlan({
+    hypotheses,
+    task: task({ runtime: { bridgeOnly: true } }),
+    isFirstCall: true,
+  })
+
+  expect(plan.referenceBaseline).toBe("tsf_linear_raw_baseline")
+})
+
+test("buildHypothesesYaml and buildHypoPlanMarkdown surface referenceBaseline when present", () => {
+  const hypotheses = generateHypotheses({
+    task: task(),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
+    runs: [],
+    memory: [],
+  })
+  const result = buildHypoPlannerResult({
+    task: task(),
+    dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
+    runs: [],
+    memory: [],
+  })
+
+  expect(result.plan.referenceBaseline).toBe("tsf_baseline_dlinear")
+  expect(result.hypothesesYaml).toContain("referenceBaseline: tsf_baseline_dlinear")
+  expect(result.planMarkdown).toContain("Reference baseline: tsf_baseline_dlinear")
+
+  const laterPlan = buildExperimentPlan({ hypotheses, task: task(), isFirstCall: false })
+  expect(buildHypothesesYaml(laterPlan)).not.toContain("referenceBaseline:")
+})
+
 test("buildHypoPlannerResult emits markdown and yaml artifacts from the same plan", () => {
   const result = buildHypoPlannerResult({
     task: task(),

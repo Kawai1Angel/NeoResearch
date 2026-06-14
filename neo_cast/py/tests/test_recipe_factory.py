@@ -15,9 +15,10 @@ if str(PY_ROOT) not in sys.path:
     sys.path.insert(0, str(PY_ROOT))
 
 from factory.build_model import build_model  # noqa: E402
-from registry.action_specs import validate_recipe_against_registry  # noqa: E402
+from model_recipe import compile_model_recipe  # noqa: E402
+from registry.action_specs import validate_recipe_against_registry, validate_scheduler_warmup  # noqa: E402
 import train as train_module  # noqa: E402
-from train import _build_scheduler, _build_train_loss, _step_scheduler  # noqa: E402
+from train import _build_scheduler, _build_train_loss, _LinearWarmupWrapper, _step_scheduler  # noqa: E402
 from validate import validate_payload  # noqa: E402
 
 
@@ -564,6 +565,84 @@ class RecipeFactoryTest(unittest.TestCase):
             )
             errors = validate_recipe_against_registry(recipe, input_len=32)
             self.assertIn(f"backbone.type='{backbone['type']}' requires embedding.type='none'", errors)
+
+    def test_compile_training_warmup_ratio_to_steps(self) -> None:
+        model_recipe = {
+            "schema_version": "model_recipe.v1",
+            "model_name": "WarmupTest",
+            "hypothesis": "Warmup ratio should compile to clamped warmup_steps.",
+            "input": {"history_window": 96, "prediction_horizon": 24, "covariates": False},
+            "architecture": {"backbone": "linear"},
+            "training": {
+                "loss": "mse",
+                "optimizer": "adamw",
+                "learning_rate": 0.001,
+                "batch_size": 32,
+                "max_epochs": 8,
+                "warmup_ratio": 0.25,
+            },
+            "constraints": {"max_params": "1M", "latency_sensitive": False},
+        }
+        compiled = compile_model_recipe(model_recipe)
+        self.assertEqual(compiled["training_strategy"]["scheduler"], {"type": "none", "warmup_steps": 2})
+
+        model_recipe["training"]["max_epochs"] = 2
+        model_recipe["training"]["warmup_ratio"] = 0.5
+        compiled = compile_model_recipe(model_recipe)
+        self.assertEqual(compiled["training_strategy"]["scheduler"]["warmup_steps"], 1)
+
+        model_recipe["training"]["warmup_ratio"] = 0.0
+        compiled = compile_model_recipe(model_recipe)
+        self.assertEqual(compiled["training_strategy"]["scheduler"]["warmup_steps"], 0)
+
+    def test_validate_scheduler_warmup(self) -> None:
+        strategy = {"scheduler": {"type": "none", "warmup_steps": 2}, "budget": {"max_epochs": 2}}
+        self.assertEqual(
+            validate_scheduler_warmup(strategy),
+            ["scheduler.warmup_steps must be < budget.max_epochs"],
+        )
+        strategy["budget"]["max_epochs"] = 3
+        self.assertEqual(validate_scheduler_warmup(strategy), [])
+
+    def test_linear_warmup_wrapper_then_cosine(self) -> None:
+        recipe = make_recipe(
+            training_strategy={
+                "loss": {"base": "mse", "horizon_weighting": "uniform"},
+                "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
+                "scheduler": {"type": "cosine", "warmup_steps": 1},
+                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "budget": {"max_epochs": 3, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
+            },
+        )
+        candidate = {"recipe": recipe}
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.Adam([parameter], lr=0.001)
+        scheduler = _build_scheduler(optimizer, candidate, max_epochs=3)
+        self.assertIsInstance(scheduler, _LinearWarmupWrapper)
+
+        warmed_up_lr = optimizer.param_groups[0]["lr"]
+        self.assertLess(warmed_up_lr, 0.001)
+
+        _step_scheduler(scheduler, 1.0)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.001)
+
+        _step_scheduler(scheduler, 1.0)
+        self.assertLess(optimizer.param_groups[0]["lr"], 0.001)
+
+    def test_build_scheduler_no_warmup_unchanged(self) -> None:
+        recipe = make_recipe(
+            training_strategy={
+                "loss": {"base": "mse", "horizon_weighting": "uniform"},
+                "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
+                "scheduler": {"type": "none", "warmup_steps": 0},
+                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "budget": {"max_epochs": 3, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
+            },
+        )
+        candidate = {"recipe": recipe}
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.Adam([parameter], lr=0.001)
+        self.assertIsNone(_build_scheduler(optimizer, candidate, max_epochs=3))
 
 
 if __name__ == "__main__":

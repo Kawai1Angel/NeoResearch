@@ -384,6 +384,7 @@ function buildSystemPrompt() {
     "  training_strategy.loss.base: mse | mae | huber | quantile | distillation",
     "  training_strategy.optimizer.type: adam | adamw | sgd",
     "  training_strategy.scheduler.type: none | cosine | one_cycle | plateau  ← ONLY these four values",
+    "  training_strategy.scheduler.warmup_steps: int >= 0, must be < training_strategy.budget.max_epochs (epoch granularity, linear LR warmup)",
     "",
     "Required numeric fields by backbone type (ALL must be present as integers ≥ 1):",
     "  linear: (none required beyond type)",

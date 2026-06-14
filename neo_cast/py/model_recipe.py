@@ -238,6 +238,11 @@ def _compile_prediction_head(architecture: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compile_training(training: dict[str, Any]) -> dict[str, Any]:
+    max_epochs = _positive_int(training.get("max_epochs"), 10)
+    warmup_ratio = float(training.get("warmup_ratio", 0.0))
+    warmup_steps = round(warmup_ratio * max_epochs)
+    warmup_steps = max(0, min(warmup_steps, max_epochs - 1))
+
     return {
         "loss": {"base": training["loss"], "horizon_weighting": "uniform"},
         "optimizer": {
@@ -245,13 +250,13 @@ def _compile_training(training: dict[str, Any]) -> dict[str, Any]:
             "lr": float(training["learning_rate"]),
             "weight_decay": float(training.get("weight_decay", 0.0)),
         },
-        "scheduler": {"type": "none", "warmup_steps": 0},
+        "scheduler": {"type": "none", "warmup_steps": warmup_steps},
         "regularization": {
             "dropout": 0.1,
             "grad_clip": float(training.get("grad_clip", 1.0)),
         },
         "budget": {
-            "max_epochs": _positive_int(training.get("max_epochs"), 10),
+            "max_epochs": max_epochs,
             "time_budget_s": _positive_int(training.get("time_budget_s"), 600),
             "batch_size": _positive_int(training.get("batch_size"), 32),
             "patience": _positive_int(training.get("patience"), 5),

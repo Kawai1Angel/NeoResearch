@@ -439,6 +439,37 @@ def _build_optimizer(
     raise ValueError(f"Unsupported optimizer: {optimizer_type}")
 
 
+class _LinearWarmupWrapper:
+    """Linearly ramps LR over the first warmup_epochs epochs, then delegates to base_scheduler (may be None)."""
+
+    def __init__(self, optimizer, warmup_epochs: int, base_scheduler, start_factor: float = 0.1):
+        self._optimizer = optimizer
+        self._warmup_epochs = warmup_epochs
+        self._base_scheduler = base_scheduler
+        self._start_factor = start_factor
+        self._base_lrs = [group["lr"] for group in optimizer.param_groups]
+        self._epoch = 0
+        self._apply_warmup_lr()
+
+    def _apply_warmup_lr(self) -> None:
+        progress = min(self._epoch / max(self._warmup_epochs, 1), 1.0)
+        factor = self._start_factor + (1.0 - self._start_factor) * progress
+        for group, base_lr in zip(self._optimizer.param_groups, self._base_lrs):
+            group["lr"] = base_lr * factor
+
+    def step(self, val_loss: float | None = None) -> None:
+        self._epoch += 1
+        if self._epoch <= self._warmup_epochs:
+            self._apply_warmup_lr()
+            return
+        if self._base_scheduler is None:
+            return
+        if isinstance(self._base_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            self._base_scheduler.step(val_loss)
+        else:
+            self._base_scheduler.step()
+
+
 def _build_scheduler(
     optimizer: torch.optim.Optimizer,
     candidate: dict[str, Any],
@@ -446,27 +477,41 @@ def _build_scheduler(
     max_epochs: int,
 ):
     strategy = _recipe_training_strategy(candidate)
-    scheduler_type = strategy.get("scheduler", {}).get("type", "none")
-    if scheduler_type in {None, "none"}:
-        return None
+    scheduler_cfg = strategy.get("scheduler", {})
+    scheduler_type = scheduler_cfg.get("type", "none")
+    warmup_steps = int(scheduler_cfg.get("warmup_steps", 0))
+    warmup_steps = max(0, min(warmup_steps, max(max_epochs - 1, 0)))
+
+    remaining_epochs = max(max_epochs - warmup_steps, 1)
+
+    base_scheduler = None
     if scheduler_type == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(max_epochs, 1))
-    if scheduler_type == "one_cycle":
+        base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs)
+    elif scheduler_type == "one_cycle":
         max_lr = max(float(group["lr"]) for group in optimizer.param_groups)
-        return torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=max_lr, total_steps=max(max_epochs, 1))
-    if scheduler_type == "plateau":
-        scheduler_cfg = strategy.get("scheduler", {})
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        pct_start = (warmup_steps / max_epochs) if warmup_steps else 0.3
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=max_lr, total_steps=max(max_epochs, 1), pct_start=pct_start,
+        )
+    elif scheduler_type == "plateau":
+        base_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
             factor=float(scheduler_cfg.get("factor", 0.5)),
             patience=int(scheduler_cfg.get("patience", 1)),
         )
-    raise ValueError(f"Unsupported scheduler: {scheduler_type}")
+    elif scheduler_type not in {None, "none"}:
+        raise ValueError(f"Unsupported scheduler: {scheduler_type}")
+
+    if warmup_steps > 0:
+        return _LinearWarmupWrapper(optimizer, warmup_steps, base_scheduler)
+    return base_scheduler
 
 
 def _step_scheduler(scheduler, val_loss: float) -> None:
-    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+    if isinstance(scheduler, _LinearWarmupWrapper):
+        scheduler.step(val_loss)
+    elif isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
         scheduler.step(val_loss)
     else:
         scheduler.step()

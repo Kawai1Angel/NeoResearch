@@ -79,7 +79,7 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { apiKeyFor, extractJsonObject, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, usageToMetadata, type AuthJsonKeyResult } from "./llm-proposal"
+import { apiKeyFor, extractJsonObject, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, type AuthJsonKeyResult } from "./llm-proposal"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
 import { analyzeIntentTask, analyzeIntentTaskWithLLM, interpretSlotModificationWithLLM, normalizeIntentSlotKeys, parseSlotInputsWithLLM, type IntentAgentResult } from "./agents/intent-agent"
 import {
@@ -106,6 +106,7 @@ import {
   buildHypothesesYaml,
   extractEvidenceSummary,
   generateHypotheses,
+  referenceBaselineOptions,
   type ExperimentPlan,
   type HypoPlannerInput,
   type HypoPlannerResult,
@@ -724,6 +725,16 @@ function experimentPlanFromMetadata(value: unknown): ExperimentPlan | undefined 
   return Array.isArray(record.hypotheses) ? (value as ExperimentPlan) : undefined
 }
 
+const MAX_ABANDONED_HYPOTHESES = 30
+
+function abandonedHypothesesFromMetadata(metadata: Record<string, unknown>): readonly { statement: string }[] {
+  if (!Array.isArray(metadata.abandonedHypotheses)) return []
+  return (metadata.abandonedHypotheses as unknown[])
+    .map((item) => recordValue(item).statement)
+    .filter((statement): statement is string => typeof statement === "string" && statement.trim().length > 0)
+    .map((statement) => ({ statement }))
+}
+
 function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
   const priority = row.priority
   return {
@@ -744,6 +755,8 @@ function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly Hypothesi
   const metadata = recordValue(task.taskSpec.metadata)
   const baselineStrategy =
     typeof metadata.baselineStrategy === "string" ? metadata.baselineStrategy : "domain_baselines_first"
+  const referenceBaseline =
+    typeof metadata.referenceBaseline === "string" ? metadata.referenceBaseline : undefined
   const searchBiases = Array.isArray(metadata.searchBiases)
     ? (metadata.searchBiases as unknown[]).filter((x): x is string => typeof x === "string")
     : []
@@ -762,6 +775,7 @@ function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly Hypothesi
       noImprovementRounds,
       ...(targetMetricValue !== undefined ? { targetMetricValue } : {}),
     },
+    ...(referenceBaseline !== undefined ? { referenceBaseline } : {}),
   }
 }
 
@@ -2500,6 +2514,7 @@ function buildHypoPlannerSystemPrompt(): string {
     "2. dataAnalysis — dataset profile with statistical features (seasonality, trend, missing rate, horizon/context ratio, cross-variate correlation, etc.).",
     "3. methodLibrary — available ModelRecipe components (backbones, preprocessing, embedding, fusion, head) with their phase eligibility and design preferences.",
     "4. previousReflection — lessons and hypotheses from prior search windows (empty on first iteration).",
+    "5. abandonedHypotheses — statements of hypotheses that were dropped/abandoned in earlier rounds (empty on first iteration).",
     "",
     "## Output",
     "Return exactly one JSON object: { \"hypotheses\": [...] }. No markdown fences. No prose outside JSON.",
@@ -2518,6 +2533,8 @@ function buildHypoPlannerSystemPrompt(): string {
     "- Produce 3–6 hypotheses ordered by priority (high first).",
     "- Each hypothesis must be distinct, concrete, and directly testable within the current phase.",
     "- Do not repeat backbone/preprocessing combinations already confirmed as failures in previousReflection.",
+    "- Do not regenerate any hypothesis whose statement restates or closely resembles an entry in abandonedHypotheses — those directions have already been ruled out.",
+    "- If you drop an existingHypothesis because previousReflection confirms it is exhausted or refuted, it has been abandoned: remove it from the output and add a new replacement hypothesis exploring a different idea/direction so the active hypothesis count does not shrink.",
     "- Ground motivation in specific values from dataAnalysis or outcomes from previousReflection.",
     "- expectedOutcome must reference val_avg_mse or a named metric and state the anticipated direction or magnitude of change.",
     "- Generate hypotheses independently from the four input sections; do not rely on any external draft.",
@@ -2533,6 +2550,7 @@ const MODEL_RECIPE_LIBRARY = {
     "Channel-mixing fusion (feature, temporal_then_feature) is only meaningful when cross-variate correlation is confirmed.",
     "For missing data, include missing_mask in preprocessing before testing any backbone.",
     "sample_reweighting is useful under distribution shift but should be validated against time-ordered splits.",
+    "If a candidate's training curve is unstable (loss spikes, oscillation, or NaN), prefer hypotheses that adjust training.learning_rate (lower it) or add training.warmup_ratio (e.g. 0.1-0.3) before concluding the architecture/preprocessing choice itself is the problem.",
   ],
   backbones: {
     linear: "Single linear projection per horizon; lowest variance, good baseline.",
@@ -2602,6 +2620,7 @@ function buildHypoPlannerUserPrompt(
   existingHypotheses: readonly { statement: string; status: string }[],
   latestReflection: LatestReflectionSummary,
   llmSearchPreferences?: string[],
+  abandonedHypotheses?: readonly { statement: string }[],
 ): string {
   const primaryMetricName = typeof (task.objective as Record<string, unknown>)?.primaryMetric === "string"
     ? (task.objective as Record<string, unknown>).primaryMetric as string
@@ -2649,9 +2668,14 @@ function buildHypoPlannerUserPrompt(
       existingHypotheses: existingHypotheses.length > 0
         ? existingHypotheses.map((h) => ({ statement: h.statement, status: h.status }))
         : null,
+      abandonedHypotheses: abandonedHypotheses && abandonedHypotheses.length > 0
+        ? abandonedHypotheses.map((h) => ({ statement: h.statement }))
+        : null,
       instruction:
         "Review existingHypotheses in light of previousReflection and produce an updated hypothesis list. " +
         "For each existing hypothesis: retain it if the reflection does not contradict it, refine its statement/expectedOutcome if reflection provides new evidence, or drop it if reflection confirms it is exhausted or refuted. " +
+        "If you drop an existingHypothesis (it is now abandoned), add a new replacement hypothesis exploring a different idea/direction so the active hypothesis count does not shrink. " +
+        "abandonedHypotheses lists ideas already abandoned in earlier rounds — do not regenerate hypotheses that restate or closely resemble these. " +
         "Then add new hypotheses for directions suggested in previousReflection.suggestedNextHypotheses that are not already covered. " +
         "If previousReflection is null, generate a fresh list grounded in dataAnalysis. " +
         "Ground each hypothesis's motivation in specific values from dataAnalysis or outcomes from previousReflection. " +
@@ -2708,6 +2732,7 @@ async function generateLLMHypotheses(
   onDelta?: (delta: string) => void,
   existingHypotheses?: readonly { statement: string; status: string }[],
   latestReflection?: LatestReflectionSummary,
+  abandonedHypotheses?: readonly { statement: string }[],
 ): Promise<{ hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
@@ -2729,7 +2754,7 @@ async function generateLLMHypotheses(
     }
     const llmSearchPreferences = await loadLLMSearchPreferences(workspaceRoot, task.id)
     const system = buildHypoPlannerSystemPrompt()
-    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences)
+    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences, abandonedHypotheses ?? [])
     const llmPromise = onDelta
       ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
@@ -2744,6 +2769,65 @@ async function generateLLMHypotheses(
       .filter((h): h is HypothesisObject => h !== undefined)
       .slice(0, 8)
     return validated.length > 0 ? { hypotheses: validated, usage: result.usage } : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function buildBaselineSelectionSystemPrompt(): string {
+  return [
+    "You are the NeoResearch HypoPlanner agent choosing the first baseline candidate to run for a TSF model search.",
+    "Given the task definition, dataset analysis, and a list of baseline options, pick exactly one baseline to run first — it will also serve as the reference/benchmark for later comparisons.",
+    "Language policy: rationale 用中文表达；保留 recipeID 等技术术语英文原文。",
+    "",
+    "## Output",
+    "Return exactly one JSON object: { \"referenceBaseline\": \"<recipeID>\", \"rationale\": \"<string>\" }. No markdown fences. No prose outside JSON.",
+    "referenceBaseline must be exactly one of the recipeID values listed in baselineOptions.",
+  ].join("\n")
+}
+
+function buildBaselineSelectionUserPrompt(
+  task: ResearchTask,
+  dataAnalysisSummary: string,
+  baselineOptions: readonly { recipeID: string; description: string }[],
+): string {
+  return JSON.stringify(
+    {
+      taskDefinition: buildTaskDefinition(task),
+      dataAnalysis: dataAnalysisSummary,
+      baselineOptions,
+      instruction:
+        "Choose the baseline most likely to perform best as the first experiment given the dataset characteristics described in dataAnalysis. " +
+        "Briefly justify the choice referencing specific dataset features.",
+    },
+    null,
+    2,
+  )
+}
+
+async function selectLLMReferenceBaseline(
+  task: ResearchTask,
+  dataAnalysisSummary: string,
+  baselineOptions: readonly { recipeID: string; description: string }[],
+  workspaceRoot: string,
+): Promise<{ referenceBaseline: string; rationale?: string; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
+  if (baselineOptions.length <= 1) return undefined
+  try {
+    const runtime = recordValue(recordValue(task.taskSpec).runtime)
+    const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
+    const llmContext = await resolveEffectiveLLMConfig({ workspaceRoot, neoCastProjectRoot })
+    if (!llmContext) return undefined
+    const system = buildBaselineSelectionSystemPrompt()
+    const user = buildBaselineSelectionUserPrompt(task, dataAnalysisSummary, baselineOptions)
+    const llmPromise = requestNeoCastLLM({ ...llmContext.config, maxTokens: 1024 }, llmContext.apiKey, system, user)
+    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 60_000))
+    const result = await Promise.race([llmPromise, timeoutPromise])
+    if (!result) return undefined
+    const parsed = recordValue(extractJsonObject(result.text))
+    const referenceBaseline = typeof parsed.referenceBaseline === "string" ? parsed.referenceBaseline.trim() : undefined
+    if (!referenceBaseline || !baselineOptions.some((option) => option.recipeID === referenceBaseline)) return undefined
+    const rationale = typeof parsed.rationale === "string" ? parsed.rationale : undefined
+    return { referenceBaseline, rationale, usage: result.usage }
   } catch {
     return undefined
   }
@@ -2796,6 +2880,11 @@ function buildReflectionLLMSystemPrompt(): string {
     "",
     "  nextStepRecommendation  — Recommend: continue with the current direction, modify the approach,",
     "    abandon this hypothesis, or pivot to a new direction. State which and explain why.",
+    "    IMPORTANT: if trainingHealthAssessment indicates the training process was unstable (loss spikes,",
+    "    oscillation, divergence, or NaNs) such that the result does not credibly reflect the model's true",
+    "    performance, do NOT recommend abandoning the hypothesis based on this run. Instead recommend first",
+    "    stabilizing training (e.g. lower training.learning_rate, add/increase training.warmup_ratio, enable",
+    "    gradient clipping) and re-running, then judge the hypothesis from the stabilized result.",
     "",
     "  distillableMemory  — A self-contained summary for future agents: what was tried, what the outcome",
     "    was, what modification is proposed, and what risks or failure modes to watch for.",
@@ -3859,6 +3948,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
     const updateTaskHypothesisPlan = Effect.fn("Research.updateTaskHypothesisPlan")(function* (input: {
       taskID: ResearchTaskID
       hypothesisPlan: ExperimentPlan
+      abandonedHypotheses?: readonly { statement: string }[]
     }) {
       const task = yield* getTask(input.taskID)
       const metadata = recordValue(task.taskSpec.metadata)
@@ -3869,6 +3959,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
           baselineStrategy: input.hypothesisPlan.baselineStrategy,
           searchBiases: input.hypothesisPlan.searchBiases,
           stopConditions: input.hypothesisPlan.stopConditions,
+          ...(input.hypothesisPlan.referenceBaseline === undefined
+            ? {}
+            : { referenceBaseline: input.hypothesisPlan.referenceBaseline }),
+          ...(input.abandonedHypotheses === undefined
+            ? {}
+            : { abandonedHypotheses: input.abandonedHypotheses.map((h) => ({ statement: h.statement })) }),
         } as unknown as JsonRecord,
       }
       const row = yield* db((d) =>
@@ -4134,7 +4230,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 
     const seedBaselines = Effect.fn("Research.seedBaselines")(function* (input: SeedBaselinesInput) {
       const task = yield* getTask(input.taskID)
-      const proposals = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
+      const allProposals = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
+      // HypoPlanner selects one of these baselines (via LLM or heuristic) as the
+      // referenceBaseline / first candidate to run. Only that baseline is seeded as a
+      // candidate — the other baseline options are dropped from the search entirely.
+      const referenceBaseline = recordValue(recordValue(task.taskSpec).metadata).referenceBaseline
+      const referenceProposals = typeof referenceBaseline === "string"
+        ? allProposals.filter((proposal) => candidateRecipeID(proposal.candidateSpec) === referenceBaseline)
+        : []
+      const proposals = referenceProposals.length > 0 ? referenceProposals : allProposals
       const existingRows = yield* db((d) =>
         d.select().from(ResearchCandidateTable).where(eq(ResearchCandidateTable.task_id, task.id)).all(),
       )
@@ -7109,6 +7213,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	          d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.task_id, input.taskID)).all(),
 	        )
 	        const existingHypotheses = existingHypothesesRaw.map((r) => ({ statement: r.statement, status: r.status }))
+        const abandonedHypotheses = abandonedHypothesesFromMetadata(recordValue(task.taskSpec.metadata))
 	        const latestReflection = yield* Effect.promise(async () => {
 	          try {
 	            const sessionsDir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID)
@@ -7144,15 +7249,28 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	          ).catch(() => undefined)
 	        }
 	        const llmHypothesesResult = yield* Effect.promise(() =>
-	          generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection),
+	          generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses),
 	        )
 	        const llmHypoUsage = llmHypothesesResult?.usage
+	        const isFirstHypoPlannerCall = runs.length === 0 && memory.length === 0
+	        const baselineSelectionResult = isFirstHypoPlannerCall
+	          ? yield* Effect.promise(() => {
+	              const baselineOptions = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
+	                .map((proposal) => {
+	                  const recipeID = candidateRecipeID(proposal.candidateSpec)
+	                  return recipeID === undefined ? undefined : { recipeID, description: proposal.rationale }
+	                })
+	                .filter((option): option is { recipeID: string; description: string } => option !== undefined)
+	              return selectLLMReferenceBaseline(task, dataAnalysisSummary, baselineOptions, Instance.directory)
+	            })
+	          : undefined
 	        const result = buildHypoPlannerResult({
 	          task,
 	          dataAnalysisSummary,
 	          runs,
 	          memory,
 	          llmHypotheses: llmHypothesesResult?.hypotheses,
+	          llmReferenceBaseline: baselineSelectionResult?.referenceBaseline,
 	        })
 	        const outputDir = path.join(
 	          Instance.directory,
@@ -7175,6 +7293,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            agent: "HypoPlannerAgent",
 	            hypothesisCount: result.plan.hypotheses.length,
 	            baselineStrategy: result.plan.baselineStrategy,
+	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
+	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
+	            ...(baselineSelectionResult?.rationale ? { referenceBaselineRationale: baselineSelectionResult.rationale } : {}),
 	            llmStatus: result.llm.status,
 	            ...(result.llm.status === "used" && result.plan.hypotheses.length > 0
 	              ? {
@@ -7196,11 +7317,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            agent: "HypoPlannerAgent",
 	            hypothesisCount: result.plan.hypotheses.length,
 	            baselineStrategy: result.plan.baselineStrategy,
+	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
+	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
+	            ...(baselineSelectionResult?.rationale ? { referenceBaselineRationale: baselineSelectionResult.rationale } : {}),
 	          },
 	        })
+	        const nextHypothesisStatements = new Set(result.plan.hypotheses.map((h) => h.statement))
+	        const newlyAbandoned = existingHypotheses
+	          .filter((h) => !nextHypothesisStatements.has(h.statement))
+	          .map((h) => ({ statement: h.statement }))
+	        const mergedAbandoned = [...abandonedHypotheses, ...newlyAbandoned]
+	          .filter((h, index, all) => all.findIndex((other) => other.statement === h.statement) === index)
+	          .slice(-MAX_ABANDONED_HYPOTHESES)
 	        yield* updateTaskHypothesisPlan({
 	          taskID: input.taskID,
 	          hypothesisPlan: result.plan,
+	          abandonedHypotheses: mergedAbandoned,
 	        })
 	        yield* bus.publish(Event.HypoPlannerAgentCompleted, {
 	          taskID: input.taskID,
@@ -7212,6 +7344,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
 	            planArtifactID: planArtifact.id,
 	            yamlArtifactID: yamlArtifact.id,
 	            baselineStrategy: result.plan.baselineStrategy,
+	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
+	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
+	            ...(baselineSelectionResult?.rationale ? { referenceBaselineRationale: baselineSelectionResult.rationale } : {}),
 	            llmStatus: result.llm.status,
 	            ...(result.llm.status === "used" && result.plan.hypotheses.length > 0
 	              ? {

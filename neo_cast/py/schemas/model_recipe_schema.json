@@ -205,6 +205,13 @@
         "grad_clip": {
           "type": "number",
           "exclusiveMinimum": 0.0
+        },
+        "warmup_ratio": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 0.5,
+          "default": 0.0,
+          "description": "Fraction of max_epochs (rounded) used for linear LR warmup, from start_factor*lr to lr. 0 disables warmup."
         }
       }
     },

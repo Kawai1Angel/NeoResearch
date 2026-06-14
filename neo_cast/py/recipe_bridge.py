@@ -41,9 +41,11 @@ def bridge_validate_recipe(recipe: dict[str, Any]) -> list[str]:
     loss_base = training_strategy.get("loss", {}).get("base")
     if loss_base != "mse":
         errors.append("Phase A/B bridge only supports training_strategy.loss.base='mse'")
-    scheduler_type = training_strategy.get("scheduler", {}).get("type", "none")
-    if scheduler_type != "none":
-        errors.append("Phase A/B bridge only supports scheduler.type='none'")
+    scheduler = training_strategy.get("scheduler", {})
+    scheduler_type = scheduler.get("type", "none")
+    warmup_steps = scheduler.get("warmup_steps", 0)
+    if scheduler_type != "none" or warmup_steps:
+        errors.append("Phase A/B bridge only supports scheduler.type='none' with warmup_steps=0")
     return errors
 
 

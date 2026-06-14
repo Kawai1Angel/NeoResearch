@@ -25,7 +25,8 @@
     "max_epochs": 8,
     "time_budget_s": 600,
     "patience": 4,
-    "seed": 42
+    "seed": 42,
+    "warmup_ratio": 0.25
   },
   "constraints": {
     "max_params": "5M",

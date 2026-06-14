@@ -78,9 +78,9 @@ const ACTION_REGISTRY = {
   },
   scheduler: {
     none: { phaseMin: "phase0b", bridgeSupported: true },
-    cosine: { phaseMin: "phase1", bridgeSupported: true },
-    one_cycle: { phaseMin: "phase2", bridgeSupported: true },
-    plateau: { phaseMin: "phase2", bridgeSupported: true },
+    cosine: { phaseMin: "phase1", bridgeSupported: false },
+    one_cycle: { phaseMin: "phase2", bridgeSupported: false },
+    plateau: { phaseMin: "phase2", bridgeSupported: false },
   },
 } as const
 
@@ -449,6 +449,7 @@ export const TSFCandidateRecipe = z
         scheduler: z
           .object({
             type: z.enum(["none", "cosine", "one_cycle", "plateau"]),
+            // Epoch granularity (not mini-batch steps); must be < trainingStrategy.budget.maxEpochs.
             warmupSteps: z.number().int().min(0).default(0),
           })
           .strict(),
@@ -619,6 +620,15 @@ export function validateTSFCandidate(taskSpec: unknown, candidateSpec: unknown):
 
   if (["dlinear", "tcn", "nbeats", "timesnet"].includes(recipe.backbone.type) && recipe.embedding.type !== "none") {
     issues.push(issue("embedding.type", `backbone.type='${recipe.backbone.type}' requires embedding.type='none'`))
+  }
+
+  if (recipe.trainingStrategy.scheduler.warmupSteps >= recipe.trainingStrategy.budget.maxEpochs) {
+    issues.push(
+      issue(
+        "trainingStrategy.scheduler.warmupSteps",
+        "training_strategy.scheduler.warmupSteps must be less than budget.maxEpochs",
+      ),
+    )
   }
 
   return {
@@ -1468,93 +1478,71 @@ function withOptimizer(
 
 export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] {
   const task = TSFTaskSpec.parse(taskSpec)
+
+  if (task.runtime.bridgeOnly) {
+    const candidates = [
+      recipe(task, {
+        recipeID: "tsf_linear_raw_baseline",
+        hypothesis: "A raw linear temporal baseline should establish the simplest forecasting floor.",
+        preprocessing: { actions: [{ type: "none" }] },
+        embedding: { type: "none" },
+        backbone: { type: "linear", shared: false, bias: true },
+        fusion: { type: "temporal", channelMode: "independent" },
+        predictionHead: { type: "linear", outputDistribution: "point" },
+      }),
+    ]
+    return candidates.map((candidate) => ({
+      candidateSpec: candidate as unknown as DomainCandidateProposal["candidateSpec"],
+      rationale: candidate.hypothesis,
+      riskLevel: "low",
+      approvalStatus: "pending",
+      generatedBy: "heuristic",
+    }))
+  }
+
   const taskFingerprint = summarizeTSFTask(task)
   const datasetProfile = datasetProfileFromFingerprint(taskFingerprint)
-  const biases = searchBiasSet(taskFingerprint)
   const patchLen = Math.min(16, task.contextLength)
   const stride = Math.max(1, Math.floor(patchLen / 2))
   const dModel = 64
+  const period = datasetProfile?.acfMainPeriod
+  const decompositionKernelSize = Math.max(
+    3,
+    Math.min(255, Math.floor((period && period > 1 ? period : 25) / 2) * 2 + 1),
+  )
 
   const candidates = [
     recipe(task, {
-      recipeID: "tsf_linear_raw_baseline",
-      hypothesis: "A raw linear temporal baseline should establish the simplest forecasting floor.",
-      preprocessing: { actions: [{ type: "none" }] },
-      embedding: { type: "none" },
-      backbone: { type: "linear", shared: false, bias: true },
+      recipeID: "tsf_baseline_patchtst",
+      hypothesis:
+        "PatchTST: instance-normalized patch embedding with a channel-independent transformer backbone should provide a strong general-purpose baseline.",
+      preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
+      embedding: { type: "patch", patchLen, stride, dModel },
+      backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 3, dropout: 0.1, ffnMult: 4 },
       fusion: { type: "temporal", channelMode: "independent" },
       predictionHead: { type: "linear", outputDistribution: "point" },
     }),
+    recipe(task, {
+      recipeID: "tsf_baseline_dlinear",
+      hypothesis:
+        "DLinear: moving-average decomposition into trend and seasonal components, each modeled by a linear layer, should establish a decomposition-aware baseline.",
+      preprocessing: { actions: [{ type: "series_decomposition", kernelSize: decompositionKernelSize }] },
+      embedding: { type: "none" },
+      backbone: { type: "dlinear", kernelSize: decompositionKernelSize, bias: true },
+      fusion: { type: "temporal", channelMode: "independent" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
+    }),
+    recipe(task, {
+      recipeID: "tsf_baseline_itransformer",
+      hypothesis:
+        "iTransformer: inverted embedding treats each variate as a token and applies cross-variate attention, testing whether multivariate dependencies improve forecasts.",
+      preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
+      embedding: { type: "invert", dModel },
+      backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 2, dropout: 0.1, ffnMult: 4 },
+      fusion: { type: "feature", variateToken: true, crossAttention: true },
+      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+    }),
   ]
-
-  if (!task.runtime.bridgeOnly) {
-    if ((datasetProfile?.seasonalityStrength ?? 0) >= 0.4 || biases.has("seasonal")) {
-      const period = datasetProfile?.acfMainPeriod
-      const kernelSize = Math.max(3, Math.min(255, Math.floor((period && period > 1 ? period : 25) / 2) * 2 + 1))
-      candidates.push(
-        recipe(task, {
-          recipeID: "tsf_profile_seasonal_decomposition_baseline",
-          hypothesis:
-            "Dataset profile or search bias shows seasonality, so decomposition should separate seasonal and residual structure before forecasting.",
-          preprocessing: { actions: [{ type: "series_decomposition", kernelSize }] },
-          embedding: { type: "none" },
-          backbone: { type: "dlinear", kernelSize, bias: true },
-          fusion: { type: "temporal", channelMode: "independent" },
-          predictionHead: { type: "linear", outputDistribution: "point" },
-        }),
-      )
-    }
-    if ((datasetProfile?.crossVarCorrelation ?? 0) >= 0.5 || biases.has("cross_var_correlated")) {
-      candidates.push(
-        recipe(task, {
-          recipeID: "tsf_profile_feature_fusion_baseline",
-          hypothesis:
-            "Dataset profile shows correlated targets, so feature fusion should test cross-variate signal sharing.",
-          preprocessing: { actions: [{ type: "none" }] },
-          embedding: { type: "invert", dModel },
-          backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
-          fusion: {
-            type: "feature",
-            variateToken: true,
-            crossAttention: (datasetProfile?.crossVarCorrelation ?? 0) >= 0.7 || biases.has("cross_var_correlated"),
-          },
-          predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
-        }),
-      )
-    }
-    if (
-      (datasetProfile?.distributionShift ?? 0) >= 0.5 ||
-      (datasetProfile?.missingRate ?? 0) > 0 ||
-      biases.has("distribution_shift") ||
-      biases.has("missing_values")
-    ) {
-      const robust = recipe(task, {
-        recipeID: "tsf_profile_shift_robust_baseline",
-        hypothesis:
-          "Dataset profile shows shift or missingness, so instance normalization and robust loss should be tested.",
-        preprocessing: {
-          actions: [
-            ...(biases.has("missing_values") || (datasetProfile?.missingRate ?? 0) > 0
-              ? ([{ type: "missing_mask", maskChannel: true, fillPolicy: "mean" }] as TSFPreprocessingAction[])
-              : []),
-            { type: "instance_norm", affine: true, eps: 1e-5 },
-          ],
-        },
-        embedding: { type: "patch", patchLen, stride, dModel },
-        backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 2, dropout: 0.15, ffnMult: 4 },
-        fusion: { type: "temporal", channelMode: "independent" },
-        predictionHead: { type: "linear", outputDistribution: "point" },
-      })
-      candidates.push({
-        ...robust,
-        trainingStrategy: {
-          ...robust.trainingStrategy,
-          loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
-          optimizer: { type: "adamw", lr: 0.0007, weightDecay: 0.01 },
-        },
-      })
-    }
-  }
 
   return candidates.map((candidate) => ({
     candidateSpec: candidate as unknown as DomainCandidateProposal["candidateSpec"],

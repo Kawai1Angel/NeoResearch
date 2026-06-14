@@ -3,7 +3,7 @@ import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
-import { mkdir, readFile, writeFile } from "fs/promises"
+import { appendFile, mkdir, readFile, writeFile } from "fs/promises"
 import path from "path"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { Spinner } from "@tui/component/spinner"
@@ -544,6 +544,17 @@ const errorEventHistoryLimit = 10
 // "full"-stage runs can emit far more than 30 epoch_end lines (up to 100 epochs x 4 horizons),
 // so a small ring buffer evicts the early training history before Reflection/HypoPlanner even run.
 const runnerOutputBufferSize = 500
+// Reflection/HypoPlanner/ModelDesigner events append ~15-25 lines per autonomous-loop iteration
+// with no other eviction; without a cap this grows unbounded over a long-running session and the
+// streamLines() memo (which re-sorts/re-renders the whole array on every refresh) eventually
+// freezes the TUI's render loop. Lines evicted from this buffer are still persisted to
+// .neo-research/sessions/<taskID>/stream.log via persistResearchSessionStreamLines().
+const designLLMLineBufferSize = 100
+// streamLines() can still assemble 600+ rows from the design/runner buffers alone (before
+// ambient/persistent/timeline lines are appended). Rendering that many rows in the scrollbox
+// every refresh is what eventually freezes the TUI on long-running sessions, so cap the final
+// rendered list to the most recent rows — older lines remain in stream.log for inspection.
+const streamLineDisplayLimit = 100
 const neoResearchVersion = InstallationVersion === "local" ? packageJson.version : InstallationVersion
 const researchCockpitOnboardingFile = path.join(Global.Path.data, "onboarded.json")
 const researchCockpitOnboardingText = [
@@ -1198,11 +1209,61 @@ export function ResearchCockpit() {
   let activeApiTimer: ReturnType<typeof setInterval> | undefined
   const [activeApiStartedAt, setActiveApiStartedAt] = createSignal<number>()
   const [activeApiTick, setActiveApiTick] = createSignal(0)
+  const sessionStreamLogQueues = new Map<string, Promise<void>>()
+  // streamLines() rebuilds its array (with brand-new object literals) on every dependency
+  // change, which can fire many times per second while runner epochs / LLM stream deltas
+  // are flowing. solid-js's <For> reconciles by item identity, so without this cache every
+  // recompute disposes and recreates the renderable for every visible line — opentui's
+  // terminal renderer falls behind under that churn until the TUI freezes. Interning lines
+  // by id (and pruning ids that drop out) keeps unchanged rows referentially stable so <For>
+  // can skip them.
+  const streamLineCache = new Map<string, StreamLine>()
+  function internStreamLines(lines: StreamLine[]): StreamLine[] {
+    const liveIds = new Set<string>()
+    const interned = lines.map((line) => {
+      liveIds.add(line.id)
+      const cached = streamLineCache.get(line.id)
+      if (cached && cached.text === line.text && cached.tone === line.tone && cached.spinner === line.spinner) {
+        return cached
+      }
+      streamLineCache.set(line.id, line)
+      return line
+    })
+    for (const id of streamLineCache.keys()) {
+      if (!liveIds.has(id)) streamLineCache.delete(id)
+    }
+    return interned
+  }
 
   function stopActiveApiTimer() {
     if (!activeApiTimer) return
     clearInterval(activeApiTimer)
     activeApiTimer = undefined
+  }
+
+  // Persist stream lines to .neo-research/sessions/<taskID>/stream.log so that lines evicted
+  // from the in-memory ring buffers (designLLMLines/runnerOutputLines) remain available for
+  // later inspection. Writes are serialized per task via a queue to avoid interleaved appends.
+  function persistResearchSessionStreamLines(taskID: string | undefined, lines: Array<{ text: string }>) {
+    const id = taskID ?? selectedTask()?.id
+    if (!id || lines.length === 0) return
+    const root = sdk.directory ?? process.cwd()
+    const dir = path.join(root, ".neo-research", "sessions", id)
+    const file = path.join(dir, "stream.log")
+    const timestamp = new Date().toISOString()
+    const content = lines.map((line) => `[${timestamp}] ${line.text}`).join("\n") + "\n"
+    const prev = sessionStreamLogQueues.get(id) ?? Promise.resolve()
+    const next = prev
+      .then(() => mkdir(dir, { recursive: true }))
+      .then(() => appendFile(file, content, "utf8"))
+      .catch(() => undefined)
+    sessionStreamLogQueues.set(id, next)
+  }
+
+  function appendDesignLLMLines(items: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }>) {
+    if (items.length === 0) return
+    persistResearchSessionStreamLines(items[0]?.taskID, items)
+    setDesignLLMLines((prev) => [...prev, ...items].slice(-designLLMLineBufferSize))
   }
 
   onMount(() => {
@@ -1426,6 +1487,7 @@ export function ResearchCockpit() {
       if (task && typeof taskID === "string" && taskID !== task.id) return
       const text = formatRunnerProgressLine(data as RunnerProgressLineEvent)
       if (text === null) return
+      persistResearchSessionStreamLines(taskID, [{ text }])
       setRunnerOutputLines((lines) => [
         ...lines.slice(-(runnerOutputBufferSize - 1)),
         {
@@ -1487,10 +1549,7 @@ export function ResearchCockpit() {
       const task = selectedTask()
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("Reflection Agent")
-      setDesignLLMLines((prev) => [
-        ...prev,
-        { id: ++streamEventID, taskID, text: "[Reflection] 分析中...", tone: "muted" as const },
-      ])
+      appendDesignLLMLines([{ id: ++streamEventID, taskID, text: "[Reflection] 分析中...", tone: "muted" as const }])
       return
     }
     if (
@@ -1535,7 +1594,7 @@ export function ResearchCockpit() {
       } else {
         newLines.push({ id: ++streamEventID, taskID, text: "[Reflection] failed", tone: "error" })
       }
-      if (newLines.length > 0) setDesignLLMLines((prev) => [...prev, ...newLines])
+      appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
       setRefresh((value) => value + 1)
       return
@@ -1631,13 +1690,13 @@ export function ResearchCockpit() {
               hypoNewLines.push({ id: ++streamEventID, taskID, text: `  ${trimmed}`, tone: "muted" })
           }
         }
-        setDesignLLMLines((prev) => [...prev, ...hypoNewLines])
+        appendDesignLLMLines(hypoNewLines)
         setHypoPlannerStream(undefined)
         setLiveAgentEventStage(undefined)
         setRefresh((value) => value + 1)
         return
       }
-      if (newLines.length > 0) setDesignLLMLines((prev) => [...prev, ...newLines])
+      appendDesignLLMLines(newLines)
       setRefresh((value) => value + 1)
       return
     }
@@ -1647,10 +1706,7 @@ export function ResearchCockpit() {
       const task = selectedTask()
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("publish")
-      setDesignLLMLines((prev) => [
-        ...prev,
-        { id: ++streamEventID, taskID, text: "[Publish] 开始发布 — 运行冠军 ref_test 并打包模型...", tone: "muted" as const },
-      ])
+      appendDesignLLMLines([{ id: ++streamEventID, taskID, text: "[Publish] 开始发布 — 运行冠军 ref_test 并打包模型...", tone: "muted" as const }])
       return
     }
     if (researchPayload.type === "research.agent.publish.completed") {
@@ -1710,7 +1766,7 @@ export function ResearchCockpit() {
         }
       }
       if (artifactPath) newLines.push({ id: ++streamEventID, taskID, text: `  ${artifactPath}`, tone: "muted" })
-      setDesignLLMLines((prev) => [...prev, ...newLines])
+      appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
       setRefresh((value) => value + 1)
       return
@@ -1725,10 +1781,7 @@ export function ResearchCockpit() {
       const refTestSkipped = meta.refTestSkipped === true
       const tone: StreamLine["tone"] = refTestSkipped ? "warning" : "error"
       const label = refTestSkipped ? "[Publish] ref_test 跳过" : "[Publish] 发布失败"
-      setDesignLLMLines((prev) => [
-        ...prev,
-        { id: ++streamEventID, taskID, text: `${label}: ${errMsg.slice(0, 120)}`, tone },
-      ])
+      appendDesignLLMLines([{ id: ++streamEventID, taskID, text: `${label}: ${errMsg.slice(0, 120)}`, tone }])
       setLiveAgentEventStage(undefined)
       setRefresh((value) => value + 1)
       return
@@ -1756,8 +1809,7 @@ export function ResearchCockpit() {
           const mseStr = valAvgMse !== undefined ? ` / val_avg_mse=${valAvgMse.toFixed(4)}` : ""
           const wallClock = run.resourceUsage?.wallClockSec
           const timePart = typeof wallClock === "number" ? ` / ${wallClock.toFixed(1)}s` : ""
-          setDesignLLMLines((prev) => [
-            ...prev,
+          appendDesignLLMLines([
             { id: ++streamEventID, taskID: task.id, text: `[TrainEval ${run.stage ?? "run"}] succeeded${mseStr}${timePart}`, tone: "success" as const },
           ])
         }
@@ -1774,8 +1826,7 @@ export function ResearchCockpit() {
         if (!runKey || !reportedRunIDs.has(runKey)) {
           if (runKey) reportedRunIDs.add(runKey)
           const errorPreview = run.error?.trim() ? formatError(run.error.trim()) : "unknown error"
-          setDesignLLMLines((prev) => [
-            ...prev,
+          appendDesignLLMLines([
             { id: ++streamEventID, taskID: task.id, text: `[TrainEval ${run.stage}] failed: ${errorPreview}`, tone: "error" as const },
           ])
         }
@@ -1790,8 +1841,7 @@ export function ResearchCockpit() {
       const reasonLines = (data?.reason ?? "")
         .split("\n")
         .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
-      setDesignLLMLines((prev) => [
-        ...prev,
+      appendDesignLLMLines([
         { id: ++streamEventID, taskID, text: `[Checkpoint:${phase}] ✓ auto-approved`, tone: "muted" as const },
         ...reasonLines.map((l) => ({ id: ++streamEventID, taskID, text: `  ${l}`, tone: "muted" as const })),
       ])
@@ -2262,8 +2312,7 @@ export function ResearchCockpit() {
           .split(/\r?\n/)
           .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
         const taskID = selectedTask()?.id
-        setDesignLLMLines((prev) => [
-          ...prev,
+        appendDesignLLMLines([
           { id: ++streamEventID, taskID, text: `[${phase}] approved ✓`, tone: "success" as const },
           ...reasonLines.map((line) => ({ id: ++streamEventID, taskID, text: `  ${line}`, tone: "muted" as const })),
         ])
@@ -2304,8 +2353,7 @@ export function ResearchCockpit() {
       const reasonLines = reason
         .split(/\r?\n/)
         .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
-      setDesignLLMLines((prev) => [
-        ...prev,
+      appendDesignLLMLines([
         { id: ++streamEventID, taskID: task.id, text: "[intent_confirmed] approved ✓", tone: "success" as const },
         ...reasonLines.map((line) => ({ id: ++streamEventID, taskID: task.id, text: `  ${line}`, tone: "muted" as const })),
       ])
@@ -4148,7 +4196,7 @@ export function ResearchCockpit() {
       timelineLines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
     lines.push(...(timelineLines.length > 0 ? [...persistentLines, ...timelineLines] : [...ambientLines, ...persistentLines]))
-    return lines
+    return internStreamLines(lines.slice(-streamLineDisplayLimit))
   })
   const promptPlaceholder = createMemo(() => {
     if (!selectedTask()) return "询问 Research Agent，或使用 /new csv 创建带数据集的任务..."

@@ -21,6 +21,13 @@ export interface ExperimentPlan {
     readonly noImprovementRounds: number
     readonly targetMetricValue?: number
   }
+  // Recipe ID of the baseline HypoPlanner picked as the comparison anchor and first candidate
+  // to run, on its first invocation (runs.length === 0 && memory.length === 0). Only set on
+  // that first call; later calls omit it and the previously persisted value is kept.
+  readonly referenceBaseline?: string
+  // Whether referenceBaseline was chosen by an LLM call or by the deterministic heuristic
+  // fallback (e.g. LLM unavailable or returned an invalid recipe ID).
+  readonly referenceBaselineSource?: "llm" | "heuristic"
 }
 
 export interface HypoPlannerResult {
@@ -43,6 +50,10 @@ export interface HypoPlannerInput {
   readonly runs: readonly ResearchRun[]
   readonly memory: readonly ResearchMemory[]
   readonly llmHypotheses?: readonly HypothesisObject[]
+  // Recipe ID an LLM call selected as the reference baseline / first candidate, when
+  // buildHypoPlannerResult is invoked on the first call. Validated against
+  // referenceBaselineOptions(task) before use; ignored otherwise.
+  readonly llmReferenceBaseline?: string
 }
 
 interface HypothesisRule {
@@ -318,9 +329,49 @@ function isBridgeOnly(task: ResearchTask) {
   return runtime.bridgeOnly === true
 }
 
+// Recipe IDs produced by buildTSFBaselines() in domains/tsf.ts. bridgeOnly tasks only ever
+// emit the linear baseline; non-bridgeOnly tasks emit exactly the PatchTST/DLinear/iTransformer
+// trio composed from ModelRecipe components.
+export const TSF_BASELINE_RECIPE_IDS = {
+  linear: "tsf_linear_raw_baseline",
+  patchtst: "tsf_baseline_patchtst",
+  dlinear: "tsf_baseline_dlinear",
+  itransformer: "tsf_baseline_itransformer",
+} as const
+
+// The set of baseline recipe IDs HypoPlanner may pick as referenceBaseline for a given task —
+// mirrors the candidates buildTSFBaselines() will emit for that task.
+export function referenceBaselineOptions(task: ResearchTask): readonly string[] {
+  return isBridgeOnly(task)
+    ? [TSF_BASELINE_RECIPE_IDS.linear]
+    : [TSF_BASELINE_RECIPE_IDS.patchtst, TSF_BASELINE_RECIPE_IDS.dlinear, TSF_BASELINE_RECIPE_IDS.itransformer]
+}
+
+// Picks one of the three ModelRecipe-composed baselines as the reference/benchmark a new
+// hypothesis should be compared against, based on the dataset profile and search biases:
+// strong seasonality/trend favors DLinear's decomposition, strong cross-variate correlation
+// favors iTransformer's cross-attention, otherwise PatchTST is the general-purpose default.
+function selectReferenceBaseline(task: ResearchTask, searchBiases: readonly string[]): string {
+  if (isBridgeOnly(task)) return TSF_BASELINE_RECIPE_IDS.linear
+  const profile = taskProfile(task)
+  if (
+    (numberValue(profile.seasonalityStrength) ?? 0) >= 0.4 ||
+    searchBiases.includes("seasonal") ||
+    searchBiases.includes("trend")
+  ) {
+    return TSF_BASELINE_RECIPE_IDS.dlinear
+  }
+  if ((numberValue(profile.crossVarCorrelation) ?? 0) >= 0.5 || searchBiases.includes("cross_var_correlated")) {
+    return TSF_BASELINE_RECIPE_IDS.itransformer
+  }
+  return TSF_BASELINE_RECIPE_IDS.patchtst
+}
+
 export function buildExperimentPlan(input: {
   readonly hypotheses: readonly HypothesisObject[]
   readonly task: ResearchTask
+  readonly isFirstCall?: boolean
+  readonly llmReferenceBaseline?: string
 }): ExperimentPlan {
   const searchBiases = unique([
     ...taskSearchBiases(input.task),
@@ -332,6 +383,15 @@ export function buildExperimentPlan(input: {
     Math.floor(budgetNumber(input.task, "noImprovementRounds", "maxNoImprove") ?? 20),
   )
   const targetMetricValue = objectiveNumber(input.task, "targetMetricValue", "targetMetric")
+  const llmReferenceBaselineValid =
+    input.llmReferenceBaseline !== undefined &&
+    referenceBaselineOptions(input.task).includes(input.llmReferenceBaseline)
+  const referenceBaseline = input.isFirstCall
+    ? llmReferenceBaselineValid
+      ? input.llmReferenceBaseline
+      : selectReferenceBaseline(input.task, searchBiases)
+    : undefined
+  const referenceBaselineSource = input.isFirstCall ? (llmReferenceBaselineValid ? "llm" : "heuristic") : undefined
   return {
     hypotheses: input.hypotheses,
     baselineStrategy: searchBiases.includes("bridge_safe") || isBridgeOnly(input.task)
@@ -343,6 +403,8 @@ export function buildExperimentPlan(input: {
       noImprovementRounds,
       ...(targetMetricValue === undefined ? {} : { targetMetricValue }),
     },
+    ...(referenceBaseline === undefined ? {} : { referenceBaseline }),
+    ...(referenceBaselineSource === undefined ? {} : { referenceBaselineSource }),
   }
 }
 
@@ -360,6 +422,10 @@ function yamlList(items: readonly string[], indent: string) {
 export function buildHypothesesYaml(plan: ExperimentPlan): string {
   const lines = [
     `baselineStrategy: ${yamlScalar(plan.baselineStrategy)}`,
+    ...(plan.referenceBaseline === undefined ? [] : [`referenceBaseline: ${yamlScalar(plan.referenceBaseline)}`]),
+    ...(plan.referenceBaselineSource === undefined
+      ? []
+      : [`referenceBaselineSource: ${yamlScalar(plan.referenceBaselineSource)}`]),
     "searchBiases:",
     ...yamlList(plan.searchBiases, "  "),
     "stopConditions:",
@@ -397,6 +463,13 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
     `- Agent: ${result.agent}`,
     `- Task ID: ${result.taskID}`,
     `- Baseline strategy: ${plan.baselineStrategy}`,
+    ...(plan.referenceBaseline === undefined
+      ? []
+      : [
+          `- Reference baseline: ${plan.referenceBaseline}${
+            plan.referenceBaselineSource === undefined ? "" : ` (selected by ${plan.referenceBaselineSource})`
+          }`,
+        ]),
     `- Search biases: ${plan.searchBiases.length > 0 ? plan.searchBiases.join(", ") : "none"}`,
     `- Stop conditions: maxTrials=${plan.stopConditions.maxTrials}, noImprovementRounds=${plan.stopConditions.noImprovementRounds}${
       plan.stopConditions.targetMetricValue === undefined
@@ -436,7 +509,13 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
   const evidenceSummary = extractEvidenceSummary(input.dataAnalysisSummary)
   const useLLMHypotheses = input.llmHypotheses !== undefined && input.llmHypotheses.length > 0
   const hypotheses = useLLMHypotheses ? [...input.llmHypotheses!] : generateHypotheses(input)
-  const plan = buildExperimentPlan({ hypotheses, task: input.task })
+  const isFirstCall = input.runs.length === 0 && input.memory.length === 0
+  const plan = buildExperimentPlan({
+    hypotheses,
+    task: input.task,
+    isFirstCall,
+    llmReferenceBaseline: input.llmReferenceBaseline,
+  })
   const partial = {
     agent: "HypoPlannerAgent" as const,
     taskID: input.task.id,

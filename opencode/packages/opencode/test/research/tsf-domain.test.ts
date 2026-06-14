@@ -32,6 +32,10 @@ describe("TSF research domain", () => {
     expect(info.actionRegistry.embedding.invert.bridgeSupported).toBe(true)
     expect(info.actionRegistry.fusion.feature.bridgeSupported).toBe(true)
     expect(info.actionRegistry.head.direct_multi_horizon.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.scheduler.none.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.scheduler.cosine.bridgeSupported).toBe(false)
+    expect(info.actionRegistry.scheduler.one_cycle.bridgeSupported).toBe(false)
+    expect(info.actionRegistry.scheduler.plateau.bridgeSupported).toBe(false)
     expect(info.actionRegistry.head.quantile.phaseMin).toBe("phase2")
     expect(info.actionRegistry.head.gaussian.phaseMin).toBe("phase2")
     expect(info.actionRegistry.head.residual_correction.phaseMin).toBe("phase2")
@@ -105,6 +109,92 @@ describe("TSF research domain", () => {
 
     expect(result.ok).toBe(false)
     expect(result.issues.map((item) => item.path)).toContain("backbone.type")
+  })
+
+  test("bridge-only mode rejects schedulers with bridgeSupported=false", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", taskSpec)
+    for (const schedulerType of ["cosine", "one_cycle", "plateau"] as const) {
+      const candidateSpec = {
+        recipeVersion: "recipe_schema_v1",
+        recipeID: `tsf_bridge_only_${schedulerType}_scheduler`,
+        hypothesis: "Bridge-only runtime should reject non-none schedulers.",
+        preprocessing: { actions: [{ type: "none" }] },
+        embedding: { type: "none" },
+        backbone: { type: "linear", shared: false, bias: true },
+        fusion: { type: "temporal", channelMode: "independent" },
+        predictionHead: { type: "linear", outputDistribution: "point" },
+        trainingStrategy: {
+          loss: { base: "mse", horizonWeighting: "uniform" },
+          optimizer: { type: "adam", lr: 0.001, weightDecay: 0 },
+          scheduler: { type: schedulerType, warmupSteps: 0 },
+          regularization: { dropout: 0.1, gradClip: 1 },
+          budget: { maxEpochs: 50, timeBudgetS: 600, batchSize: 32, patience: 5, seed: 42 },
+        },
+      }
+
+      const result = Research.DomainRegistry.validateCandidate("tsf", {
+        taskSpec: normalizedTask,
+        candidateSpec: candidateSpec as unknown as Research.JsonRecord,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.issues).toContainEqual(
+        expect.objectContaining({
+          path: "scheduler",
+          message: `Unsupported scheduler action for current runtime: ${schedulerType}`,
+        }),
+      )
+    }
+  })
+
+  test("rejects scheduler.warmupSteps that meet or exceed budget.maxEpochs", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      runtime: { bridgeOnly: false },
+    })
+    const candidateSpec = {
+      recipeVersion: "recipe_schema_v1",
+      recipeID: "tsf_warmup_exceeds_max_epochs",
+      hypothesis: "warmupSteps must be strictly less than budget.maxEpochs.",
+      preprocessing: { actions: [{ type: "none" }] },
+      embedding: { type: "none" },
+      backbone: { type: "linear", shared: false, bias: true },
+      fusion: { type: "temporal", channelMode: "independent" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
+      trainingStrategy: {
+        loss: { base: "mse", horizonWeighting: "uniform" },
+        optimizer: { type: "adam", lr: 0.001, weightDecay: 0 },
+        scheduler: { type: "cosine", warmupSteps: 5 },
+        regularization: { dropout: 0.1, gradClip: 1 },
+        budget: { maxEpochs: 5, timeBudgetS: 600, batchSize: 32, patience: 5, seed: 42 },
+      },
+    }
+
+    const result = Research.DomainRegistry.validateCandidate("tsf", {
+      taskSpec: normalizedTask,
+      candidateSpec: candidateSpec as unknown as Research.JsonRecord,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        path: "trainingStrategy.scheduler.warmupSteps",
+        message: "training_strategy.scheduler.warmupSteps must be less than budget.maxEpochs",
+      }),
+    )
+
+    const validCandidateSpec = {
+      ...candidateSpec,
+      trainingStrategy: {
+        ...candidateSpec.trainingStrategy,
+        scheduler: { type: "cosine", warmupSteps: 1 },
+      },
+    }
+    const validResult = Research.DomainRegistry.validateCandidate("tsf", {
+      taskSpec: normalizedTask,
+      candidateSpec: validCandidateSpec as unknown as Research.JsonRecord,
+    })
+    expect(validResult.issues.map((item) => item.path)).not.toContain("trainingStrategy.scheduler.warmupSteps")
   })
 
   test("summarizes leak-safe TSF task fingerprints from task specs", () => {
@@ -267,8 +357,7 @@ describe("TSF research domain", () => {
     const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
     const recipeIDs = baselines.map((item) => asRecord(item.candidateSpec).recipeID)
 
-    expect(recipeIDs).toContain("tsf_profile_feature_fusion_baseline")
-    expect(recipeIDs).toContain("tsf_profile_shift_robust_baseline")
+    expect(recipeIDs).toEqual(["tsf_baseline_patchtst", "tsf_baseline_dlinear", "tsf_baseline_itransformer"])
     for (const proposal of baselines) {
       const result = Research.DomainRegistry.validateCandidate("tsf", {
         taskSpec: normalizedTask,
@@ -299,17 +388,13 @@ describe("TSF research domain", () => {
       },
     })
     const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
-    const seasonal = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_profile_seasonal_decomposition_baseline")
-    const feature = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_profile_feature_fusion_baseline")
-    const robust = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_profile_shift_robust_baseline")
+    const dlinear = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_baseline_dlinear")
+    const itransformer = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_baseline_itransformer")
 
-    expect(seasonal?.candidateSpec.preprocessing).toMatchObject({
+    expect(dlinear?.candidateSpec.preprocessing).toMatchObject({
       actions: [{ type: "series_decomposition" }],
     })
-    expect(feature?.candidateSpec.fusion).toMatchObject({ type: "feature" })
-    expect(robust?.candidateSpec.trainingStrategy).toMatchObject({
-      loss: { base: "huber", horizonWeighting: "tail_heavy" },
-    })
+    expect(itransformer?.candidateSpec.fusion).toMatchObject({ type: "feature" })
   })
 
   test("does not classify pure trend as seasonality", async () => {
@@ -433,7 +518,7 @@ describe("TSF research domain", () => {
       trainingStrategy: {
         loss: { base: "mae", horizonWeighting: "tail_heavy" },
         optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
-        scheduler: { type: "one_cycle", warmupSteps: 10 },
+        scheduler: { type: "one_cycle", warmupSteps: 2 },
         regularization: { dropout: 0.1, gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
       },
@@ -470,7 +555,7 @@ describe("TSF research domain", () => {
     })
     expect(payload.training_strategy).toMatchObject({
       loss: { base: "mae", horizon_weighting: "tail_heavy" },
-      scheduler: { type: "one_cycle", warmup_steps: 10 },
+      scheduler: { type: "one_cycle", warmup_steps: 2 },
       budget: { max_epochs: 5, seed: 7 },
     })
   })
@@ -504,7 +589,7 @@ describe("TSF research domain", () => {
       trainingStrategy: {
         loss: { base: "quantile", horizonWeighting: "tail_heavy", quantiles: [0.1, 0.5, 0.9] },
         optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
-        scheduler: { type: "one_cycle", warmupSteps: 10 },
+        scheduler: { type: "one_cycle", warmupSteps: 2 },
         regularization: { dropout: 0.1, gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
       },

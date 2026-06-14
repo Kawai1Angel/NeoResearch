@@ -248,6 +248,18 @@ def validate_recipe_against_registry(
     if backbone_type == "rnn" and str(backbone.get("cell", "gru")) not in {"gru", "lstm", "rnn"}:
         errors.append("backbone.cell must be one of: gru, lstm, rnn")
 
+    errors.extend(validate_scheduler_warmup(recipe.get("training_strategy", {})))
+
+    return errors
+
+
+def validate_scheduler_warmup(training_strategy: dict[str, Any]) -> list[str]:
+    errors = []
+    scheduler = training_strategy.get("scheduler", {})
+    warmup_steps = scheduler.get("warmup_steps", 0)
+    max_epochs = training_strategy.get("budget", {}).get("max_epochs", 1)
+    if warmup_steps and warmup_steps >= max_epochs:
+        errors.append("scheduler.warmup_steps must be < budget.max_epochs")
     return errors
 
 

@@ -101,7 +101,7 @@ function benchmarkInvertTsfCandidateSpec() {
     trainingStrategy: {
       loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
       optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
-      scheduler: { type: "one_cycle", warmupSteps: 10 },
+      scheduler: { type: "one_cycle", warmupSteps: 2 },
       regularization: { dropout: 0.1, gradClip: 1 },
       budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
     },
@@ -2715,8 +2715,7 @@ describe("Research service", () => {
         const seeded = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
         const recipeIDs = seeded.candidates.map((candidate) => candidate.candidateSpec.recipeID)
 
-        expect(recipeIDs).toContain("tsf_profile_feature_fusion_baseline")
-        expect(recipeIDs).toContain("tsf_profile_shift_robust_baseline")
+        expect(recipeIDs).toEqual(["tsf_baseline_patchtst", "tsf_baseline_dlinear", "tsf_baseline_itransformer"])
         expect(seeded.candidates.every((item) => item.approvalStatus === "auto_approved")).toBe(true)
       },
     })

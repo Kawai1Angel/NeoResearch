@@ -736,10 +736,12 @@ export function formatResearchCockpitArtifactMetadata(artifact: ResearchCockpitA
     const agent = metadataString(artifact.metadata, "agent")
     const hypothesisCount = compactValue(artifact.metadata.hypothesisCount)
     const baseline = metadataString(artifact.metadata, "baselineStrategy")
+    const referenceBaseline = metadataString(artifact.metadata, "referenceBaseline")
     parts = [
       agent ? `agent=${agent}` : undefined,
       hypothesisCount ? `hypotheses=${hypothesisCount}` : undefined,
       baseline ? `baseline=${baseline}` : undefined,
+      referenceBaseline ? `reference=${referenceBaseline}` : undefined,
     ]
   } else if (artifact.kind === "model_compile_report_md") {
     const agent = metadataString(artifact.metadata, "agent")
