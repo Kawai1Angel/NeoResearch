@@ -9,6 +9,7 @@ import { deflateSync } from "zlib"
 import z from "zod"
 import { and, desc, eq, inArray, notInArray, isNull, lt, ne, Database, NotFoundError } from "@/storage"
 import { Bus } from "@/bus"
+import { Session } from "@/session"
 import { Instance } from "@/project/instance"
 import * as Process from "@/util/process"
 import {
@@ -3724,10 +3725,11 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Research") {}
 
-export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
+export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+    const session = yield* Session.Service
 
     const reconcileStaleRuns = Effect.fn("Research.reconcileStaleRuns")(function* () {
       const cutoff = Date.now() - STALE_RUN_RECONCILE_MS
@@ -3808,13 +3810,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
     const createTask = Effect.fn("Research.createTask")(function* (input: CreateTaskInput) {
       const time = nowTime()
       const taskSpec = normalizeTaskSpec(input)
+      const sessionID = input.sessionID ?? (yield* session.create({ title: `Research: ${input.title}` })).id
       const row = yield* db((d) =>
         d
           .insert(ResearchTaskTable)
           .values({
             id: ResearchTaskID.ascending(),
             project_id: Instance.project.id,
-            session_id: input.sessionID,
+            session_id: sessionID,
             title: input.title,
             domain_id: input.domainID,
             mode: input.mode,
@@ -8666,4 +8669,4 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
+export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Session.defaultLayer))

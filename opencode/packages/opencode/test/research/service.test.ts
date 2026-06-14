@@ -3,6 +3,7 @@ import { Cause, Effect, Layer } from "effect"
 import { mkdir, mkdtemp, readFile, writeFile } from "fs/promises"
 import { tmpdir as osTmpdir } from "os"
 import { Bus } from "../../src/bus"
+import { Session } from "../../src/session"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
@@ -17,7 +18,9 @@ function runResearch<A, E>(fx: Effect.Effect<A, E, Research.Service>) {
 }
 
 function runResearchWithBus<A, E>(fx: Effect.Effect<A, E, Research.Service | Bus.Service>) {
-  return Effect.runPromise(fx.pipe(Effect.provide(Research.layer.pipe(Layer.provideMerge(Bus.layer)))))
+  return Effect.runPromise(
+    fx.pipe(Effect.provide(Research.layer.pipe(Layer.provideMerge(Bus.layer), Layer.provideMerge(Session.defaultLayer)))),
+  )
 }
 
 function validTsfTaskSpec(runtime: Research.JsonRecord = {}) {
