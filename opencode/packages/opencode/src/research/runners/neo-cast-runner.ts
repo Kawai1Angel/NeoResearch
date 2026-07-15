@@ -143,6 +143,7 @@ export function createNeoCastRunnerCommand(input: {
   readonly stage: DomainRunStage
   readonly runtime: NeoCastRuntime
   readonly description: string
+  readonly runnerRunID?: string
   readonly explicitRoot?: string
 }): DomainRunnerCommand {
   const runnerRoot = resolveNeoCastRunnerRoot(input.explicitRoot)
@@ -166,9 +167,14 @@ export function createNeoCastRunnerCommand(input: {
         : { cwd: path.resolve(input.explicitRoot) }
   const env = input.explicitRoot === undefined ? commandEnvironment(runnerRoot) : undefined
 
+  const args = [script, ...command.args.map((arg) => renderTemplate(arg, variables))]
+  if ((input.stage === "ref_test" || input.stage === "blind_test") && input.runnerRunID !== undefined) {
+    args.push("--run-id", input.runnerRunID)
+  }
+
   return {
     executable: resolvePythonExecutable(input.runtime, runnerRoot),
-    args: [script, ...command.args.map((arg) => renderTemplate(arg, variables))],
+    args,
     ...(command.timeout_ms === undefined ? {} : { timeoutMs: command.timeout_ms }),
     ...cwd,
     ...(env === undefined ? {} : { env }),

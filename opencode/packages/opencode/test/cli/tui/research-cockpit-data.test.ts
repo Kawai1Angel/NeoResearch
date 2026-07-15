@@ -653,14 +653,14 @@ describe("research cockpit data helpers", () => {
       domainID: "tsf",
       mode: "review",
       taskSpec: {
-        contextLength: 96,
-        predictionLengths: [24],
+        contextLength: 336,
+        predictionLengths: [96],
         dataset: {
           loaderID: "etth1_tslib_v1",
           targetCols: ["OT"],
         },
         runtime: {
-          bridgeOnly: true,
+          bridgeOnly: false,
         },
         metadata: { interactionMode: "companion" },
       },
@@ -672,18 +672,18 @@ describe("research cockpit data helpers", () => {
       mode: "autonomous",
       interactionMode: "socratic",
       taskSpec: {
-        contextLength: 96,
-        predictionLengths: [24],
+        contextLength: 336,
+        predictionLengths: [96],
         dataset: {
           loaderID: "etth1_tslib_v1",
           targetCols: ["OT"],
         },
         runtime: {
-          bridgeOnly: true,
+          bridgeOnly: false,
         },
         metadata: { interactionMode: "socratic" },
       },
-      budget: { maxRuns: 12, maxParallel: 1 },
+      budget: { maxRuns: 50, maxParallel: 1 },
     })
     expect(companionTask).toMatchObject({
       mode: "autonomous",
@@ -698,7 +698,7 @@ describe("research cockpit data helpers", () => {
     expect(buildDefaultTsfResearchTask("autonomous", "/tmp/neo-cast")).toMatchObject({
       taskSpec: {
         runtime: {
-          bridgeOnly: true,
+          bridgeOnly: false,
           neoCastProjectRoot: "/tmp/neo-cast",
         },
       },
@@ -1541,6 +1541,61 @@ describe("research cockpit data helpers", () => {
       question: "模型搜索应该优化哪个验证指标？",
       status: "missing",
     })
+  })
+
+  test("builds active Socratic clarification state for companion-mode pending protocol approvals", () => {
+    const result = buildSocraticClarificationState(
+      task({
+        id: "task_companion",
+        mode: "autonomous",
+        status: "paused",
+        taskSpec: { metadata: { interactionMode: "companion" } },
+      }),
+      [
+        {
+          id: "approval_protocol",
+          kind: "protocol",
+          status: "pending",
+          reason: ["需要澄清研究意图：", "- 预测对象是什么？"].join("\n"),
+          time: { created: 1, updated: 1 },
+        },
+      ],
+      { includeCompanion: true },
+    )
+    expect(result.active).toBe(true)
+    expect(result.nextQuestion).toBe("预测对象是什么？")
+  })
+
+  test("prefers a newer intent_confirmed checkpoint approval over a stale unresolved ask_user clarification", () => {
+    // ask_user never resolves its own pending "需要澄清研究意图" approval — once check_taskspec
+    // opens the intent_confirmed checkpoint, that newer approval should win so the cockpit
+    // renders the checkpoint content instead of getting stuck showing the old question forever.
+    const result = buildSocraticClarificationState(
+      task({
+        id: "task_companion",
+        mode: "autonomous",
+        status: "paused",
+        taskSpec: { metadata: { interactionMode: "companion" } },
+      }),
+      [
+        {
+          id: "approval_checkpoint",
+          kind: "protocol",
+          status: "pending",
+          reason: "[checkpoint:intent_confirmed]\nIntent signature: ...",
+          time: { created: 2, updated: 2 },
+        },
+        {
+          id: "approval_ask_user",
+          kind: "protocol",
+          status: "pending",
+          reason: ["需要澄清研究意图：", "- 预测对象是什么？"].join("\n"),
+          time: { created: 1, updated: 1 },
+        },
+      ],
+      { includeCompanion: true },
+    )
+    expect(result.active).toBe(false)
   })
 
   test("detects research events that should refresh cockpit data", () => {

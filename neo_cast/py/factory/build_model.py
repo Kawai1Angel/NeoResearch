@@ -360,13 +360,34 @@ class GatedHybridMixer(nn.Module):
 
 
 class DLinearCore(nn.Module):
-    def __init__(self, *, input_len: int, horizon: int, kernel_size: int, bias: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        input_len: int,
+        horizon: int,
+        kernel_size: int,
+        bias: bool = True,
+        individual: bool = False,
+        num_channels: int | None = None,
+    ) -> None:
         super().__init__()
         if kernel_size % 2 == 0:
             kernel_size += 1
         self.kernel_size = kernel_size
-        self.seasonal = nn.Linear(input_len, horizon, bias=bias)
-        self.trend = nn.Linear(input_len, horizon, bias=bias)
+        self.individual = bool(individual)
+        self.num_channels = int(num_channels or 0)
+        if self.individual:
+            if self.num_channels <= 0:
+                raise ValueError("DLinear individual=True requires num_channels")
+            self.seasonal_layers = nn.ModuleList(
+                [nn.Linear(input_len, horizon, bias=bias) for _ in range(self.num_channels)]
+            )
+            self.trend_layers = nn.ModuleList(
+                [nn.Linear(input_len, horizon, bias=bias) for _ in range(self.num_channels)]
+            )
+        else:
+            self.seasonal = nn.Linear(input_len, horizon, bias=bias)
+            self.trend = nn.Linear(input_len, horizon, bias=bias)
 
     def _moving_average(self, x: torch.Tensor) -> torch.Tensor:
         pad = (self.kernel_size - 1) // 2
@@ -376,6 +397,21 @@ class DLinearCore(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         trend = self._moving_average(x)
         seasonal = x - trend
+        if self.individual:
+            if x.size(0) % self.num_channels != 0:
+                raise ValueError(
+                    f"DLinear individual=True expected batch*channels rows divisible by {self.num_channels}, "
+                    f"got {x.size(0)}"
+                )
+            batch_size = x.size(0) // self.num_channels
+            seasonal_by_channel = seasonal.reshape(batch_size, self.num_channels, seasonal.size(-1))
+            trend_by_channel = trend.reshape(batch_size, self.num_channels, trend.size(-1))
+            outputs = [
+                self.seasonal_layers[index](seasonal_by_channel[:, index, :])
+                + self.trend_layers[index](trend_by_channel[:, index, :])
+                for index in range(self.num_channels)
+            ]
+            return torch.stack(outputs, dim=1).reshape(x.size(0), -1)
         return self.seasonal(seasonal) + self.trend(trend)
 
 
@@ -621,28 +657,53 @@ class SSMTokenBlock(nn.Module):
 
 
 class TokenMixerBlock(nn.Module):
-    def __init__(self, *, token_count: int, hidden_dim: int, dropout: float, activation: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        token_count: int,
+        hidden_dim: int,
+        dropout: float,
+        activation: str | None,
+        temporal_mixing: str = "mlp",
+        channel_mixing: str = "mlp",
+    ) -> None:
         super().__init__()
         self.token_norm = nn.LayerNorm(hidden_dim)
-        self.token_mlp = nn.Sequential(
-            nn.Linear(token_count, token_count),
-            _activation(activation),
-            nn.Dropout(dropout),
-            nn.Linear(token_count, token_count),
-            nn.Dropout(dropout),
-        )
+        if temporal_mixing == "mlp":
+            self.token_mixer = nn.Sequential(
+                nn.Linear(token_count, token_count),
+                _activation(activation),
+                nn.Dropout(dropout),
+                nn.Linear(token_count, token_count),
+                nn.Dropout(dropout),
+            )
+        elif temporal_mixing == "conv":
+            kernel_size = 3
+            self.token_mixer = nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=hidden_dim),
+                _activation(activation),
+                nn.Dropout(dropout),
+            )
+        else:
+            raise ValueError(f"Unsupported mixer.temporal_mixing: {temporal_mixing}")
+
         self.feature_norm = nn.LayerNorm(hidden_dim)
-        self.feature_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            _activation(activation),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Dropout(dropout),
-        )
+        if channel_mixing == "mlp":
+            self.feature_mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                _activation(activation),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Dropout(dropout),
+            )
+        elif channel_mixing == "identity":
+            self.feature_mlp = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported mixer.channel_mixing: {channel_mixing}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.token_norm(x).transpose(1, 2)
-        x = x + self.token_mlp(y).transpose(1, 2)
+        x = x + self.token_mixer(y).transpose(1, 2)
         return x + self.feature_mlp(self.feature_norm(x))
 
 
@@ -696,6 +757,10 @@ class RecipeModel(nn.Module):
         horizon: int,
         *,
         num_channels: int | None = None,
+        num_target_channels: int | None = None,
+        num_past_covariate_channels: int = 0,
+        num_future_covariate_channels: int = 0,
+        num_output_channels: int | None = None,
     ) -> None:
         super().__init__()
         self.recipe = recipe
@@ -712,6 +777,10 @@ class RecipeModel(nn.Module):
         self.fusion_type = self.fusion_cfg.get("type", "temporal")
         self.channel_mode = self.fusion_cfg.get("channel_mode", "independent")
         self.num_channels = num_channels
+        self.num_target_channels = int(num_target_channels if num_target_channels is not None else num_channels or 0)
+        self.num_past_covariate_channels = int(num_past_covariate_channels)
+        self.num_future_covariate_channels = int(num_future_covariate_channels)
+        self.num_output_channels = int(num_output_channels if num_output_channels is not None else self.num_target_channels)
         self.model_num_channels = self._effective_num_channels(num_channels)
         self.channel_mixer, self.output_mixer = self._build_fusion_modules()
 
@@ -962,6 +1031,8 @@ class RecipeModel(nn.Module):
             horizon=self.horizon,
             kernel_size=int(self.backbone_cfg["kernel_size"]),
             bias=bool(self.backbone_cfg.get("bias", True)),
+            individual=bool(self.backbone_cfg.get("individual", False)),
+            num_channels=self.model_num_channels,
         )
 
     def _build_tcn_model(self) -> nn.Module:
@@ -1050,6 +1121,8 @@ class RecipeModel(nn.Module):
         depth = int(self.backbone_cfg.get("depth", self.backbone_cfg.get("n_layers", 1)))
         dropout = float(self.backbone_cfg.get("dropout", 0.0))
         activation = self.backbone_cfg.get("activation", "gelu")
+        temporal_mixing = str(self.backbone_cfg.get("temporal_mixing", "mlp"))
+        channel_mixing = str(self.backbone_cfg.get("channel_mixing", "mlp"))
         return nn.ModuleDict(
             {
                 "embedding": embedding,
@@ -1061,6 +1134,8 @@ class RecipeModel(nn.Module):
                             hidden_dim=hidden_dim,
                             dropout=dropout,
                             activation=activation,
+                            temporal_mixing=temporal_mixing,
+                            channel_mixing=channel_mixing,
                         )
                         for _ in range(depth)
                     ]
@@ -1105,6 +1180,40 @@ class RecipeModel(nn.Module):
         batch_size, seq_len, channels = series.shape
         flat = series.permute(0, 2, 1).reshape(batch_size * channels, seq_len)
         return flat, batch_size, channels, last_value, contexts
+
+    def _merge_history(
+        self,
+        x: torch.Tensor | None = None,
+        *,
+        target_history: torch.Tensor | None = None,
+        exogenous_past: torch.Tensor | None = None,
+        exogenous_future: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x is not None:
+            if target_history is not None or exogenous_past is not None or exogenous_future is not None:
+                raise ValueError("Provide either x or structured covariate inputs, not both")
+            return x
+        if target_history is None:
+            raise ValueError("RecipeModel.forward requires x or target_history")
+        if exogenous_past is None:
+            return target_history
+        if exogenous_past.size(-1) == 0:
+            return target_history
+        if target_history.shape[:2] != exogenous_past.shape[:2]:
+            raise ValueError(
+                "target_history and exogenous_past must share batch and input length, "
+                f"got {tuple(target_history.shape)} and {tuple(exogenous_past.shape)}"
+            )
+        return torch.cat([target_history, exogenous_past], dim=-1)
+
+    def _slice_output_channels(self, y: torch.Tensor) -> torch.Tensor:
+        if self.num_output_channels <= 0 or y.size(-2) == 0:
+            return y
+        if y.dim() == 4:
+            return y[:, :, : self.num_output_channels, :]
+        if y.dim() >= 3:
+            return y[..., : self.num_output_channels]
+        return y
 
     def _restore_point_forecast(
         self,
@@ -1193,32 +1302,58 @@ class RecipeModel(nn.Module):
         pooled = encoded.mean(dim=1)
         return modules["head"](pooled)
 
-    def forward_quantiles(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_quantiles(
+        self,
+        x: torch.Tensor | None = None,
+        *,
+        target_history: torch.Tensor | None = None,
+        exogenous_past: torch.Tensor | None = None,
+        exogenous_future: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self._merge_history(
+            x,
+            target_history=target_history,
+            exogenous_past=exogenous_past,
+            exogenous_future=exogenous_future,
+        )
         flat, batch_size, channels, last_value, contexts = self._prepare_flat_series(x)
         base_pred = self._forward_core(flat)
         if hasattr(self.prediction_head, "forward_quantiles"):
             quantiles = self.prediction_head.forward_quantiles(base_pred)
         else:
             quantiles = self.prediction_head(base_pred).unsqueeze(-1)
-        return self._restore_quantile_forecast(
+        return self._slice_output_channels(self._restore_quantile_forecast(
             quantiles,
             batch_size=batch_size,
             channels=channels,
             last_value=last_value,
             contexts=contexts,
-        )
+        ))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor | None = None,
+        *,
+        target_history: torch.Tensor | None = None,
+        exogenous_past: torch.Tensor | None = None,
+        exogenous_future: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self._merge_history(
+            x,
+            target_history=target_history,
+            exogenous_past=exogenous_past,
+            exogenous_future=exogenous_future,
+        )
         flat, batch_size, channels, last_value, contexts = self._prepare_flat_series(x)
         pred = self._forward_core(flat)
         pred = self.prediction_head(pred)
-        return self._restore_point_forecast(
+        return self._slice_output_channels(self._restore_point_forecast(
             pred,
             batch_size=batch_size,
             channels=channels,
             last_value=last_value,
             contexts=contexts,
-        )
+        ))
 
 
 def _extract_recipe(model_config: dict[str, Any]) -> dict[str, Any]:
@@ -1232,9 +1367,17 @@ def _extract_recipe(model_config: dict[str, Any]) -> dict[str, Any]:
 
 def build_model(model_config: dict[str, Any], input_len: int, horizon: int) -> nn.Module:
     num_channels = model_config.get("num_channels")
+    num_target_channels = model_config.get("num_target_channels")
+    num_past_covariate_channels = model_config.get("num_past_covariate_channels", 0)
+    num_future_covariate_channels = model_config.get("num_future_covariate_channels", 0)
+    num_output_channels = model_config.get("num_output_channels")
     return RecipeModel(
         _extract_recipe(model_config),
         input_len=input_len,
         horizon=horizon,
         num_channels=int(num_channels) if num_channels is not None else None,
+        num_target_channels=int(num_target_channels) if num_target_channels is not None else None,
+        num_past_covariate_channels=int(num_past_covariate_channels),
+        num_future_covariate_channels=int(num_future_covariate_channels),
+        num_output_channels=int(num_output_channels) if num_output_channels is not None else None,
     )

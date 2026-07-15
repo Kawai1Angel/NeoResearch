@@ -54,10 +54,42 @@ export class ResearchAgentStreamDelta extends Schema.Class<ResearchAgentStreamDe
   delta: Schema.String,
 }) {}
 
+export class ResearchLLMCallPath extends Schema.Class<ResearchLLMCallPath>("ResearchLLMCallPath")({
+  taskID: ResearchTaskID,
+  agent: Schema.String,
+  path: Schema.Literals(["session", "direct"]),
+}) {}
+
+export class ResearchHypothesisChanged extends Schema.Class<ResearchHypothesisChanged>("ResearchHypothesisChanged")({
+  taskID: ResearchTaskID,
+  action: Schema.Literals(["add", "update", "abandon"]),
+  hypoID: Schema.String,
+  snapshot: JsonRecord,
+}) {}
+
+export class ResearchAgentPartUpdated extends Schema.Class<ResearchAgentPartUpdated>("ResearchAgentPartUpdated")({
+  taskID: ResearchTaskID,
+  agent: Schema.String,
+  partID: Schema.String,
+  kind: Schema.Literals(["text", "tool"]),
+  text: Schema.optional(Schema.String),
+  toolName: Schema.optional(Schema.String),
+  toolInput: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  toolOutput: Schema.optional(Schema.String),
+  toolState: Schema.optional(Schema.Literals(["pending", "running", "completed", "error"])),
+  toolDurationMs: Schema.optional(Schema.Number),
+  toolError: Schema.optional(Schema.String),
+}) {}
+
 export class ResearchCheckpointAutoApproved extends Schema.Class<ResearchCheckpointAutoApproved>("ResearchCheckpointAutoApproved")({
   taskID: ResearchTaskID,
   phase: Schema.String,
   reason: Schema.String,
+}) {}
+
+export class ResearchIntentAwaitingUser extends Schema.Class<ResearchIntentAwaitingUser>("ResearchIntentAwaitingUser")({
+  taskID: ResearchTaskID,
+  questions: Schema.Array(Schema.String),
 }) {}
 
 export class ResearchRunnerProgressLine extends Schema.Class<ResearchRunnerProgressLine>("ResearchRunnerProgressLine")({
@@ -87,12 +119,17 @@ export const Event = {
   IntentAgentStarted: BusEvent.define("research.agent.intent.started", ResearchAgentStageChanged),
   IntentAgentCompleted: BusEvent.define("research.agent.intent.completed", ResearchAgentStageChanged),
   IntentAgentFailed: BusEvent.define("research.agent.intent.failed", ResearchAgentStageChanged),
+  IntentAgentAwaitingUser: BusEvent.define("research.agent.intent.awaiting_user", ResearchIntentAwaitingUser),
+  IntentAgentStreamDelta: BusEvent.define("research.agent.intent.stream.delta", ResearchAgentStreamDelta),
+  IntentAgentPartUpdated: BusEvent.define("research.agent.intent.part.updated", ResearchAgentPartUpdated),
   DataAnalysisAgentStarted: BusEvent.define("research.agent.dataAnalysis.started", ResearchAgentStageChanged),
   DataAnalysisAgentStreamDelta: BusEvent.define("research.agent.dataAnalysis.stream.delta", ResearchAgentStreamDelta),
+  DataAnalysisAgentPartUpdated: BusEvent.define("research.agent.dataAnalysis.part.updated", ResearchAgentPartUpdated),
   DataAnalysisAgentCompleted: BusEvent.define("research.agent.dataAnalysis.completed", ResearchAgentStageChanged),
   DataAnalysisAgentFailed: BusEvent.define("research.agent.dataAnalysis.failed", ResearchAgentStageChanged),
   HypoPlannerAgentStarted: BusEvent.define("research.agent.hypoPlanner.started", ResearchAgentStageChanged),
   HypoPlannerAgentStreamDelta: BusEvent.define("research.agent.hypoPlanner.stream.delta", ResearchAgentStreamDelta),
+  HypoPlannerAgentPartUpdated: BusEvent.define("research.agent.hypoPlanner.part.updated", ResearchAgentPartUpdated),
   HypoPlannerAgentCompleted: BusEvent.define("research.agent.hypoPlanner.completed", ResearchAgentStageChanged),
   HypoPlannerAgentFailed: BusEvent.define("research.agent.hypoPlanner.failed", ResearchAgentStageChanged),
   NASAgentStarted: BusEvent.define("research.agent.nas.started", ResearchAgentStageChanged),
@@ -103,10 +140,17 @@ export const Event = {
   PublishAgentCompleted: BusEvent.define("research.agent.publish.completed", ResearchAgentStageChanged),
   PublishAgentFailed: BusEvent.define("research.agent.publish.failed", ResearchAgentStageChanged),
   ReflectionAgentStarted: BusEvent.define("research.agent.reflection.started", ResearchAgentStageChanged),
+  ReflectionAgentStreamDelta: BusEvent.define("research.agent.reflection.stream.delta", ResearchAgentStreamDelta),
+  ReflectionAgentPartUpdated: BusEvent.define("research.agent.reflection.part.updated", ResearchAgentPartUpdated),
   ReflectionAgentCompleted: BusEvent.define("research.agent.reflection.completed", ResearchAgentStageChanged),
   ReflectionAgentFailed: BusEvent.define("research.agent.reflection.failed", ResearchAgentStageChanged),
   RunVerified: BusEvent.define("research.run.verified", ResearchAgentStageChanged),
   RunRejectedByVerifier: BusEvent.define("research.run.rejected_by_verifier", ResearchAgentStageChanged),
   ModelDesignerCompleted: BusEvent.define("research.agent.modelDesigner.completed", ResearchAgentStageChanged),
   CheckpointAutoApproved: BusEvent.define("research.checkpoint.auto_approved", ResearchCheckpointAutoApproved),
+  LLMCallPath: BusEvent.define("research.agent.llm.call_path", ResearchLLMCallPath),
+  HypoPlannerAgentHypothesisChanged: BusEvent.define(
+    "research.agent.hypoPlanner.hypothesis.changed",
+    ResearchHypothesisChanged,
+  ),
 }

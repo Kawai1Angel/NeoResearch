@@ -593,7 +593,7 @@ describe("ResearchCockpit render", () => {
     })
   })
 
-  test("shows the conversation-first onboarding bubble once", async () => {
+  test("marks onboarding seen once without rendering a status bubble for it", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
     await rm(onboardingPath, { force: true })
@@ -603,9 +603,12 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={emptyFetch} />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "欢迎来到 NeoResearch")
+      // Onboarding used to render as a "Research Agent: 欢迎来到 NeoResearch..." status line —
+      // that's gone now (operation-result/notice noise, not an AskUser dialogue), but the
+      // "mark as seen" side effect (writing onboardingPath) must still happen exactly once.
       let persisted: Record<string, unknown> = {}
-      for (let attempt = 0; attempt < 20; attempt++) {
+      for (let attempt = 0; attempt < 40; attempt++) {
+        await app.renderOnce()
         try {
           persisted = JSON.parse(await readFile(onboardingPath, "utf8")) as Record<string, unknown>
           break
@@ -613,8 +616,9 @@ describe("ResearchCockpit render", () => {
           await Bun.sleep(25)
         }
       }
+      const frame = app.captureCharFrame()
 
-      expect(frame).toContain("常用斜杠命令：/new csv、/dataset prepare、/loop start、/help。")
+      expect(frame).not.toContain("欢迎来到 NeoResearch")
       expect(persisted.cockpit).toBe(true)
     } finally {
       app.renderer.destroy()
@@ -782,7 +786,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请给出下一步实验建议")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -842,7 +846,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("数据集需要处理吗")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -891,7 +895,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/agent-loop")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1000,7 +1004,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1093,7 +1097,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1173,7 +1177,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请拼接多段回复")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1239,7 +1243,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1268,7 +1272,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} />, { width: 170, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1335,7 +1339,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1657,7 +1661,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} />, { width: 170, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1703,7 +1707,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} />, { width: 170, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1742,7 +1746,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={chatFetch} />, { width: 170, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("请解释当前状态")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1798,7 +1802,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("first user turn")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1845,7 +1849,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("整理当前可做的事情")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1887,7 +1891,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/seed-baselines")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1899,8 +1903,6 @@ describe("ResearchCockpit render", () => {
 
       expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/baselines`)
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
-      const frame = await waitForFrame(app, "Research Agent: 0 candidates seeded")
-      expect(frame).not.toContain("Research Agent: 当前研究")
     } finally {
       app.renderer.destroy()
     }
@@ -1934,7 +1936,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/ref-gate")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -1969,7 +1971,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/doctor")
       app.mockInput.pressEnter()
       for (let attempt = 0; attempt < 20 && route?.data.type !== "home"; attempt++) {
@@ -2016,7 +2018,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("try mixer next")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -2041,7 +2043,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       const displays = command?.slashes().map((slash) => slash.display.trim()) ?? []
 
       expect(displays).toEqual(
@@ -2101,7 +2103,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/")
       const frame = await waitForFrame(app, "Selected /new")
 
@@ -2136,7 +2138,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/loo")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -2163,7 +2165,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/exit")
       await app.renderOnce()
 
@@ -2199,7 +2201,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/")
       await app.renderOnce()
       app.mockInput.pressKey("ARROW_DOWN")
@@ -2281,7 +2283,10 @@ describe("ResearchCockpit render", () => {
       await waitForFrame(app, "Interaction mode")
       app.mockInput.pressKey("1")
       app.mockInput.pressEnter()
-      const frame = await waitForFrame(app, "model_export_package exported")
+      for (let attempt = 0; attempt < 80 && posts.length < 2; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
 
       expect(posts).toHaveLength(2)
       expect(posts[0]).toMatchObject({
@@ -2306,11 +2311,9 @@ describe("ResearchCockpit render", () => {
         body: {
           stage: "smoke",
           description: "Forecast ETTh1 horizon 24",
-          maxIterations: 10,
+          maxIterations: 50,
         }
       })
-      expect(frame).toContain("Forecast ETTh1 horizon 24")
-      expect(frame).toContain("loop stopped: reached max iterations")
     } finally {
       app.renderer.destroy()
     }
@@ -2377,7 +2380,10 @@ describe("ResearchCockpit render", () => {
       await waitForFrame(app, "Interaction mode")
       app.mockInput.pressKey("2")
       app.mockInput.pressEnter()
-      await waitForFrame(app, "model_export_package exported")
+      for (let attempt = 0; attempt < 80 && posts.length < 2; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
 
       expect(posts[0]).toMatchObject({
         path: "/research/tasks",
@@ -2445,7 +2451,11 @@ describe("ResearchCockpit render", () => {
       await waitForFrame(app, "Interaction mode")
       app.mockInput.pressKey("2")
       app.mockInput.pressEnter()
-      const frame = await waitForFrame(app, "Forecast missing runner created from home goal")
+      for (let attempt = 0; attempt < 80 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+      const frame = app.captureCharFrame()
 
       expect(posts.map((post) => post.path)).toEqual(["/research/tasks"])
       expect(frame).toContain("Forecast missing runner")
@@ -2462,13 +2472,12 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 52 })
 
     try {
-      const frame = await waitForFrame(app, "run_smoke")
+      const frame = await waitForFrame(app, "smoke succeeded")
 
       expect(frame).toContain("NeoResearch Workspace")
       expect(frame).toContain("Publish Agent")
       expect(frame).toContain("Home")
       expect(frame).toContain("Research Agent")
-      expect(frame).toContain("run_smoke")
       expect(frame).toContain("smoke succeeded")
       expect(frame).toContain("Neo-Cast Autonomous TSF")
       expect(frame).toContain("苏格拉底")
@@ -2630,10 +2639,14 @@ describe("ResearchCockpit render", () => {
     try {
       const frame = await waitForFrame(app, "Companion onboarding")
 
+      // No fetch in this test ever creates the task through the cockpit, so the live
+      // IntentAgent session was never kicked off — the static 15-slot checklist is gone
+      // (per specs/research/intent-agent-tui-streaming.md §3.5), replaced by a "waiting for
+      // the session to start" placeholder instead.
       expect(frame).toContain("Companion onboarding")
-      expect(frame).toContain("交互模式: companion")
-      expect(frame).toContain("→ 预测对象")
-      expect(frame).toContain("Next question")
+      expect(frame).toContain("等待 IntentAgent 启动")
+      expect(frame).not.toContain("交互模式: companion")
+      expect(frame).not.toContain("→ 预测对象")
       expect(frame).toContain("→ Intent Agent")
       expect(frame).toContain("• Data Analysis Agent")
       expect(frame).toContain("Confirm requirements")
@@ -2702,7 +2715,6 @@ describe("ResearchCockpit render", () => {
       // Socratic onboarding context must still be visible
       const frame = app.captureCharFrame()
       expect(frame).toContain("Socratic onboarding")
-      expect(frame).toContain("Next question")
     } finally {
       app.renderer.destroy()
     }
@@ -2812,11 +2824,109 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={clarificationFetch} />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "Socratic clarification")
+      const frame = await waitForFrame(app, "Question: NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
 
-      expect(frame).toContain("slots: data_source")
-      expect(frame).toContain("Next question: NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
+      // Per specs/research/intent-agent-tui-streaming.md §3.5, the "slots: ..." summary line
+      // and slot checklist are gone — only the "Question: ..." line (sourced from the real
+      // ask_user/approval text) and the live IntentAgent log remain.
+      expect(frame).not.toContain("Socratic clarification: slots:")
+      expect(frame).toContain("Question: NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
       expect(frame).toContain("回答当前 Socratic 问题")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("renders the live IntentAgent part stream and keeps it after the user answers", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const clarificationFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === "/research/tasks" && !init?.method) {
+        return Promise.resolve(
+          response([
+            {
+              id: "task_clarify",
+              title: "Clarify goal",
+              domainID: "tsf",
+              mode: "autonomous",
+              status: "paused",
+              taskSpec: { metadata: { interactionMode: "socratic" }, runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+              budget: { maxRuns: 8 },
+              time: { created: now, updated: now },
+            },
+          ]),
+        )
+      }
+      if (path === "/research/tasks/task_clarify/approvals") {
+        return Promise.resolve(
+          response([
+            {
+              id: "approval_protocol",
+              taskID: "task_clarify",
+              kind: "protocol",
+              status: "pending",
+              reason: ["运行自主研究流水线前需要先澄清研究意图。", "- 数据集在哪里？"].join("\n"),
+              time: { created: now, updated: now },
+            },
+          ]),
+        )
+      }
+      if (path === "/research/tasks/task_clarify/intent/answer") return Promise.resolve(response({}))
+      if (path.startsWith("/research/tasks/task_clarify/")) return Promise.resolve(response([]))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const events = createCockpitEventSource()
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={clarificationFetch} events={events.source} />,
+      { width: 160, height: 48 },
+    )
+
+    try {
+      await waitForFrame(app, "Question: 数据集在哪里？")
+
+      events.emit({ type: "research.agent.intent.started", properties: { taskID: "task_clarify" } })
+      await waitForFrame(app, "[IntentAgent]")
+      events.emit({
+        type: "research.agent.intent.part.updated",
+        properties: { taskID: "task_clarify", partID: "part_q1", kind: "text", text: "数据集在哪里？" },
+      })
+      // "数据集在哪里？" already matches once via the standalone "Question: ..." fallback line
+      // (still showing because no live ask_user tool part has landed yet) — the SDK's event
+      // source also debounces bursts within a 16ms window (sdk.tsx handleEvent), so a single
+      // frame.includes() check can resolve before the part is applied. Wait for a second,
+      // distinct occurrence (the part rendered inside [IntentAgent]) instead.
+      let frame = ""
+      for (let attempt = 0; attempt < 80; attempt++) {
+        await app.renderOnce()
+        frame = app.captureCharFrame()
+        if (occurrenceCount(frame, "数据集在哪里？") >= 2) break
+        await Bun.sleep(25)
+      }
+      expect(occurrenceCount(frame, "数据集在哪里？")).toBeGreaterThanOrEqual(2)
+      expect(frameLine(frame, "[IntentAgent]")).toBeLessThan(frameLine(frame, "数据集在哪里？"))
+
+      await app.mockInput.typeText("数据在 /tmp/etth1.csv")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+      await app.renderOnce()
+
+      events.emit({
+        type: "research.agent.intent.part.updated",
+        properties: { taskID: "task_clarify", partID: "part_q2", kind: "text", text: "目标列是什么？" },
+      })
+      frame = await waitForFrame(app, "目标列是什么？")
+
+      // The original question, the user's echoed answer, and the agent's next question must
+      // all still be visible, in that causal order — not just the latest LLM turn replacing
+      // the conversation, and not the answer trailing behind in an unrelated bottom timeline.
+      expect(frame).toContain("数据集在哪里？")
+      expect(frame).toContain("You: 数据在 /tmp/etth1.csv")
+      expect(frameLine(frame, "数据集在哪里？")).toBeLessThan(frameLine(frame, "You: 数据在 /tmp/etth1.csv"))
+      expect(frameLine(frame, "You: 数据在 /tmp/etth1.csv")).toBeLessThan(frameLine(frame, "目标列是什么？"))
     } finally {
       app.renderer.destroy()
     }
@@ -2829,9 +2939,9 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       app.resize(88, 48)
-      const frame = await waitForFrame(app, "run_smoke")
+      const frame = await waitForFrame(app, "smoke succeeded")
 
       expect(frame).not.toContain("Candidate Table")
       expect(frame).not.toContain("AutoResearch进展")
@@ -3311,7 +3421,7 @@ describe("ResearchCockpit render", () => {
     try {
       const frame = await waitForFrame(app, "ModuleNotFoundError")
 
-      expect(frame).toContain("run_failed_smoke smoke failed")
+      expect(frame).toContain("smoke failed")
       expect(frame).toContain("ModuleNotFoundError: No module named 'torch'")
       expect(frame).not.toContain("Latest Failure")
     } finally {
@@ -3352,7 +3462,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.create.autonomous.full")
 
       for (let attempt = 0; attempt < 40 && bodies.length === 0; attempt++) {
@@ -3408,7 +3518,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.create.autonomous.csv")
       await waitForFrame(app, "Interaction mode")
       await app.mockInput.typeText("2")
@@ -3469,7 +3579,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.create.autonomous.csv")
       await waitForFrame(app, "Interaction mode")
       await app.mockInput.typeText("2")
@@ -3511,7 +3621,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.create.autonomous.csv")
       await waitForFrame(app, "Interaction mode")
       await app.mockInput.typeText("2")
@@ -3563,7 +3673,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.create.autonomous.csv.full")
       await waitForFrame(app, "Interaction mode")
       await app.mockInput.typeText("1")
@@ -3688,13 +3798,15 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={modeFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/mode-companion")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "interaction mode switched to 认知伴随")
-      expect(frame).toContain("认知伴随")
+      for (let attempt = 0; attempt < 80 && patches.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
       expect(patches).toEqual([
         expect.objectContaining({
           interactionMode: "companion",
@@ -3780,7 +3892,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.home")
       await app.renderOnce()
 
@@ -3837,7 +3949,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.next.run")
       for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
         await app.renderOnce()
@@ -3846,7 +3958,7 @@ describe("ResearchCockpit render", () => {
 
       expect(posts).toContainEqual({
         path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "full", maxIterations: 10, description: "cockpit autonomous loop" },
+        body: { stage: "full", maxIterations: 50, description: "cockpit autonomous loop" },
       })
     } finally {
       app.renderer.destroy()
@@ -3875,7 +3987,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       await app.mockInput.typeText("/loop start")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -4021,7 +4133,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       app.mockInput.pressEnter()
       for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
         await app.renderOnce()
@@ -4030,7 +4142,7 @@ describe("ResearchCockpit render", () => {
 
       expect(posts).toContainEqual({
         path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "full", maxIterations: 10, description: "cockpit autonomous loop" },
+        body: { stage: "full", maxIterations: 50, description: "cockpit autonomous loop" },
       })
     } finally {
       app.renderer.destroy()
@@ -4079,7 +4191,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.candidate.refGate")
       for (let attempt = 0; attempt < 40 && posts.length < 1; attempt++) {
         await app.renderOnce()
@@ -4188,7 +4300,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      const frame = await waitForFrame(app, "run_smoke")
+      const frame = await waitForFrame(app, "smoke succeeded")
 
       expect(frame).not.toContain("Candidate Table")
       expect(frame).not.toContain("Smoke Prep")
@@ -4275,7 +4387,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      const frame = await waitForFrame(app, "run_smoke")
+      const frame = await waitForFrame(app, "smoke succeeded")
       expect(frame).not.toContain("Next Action")
       expect(frame).not.toContain("Configure Neo-Cast runner")
       expect(frame).toContain("Runner root missing")
@@ -4337,7 +4449,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, `${runningRunID} smoke running`)
+      await waitForFrame(app, `smoke running`)
       events.emit({
         type: "research.runner.progress.line",
         properties: {
@@ -4352,7 +4464,7 @@ describe("ResearchCockpit render", () => {
       })
 
       const frame = await waitForFrame(app, "epoch 2 | h24 | val_loss 0.1235")
-      expect(frame).toContain(`${runningRunID} smoke running`)
+      expect(frame).toContain(`smoke running`)
     } finally {
       app.renderer.destroy()
     }
@@ -4392,7 +4504,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, `${runningRunID} smoke running`)
+      await waitForFrame(app, `smoke running`)
       events.emit({
         type: "research.runner.progress.line",
         properties: {
@@ -4447,7 +4559,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, `${runningRunID} smoke running`)
+      await waitForFrame(app, `smoke running`)
       const fetchesBeforeProgress = runsFetches
       for (let epoch = 1; epoch <= 3; epoch++) {
         events.emit({
@@ -4508,7 +4620,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, `${changingRunID} smoke running`)
+      await waitForFrame(app, `smoke running`)
       runStatus = "succeeded"
       events.emit({
         type: "research.runner.progress.line",
@@ -4520,7 +4632,7 @@ describe("ResearchCockpit render", () => {
         },
       })
 
-      const frame = await waitForFrame(app, `${changingRunID} smoke succeeded`)
+      const frame = await waitForFrame(app, `smoke succeeded`)
       expect(frame).toContain("val_avg_mse 0.101")
     } finally {
       app.renderer.destroy()
@@ -4906,7 +5018,7 @@ describe("ResearchCockpit render", () => {
         { path: `/research/tasks/${taskID}/prepare-dataset`, body: { force: true } },
         {
           path: `/research/tasks/${taskID}/autonomous/loop`,
-          body: { stage: "full", maxIterations: 10, description: "cockpit autonomous loop" },
+          body: { stage: "full", maxIterations: 50, description: "cockpit autonomous loop" },
         },
       ])
     } finally {
@@ -5085,7 +5197,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.seed.baselines")
       await waitForFrame(app, "seed failed for review")
 
@@ -5137,7 +5249,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={reviewTaskFetch} />, { width: 170, height: 72 })
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       for (const index of [1, 2, 3, 4, 5, 6]) {
         await app.mockInput.typeText(`note ${index}`)
         await app.renderOnce()
@@ -5177,7 +5289,7 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
       command?.trigger("research.seed.baselines")
       const frame = await waitForFrame(app, "Working / seed-baselines")
 
@@ -5202,9 +5314,11 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "run_smoke")
+      await waitForFrame(app, "smoke succeeded")
 
-      // DataAnalysis: LLM not configured → "skipped"
+      // DataAnalysis: LLM not configured → "skipped". No completion summary/placeholder is
+      // synthesized — without a prior "started" event there's no live stream to show, so no
+      // [DataAnalysis] block appears at all.
       events.emit({
         type: "research.agent.dataAnalysis.completed",
         properties: {
@@ -5215,10 +5329,11 @@ describe("ResearchCockpit render", () => {
           metadata: { llmStatus: "skipped", warningCount: 0, searchBiases: [] },
         },
       })
-      const frameAfterDA = await waitForFrame(app, "[DataAnalysis]")
-      expect(frameAfterDA).toContain("[DataAnalysis]")
+      await app.renderOnce()
+      expect(app.captureCharFrame()).not.toContain("heuristic — LLM not configured")
 
-      // HypoPlanner: LLM not configured → "skipped"
+      // HypoPlanner: LLM not configured → "skipped". The [HypoPlanner] header still appears
+      // (it labels the completed step) but no fallback summary/placeholder body is appended.
       events.emit({
         type: "research.agent.hypoPlanner.completed",
         properties: {
@@ -5231,8 +5346,9 @@ describe("ResearchCockpit render", () => {
       })
       const frameAfterHP = await waitForFrame(app, "[HypoPlanner]")
       expect(frameAfterHP).toContain("[HypoPlanner]")
+      expect(frameAfterHP).not.toContain("heuristic — LLM not configured")
 
-      // HypoPlanner: LLM used with preview
+      // HypoPlanner: LLM used with a preview — the preview text is no longer rendered.
       events.emit({
         type: "research.agent.hypoPlanner.completed",
         properties: {
@@ -5247,8 +5363,87 @@ describe("ResearchCockpit render", () => {
           },
         },
       })
-      const frameAfterHPUsed = await waitForFrame(app, "h1: RevIN")
-      expect(frameAfterHPUsed).toContain("h1: RevIN")
+      await app.renderOnce()
+      expect(app.captureCharFrame()).not.toContain("h1: RevIN")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("DataAnalysis stream renders below a pending intent checkpoint", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+    const intentApproval = {
+      id: "approval_intent_01",
+      kind: "protocol",
+      status: "pending",
+      reason: "[checkpoint:intent_confirmed]\nIntent requirements confirmed.",
+      time: { created: now - 7_000, updated: now - 7_000 },
+    }
+    const intentFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const p = requestURL(input).pathname
+      if (p === `/research/tasks/${taskID}/approvals`) return Promise.resolve(response([intentApproval]))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+    const events = createCockpitEventSource()
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={intentFetch} events={events.source} />,
+      { width: 160, height: 48 },
+    )
+    try {
+      await waitForFrame(app, "Approval requested")
+      events.emit({ type: "research.agent.dataAnalysis.started", properties: { taskID } })
+      const frame = await waitForFrame(app, "[DataAnalysis]")
+      expect(frameLine(frame, "Approval requested")).toBeLessThan(frameLine(frame, "[DataAnalysis]"))
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("confirmed intent_confirmed banner stays above DataAnalysis and HypoPlanner after /approve", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+    const intentApproval = {
+      id: "approval_intent_01",
+      taskID,
+      kind: "protocol",
+      status: "pending",
+      reason: "[checkpoint:intent_confirmed]\nIntent requirements confirmed.",
+      time: { created: now - 7_000, updated: now - 7_000 },
+    }
+    let approvalStatus: "pending" | "approved" = "pending"
+    const intentFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      const method = requestMethod(input, init)
+      if (url.pathname === `/research/tasks/${taskID}/approvals`) {
+        return response([{ ...intentApproval, status: approvalStatus }])
+      }
+      if (method === "POST" && url.pathname === `/research/approvals/${intentApproval.id}/reply`) {
+        approvalStatus = "approved"
+        return response({ ...intentApproval, status: "approved" })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+    const events = createCockpitEventSource()
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={intentFetch} events={events.source} />,
+      { width: 160, height: 48 },
+    )
+    try {
+      await waitForFrame(app, "Approval requested")
+      await app.mockInput.typeText("/approve")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      await waitForFrame(app, "[intent_confirmed] approved")
+
+      events.emit({ type: "research.agent.dataAnalysis.started", properties: { taskID } })
+      let frame = await waitForFrame(app, "[DataAnalysis]")
+      expect(frameLine(frame, "[intent_confirmed] approved")).toBeLessThan(frameLine(frame, "[DataAnalysis]"))
+
+      events.emit({ type: "research.agent.hypoPlanner.started", properties: { taskID } })
+      frame = await waitForFrame(app, "[HypoPlanner]")
+      expect(frameLine(frame, "[intent_confirmed] approved")).toBeLessThan(frameLine(frame, "[HypoPlanner]"))
     } finally {
       app.renderer.destroy()
     }

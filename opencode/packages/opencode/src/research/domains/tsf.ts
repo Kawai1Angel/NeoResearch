@@ -81,6 +81,13 @@ const ACTION_REGISTRY = {
     cosine: { phaseMin: "phase1", bridgeSupported: false },
     one_cycle: { phaseMin: "phase2", bridgeSupported: false },
     plateau: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_type1: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_type2: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_type3: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_3: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_4: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_5: { phaseMin: "phase2", bridgeSupported: false },
+    lradj_6: { phaseMin: "phase2", bridgeSupported: false },
   },
 } as const
 
@@ -116,6 +123,31 @@ export const TSFTaskSpec = z
         knownFutureCovariates: z.array(z.string()).default([]),
         observedPastCovariates: z.array(z.string()).default([]),
         staticCovariates: z.array(z.string()).default([]),
+      })
+      .superRefine((dataset, ctx) => {
+        for (const [name, columns] of Object.entries({
+          targetCols: dataset.targetCols,
+          knownFutureCovariates: dataset.knownFutureCovariates,
+          observedPastCovariates: dataset.observedPastCovariates,
+          staticCovariates: dataset.staticCovariates,
+        })) {
+          if (new Set(columns).size !== columns.length) {
+            ctx.addIssue({ code: "custom", path: [name], message: `${name} must contain unique columns` })
+          }
+        }
+        const covariates = new Set([
+          ...dataset.knownFutureCovariates,
+          ...dataset.observedPastCovariates,
+          ...dataset.staticCovariates,
+        ])
+        const overlap = dataset.targetCols.filter((column) => covariates.has(column))
+        if (overlap.length > 0) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["targetCols"],
+            message: `targetCols must not overlap covariates: ${overlap.join(", ")}`,
+          })
+        }
       })
       .strict(),
     evaluation: z
@@ -263,7 +295,7 @@ const Backbone = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("rnn"),
-      cell: z.enum(["gru", "lstm"]),
+      cell: z.enum(["gru", "lstm", "rnn"]),
       hiddenDim: PositiveInt.max(4096),
       numLayers: PositiveInt.max(24),
       dropout: z.number().min(0).max(0.9).default(0.1),
@@ -274,6 +306,7 @@ const Backbone = z.discriminatedUnion("type", [
       type: z.literal("dlinear"),
       kernelSize: z.number().int().min(3).max(255),
       bias: z.boolean().default(true),
+      individual: z.boolean().default(false),
     })
     .strict(),
   z
@@ -299,8 +332,8 @@ const Backbone = z.discriminatedUnion("type", [
       type: z.literal("mixer"),
       hiddenDim: PositiveInt.max(4096),
       depth: PositiveInt.max(24),
-      temporalMixing: z.enum(["mlp", "conv", "fft"]).default("mlp"),
-      channelMixing: z.boolean().default(true),
+      temporalMixing: z.enum(["mlp", "conv"]).default("mlp"),
+      channelMixing: z.enum(["mlp", "identity"]).default("mlp"),
       dropout: z.number().min(0).max(0.9).default(0.1),
     })
     .strict(),
@@ -448,7 +481,19 @@ export const TSFCandidateRecipe = z
           .strict(),
         scheduler: z
           .object({
-            type: z.enum(["none", "cosine", "one_cycle", "plateau"]),
+            type: z.enum([
+              "none",
+              "cosine",
+              "one_cycle",
+              "plateau",
+              "lradj_type1",
+              "lradj_type2",
+              "lradj_type3",
+              "lradj_3",
+              "lradj_4",
+              "lradj_5",
+              "lradj_6",
+            ]),
             // Epoch granularity (not mini-batch steps); must be < trainingStrategy.budget.maxEpochs.
             warmupSteps: z.number().int().min(0).default(0),
           })
@@ -706,7 +751,7 @@ function snakeBackbone(backbone: TSFBackbone) {
     }
   }
   if (backbone.type === "dlinear") {
-    return { type: backbone.type, kernel_size: backbone.kernelSize, bias: backbone.bias }
+    return { type: backbone.type, kernel_size: backbone.kernelSize, bias: backbone.bias, individual: backbone.individual }
   }
   if (backbone.type === "rnn") {
     return {
@@ -881,12 +926,14 @@ function commandForStage(
   task: TSFTaskSpec,
   description: string,
   recipe?: TSFCandidateRecipe,
+  runnerRunID?: string,
 ): DomainRunPlan["command"] {
   const runtime = task.runtime
   const command = createNeoCastRunnerCommand({
     stage,
     runtime,
     description,
+    runnerRunID,
     explicitRoot: runtime.neoCastProjectRoot,
   })
   const timeoutMs = commandTimeoutForRecipe(stage, recipe)
@@ -912,6 +959,7 @@ export function createTSFRunPlan(input: {
   candidateSpec: JsonRecord
   stage?: DomainRunStage
   description?: string
+  runnerRunID?: string
 }): DomainRunPlan {
   const task = TSFTaskSpec.parse(input.taskSpec)
   const stage = DomainRunStage.parse(input.stage ?? "smoke")
@@ -935,7 +983,7 @@ export function createTSFRunPlan(input: {
         content: payload as DomainRunPlan["writes"][number]["content"],
       },
     ],
-    command: commandForStage(stage, task, description, recipe),
+    command: commandForStage(stage, task, description, recipe, input.runnerRunID),
     expectedEvents: expectedEvents(stage),
     expectedMetrics:
       stage === "ref_test"
@@ -1451,7 +1499,9 @@ export function summarizeTSFTask(taskSpec: unknown): JsonRecord {
 
 function recipe(
   task: TSFTaskSpec,
-  input: Omit<TSFCandidateRecipe, "recipeVersion" | "trainingStrategy">,
+  input: Omit<TSFCandidateRecipe, "recipeVersion" | "trainingStrategy"> & {
+    trainingStrategy?: TSFCandidateRecipe["trainingStrategy"]
+  },
 ): TSFCandidateRecipe {
   return {
     recipeVersion: "recipe_schema_v1",
@@ -1500,47 +1550,79 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
     }))
   }
 
-  const taskFingerprint = summarizeTSFTask(task)
-  const datasetProfile = datasetProfileFromFingerprint(taskFingerprint)
   const patchLen = Math.min(16, task.contextLength)
   const stride = Math.max(1, Math.floor(patchLen / 2))
   const dModel = 64
-  const period = datasetProfile?.acfMainPeriod
-  const decompositionKernelSize = Math.max(
-    3,
-    Math.min(255, Math.floor((period && period > 1 ? period : 25) / 2) * 2 + 1),
-  )
+  const patchTSTDModel = 512
+  const dlinearKernelSize = 25
 
   const candidates = [
     recipe(task, {
       recipeID: "tsf_baseline_patchtst",
       hypothesis:
         "PatchTST: instance-normalized patch embedding with a channel-independent transformer backbone should provide a strong general-purpose baseline.",
-      preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
-      embedding: { type: "patch", patchLen, stride, dModel },
-      backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 3, dropout: 0.1, ffnMult: 4 },
+      preprocessing: { actions: [{ type: "instance_norm", affine: false, eps: 1e-5 }] },
+      embedding: { type: "patch", patchLen, stride, dModel: patchTSTDModel },
+      backbone: { type: "transformer", dModel: patchTSTDModel, nHeads: 8, nLayers: 2, dropout: 0.05, ffnMult: 4 },
       fusion: { type: "temporal", channelMode: "independent" },
       predictionHead: { type: "linear", outputDistribution: "point" },
+      trainingStrategy: {
+        ...baseStrategy(task),
+        optimizer: { type: "adam", lr: 0.0001, weightDecay: 0 },
+        scheduler: { type: "lradj_type3", warmupSteps: 0 },
+        regularization: { dropout: 0.05, gradClip: 1 },
+        budget: {
+          ...trainingBudget(task),
+          maxEpochs: 100,
+          batchSize: 128,
+          patience: 100,
+          seed: 2021,
+        },
+      },
     }),
     recipe(task, {
       recipeID: "tsf_baseline_dlinear",
       hypothesis:
         "DLinear: moving-average decomposition into trend and seasonal components, each modeled by a linear layer, should establish a decomposition-aware baseline.",
-      preprocessing: { actions: [{ type: "series_decomposition", kernelSize: decompositionKernelSize }] },
+      preprocessing: { actions: [{ type: "none" }] },
       embedding: { type: "none" },
-      backbone: { type: "dlinear", kernelSize: decompositionKernelSize, bias: true },
+      backbone: { type: "dlinear", kernelSize: dlinearKernelSize, bias: true, individual: false },
       fusion: { type: "temporal", channelMode: "independent" },
       predictionHead: { type: "linear", outputDistribution: "point" },
+      trainingStrategy: {
+        ...baseStrategy(task),
+        optimizer: { type: "adam", lr: 0.0001, weightDecay: 0 },
+        scheduler: { type: "lradj_type1", warmupSteps: 0 },
+        budget: {
+          ...trainingBudget(task),
+          maxEpochs: 10,
+          batchSize: 32,
+          patience: 3,
+          seed: 2021,
+        },
+      },
     }),
     recipe(task, {
       recipeID: "tsf_baseline_itransformer",
       hypothesis:
         "iTransformer: inverted embedding treats each variate as a token and applies cross-variate attention, testing whether multivariate dependencies improve forecasts.",
       preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
-      embedding: { type: "invert", dModel },
-      backbone: { type: "transformer", dModel, nHeads: 4, nLayers: 2, dropout: 0.1, ffnMult: 4 },
+      embedding: { type: "invert", dModel: 512 },
+      backbone: { type: "transformer", dModel: 512, nHeads: 8, nLayers: 2, dropout: 0.1, ffnMult: 4 },
       fusion: { type: "feature", variateToken: true, crossAttention: true },
       predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+      trainingStrategy: {
+        ...baseStrategy(task),
+        optimizer: { type: "adam", lr: 0.0001, weightDecay: 0 },
+        scheduler: { type: "lradj_type1", warmupSteps: 0 },
+        budget: {
+          ...trainingBudget(task),
+          maxEpochs: 10,
+          batchSize: 32,
+          patience: 3,
+          seed: 2023,
+        },
+      },
     }),
   ]
 
@@ -1876,7 +1958,7 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
         hiddenDim: 64,
         depth: 2,
         temporalMixing: "mlp",
-        channelMixing: true,
+        channelMixing: "mlp",
         dropout: 0.1,
       },
       fusion: { type: "gated_hybrid", gateType: "channel" },

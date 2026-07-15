@@ -197,12 +197,14 @@ function loadJsonFile(filePath) {
 
 function buildTaskSpecFromDatasetSpec(datasetSpec, overrides = {}) {
   assertPlainObject(datasetSpec, "dataset spec");
-  if (datasetSpec.schema_version !== "dataset.v1") {
-    throw new Error("dataset spec schema_version must be dataset.v1");
+  if (!["dataset.v1", "dataset.v2"].includes(datasetSpec.schema_version)) {
+    throw new Error("dataset spec schema_version must be dataset.v1 or dataset.v2");
   }
-  const featureColumns = Array.isArray(datasetSpec.feature_columns) ? datasetSpec.feature_columns : [];
+  const featureColumns = datasetSpec.schema_version === "dataset.v2"
+    ? (Array.isArray(datasetSpec.target_columns) ? datasetSpec.target_columns : [])
+    : (Array.isArray(datasetSpec.feature_columns) ? datasetSpec.feature_columns : []);
   if (featureColumns.length === 0) {
-    throw new Error("dataset spec feature_columns must be a non-empty array");
+    throw new Error("dataset spec target/feature columns must be a non-empty array");
   }
   const horizons = uniquePositiveIntegers(datasetSpec.horizons, "dataset spec horizons");
   const frequency = datasetSpec.time && datasetSpec.time.frequency

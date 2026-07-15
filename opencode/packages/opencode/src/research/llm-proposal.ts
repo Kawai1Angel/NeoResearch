@@ -4,6 +4,7 @@ import os from "os"
 import path from "path"
 import type { DomainCandidateProposal, DomainProposalContext } from "./domain"
 import type { JsonRecord, ResearchTask } from "./schema"
+import PROMPT_RESEARCH_MODEL_DESIGNER from "../agent/prompt/research-model-designer.txt"
 
 type LLMProvider = "anthropic" | "openai-compatible"
 
@@ -16,7 +17,31 @@ export type LLMTokenUsage = {
 
 type LLMResponse = { text: string; usage: LLMTokenUsage }
 
-const ZERO_USAGE: LLMTokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+export const ZERO_USAGE: LLMTokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+
+export type OpencodeModelRef = { readonly providerID: string; readonly modelID: string }
+
+/**
+ * Maps a resolved neo-cast LLM config to an opencode {providerID, modelID} pair, when possible.
+ * The Anthropic-native path (no custom baseURL) maps directly to opencode's "anthropic" provider.
+ * openai-compatible configs map to a known opencode provider when their baseURL matches one of
+ * OPENCODE_PROVIDER_BASE_URLS (e.g. deepseek, zhipuai); other custom baseURLs have no equivalent
+ * among opencode's @ai-sdk/* providers and are treated as unmappable.
+ */
+export function mapToModelRef(config: NeoCastLLMConfig): OpencodeModelRef | undefined {
+  if (config.provider === "anthropic" && !config.baseURL) {
+    return { providerID: "anthropic", modelID: config.model }
+  }
+  if (config.provider === "openai-compatible" && config.baseURL) {
+    const normalized = config.baseURL.replace(/\/+$/, "")
+    for (const [providerID, baseURL] of Object.entries(OPENCODE_PROVIDER_BASE_URLS)) {
+      if (baseURL && baseURL.replace(/\/+$/, "") === normalized) {
+        return { providerID, modelID: config.model }
+      }
+    }
+  }
+  return undefined
+}
 
 export type NeoCastLLMConfig = {
   readonly provider: LLMProvider
@@ -169,7 +194,7 @@ export function extractJsonObject(text: string) {
   return JSON.parse(stripped.slice(start, end + 1))
 }
 
-function camelizeKnown(value: unknown): unknown {
+export function camelizeKnown(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(camelizeKnown)
   if (!isRecord(value)) return value
   const result: Record<string, unknown> = {}
@@ -190,7 +215,7 @@ const BACKBONE_ALLOWED_KEYS: Record<string, readonly string[]> = {
   linear: ["type", "shared", "bias"],
   mlp: ["type", "depth", "hiddenDim", "activation", "dropout"],
   transformer: ["type", "dModel", "nHeads", "nLayers", "dropout", "ffnMult"],
-  dlinear: ["type", "kernelSize", "bias"],
+  dlinear: ["type", "kernelSize", "bias", "individual"],
   tcn: ["type", "hiddenDim", "nLayers", "kernelSize", "activation", "dropout"],
   nbeats: ["type", "hiddenDim", "nBlocks", "nLayers", "activation", "dropout"],
   timesnet: ["type", "hiddenDim", "nLayers", "topK", "kernelSize", "dropout"],
@@ -259,7 +284,7 @@ function normalizeNumber(obj: Record<string, unknown>, key: string, fallback: nu
   if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) obj[key] = fallback
 }
 
-function pruneCandidateSpec(value: unknown): JsonRecord {
+export function pruneCandidateSpec(value: unknown): JsonRecord {
   // Strip top-level keys not in the schema (TSFCandidateRecipe is .strict()).
   const raw = isRecord(value) ? value : {}
   const spec: Record<string, unknown> = {}
@@ -345,65 +370,8 @@ function pruneCandidateSpec(value: unknown): JsonRecord {
   return spec as JsonRecord
 }
 
-const EXAMPLE_CANDIDATE = {
-  recipe_version: "recipe_schema_v1",
-  recipe_id: "recipe_dlinear_decomp_example",
-  hypothesis: "DLinear 通过趋势-残差分解直接预测，参数量少，适合具有明显趋势的序列。",
-  preprocessing: { actions: [{ type: "series_decomposition", kernel_size: 25 }] },
-  embedding: { type: "none" },
-  backbone: { type: "dlinear", kernel_size: 25, bias: true },
-  fusion: { type: "temporal", channel_mode: "independent" },
-  prediction_head: { type: "linear", output_distribution: "point" },
-  post_processing: { type: "auto" },
-  training_strategy: {
-    loss: { base: "mse", horizon_weighting: "uniform" },
-    optimizer: { type: "adam", lr: 0.001, weight_decay: 0.0 },
-    scheduler: { type: "none", warmup_steps: 0 },
-    regularization: { dropout: 0.0, grad_clip: 1.0 },
-    budget: { max_epochs: 5, time_budget_s: 600, batch_size: 32, patience: 3, seed: 42 },
-  },
-  constraints: { max_params: 500000, max_latency_ms: 30 },
-  notes: "轻量基线，用于趋势主导场景。",
-}
-
 function buildSystemPrompt() {
-  return [
-    "You are the NeoResearch TSF model-design planner.",
-    "Language policy: 尽量用中文表达 hypothesis、rationale、notes 等自然语言内容；保留 JSON 字段名、schema 名称、模块名、指标名、命令和文件路径的英文原文。",
-    "Return exactly one JSON object using Neo-Cast recipe_schema_v1 snake_case field names.",
-    "Each field must have a single concrete value — NOT a list of alternatives.",
-    "Do not return markdown fences or any prose outside JSON.",
-    "Do NOT include post_processing, constraints, or any key not shown in the example or schema below.",
-    "",
-    "Available module options (choose exactly one value per field):",
-    "  preprocessing.actions[].type: none | instance_norm | series_decomposition | seasonal_differencing | missing_mask | sample_reweighting",
-    "  embedding.type: none | patch | multiscale_patch | invert | frequency | calendar",
-    "  backbone.type: linear | mlp | transformer | dlinear | tcn | nbeats | timesnet | rnn | ssm | mixer",
-    "  fusion.type: temporal | feature | temporal_then_feature | feature_then_temporal | graph | gated_hybrid",
-    "  prediction_head.type: linear | direct_multi_horizon | quantile | gaussian | residual_correction",
-    "  training_strategy.loss.base: mse | mae | huber | quantile | distillation",
-    "  training_strategy.optimizer.type: adam | adamw | sgd",
-    "  training_strategy.scheduler.type: none | cosine | one_cycle | plateau  ← ONLY these four values",
-    "  training_strategy.scheduler.warmup_steps: int >= 0, must be < training_strategy.budget.max_epochs (epoch granularity, linear LR warmup)",
-    "",
-    "Required numeric fields by backbone type (ALL must be present as integers ≥ 1):",
-    "  linear: (none required beyond type)",
-    "  mlp: depth (int ≥1, ≤24), hidden_dim (int ≥1, ≤4096)",
-    "  transformer: d_model (int ≥1, ≤1024), n_heads (int ≥1, ≤32), n_layers (int ≥1, ≤24)",
-    "  dlinear: kernel_size (int ≥3, ≤255)",
-    "  tcn: hidden_dim (int ≥1, ≤4096), n_layers (int ≥1, ≤24), kernel_size (int ≥2, ≤255)",
-    "  nbeats: hidden_dim (int ≥1, ≤4096), n_blocks (int ≥1, ≤64), n_layers (int ≥1, ≤24)",
-    "  timesnet: hidden_dim (int ≥1, ≤4096), n_layers (int ≥1, ≤24), top_k (int ≥1, ≤16), kernel_size (int ≥2, ≤255)",
-    "  rnn: hidden_dim (int ≥1, ≤4096), num_layers (int ≥1, ≤24)",
-    "  ssm: state_dim (int ≥1, ≤4096), depth (int ≥1, ≤24)",
-    "  mixer: hidden_dim (int ≥1, ≤4096), depth (int ≥1, ≤24)",
-    "",
-    "Required numeric fields in training_strategy.budget (ALL required, no defaults):",
-    "  max_epochs (int ≥1, ≤1000), time_budget_s (int ≥1), batch_size (int ≥1, ≤512), patience (int ≥1, ≤100)",
-    "",
-    "Treat profileDerivedSearchDirectives as high-priority search priors unless they conflict with runtime constraints.",
-    `\nEXAMPLE (follow this exact structure):\n${JSON.stringify(EXAMPLE_CANDIDATE, null, 2)}`,
-  ].join("\n")
+  return PROMPT_RESEARCH_MODEL_DESIGNER
 }
 
 function numberFromRecord(record: Record<string, unknown>, key: string) {
@@ -555,7 +523,7 @@ function forbiddenCandidateSignatures(context: DomainProposalContext) {
   return [...new Set(signatures)].slice(0, 24)
 }
 
-function buildUserPrompt(input: {
+export function buildUserPrompt(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
   readonly dataAnalysisMarkdown?: string
@@ -839,7 +807,7 @@ export function usageToMetadata(usage: LLMTokenUsage): JsonRecord {
   }
 }
 
-function llmMetadata(config: NeoCastLLMConfig, status: string, extra: JsonRecord = {}, usage?: LLMTokenUsage): JsonRecord {
+export function llmMetadata(config: NeoCastLLMConfig, status: string, extra: JsonRecord = {}, usage?: LLMTokenUsage): JsonRecord {
   return {
     llmStatus: status,
     llmProvider: config.provider,
@@ -865,7 +833,7 @@ function numberField(record: Record<string, unknown>, key: string) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
-function candidateGovernance(candidateSpec: JsonRecord) {
+export function candidateGovernance(candidateSpec: JsonRecord) {
   let risk: CandidateRiskLevel = "low"
   const preprocessing = isRecord(candidateSpec.preprocessing) ? candidateSpec.preprocessing : {}
   const actions = Array.isArray(preprocessing.actions) ? preprocessing.actions : []
@@ -926,6 +894,31 @@ function candidateGovernance(candidateSpec: JsonRecord) {
   } as const
 }
 
+/**
+ * Parses an LLM-generated candidate proposal from raw response text. Returns undefined when the
+ * text doesn't contain a valid candidate JSON object — callers should treat this as a failed attempt.
+ */
+export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, config: NeoCastLLMConfig): LLMProposalResult | undefined {
+  try {
+    const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
+    const governance = candidateGovernance(candidateSpec)
+    return {
+      proposal: {
+        candidateSpec,
+        rationale:
+          typeof candidateSpec.hypothesis === "string"
+            ? candidateSpec.hypothesis
+            : "LLM-generated TSF candidate.",
+        ...governance,
+        generatedBy: "llm",
+      },
+      metadata: llmMetadata(config, "used", {}, usage),
+    }
+  } catch {
+    return undefined
+  }
+}
+
 export async function proposeLLMCandidate(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
@@ -979,20 +972,9 @@ export async function proposeLLMCandidate(input: {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const { text, usage } = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
-      const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
-      const governance = candidateGovernance(candidateSpec)
-      return {
-        proposal: {
-          candidateSpec,
-          rationale:
-            typeof candidateSpec.hypothesis === "string"
-              ? candidateSpec.hypothesis
-              : "LLM-generated TSF candidate.",
-          ...governance,
-          generatedBy: "llm",
-        },
-        metadata: llmMetadata(effectiveConfig, "used", {}, usage),
-      }
+      const result = buildLLMProposalFromText(text, usage, effectiveConfig)
+      if (!result) throw new Error("Failed to parse LLM proposal JSON")
+      return result
     } catch (error) {
       lastError = error
       if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, 1500 * attempt))

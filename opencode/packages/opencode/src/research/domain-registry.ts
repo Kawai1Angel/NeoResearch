@@ -86,6 +86,7 @@ export function createRunPlan(
     candidateSpec: JsonRecord
     stage?: DomainRunStage
     description?: string
+    runnerRunID?: string
   },
 ): DomainRunPlan {
   return get(domainID).createRunPlan(input)

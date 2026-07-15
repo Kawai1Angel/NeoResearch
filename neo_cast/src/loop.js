@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { describeCandidateFamily, describeCandidateId } = require("./candidate-utils");
 const { generateCandidate } = require("./llm");
+const { appendModelDesignRecord } = require("./model-design-log");
 const { getBestSessionRow, getLatestSessionRow } = require("./session");
 const {
   getProjectPaths,
@@ -230,7 +231,7 @@ async function proposeCandidate(requirementBundle, history, previousRow, resolve
 async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}) {
   const projectRoot = options.projectRoot || process.cwd();
   const timeBudgetMs = options.timeBudgetMs || null;
-  const maxNoImprove = Number(options.maxNoImprove || 8);
+  const maxNoImprove = Number(options.maxNoImprove || 5);
   const maxCandidates = options.maxCandidates ?? Infinity;
   const sessionStartMs = Date.now();
   let attempt = 0;
@@ -279,6 +280,13 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
       taskContext: options.taskContext,
     });
     console.log(`recipe_version=${recipeVersion.version_id}`);
+    const designLog = appendModelDesignRecord(projectRoot, candidate, {
+      attempt,
+      source: result.source,
+      candidatePath,
+      recipeVersionId: recipeVersion.version_id,
+    });
+    console.log(`model_designs_path=${designLog.markdownPath}`);
 
     const description = candidate.hypothesis || `${describeCandidateFamily(candidate)} autonomous attempt ${attempt}`;
     const exitCode = await runRunner(projectRoot, description, {

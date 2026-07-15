@@ -28,10 +28,13 @@ import torch.nn.functional as F
 
 from families import FAMILY_REGISTRY
 from prepare_tsf import (
+    ACTIVE_SPEC,
     DATASET,
     HORIZONS,
     INPUT_LEN,
+    KNOWN_FUTURE_COVARIATES,
     NUM_CHANNELS,
+    PAST_COVARIATE_COLUMNS,
     SEED,
     build_preprocess_spec,
     evaluate_val_tsf,
@@ -146,6 +149,31 @@ def load_resolved_candidate(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _with_native_channel_roles(model_config: dict[str, Any]) -> dict[str, Any]:
+    config = copy.deepcopy(model_config)
+    if ACTIVE_SPEC.schema_version != "dataset.v2":
+        return config
+    input_channels = NUM_CHANNELS + len(PAST_COVARIATE_COLUMNS)
+    config.pop("covariate_fusion", None)
+    config["num_target_channels"] = NUM_CHANNELS
+    config["num_past_covariate_channels"] = len(PAST_COVARIATE_COLUMNS)
+    config["num_future_covariate_channels"] = len(KNOWN_FUTURE_COVARIATES)
+    config["num_input_channels"] = input_channels
+    config["num_output_channels"] = NUM_CHANNELS
+    config["num_channels"] = input_channels
+    config["target_channel_indices"] = list(range(NUM_CHANNELS))
+    config["future_covariate_mode"] = str(config.get("future_covariate_mode", "none"))
+    return config
+
+
+def _normalize_candidate_model_config(candidate: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(candidate)
+    model_config = normalized.get("model_config")
+    if isinstance(model_config, dict):
+        normalized["model_config"] = _with_native_channel_roles(model_config)
+    return normalized
+
+
 def run_epoch(
     model: nn.Module,
     loader,
@@ -158,12 +186,12 @@ def run_epoch(
     batch_report_interval: int = 50,
 ) -> None:
     model.train()
-    for batch_idx, (x, y) in enumerate(loader):
-        x = x.to(device)
-        y = y.to(device)
+    for batch_idx, batch in enumerate(loader):
+        x, y = _move_batch(batch, device)
 
         pred = predict_fn(model, x) if predict_fn is not None else model(x)
-        loss = loss_fn(pred, y, x)
+        context = x["target_history"] if isinstance(x, dict) else x
+        loss = loss_fn(pred, y, context)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -180,13 +208,20 @@ def compute_val_loss(model: nn.Module, loader, device: torch.device, predict_fn=
     model.eval()
     total_loss = 0.0
     total_batches = 0
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+    for batch in loader:
+        x, y = _move_batch(batch, device)
         pred = predict_fn(model, x) if predict_fn is not None else model(x)
         total_loss += F.mse_loss(_point_prediction(pred, y), y).item()
         total_batches += 1
     return total_loss / max(total_batches, 1)
+
+
+def _move_batch(batch, device: torch.device):
+    if isinstance(batch, dict):
+        moved = {key: value.to(device) for key, value in batch.items()}
+        return moved, moved["target"]
+    x, y = batch
+    return x.to(device), y.to(device)
 
 
 def _recipe_training_strategy(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -349,7 +384,7 @@ def _build_train_loss(candidate: dict[str, Any]):
     raise ValueError(f"Unsupported training loss: {loss_base}")
 
 
-def _predict_for_training(model: nn.Module, candidate: dict[str, Any], x: torch.Tensor) -> torch.Tensor:
+def _predict_for_training(model: nn.Module, candidate: dict[str, Any], x) -> torch.Tensor:
     strategy = _recipe_training_strategy(candidate)
     loss_base = strategy.get("loss", {}).get("base")
     head_cfg = _recipe_prediction_head(candidate)
@@ -358,15 +393,34 @@ def _predict_for_training(model: nn.Module, candidate: dict[str, Any], x: torch.
         or head_cfg.get("type") == "quantile"
         or head_cfg.get("output_distribution") == "quantile"
     )
+    if isinstance(x, dict):
+        inputs = {
+            "target_history": x["target_history"],
+            "exogenous_past": x["exogenous_past"],
+            "exogenous_future": x["exogenous_future"],
+        }
+        if wants_quantiles and hasattr(model, "forward_quantiles"):
+            return model.forward_quantiles(**inputs)
+        return model(**inputs)
     if wants_quantiles and hasattr(model, "forward_quantiles"):
         return model.forward_quantiles(x)
     return model(x)
 
 
 def _slice_context_window(x: torch.Tensor, input_len: int) -> torch.Tensor:
+    if isinstance(x, dict):
+        return {
+            **x,
+            "target_history": x["target_history"][:, -input_len:, :],
+            "exogenous_past": x["exogenous_past"][:, -input_len:, :],
+        }
     if x.size(1) > input_len:
         return x[:, -input_len:, :]
     return x
+
+
+def _build_runtime_model(family_module, candidate: dict[str, Any], input_len: int, horizon: int) -> nn.Module:
+    return family_module.build_model(_with_native_channel_roles(candidate["model_config"]), input_len, horizon)
 
 
 def _candidate_recipe(candidate: dict[str, Any]) -> dict[str, Any] | None:
@@ -470,6 +524,50 @@ class _LinearWarmupWrapper:
             self._base_scheduler.step()
 
 
+class _DatasciLrAdjustScheduler:
+    """Replicates the epoch-end lradj rules used by the datasci baselines."""
+
+    _TYPE2_LRS = {
+        2: 5e-5,
+        4: 1e-5,
+        6: 5e-6,
+        8: 1e-6,
+        10: 5e-7,
+        15: 1e-7,
+        20: 5e-8,
+    }
+
+    def __init__(self, optimizer: torch.optim.Optimizer, scheduler_type: str):
+        self._optimizer = optimizer
+        self._scheduler_type = scheduler_type
+        self._base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self._epoch = 0
+
+    def _lr_for_epoch(self, epoch: int, base_lr: float) -> float | None:
+        if self._scheduler_type == "lradj_type1":
+            return base_lr * (0.5 ** ((epoch - 1) // 1))
+        if self._scheduler_type == "lradj_type2":
+            return self._TYPE2_LRS.get(epoch)
+        if self._scheduler_type == "lradj_type3":
+            return base_lr if epoch < 3 else base_lr * (0.9 ** ((epoch - 3) // 1))
+        if self._scheduler_type == "lradj_3":
+            return base_lr if epoch < 10 else base_lr * 0.1
+        if self._scheduler_type == "lradj_4":
+            return base_lr if epoch < 15 else base_lr * 0.1
+        if self._scheduler_type == "lradj_5":
+            return base_lr if epoch < 25 else base_lr * 0.1
+        if self._scheduler_type == "lradj_6":
+            return base_lr if epoch < 5 else base_lr * 0.1
+        raise ValueError(f"Unsupported datasci lradj scheduler: {self._scheduler_type}")
+
+    def step(self) -> None:
+        self._epoch += 1
+        for group, base_lr in zip(self._optimizer.param_groups, self._base_lrs):
+            lr = self._lr_for_epoch(self._epoch, base_lr)
+            if lr is not None:
+                group["lr"] = lr
+
+
 def _build_scheduler(
     optimizer: torch.optim.Optimizer,
     candidate: dict[str, Any],
@@ -500,6 +598,16 @@ def _build_scheduler(
             factor=float(scheduler_cfg.get("factor", 0.5)),
             patience=int(scheduler_cfg.get("patience", 1)),
         )
+    elif scheduler_type in {
+        "lradj_type1",
+        "lradj_type2",
+        "lradj_type3",
+        "lradj_3",
+        "lradj_4",
+        "lradj_5",
+        "lradj_6",
+    }:
+        base_scheduler = _DatasciLrAdjustScheduler(optimizer, scheduler_type)
     elif scheduler_type not in {None, "none"}:
         raise ValueError(f"Unsupported scheduler: {scheduler_type}")
 
@@ -554,6 +662,11 @@ def save_run_artifacts(
             "run_id": run_id,
             "candidate": candidate,
             "model_family": candidate["model_family"],
+            "dataset_schema_version": ACTIVE_SPEC.schema_version,
+            "input_len": INPUT_LEN,
+            "target_channels": NUM_CHANNELS,
+            "past_exogenous_channels": len(PAST_COVARIATE_COLUMNS),
+            "future_exogenous_channels": len(KNOWN_FUTURE_COVARIATES),
             "state_dict_layout": family_spec["state_dict_layout"],
             "state_dicts": {str(h): model.state_dict() for h, model in models.items()},
         },
@@ -606,7 +719,7 @@ def train_models(
 
     t_start = time.time()
     input_len = int(candidate.get("task", {}).get("input_len", INPUT_LEN))
-    models = {h: family_module.build_model(candidate["model_config"], input_len, h).to(device) for h in horizons}
+    models = {h: _build_runtime_model(family_module, candidate, input_len, h).to(device) for h in horizons}
     num_params = sum(param.numel() for model in models.values() for param in model.parameters())
     num_params_m = num_params / 1e6
     param_budget_m = float(constraints["param_budget_m"])
@@ -635,6 +748,11 @@ def train_models(
     }
     train_loaders = {h: make_dataloader("train", h, batch_size, shuffle=True) for h in horizons}
     val_loaders = {h: make_dataloader("val", h, batch_size, shuffle=False) for h in horizons}
+    first_batch = next(iter(train_loaders[horizons[0]]))
+    if isinstance(first_batch, dict):
+        first_batch_shapes = {key: list(value.shape) for key, value in first_batch.items()}
+    else:
+        first_batch_shapes = {"input": list(first_batch[0].shape), "target": list(first_batch[1].shape)}
 
     best_states = {h: copy.deepcopy(models[h].state_dict()) for h in horizons}
     best_val_losses = {h: float("inf") for h in horizons}
@@ -720,6 +838,16 @@ def train_models(
         "peak_vram_mb": round(peak_vram_mb, 6),
         "num_params_M": round(num_params_m, 6),
         **_recipe_execution_summary(candidate),
+        "target_columns": list(ACTIVE_SPEC.target_columns),
+        "used_observed_past_covariates": list(ACTIVE_SPEC.observed_past_covariates),
+        "used_known_future_covariates": list(ACTIVE_SPEC.known_future_covariates),
+        "target_channels": NUM_CHANNELS,
+        "past_exogenous_channels": len(PAST_COVARIATE_COLUMNS),
+        "future_exogenous_channels": len(KNOWN_FUTURE_COVARIATES),
+        "model_input_channels": NUM_CHANNELS + len(PAST_COVARIATE_COLUMNS),
+        "model_output_channels": NUM_CHANNELS,
+        "future_covariate_mode": candidate["model_config"].get("future_covariate_mode", "none"),
+        "first_batch_shapes": first_batch_shapes,
     }
 
     run_id = _make_run_id()
@@ -758,7 +886,7 @@ def main() -> None:
     artifacts_dir = Path(args.artifacts_dir).expanduser()
 
     try:
-        candidate = load_resolved_candidate(resolved_candidate_path)
+        candidate = _normalize_candidate_model_config(load_resolved_candidate(resolved_candidate_path))
         set_seed(int(candidate["train_config"]["seed"]))
         exit_code = train_models(candidate=candidate, smoke=args.smoke, artifact_root=artifacts_dir)
     except Exception as exc:  # pragma: no cover - defensive CLI path

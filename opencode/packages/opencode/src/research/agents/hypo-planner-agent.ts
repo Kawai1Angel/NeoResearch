@@ -1,5 +1,7 @@
 import type { JsonRecord, ResearchMemory, ResearchRun, ResearchTask, ResearchTaskID } from "../schema"
 
+export type HypothesisStatus = "pending" | "active" | "testing" | "confirmed" | "rejected" | "abandoned"
+
 export interface HypothesisObject {
   readonly id: string
   readonly statement: string
@@ -10,6 +12,8 @@ export interface HypothesisObject {
   readonly priority: "high" | "medium" | "low"
   readonly risk: string
   readonly testable: boolean
+  readonly status?: HypothesisStatus
+  readonly abandonReason?: string
 }
 
 export interface ExperimentPlan {
@@ -25,9 +29,9 @@ export interface ExperimentPlan {
   // to run, on its first invocation (runs.length === 0 && memory.length === 0). Only set on
   // that first call; later calls omit it and the previously persisted value is kept.
   readonly referenceBaseline?: string
-  // Whether referenceBaseline was chosen by an LLM call or by the deterministic heuristic
-  // fallback (e.g. LLM unavailable or returned an invalid recipe ID).
-  readonly referenceBaselineSource?: "llm" | "heuristic"
+  // Whether referenceBaseline was chosen via the pick_baseline tool (session mode) or by the
+  // deterministic heuristic fallback (e.g. no session, or the tool was never called).
+  readonly referenceBaselineSource?: "tool" | "heuristic"
 }
 
 export interface HypoPlannerResult {
@@ -50,10 +54,10 @@ export interface HypoPlannerInput {
   readonly runs: readonly ResearchRun[]
   readonly memory: readonly ResearchMemory[]
   readonly llmHypotheses?: readonly HypothesisObject[]
-  // Recipe ID an LLM call selected as the reference baseline / first candidate, when
-  // buildHypoPlannerResult is invoked on the first call. Validated against
+  // Recipe ID picked via the pick_baseline tool as the reference baseline / first candidate,
+  // when buildHypoPlannerResult is invoked on the first call. Validated against
   // referenceBaselineOptions(task) before use; ignored otherwise.
-  readonly llmReferenceBaseline?: string
+  readonly toolReferenceBaseline?: string
 }
 
 interface HypothesisRule {
@@ -347,10 +351,10 @@ export function referenceBaselineOptions(task: ResearchTask): readonly string[] 
     : [TSF_BASELINE_RECIPE_IDS.patchtst, TSF_BASELINE_RECIPE_IDS.dlinear, TSF_BASELINE_RECIPE_IDS.itransformer]
 }
 
-// Picks one of the three ModelRecipe-composed baselines as the reference/benchmark a new
-// hypothesis should be compared against, based on the dataset profile and search biases:
-// strong seasonality/trend favors DLinear's decomposition, strong cross-variate correlation
-// favors iTransformer's cross-attention, otherwise PatchTST is the general-purpose default.
+// Deterministic fallback used only when no baseline was picked via the pick_baseline tool
+// (e.g. no session, or the agent never called the tool): strong seasonality/trend favors
+// DLinear's decomposition, strong cross-variate correlation favors iTransformer's
+// cross-attention, otherwise PatchTST is the general-purpose default.
 function selectReferenceBaseline(task: ResearchTask, searchBiases: readonly string[]): string {
   if (isBridgeOnly(task)) return TSF_BASELINE_RECIPE_IDS.linear
   const profile = taskProfile(task)
@@ -371,7 +375,7 @@ export function buildExperimentPlan(input: {
   readonly hypotheses: readonly HypothesisObject[]
   readonly task: ResearchTask
   readonly isFirstCall?: boolean
-  readonly llmReferenceBaseline?: string
+  readonly toolReferenceBaseline?: string
 }): ExperimentPlan {
   const searchBiases = unique([
     ...taskSearchBiases(input.task),
@@ -383,15 +387,15 @@ export function buildExperimentPlan(input: {
     Math.floor(budgetNumber(input.task, "noImprovementRounds", "maxNoImprove") ?? 20),
   )
   const targetMetricValue = objectiveNumber(input.task, "targetMetricValue", "targetMetric")
-  const llmReferenceBaselineValid =
-    input.llmReferenceBaseline !== undefined &&
-    referenceBaselineOptions(input.task).includes(input.llmReferenceBaseline)
+  const toolReferenceBaselineValid =
+    input.toolReferenceBaseline !== undefined &&
+    referenceBaselineOptions(input.task).includes(input.toolReferenceBaseline)
   const referenceBaseline = input.isFirstCall
-    ? llmReferenceBaselineValid
-      ? input.llmReferenceBaseline
+    ? toolReferenceBaselineValid
+      ? input.toolReferenceBaseline
       : selectReferenceBaseline(input.task, searchBiases)
     : undefined
-  const referenceBaselineSource = input.isFirstCall ? (llmReferenceBaselineValid ? "llm" : "heuristic") : undefined
+  const referenceBaselineSource = input.isFirstCall ? (toolReferenceBaselineValid ? "tool" : "heuristic") : undefined
   return {
     hypotheses: input.hypotheses,
     baselineStrategy: searchBiases.includes("bridge_safe") || isBridgeOnly(input.task)
@@ -514,7 +518,7 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
     hypotheses,
     task: input.task,
     isFirstCall,
-    llmReferenceBaseline: input.llmReferenceBaseline,
+    toolReferenceBaseline: input.toolReferenceBaseline,
   })
   const partial = {
     agent: "HypoPlannerAgent" as const,

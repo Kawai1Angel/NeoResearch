@@ -8,6 +8,7 @@ const {
 const { formatDoctorReport, runDoctor } = require("./doctor");
 const { generateCandidate } = require("./llm");
 const { describeCandidateFamily, describeCandidateId } = require("./candidate-utils");
+const { appendModelDesignRecord } = require("./model-design-log");
 const { collectSocraticRequirement } = require("./modes/socratic");
 const {
   buildCompanionRequirement,
@@ -84,7 +85,7 @@ Usage:
   neo-cast task-spec validate [.neo-cast/task_spec.json]
   neo-cast checkpoint <status|request|approve|reject> [stage]
   neo-cast correction <add|list> [--scope data_schema] [--field column] [--correction "..."]
-  neo-cast prepare-data --source /path/to/data.csv [--task-id etth1] [--feature-cols a,b,c]
+  neo-cast prepare-data --source /path/to/data.csv [--target-cols y] [--observed-past-covariates x1,x2] [--known-future-covariates x1,x2]
   neo-cast runner init [--force]
   neo-cast runner run --description "baseline"
   neo-cast runner ref-test [--run-id 20260424-...]
@@ -93,7 +94,7 @@ Usage:
   neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3]
                   [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep] [--require-approval]
   neo-cast design --requirement "small transformer for ETTh1" --autonomous [--time-budget 2h]
-                  [--max-no-improve 8] [--mock-llm] [--use-reflection] [--use-mutation]
+                  [--max-no-improve 5] [--mock-llm] [--use-reflection] [--use-mutation]
 
 Commands:
   doctor         Check python3, uv, API key, and resolved config
@@ -114,7 +115,7 @@ Design flags:
   --autonomous       Continue iterating until budget, plateau, or crash stopping conditions are met
   --require-approval Pause after model design and require: neo-cast checkpoint approve model_design
   --time-budget      Autonomous wall-clock budget, e.g. 2h, 90m, 3600s
-  --max-no-improve   Autonomous plateau limit; defaults to 8 consecutive non-improving runs
+  --max-no-improve   Autonomous plateau limit; defaults to 5 consecutive non-improving runs
 
 No API key?
   Use \`--mock-llm\` on design commands, or set \`NEO_CAST_USE_MOCK=1\`, to run the
@@ -539,6 +540,13 @@ async function handlePrepareData(rawFlags) {
     ["dataset-preset", "--dataset-preset"],
     ["timestamp-col", "--timestamp-col"],
     ["feature-cols", "--feature-cols"],
+    ["target-cols", "--target-cols"],
+    ["observed-past-covariates", "--observed-past-covariates"],
+    ["known-future-covariates", "--known-future-covariates"],
+    ["static-covariates", "--static-covariates"],
+    ["known-future-source", "--known-future-source"],
+    ["known-future-available", "--known-future-available"],
+    ["experiment-scope", "--experiment-scope"],
     ["input-len", "--input-len"],
     ["horizons", "--horizons"],
     ["train-rows", "--train-rows"],
@@ -904,7 +912,7 @@ async function handleDesign(positionals, rawFlags) {
 
   if (isAutonomous) {
     const { parseTimeBudget, runAutonomousLoop } = require("./loop");
-    const maxNoImprove = Number(rawFlags["max-no-improve"] || 8);
+    const maxNoImprove = Number(rawFlags["max-no-improve"] || 5);
     if (!Number.isFinite(maxNoImprove) || maxNoImprove < 1) {
       console.error("--max-no-improve must be a positive integer");
       return 1;
@@ -1064,6 +1072,13 @@ async function handleDesign(positionals, rawFlags) {
       taskContext,
     });
     console.log(`recipe_version=${recipeVersion.version_id}`);
+    const designLog = appendModelDesignRecord(projectRoot, candidate, {
+      attempt,
+      source: result.source,
+      candidatePath,
+      recipeVersionId: recipeVersion.version_id,
+    });
+    console.log(`model_designs_path=${designLog.markdownPath}`);
 
     if (rawFlags["require-approval"]) {
       const checkpoint = requestCheckpoint({

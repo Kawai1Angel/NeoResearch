@@ -207,7 +207,11 @@ describe("research dashboard data helpers", () => {
       title: "TSF Autonomous Research",
       domainID: "tsf",
       mode: "autonomous",
-      budget: { maxRuns: 12, maxParallel: 1 },
+      budget: {
+        maxRuns: 100,
+        maxParallel: 1,
+        parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
+      },
     })
     expect(review.taskSpec).toMatchObject({
       contextLength: 96,

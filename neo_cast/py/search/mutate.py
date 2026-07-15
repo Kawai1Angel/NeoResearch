@@ -186,7 +186,7 @@ def _switch_to_raw_backbone(recipe: dict[str, Any], backbone: dict[str, Any], no
 def _switch_to_dlinear(recipe: dict[str, Any]) -> str | None:
     return _switch_to_raw_backbone(
         recipe,
-        {"type": "dlinear", "kernel_size": 25, "bias": True},
+        {"type": "dlinear", "kernel_size": 25, "bias": True, "individual": False},
         "switch_to_dlinear",
     )
 

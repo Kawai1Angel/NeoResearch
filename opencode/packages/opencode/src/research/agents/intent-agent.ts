@@ -24,6 +24,7 @@ export interface IntentSpec {
   readonly prediction_horizon: number[]
   readonly time_grain?: string
   readonly exogenous_variables?: string[]
+  readonly future_covariate_availability?: string
   readonly business_context?: string
   readonly primary_metric?: string
   readonly secondary_metrics: string[]
@@ -54,7 +55,7 @@ export interface IntentAgentResult {
   }
 }
 
-type SlotID =
+export type SlotID =
   | "interaction_mode"
   | "forecast_object"
   | "data_source"
@@ -62,6 +63,7 @@ type SlotID =
   | "lookback_window"
   | "prediction_horizon"
   | "exogenous_variables"
+  | "future_covariate_availability"
   | "business_context"
   | "primary_metric"
   | "secondary_metrics"
@@ -71,7 +73,7 @@ type SlotID =
   | "interpretability"
   | "deployment_target"
 
-type IntentSlot = {
+export type IntentSlot = {
   readonly id: SlotID
   readonly field: string
   readonly label: string
@@ -142,7 +144,7 @@ function firstKnown(...values: unknown[]) {
   return undefined
 }
 
-function interactionModeForTask(task: ResearchTask): IntentInteractionMode {
+export function interactionModeForTask(task: ResearchTask): IntentInteractionMode {
   const taskSpec = recordValue(task.taskSpec)
   const metadata = recordValue(taskSpec.metadata)
   const raw = metadata.interactionMode ?? metadata.interaction_mode
@@ -151,7 +153,7 @@ function interactionModeForTask(task: ResearchTask): IntentInteractionMode {
   return task.mode === "review" ? "companion" : "socratic"
 }
 
-function dialogueStrategy(mode: IntentInteractionMode): IntentDialogueStrategy {
+export function dialogueStrategy(mode: IntentInteractionMode): IntentDialogueStrategy {
   if (mode === "companion") {
     return {
       mode,
@@ -170,7 +172,7 @@ function dialogueStrategy(mode: IntentInteractionMode): IntentDialogueStrategy {
   }
 }
 
-function collectedIntentSlots(task: ResearchTask) {
+export function collectedIntentSlots(task: ResearchTask) {
   const taskSpec = recordValue(task.taskSpec)
   const dataset = recordValue(taskSpec.dataset)
   const objective = recordValue(task.objective)
@@ -223,6 +225,10 @@ function collectedIntentSlots(task: ResearchTask) {
     prediction_horizon: numberArray(firstKnown(taskSpec.predictionLengths, taskSpec.predictionHorizon, mergedSlots.prediction_horizon)),
     time_grain: firstString(mergedSlots.time_grain, taskSpec.timeGrain, taskSpec.frequency, dataset.frequency),
     exogenous_variables: optionalStringArray(exogenousVariables),
+    future_covariate_availability: firstString(
+      mergedSlots.future_covariate_availability,
+      metadata.futureCovariateAvailability,
+    ),
     business_context: firstString(
       mergedSlots.business_context,
       taskSpec.businessContext,
@@ -272,7 +278,7 @@ function collectedIntentSlots(task: ResearchTask) {
   }
 }
 
-function slotDefinitions(task: ResearchTask): IntentSlot[] {
+export function slotDefinitions(task: ResearchTask): IntentSlot[] {
   const slots = collectedIntentSlots(task)
   return [
     {
@@ -339,6 +345,15 @@ function slotDefinitions(task: ResearchTask): IntentSlot[] {
       socraticQuestion: "是否有天气、节假日、价格、事件等外生变量？如果没有，请明确为 none。",
       companionQuestion: "外生变量有哪些？没有的话回答 none。",
       value: slots.exogenous_variables,
+    },
+    {
+      id: "future_covariate_availability",
+      field: "metadata.futureCovariateAvailability",
+      label: "未来外生变量可用性",
+      required: (slots.exogenous_variables ?? []).length > 0,
+      socraticQuestion: "这些外生变量的未来值在真实预测时是否可获得？请说明来源；若仅使用离线真值，请明确为 oracle upper-bound。",
+      companionQuestion: "预测时能否获得这些外生变量的未来值？请说明来源，或标记为 oracle upper-bound。",
+      value: slots.future_covariate_availability,
     },
     {
       id: "business_context",
@@ -415,7 +430,7 @@ function slotDefinitions(task: ResearchTask): IntentSlot[] {
   ]
 }
 
-function slotIsMissing(slot: IntentSlot) {
+export function slotIsMissing(slot: IntentSlot) {
   if (!slot.required) return false
   if (slot.value === undefined || slot.value === null) return true
   if (typeof slot.value === "string") return slot.value.trim().length === 0
@@ -427,7 +442,7 @@ function questionForSlot(slot: IntentSlot, mode: IntentInteractionMode) {
   return mode === "companion" ? slot.companionQuestion : slot.socraticQuestion
 }
 
-function confidenceFor(slots: IntentSlot[], strategy: IntentDialogueStrategy) {
+export function confidenceFor(slots: IntentSlot[], strategy: IntentDialogueStrategy) {
   const required = slots.filter((slot) => slot.required)
   const filled = required.filter((slot) => !slotIsMissing(slot)).length
   const coverage = required.length === 0 ? 1 : filled / required.length
@@ -461,6 +476,9 @@ function intentSpecFrom(task: ResearchTask, missingSlots: IntentSlot[], llmSlots
     prediction_horizon: merged.prediction_horizon,
     ...(merged.time_grain === undefined ? {} : { time_grain: merged.time_grain }),
     ...(merged.exogenous_variables === undefined ? {} : { exogenous_variables: merged.exogenous_variables }),
+    ...(merged.future_covariate_availability === undefined
+      ? {}
+      : { future_covariate_availability: merged.future_covariate_availability }),
     ...(merged.business_context === undefined ? {} : { business_context: merged.business_context }),
     ...(merged.primary_metric === undefined ? {} : { primary_metric: merged.primary_metric }),
     secondary_metrics: merged.secondary_metrics,
@@ -509,6 +527,7 @@ function renderIntentSpecMarkdown(input: {
     `- Prediction horizon: ${markdownList(spec.prediction_horizon)}`,
     `- Time grain: ${markdownValue(spec.time_grain)}`,
     `- Exogenous variables: ${markdownValue(spec.exogenous_variables)}`,
+    `- Future covariate availability: ${markdownValue(spec.future_covariate_availability)}`,
     "",
     "## Business Context",
     "",
@@ -609,6 +628,10 @@ function normalizeLLMSlots(value: Record<string, unknown>) {
       : undefined,
     exogenous_variables:
       typeof exogenous === "string" && /^none$/i.test(exogenous.trim()) ? [] : optionalStringArray(exogenous),
+    future_covariate_availability: firstString(
+      value.future_covariate_availability,
+      value.futureCovariateAvailability,
+    ),
     business_context: firstString(value.business_context, value.businessContext),
     primary_metric: firstString(value.primary_metric, value.primaryMetric),
     secondary_metrics: optionalStringArray(secondary),
@@ -732,6 +755,7 @@ const SLOT_KEY_ALIASES: Record<string, string> = {
   predictionHorizon: "prediction_horizon",
   timeGrain: "time_grain",
   exogenousVariables: "exogenous_variables",
+  futureCovariateAvailability: "future_covariate_availability",
   businessContext: "business_context",
   primaryMetric: "primary_metric",
   secondaryMetrics: "secondary_metrics",

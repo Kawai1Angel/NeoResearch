@@ -20,6 +20,7 @@ function loadCliWithStubs(state = {}) {
   const checkpointRequests = [];
   const publishedReports = [];
   const versionCalls = [];
+  const designRecords = [];
   const logs = [];
 
   const stubs = {
@@ -57,6 +58,16 @@ function loadCliWithStubs(state = {}) {
             model_family: "mock_family",
             hypothesis: `candidate ${options.attempt}`,
           },
+        };
+      },
+    },
+    "./model-design-log": {
+      appendModelDesignRecord: (_projectRoot, candidate, options) => {
+        designRecords.push({ candidate, options });
+        return {
+          markdownPath: "/tmp/model_designs.md",
+          jsonlPath: "/tmp/model_designs.jsonl",
+          record: {},
         };
       },
     },
@@ -177,6 +188,7 @@ function loadCliWithStubs(state = {}) {
     generatedTaskContexts,
     autonomousOptions,
     checkpointRequests,
+    designRecords,
     logs,
     mutationAttempts,
     publishedReports,
@@ -291,6 +303,27 @@ test("design delegates autonomous mode to the autonomous loop with budgets", asy
   }
 });
 
+test("design defaults autonomous max no-improve budget to 5", async () => {
+  const harness = loadCliWithStubs();
+  try {
+    const exitCode = await harness.cli.runCli([
+      "design",
+      "--requirement",
+      "run until default plateau",
+      "--mode",
+      "companion",
+      "--autonomous",
+      "--mock-llm",
+    ]);
+
+    assert.equal(exitCode, 0);
+    assert.equal(harness.autonomousOptions.length, 1);
+    assert.equal(harness.autonomousOptions[0].maxNoImprove, 5);
+  } finally {
+    harness.restore();
+  }
+});
+
 test("design treats NEO_CAST_USE_MOCK as mock mode for config validation and generation", async () => {
   const previous = process.env.NEO_CAST_USE_MOCK;
   process.env.NEO_CAST_USE_MOCK = "1";
@@ -397,9 +430,13 @@ test("design records recipe, experiment, and release versions for lineage", asyn
     assert.equal(harness.versionCalls[0].logicalId, "candidate_1");
     assert.equal(harness.versionCalls[1].logicalId, "run_1");
     assert.equal(harness.versionCalls[2].logicalId, "run_1");
+    assert.equal(harness.designRecords.length, 1);
+    assert.equal(harness.designRecords[0].candidate.candidate_id, "candidate_1");
+    assert.equal(harness.designRecords[0].options.recipeVersionId, "recipe_candidate_1_v1");
     assert.equal(harness.publishedReports.length, 1);
     assert.equal(harness.publishedReports[0].versionId, "release_run_1_v1");
     assert.match(harness.logs.join("\n"), /recipe_version=recipe_candidate_1_v/);
+    assert.match(harness.logs.join("\n"), /model_designs_path=\/tmp\/model_designs\.md/);
   } finally {
     harness.restore();
   }

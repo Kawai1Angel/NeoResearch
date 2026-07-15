@@ -1,5 +1,5 @@
 import { NamedError } from "@opencode-ai/core/util/error"
-import { Cause, Context, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Schema, Stream } from "effect"
 import { cp, mkdir, readdir, readFile, writeFile } from "fs/promises"
 import { existsSync, openSync, readSync, closeSync } from "fs"
 import { createHash } from "crypto"
@@ -10,7 +10,15 @@ import z from "zod"
 import { and, desc, eq, inArray, notInArray, isNull, lt, ne, Database, NotFoundError } from "@/storage"
 import { Bus } from "@/bus"
 import { Session } from "@/session"
+import { SessionPrompt } from "@/session/prompt"
+import { MessageV2 } from "@/session/message-v2"
+import { SessionTable } from "@/session/session.sql"
 import { Instance } from "@/project/instance"
+import { mapTask } from "./task-mapper"
+import { Log } from "@/util"
+import PROMPT_RESEARCH_DATA_ANALYSIS from "../agent/prompt/research-data-analysis.txt"
+import PROMPT_RESEARCH_HYPO_PLANNER from "../agent/prompt/research-hypo-planner.txt"
+import PROMPT_RESEARCH_REFLECTION from "../agent/prompt/research-reflection.txt"
 import * as Process from "@/util/process"
 import {
   ResearchApprovalTable,
@@ -80,14 +88,20 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { apiKeyFor, extractJsonObject, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, type AuthJsonKeyResult } from "./llm-proposal"
+import { apiKeyFor, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
+import { ProviderID, ModelID } from "@/provider/schema"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
-import { analyzeIntentTask, analyzeIntentTaskWithLLM, interpretSlotModificationWithLLM, normalizeIntentSlotKeys, parseSlotInputsWithLLM, type IntentAgentResult } from "./agents/intent-agent"
+import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
 import {
+  analyzeDataset,
+  buildDatasetAnalysisContext,
   buildDatasetAnalysisReportMarkdown,
-  type DatasetAnalysisSourceReport,
-  summarizeDataAnalysisAgent,
   type DataAnalysisAgentResult,
+  type DatasetAnalysisContext,
+  type DatasetAnalysisPlot,
+  type DatasetAnalysisSourceReport,
+  type DatasetStatisticalAnalysis,
+  summarizeDataAnalysisAgent,
 } from "./agents/data-analysis-agent"
 import {
   buildModelCompilerResult,
@@ -112,6 +126,7 @@ import {
   type HypoPlannerInput,
   type HypoPlannerResult,
   type HypothesisObject,
+  type HypothesisStatus,
 } from "./agents/hypo-planner-agent"
 import { buildNASAgentResult, summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
 import { summarizePublishAgent, type PublishAgentResult } from "./agents/publish-agent"
@@ -132,7 +147,6 @@ import {
 import { buildEvaluationResultMarkdown, buildVerifierDecisionRecord, runVerifiers, type VerifierReport } from "./verifiers"
 
 type DbClient = Parameters<typeof Database.use>[0] extends (trx: infer D) => unknown ? D : never
-type ResearchTaskRow = typeof ResearchTaskTable.$inferSelect
 type ResearchApprovalRow = typeof ResearchApprovalTable.$inferSelect
 type ResearchCandidateRow = typeof ResearchCandidateTable.$inferSelect
 type ResearchRunRow = typeof ResearchRunTable.$inferSelect
@@ -369,6 +383,9 @@ function intentCheckpointSignature(task: ResearchTask) {
     `mode=${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
     `targets=${compactIntentValue(dataset.targetCols)}`,
+    `pastCovariates=${compactIntentValue(dataset.observedPastCovariates)}`,
+    `futureCovariates=${compactIntentValue(dataset.knownFutureCovariates)}`,
+    `covariateSchema=${compactIntentValue(recordValue(recordValue(spec.metadata).resolvedCovariates).schemaFingerprint)}`,
     `context=${compactIntentValue(spec.contextLength)}`,
     `horizons=${compactIntentValue(spec.predictionLengths)}`,
     `metric=${compactIntentValue(objective.primaryMetric)}`,
@@ -403,6 +420,11 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Prediction lengths: ${compactIntentValue(slotOr(spec.predictionLengths, "prediction_horizon"))}`,
     `Time grain: ${compactIntentValue(intentSlots.time_grain ?? spec.timeGrain ?? spec.frequency)}`,
     `Exogenous variables: ${compactIntentValue(intentSlots.exogenous_variables ?? dataset.exogenousCols)}`,
+    `Observed past covariates: ${compactIntentValue(dataset.observedPastCovariates)}`,
+    `Known future covariates: ${compactIntentValue(dataset.knownFutureCovariates)}`,
+    `Covariate count: ${Array.isArray(dataset.knownFutureCovariates) ? dataset.knownFutureCovariates.length : 0}`,
+    `Future availability: ${compactIntentValue(metadata.futureCovariateAvailability)}`,
+    "Risk notice: known-future values may only be used when they are available at prediction time; offline realized values make this an oracle upper-bound experiment.",
     `Primary metric: ${compactIntentValue(slotOr(objective.primaryMetric, "primary_metric"))}`,
     `Error preferences: ${compactIntentValue(intentSlots.error_preferences ?? objective.errorPreferences)}`,
     `Latency budget: ${compactIntentValue(intentSlots.latency_budget ?? budget.latencyBudget)}`,
@@ -414,17 +436,6 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     "",
     "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并逐一修改 slots 后重新确认。",
   ].join("\n")
-}
-
-function taskInteractionModeFromFields(mode: string, taskSpec: JsonRecord) {
-  const metadata =
-    taskSpec.metadata && typeof taskSpec.metadata === "object" && !Array.isArray(taskSpec.metadata)
-      ? (taskSpec.metadata as Record<string, unknown>)
-      : {}
-  const raw = metadata.interactionMode ?? metadata.interaction_mode
-  if (raw === "companion" || raw === "cognitive_companion") return "companion"
-  if (raw === "socratic") return "socratic"
-  return mode === "autonomous" ? "socratic" : undefined
 }
 
 function parseRunnerRecords(stdout: string) {
@@ -738,6 +749,16 @@ function abandonedHypothesesFromMetadata(metadata: Record<string, unknown>): rea
 
 function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
   const priority = row.priority
+  const status = row.status
+  const validStatus: HypothesisStatus =
+    status === "pending" ||
+    status === "active" ||
+    status === "testing" ||
+    status === "confirmed" ||
+    status === "rejected" ||
+    status === "abandoned"
+      ? status
+      : "pending"
   return {
     id: row.hypo_id,
     statement: row.statement,
@@ -748,6 +769,8 @@ function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
     priority: priority === "high" || priority === "medium" || priority === "low" ? priority : "medium",
     risk: row.risk,
     testable: row.testable,
+    status: validStatus,
+    ...(row.abandon_reason ? { abandonReason: row.abandon_reason } : {}),
   }
 }
 
@@ -1045,17 +1068,53 @@ function isMeaningfulMetricImprovement(
   return delta / Math.max(Math.abs(current), 1e-12) >= minRelativeImprovement
 }
 
+function sessionLocalMetricState(input: {
+  readonly runs: readonly ResearchRun[]
+  readonly stage: ResearchRun["stage"]
+  readonly primaryMetricName: string
+  readonly direction: "minimize" | "maximize"
+  readonly minRelativeImprovement: number
+}) {
+  let bestMetric: number | undefined
+  let noImproveStreak = 0
+  const runs = input.runs
+    .filter((run) => run.stage === input.stage && run.status === "succeeded")
+    .toSorted((left, right) =>
+      (left.timeFinished ?? left.time.updated ?? left.time.created) -
+      (right.timeFinished ?? right.time.updated ?? right.time.created),
+    )
+  for (const run of runs) {
+    const metric = metricValue(run.metrics, input.primaryMetricName)
+    if (metric === undefined) continue
+    const improved =
+      bestMetric === undefined ||
+      isMeaningfulMetricImprovement(input.direction, metric, bestMetric, input.minRelativeImprovement)
+    if (improved) {
+      bestMetric = metric
+      noImproveStreak = 0
+    } else {
+      noImproveStreak += 1
+    }
+  }
+  return { bestMetric, noImproveStreak }
+}
+
 function autonomousLoopMaxIterations(inputValue: unknown, task: ResearchTask) {
   const requested = integerPolicyValue(inputValue)
   if (requested !== undefined) return Math.max(1, Math.min(requested, 200))
-  const budgetMaxRuns = maxRunsLimit(task.budget)
-  return Math.max(1, Math.min(Math.max(budgetMaxRuns ?? 50, 50), 200))
+  return 20
 }
 
 function artifactDirsFromRecords(records: Record<string, unknown>[]) {
   return records
     .map((record) => record.artifact_dir)
     .filter((value): value is string => typeof value === "string" && value.length > 0)
+}
+
+function neoCastRunIDFromArtifactURI(uri: string) {
+  const withoutScheme = uri.startsWith("file://") ? uri.slice("file://".length) : uri
+  const basename = path.basename(withoutScheme)
+  return basename.startsWith("run_") ? basename.slice("run_".length) : undefined
 }
 
 function jsonBlock(value: unknown) {
@@ -1700,60 +1759,9 @@ type DatasetAnalysisReport = {
   readonly metadata: JsonRecord
 }
 
-type DatasetAnalysisPlot = {
-  readonly kind: "dataset_analysis_plot_png"
-  readonly filename: string
-  readonly relativePath: string
-  readonly role: string
-  readonly data: Uint8Array
-  readonly metadata: JsonRecord
-}
-
-type DatasetSeriesMatrix = {
-  readonly columns: readonly string[]
-  readonly values: readonly (readonly number[])[]
-}
-
-type DatasetStatisticalAnalysis = {
-  readonly stationarity: {
-    readonly adfStatistic?: number
-    readonly adfStationary?: boolean
-    readonly kpssStatistic?: number
-    readonly kpssStationary?: boolean
-  }
-  readonly acf: {
-    readonly topLag?: number
-    readonly topCorrelation?: number
-    readonly pacfTopLag?: number
-    readonly pacfTopCorrelation?: number
-  }
-  readonly decomposition: {
-    readonly period?: number
-    readonly trendVarianceShare?: number
-    readonly seasonalVarianceShare?: number
-    readonly residualVarianceShare?: number
-  }
-  readonly frequency: {
-    readonly dominantPeriod?: number
-    readonly dominantPowerShare?: number
-  }
-  readonly changepoint: {
-    readonly index?: number
-    readonly score?: number
-    readonly severity?: string
-  }
-  readonly crossLag: {
-    readonly source?: string
-    readonly target?: string
-    readonly lag?: number
-    readonly correlation?: number
-  }
-}
-
-type DatasetAnalysisContext = {
-  readonly statistics: DatasetStatisticalAnalysis
-  readonly plotRefs: readonly DatasetAnalysisPlot[]
-}
+// Quantitative analysis pipeline (stats, plots, buildDatasetAnalysisContext) lives in
+// ./agents/data-analysis-agent — it's also invoked directly by the analyze_dataset tool
+// (src/tool/research-data-analysis.ts), which cannot import this Session-wired module.
 
 function markdownValue(value: unknown) {
   if (typeof value === "number") return formatMetricValue(value)
@@ -1771,524 +1779,38 @@ function dataAnalysisSignal(value: number | undefined, threshold: number, active
   return value !== undefined && value >= threshold ? active : inactive
 }
 
-function roundAnalysisValue(value: number | undefined) {
-  return value === undefined || !Number.isFinite(value) ? undefined : Number(value.toFixed(6))
-}
-
-function csvCells(line: string) {
-  const cells: string[] = []
-  let current = ""
-  let quoted = false
-  for (let index = 0; index < line.length; index++) {
-    const char = line[index]!
-    if (char === '"') {
-      if (quoted && line[index + 1] === '"') {
-        current += '"'
-        index++
-      } else {
-        quoted = !quoted
-      }
-      continue
-    }
-    if (char === "," && !quoted) {
-      cells.push(current)
-      current = ""
-      continue
-    }
-    current += char
-  }
-  cells.push(current)
-  return cells
-}
-
 function taskDatasetSpec(task: ResearchTask) {
   const taskSpec = recordValue(task.taskSpec)
   return recordValue(taskSpec.dataset)
 }
 
-function datasetTargetColumns(task: ResearchTask, header: readonly string[]) {
-  const dataset = taskDatasetSpec(task)
-  const targetCols = Array.isArray(dataset.targetCols)
-    ? dataset.targetCols.filter((item): item is string => typeof item === "string" && header.includes(item))
-    : []
-  if (targetCols.length > 0) return targetCols
-  return header.slice(1)
-}
-
-function taskTrainDataPath(task: ResearchTask): string | undefined {
+function datasetCovariateContext(task: ResearchTask) {
   const taskSpec = recordValue(task.taskSpec)
-  const runtime = recordValue(taskSpec.runtime)
   const dataset = recordValue(taskSpec.dataset)
-  const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
-  const loaderID = typeof dataset.loaderID === "string" ? dataset.loaderID.trim() : ""
-  if (!root || !loaderID) return undefined
-  const safeID = loaderID.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 64)
-  return path.join(root, ".neo-cast", "dataset", `${safeID}_train.csv`)
-}
-
-async function loadDatasetSeriesMatrix(task: ResearchTask): Promise<DatasetSeriesMatrix | undefined> {
-  const dataset = taskDatasetSpec(task)
-  const trainPath = taskTrainDataPath(task)
-  const resolvedTrainPath = trainPath && existsSync(trainPath) ? trainPath : undefined
-  const rawPath = typeof dataset.path === "string" && dataset.path.length > 0
-    ? (path.isAbsolute(dataset.path) ? dataset.path : path.join(Instance.directory, dataset.path))
-    : undefined
-  const datasetPath = resolvedTrainPath ?? rawPath
-  if (!datasetPath || !existsSync(datasetPath)) return undefined
-  const text = await readFile(datasetPath, "utf8")
-  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0)
-  if (lines.length < 3) return undefined
-  const header = csvCells(lines[0]!)
-  const columns = datasetTargetColumns(task, header)
-  const columnIndexes = columns.map((column) => header.indexOf(column))
-  if (columns.length === 0 || columnIndexes.some((index) => index < 0)) return undefined
-  const values = lines.slice(1).map((line) => {
-    const row = csvCells(line)
-    return columnIndexes.map((columnIndex) => {
-      const parsed = Number(row[columnIndex])
-      return Number.isFinite(parsed) ? parsed : Number.NaN
-    })
-  })
-  return { columns, values }
-}
-
-function finiteSeries(values: readonly number[]) {
-  return values.filter((value) => Number.isFinite(value))
-}
-
-function finiteMean(values: readonly number[]) {
-  const finite = finiteSeries(values)
-  if (finite.length === 0) return undefined
-  return finite.reduce((sum, value) => sum + value, 0) / finite.length
-}
-
-function variance(values: readonly number[]) {
-  const finite = finiteSeries(values)
-  const avg = finiteMean(finite)
-  if (avg === undefined || finite.length < 2) return undefined
-  return finite.reduce((sum, value) => sum + (value - avg) ** 2, 0) / (finite.length - 1)
-}
-
-function matrixColumn(matrix: DatasetSeriesMatrix, columnIndex: number) {
-  return matrix.values.map((row) => row[columnIndex] ?? Number.NaN)
-}
-
-function aggregateSeries(matrix: DatasetSeriesMatrix) {
-  return matrix.values.map((row) => {
-    const finite = finiteSeries(row)
-    return finite.length === 0 ? Number.NaN : finite.reduce((sum, value) => sum + value, 0) / finite.length
-  })
-}
-
-function correlationAtLag(left: readonly number[], right: readonly number[], lag: number) {
-  const xs: number[] = []
-  const ys: number[] = []
-  const start = Math.max(0, -lag)
-  const end = Math.min(left.length, right.length - lag)
-  for (let index = start; index < end; index++) {
-    const x = left[index]
-    const y = right[index + lag]
-    if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y)) continue
-    xs.push(x)
-    ys.push(y)
-  }
-  if (xs.length < 3) return undefined
-  const xMean = finiteMean(xs)
-  const yMean = finiteMean(ys)
-  if (xMean === undefined || yMean === undefined) return undefined
-  let numerator = 0
-  let xDenom = 0
-  let yDenom = 0
-  for (let index = 0; index < xs.length; index++) {
-    const dx = xs[index]! - xMean
-    const dy = ys[index]! - yMean
-    numerator += dx * dy
-    xDenom += dx * dx
-    yDenom += dy * dy
-  }
-  const denom = Math.sqrt(xDenom * yDenom)
-  return denom === 0 ? undefined : numerator / denom
-}
-
-function averageAutocorrelation(matrix: DatasetSeriesMatrix, lag: number) {
-  const correlations = matrix.columns
-    .map((_, index) => correlationAtLag(matrixColumn(matrix, index), matrixColumn(matrix, index), lag))
-    .filter((value): value is number => value !== undefined && Number.isFinite(value))
-  if (correlations.length === 0) return undefined
-  return correlations.reduce((sum, value) => sum + value, 0) / correlations.length
-}
-
-function topLag(values: readonly { lag: number; value: number }[]) {
-  return values.toSorted((left, right) => Math.abs(right.value) - Math.abs(left.value))[0]
-}
-
-function stationarityAnalysis(matrix: DatasetSeriesMatrix, profile: Record<string, unknown>) {
-  const series = finiteSeries(aggregateSeries(matrix))
-  const avg = finiteMean(series)
-  const seriesVariance = variance(series)
-  let kpssStatistic: number | undefined
-  if (avg !== undefined && seriesVariance !== undefined && seriesVariance > 0 && series.length > 2) {
-    let cumulative = 0
-    const cumulativeSquares = series.reduce((sum, value) => {
-      cumulative += value - avg
-      return sum + cumulative * cumulative
-    }, 0)
-    kpssStatistic = cumulativeSquares / (series.length * series.length * seriesVariance)
-  }
+  const metadata = recordValue(taskSpec.metadata)
+  const availability = recordValue(metadata.knownFutureAvailability)
+  const observedPastCovariates = Array.isArray(dataset.observedPastCovariates)
+    ? dataset.observedPastCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
+  const knownFutureCovariates = Array.isArray(dataset.knownFutureCovariates)
+    ? dataset.knownFutureCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
+  const staticCovariates = Array.isArray(dataset.staticCovariates)
+    ? dataset.staticCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
   return {
-    adfStatistic: roundAnalysisValue(numericProfileValue(profile, "adfStatistic")),
-    adfStationary: typeof profile.adfStationary === "boolean" ? profile.adfStationary : undefined,
-    kpssStatistic: roundAnalysisValue(kpssStatistic),
-    kpssStationary: kpssStatistic === undefined ? undefined : kpssStatistic < 0.463,
-  }
-}
-
-function acfPacfAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
-  const acfValues = Array.from({ length: maxLag }, (_, index) => {
-    const lag = index + 1
-    return { lag, value: averageAutocorrelation(matrix, lag) ?? 0 }
-  })
-  const pacfValues = acfValues.map((item, index) => ({
-    lag: item.lag,
-    value: index === 0 ? item.value : item.value - acfValues[index - 1]!.value * acfValues[0]!.value,
-  }))
-  const acfTop = topLag(acfValues)
-  const pacfTop = topLag(pacfValues)
-  return {
-    topLag: acfTop?.lag,
-    topCorrelation: roundAnalysisValue(acfTop?.value),
-    pacfTopLag: pacfTop?.lag,
-    pacfTopCorrelation: roundAnalysisValue(pacfTop?.value),
-  }
-}
-
-function frequencyAnalysis(series: readonly number[]) {
-  const values = finiteSeries(series)
-  const avg = finiteMean(values) ?? 0
-  const centered = values.map((value) => value - avg)
-  if (centered.length < 4) return {}
-  const powers: Array<{ period: number; power: number }> = []
-  for (let k = 1; k <= Math.floor(centered.length / 2); k++) {
-    let real = 0
-    let imag = 0
-    for (let index = 0; index < centered.length; index++) {
-      const angle = (2 * Math.PI * k * index) / centered.length
-      real += centered[index]! * Math.cos(angle)
-      imag -= centered[index]! * Math.sin(angle)
-    }
-    powers.push({ period: centered.length / k, power: real * real + imag * imag })
-  }
-  const totalPower = powers.reduce((sum, item) => sum + item.power, 0)
-  const best = powers.toSorted((left, right) => right.power - left.power)[0]
-  return {
-    dominantPeriod: roundAnalysisValue(best?.period),
-    dominantPowerShare: roundAnalysisValue(best && totalPower > 0 ? best.power / totalPower : undefined),
-  }
-}
-
-function movingAverage(values: readonly number[], window: number) {
-  const radius = Math.max(1, Math.floor(window / 2))
-  return values.map((_, index) => {
-    const slice = values.slice(Math.max(0, index - radius), Math.min(values.length, index + radius + 1))
-    return finiteMean(slice) ?? values[index] ?? 0
-  })
-}
-
-function decompositionAnalysis(series: readonly number[], period: number | undefined) {
-  const values = finiteSeries(series)
-  if (values.length < 4) return {}
-  const resolvedPeriod = Math.max(2, Math.min(Math.floor(values.length / 2), Math.round(period ?? 12)))
-  const trend = movingAverage(values, resolvedPeriod)
-  const detrended = values.map((value, index) => value - trend[index]!)
-  const seasonalMeans = Array.from({ length: resolvedPeriod }, (_, seasonalIndex) =>
-    finiteMean(detrended.filter((_, index) => index % resolvedPeriod === seasonalIndex)) ?? 0,
-  )
-  const seasonal = detrended.map((_, index) => seasonalMeans[index % resolvedPeriod]!)
-  const residual = values.map((value, index) => value - trend[index]! - seasonal[index]!)
-  const totalVariance = variance(values) ?? 0
-  const share = (part: readonly number[]) => (totalVariance > 0 ? (variance(part) ?? 0) / totalVariance : undefined)
-  return {
-    period: resolvedPeriod,
-    trendVarianceShare: roundAnalysisValue(share(trend)),
-    seasonalVarianceShare: roundAnalysisValue(share(seasonal)),
-    residualVarianceShare: roundAnalysisValue(share(residual)),
-  }
-}
-
-function changepointAnalysis(series: readonly number[]) {
-  const values = finiteSeries(series)
-  const std = Math.sqrt(variance(values) ?? 0)
-  const minWindow = Math.max(6, Math.floor(values.length * 0.1))
-  if (values.length < minWindow * 2 || std === 0) return {}
-  let best: { index: number; score: number } | undefined
-  for (let index = minWindow; index <= values.length - minWindow; index++) {
-    const left = finiteMean(values.slice(0, index))
-    const right = finiteMean(values.slice(index))
-    if (left === undefined || right === undefined) continue
-    const score = Math.abs(left - right) / std
-    if (!best || score > best.score) best = { index, score }
-  }
-  return {
-    index: best?.index,
-    score: roundAnalysisValue(best?.score),
-    severity: best === undefined ? undefined : best.score >= 1 ? "high" : best.score >= 0.5 ? "medium" : "low",
-  }
-}
-
-function crossLagAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
-  let best: DatasetStatisticalAnalysis["crossLag"] = {}
-  for (let leftIndex = 0; leftIndex < matrix.columns.length; leftIndex++) {
-    for (let rightIndex = 0; rightIndex < matrix.columns.length; rightIndex++) {
-      if (leftIndex === rightIndex) continue
-      const left = matrixColumn(matrix, leftIndex)
-      const right = matrixColumn(matrix, rightIndex)
-      for (let lag = -maxLag; lag <= maxLag; lag++) {
-        if (lag === 0) continue
-        const correlation = correlationAtLag(left, right, lag)
-        if (correlation === undefined) continue
-        if (best.correlation === undefined || Math.abs(correlation) > Math.abs(best.correlation)) {
-          best = {
-            source: matrix.columns[leftIndex],
-            target: matrix.columns[rightIndex],
-            lag,
-            correlation: roundAnalysisValue(correlation),
-          }
-        }
-      }
-    }
-  }
-  return best
-}
-
-function buildStatisticalAnalysis(matrix: DatasetSeriesMatrix | undefined, fingerprint: JsonRecord): DatasetStatisticalAnalysis {
-  const profile = recordValue(recordValue(fingerprint).datasetProfile)
-  if (!matrix) {
-    return {
-      stationarity: {
-        adfStatistic: roundAnalysisValue(numericProfileValue(profile, "adfStatistic")),
-        adfStationary: typeof profile.adfStationary === "boolean" ? profile.adfStationary : undefined,
-      },
-      acf: {
-        topLag: typeof profile.acfMainPeriod === "number" ? profile.acfMainPeriod : undefined,
-        topCorrelation: roundAnalysisValue(numericProfileValue(profile, "acfMainPeriodStrength")),
-      },
-      decomposition: {},
-      frequency: {},
-      changepoint: {},
-      crossLag: {},
-    }
-  }
-  const maxLag = Math.max(1, Math.min(40, Math.floor(matrix.values.length / 2)))
-  const series = aggregateSeries(matrix)
-  return {
-    stationarity: stationarityAnalysis(matrix, profile),
-    acf: acfPacfAnalysis(matrix, maxLag),
-    decomposition: decompositionAnalysis(series, numericProfileValue(profile, "acfMainPeriod")),
-    frequency: frequencyAnalysis(series),
-    changepoint: changepointAnalysis(series),
-    crossLag: crossLagAnalysis(matrix, Math.min(24, maxLag)),
-  }
-}
-
-const pngSignature = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10])
-
-function crc32(buffer: Uint8Array) {
-  let crc = 0xffffffff
-  for (const byte of buffer) {
-    crc ^= byte
-    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
-  }
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-function pngChunk(type: string, data: Uint8Array) {
-  const typeBytes = Buffer.from(type, "ascii")
-  const length = Buffer.alloc(4)
-  length.writeUInt32BE(data.length, 0)
-  const crcInput = Buffer.concat([typeBytes, Buffer.from(data)])
-  const crc = Buffer.alloc(4)
-  crc.writeUInt32BE(crc32(crcInput), 0)
-  return Buffer.concat([length, typeBytes, Buffer.from(data), crc])
-}
-
-function simplePng(width: number, height: number, values: readonly number[], accent: [number, number, number]) {
-  const pixels = Buffer.alloc((width * 3 + 1) * height, 255)
-  const setPixel = (x: number, y: number, color: [number, number, number]) => {
-    if (x < 0 || y < 0 || x >= width || y >= height) return
-    const offset = y * (width * 3 + 1) + 1 + x * 3
-    pixels[offset] = color[0]
-    pixels[offset + 1] = color[1]
-    pixels[offset + 2] = color[2]
-  }
-  for (let x = 28; x < width - 8; x++) setPixel(x, height - 24, [70, 70, 80])
-  for (let y = 8; y < height - 24; y++) setPixel(28, y, [70, 70, 80])
-  const finite = finiteSeries(values)
-  const min = finite.length ? Math.min(...finite) : 0
-  const max = finite.length ? Math.max(...finite) : 1
-  const span = max - min || 1
-  const chartWidth = width - 40
-  const chartHeight = height - 36
-  const samples = values.length > 0 ? values : [0]
-  for (let index = 0; index < samples.length; index++) {
-    const value = Number.isFinite(samples[index]!) ? samples[index]! : min
-    const x = 30 + Math.floor((index / Math.max(1, samples.length - 1)) * (chartWidth - 1))
-    const y = 8 + Math.floor((1 - (value - min) / span) * (chartHeight - 1))
-    for (let dy = y; dy < height - 24; dy++) setPixel(x, dy, accent)
-    setPixel(x, y, [20, 24, 32])
-  }
-  const ihdr = Buffer.alloc(13)
-  ihdr.writeUInt32BE(width, 0)
-  ihdr.writeUInt32BE(height, 4)
-  ihdr[8] = 8
-  ihdr[9] = 2
-  const compressed = deflateSync(pixels)
-  return Buffer.concat([
-    Buffer.from(pngSignature),
-    pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", compressed),
-    pngChunk("IEND", Buffer.alloc(0)),
-  ])
-}
-
-function buildDatasetAnalysisPlots(
-  matrix: DatasetSeriesMatrix | undefined,
-  statistics: DatasetStatisticalAnalysis,
-): DatasetAnalysisPlot[] {
-  const series = matrix ? aggregateSeries(matrix) : [0]
-  const acfValues = matrix
-    ? Array.from({ length: Math.max(1, Math.min(24, Math.floor(matrix.values.length / 2))) }, (_, index) =>
-        Math.abs(averageAutocorrelation(matrix, index + 1) ?? 0),
-      )
-    : [0]
-  const decompositionValues = [
-    statistics.decomposition.trendVarianceShare ?? 0,
-    statistics.decomposition.seasonalVarianceShare ?? 0,
-    statistics.decomposition.residualVarianceShare ?? 0,
-  ]
-  const crossLagValue = statistics.crossLag.correlation === undefined ? [0] : [Math.abs(statistics.crossLag.correlation)]
-  const baseMetadata = { format: "png", role: "quantitative-data-analyst", phase: "data_analysis" } as JsonRecord
-  return [
-    {
-      kind: "dataset_analysis_plot_png",
-      filename: "time-series-overview.png",
-      relativePath: "quantitative/plots/time-series-overview.png",
-      role: "quantitative-data-analyst",
-      data: simplePng(480, 240, series, [80, 140, 240]),
-      metadata: { ...baseMetadata, plotType: "time_series_overview", title: "Time series overview" },
+    observedPastCovariates,
+    knownFutureCovariates,
+    staticCovariates,
+    covariateCount: new Set([...observedPastCovariates, ...knownFutureCovariates, ...staticCovariates]).size,
+    knownFutureAvailability: {
+      availableAtPredictionTime:
+        typeof availability.availableAtPredictionTime === "boolean" ? availability.availableAtPredictionTime : undefined,
+      source: typeof availability.source === "string" ? availability.source : undefined,
     },
-    {
-      kind: "dataset_analysis_plot_png",
-      filename: "acf-pacf.png",
-      relativePath: "quantitative/plots/acf-pacf.png",
-      role: "quantitative-data-analyst",
-      data: simplePng(480, 240, acfValues, [240, 150, 80]),
-      metadata: { ...baseMetadata, plotType: "acf_pacf", title: "ACF/PACF diagnostics" },
-    },
-    {
-      kind: "dataset_analysis_plot_png",
-      filename: "stl-decomposition.png",
-      relativePath: "quantitative/plots/stl-decomposition.png",
-      role: "quantitative-data-analyst",
-      data: simplePng(480, 240, decompositionValues, [110, 190, 120]),
-      metadata: { ...baseMetadata, plotType: "stl_decomposition", title: "STL-style decomposition" },
-    },
-    {
-      kind: "dataset_analysis_plot_png",
-      filename: "cross-lag.png",
-      relativePath: "quantitative/plots/cross-lag.png",
-      role: "quantitative-data-analyst",
-      data: simplePng(480, 240, crossLagValue, [190, 110, 220]),
-      metadata: { ...baseMetadata, plotType: "cross_lag", title: "Cross-lag correlation" },
-    },
-  ]
-}
-
-async function buildDatasetAnalysisContext(task: ResearchTask, fingerprint: JsonRecord): Promise<DatasetAnalysisContext> {
-  const matrix = await loadDatasetSeriesMatrix(task)
-  const statistics = buildStatisticalAnalysis(matrix, fingerprint)
-  return {
-    statistics,
-    plotRefs: buildDatasetAnalysisPlots(matrix, statistics),
+    experimentScope: typeof metadata.experimentScope === "string" ? metadata.experimentScope : undefined,
+    productionComparable: typeof metadata.productionComparable === "boolean" ? metadata.productionComparable : undefined,
   }
-}
-
-function renderDatasetQuantitativeAnalysis(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext) {
-  const profile = recordValue(recordValue(fingerprint).datasetProfile)
-  const stats = context.statistics
-  const rows = [
-    ["Rows", profile.rowCount, "usable observations detected in the CSV profile"],
-    ["Targets", profile.targetCount, "forecast target columns used by the task"],
-    ["Missing rate", profile.missingRate, "fraction of missing numeric target cells"],
-    ["Trend strength", profile.trendStrength, "mean absolute correlation with time index"],
-    ["Seasonality strength", profile.seasonalityStrength, "best lag-correlation over common TSF lags"],
-    ["Cross-variate correlation", profile.crossVarCorrelation, "mean absolute pairwise target correlation"],
-    ["Distribution shift", profile.distributionShift, "normalized first-half vs second-half drift"],
-    ["Outlier rate", profile.outlierRate, "IQR-based extreme-value share"],
-    ["ACF main period", profile.acfMainPeriod, "dominant lag from average target autocorrelation"],
-    ["ACF main period strength", profile.acfMainPeriodStrength, "mean autocorrelation strength at the dominant lag"],
-    ["ADF statistic", profile.adfStatistic, "Augmented Dickey-Fuller style stationarity statistic"],
-    ["ADF stationarity", profile.adfStationary, "whether the profile suggests stationarity at the default threshold"],
-    ["Irregular interval ratio", profile.irregularIntervalRatio, "timestamp cadence instability"],
-    ["Duplicate timestamp rate", profile.duplicateTimestampRate, "duplicate timestamp share"],
-    ["KPSS statistic", stats.stationarity.kpssStatistic, "level-stationarity diagnostic; lower values support stationary residual behavior"],
-    ["KPSS stationarity", stats.stationarity.kpssStationary, "whether the KPSS-style statistic remains below the default level threshold"],
-    ["ACF top lag", stats.acf.topLag, "lag with strongest average autocorrelation across target columns"],
-    ["ACF top correlation", stats.acf.topCorrelation, "strength of the strongest average autocorrelation lag"],
-    ["PACF top lag", stats.acf.pacfTopLag, "lag with strongest approximate partial autocorrelation"],
-    ["PACF top correlation", stats.acf.pacfTopCorrelation, "approximate partial autocorrelation strength at the selected lag"],
-    ["Dominant frequency period", stats.frequency.dominantPeriod, "DFT-derived period with highest spectral power"],
-    ["Dominant frequency power share", stats.frequency.dominantPowerShare, "share of spectral energy explained by the dominant period"],
-    ["Change point", stats.changepoint.index, "index with largest normalized mean shift between prefix and suffix windows"],
-    ["Change point score", stats.changepoint.score, "normalized change-point severity score"],
-    ["Cross-lag", stats.crossLag.lag, "best non-zero lag between target columns"],
-    ["Cross-lag correlation", stats.crossLag.correlation, "strongest absolute lead-lag correlation across target pairs"],
-  ]
-  const lines = [
-    "# Quantitative Sub-Agent Data Analysis",
-    "",
-    "- Agent: quantitative-data-analyst",
-    `- Task ID: ${task.id}`,
-    `- Primary metric: ${markdownValue(recordValue(task.objective).primaryMetric)}`,
-    `- Direction: ${markdownValue(recordValue(task.objective).direction)}`,
-    "",
-    "## Dataset Metrics",
-    "",
-    "| Metric | Value | Interpretation |",
-    "| --- | ---: | --- |",
-    ...rows.map(([label, value, meaning]) => `| ${label} | ${markdownValue(value)} | ${meaning} |`),
-    "",
-    "## Constraint Signals",
-    "",
-    `- Context length: ${markdownValue(recordValue(fingerprint).contextLength)}`,
-    `- Max prediction length: ${markdownValue(recordValue(fingerprint).maxPredictionLength)}`,
-    `- Horizon/context ratio: ${markdownValue(recordValue(fingerprint).horizonContextRatio)}`,
-    `- Max params: ${markdownValue(recordValue(fingerprint).maxParams)}`,
-    `- Max training seconds: ${markdownValue(recordValue(fingerprint).maxTrainingSeconds)}`,
-    "",
-    "## Statistical Tests",
-    "",
-    `- ADF statistic: ${markdownValue(stats.stationarity.adfStatistic)}; stationary=${markdownValue(stats.stationarity.adfStationary)}`,
-    `- KPSS statistic: ${markdownValue(stats.stationarity.kpssStatistic)}; stationary=${markdownValue(stats.stationarity.kpssStationary)}`,
-    `- PACF top lag: ${markdownValue(stats.acf.pacfTopLag)} (${markdownValue(stats.acf.pacfTopCorrelation)})`,
-    "",
-    "## STL-style decomposition",
-    "",
-    `- Period: ${markdownValue(stats.decomposition.period)}`,
-    `- Trend variance share: ${markdownValue(stats.decomposition.trendVarianceShare)}`,
-    `- Seasonal variance share: ${markdownValue(stats.decomposition.seasonalVarianceShare)}`,
-    `- Residual variance share: ${markdownValue(stats.decomposition.residualVarianceShare)}`,
-    "",
-    "## Frequency and Change Diagnostics",
-    "",
-    `- Dominant frequency period: ${markdownValue(stats.frequency.dominantPeriod)} with power share ${markdownValue(stats.frequency.dominantPowerShare)}`,
-    `- Change point: ${markdownValue(stats.changepoint.index)} score=${markdownValue(stats.changepoint.score)} severity=${markdownValue(stats.changepoint.severity)}`,
-    `- Cross-lag: ${markdownValue(stats.crossLag.source)} -> ${markdownValue(stats.crossLag.target)} lag=${markdownValue(stats.crossLag.lag)} corr=${markdownValue(stats.crossLag.correlation)}`,
-    "",
-    "## Visualizations",
-    "",
-    ...context.plotRefs.map((plot) => `![${plot.metadata.title}](${plot.relativePath})`),
-  ]
-  return `${lines.join("\n")}\n`
 }
 
 function renderDatasetQualitativeAnalysis(
@@ -2384,21 +1906,7 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
 }
 
 function buildQualitativeSystemPrompt(): string {
-  return [
-    "You are the NeoResearch qualitative data analyst for time series forecasting.",
-    "Language policy: 用中文写领域解读、业务机制、风险分析、建模建议；保留英文的技术术语、指标名和模块名。",
-    "Task: Interpret the provided time series dataset statistics from a domain and business perspective.",
-    "Output format: Return exactly three markdown sections as plain text (no code blocks, no JSON):",
-    "## Reading",
-    "(2-4 bullet points: key statistical patterns and their implications for model design)",
-    "## 领域解读",
-    "(4-6 bullet points: 字段语义、业务机制、外部因素、潜在事件、风险、领域建模建议 — one bullet per aspect)",
-    "## Search Preferences",
-    "(3-5 bullet points: concrete backbone/preprocessing search guidance derived directly from THIS dataset's statistics.",
-    " Each bullet must be a self-contained preference string in English, e.g. 'Prefer dlinear as a baseline given the strong trend component (trendVarianceShare > 0.6).'",
-    " These will replace the default library preferences in the hypothesis planner, so make them specific and data-driven.)",
-    "Do not include any other heading, section, or text outside these three sections.",
-  ].join("\n")
+  return PROMPT_RESEARCH_DATA_ANALYSIS
 }
 
 function parseSearchPreferencesFromQualitative(text: string): string[] {
@@ -2414,6 +1922,7 @@ function parseSearchPreferencesFromQualitative(text: string): string[] {
 function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext): string {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
   const dataset = taskDatasetSpec(task)
+  const covariates = datasetCovariateContext(task)
   return JSON.stringify(
     {
       task: {
@@ -2421,8 +1930,18 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
         title: task.title,
         domainID: task.domainID,
         objective: task.objective,
-        dataset: { targetCols: dataset.targetCols, loaderID: dataset.loaderID },
+        dataset: {
+          targetCols: dataset.targetCols,
+          loaderID: dataset.loaderID,
+          observedPastCovariates: covariates.observedPastCovariates,
+          knownFutureCovariates: covariates.knownFutureCovariates,
+          staticCovariates: covariates.staticCovariates,
+          knownFutureAvailability: covariates.knownFutureAvailability,
+          experimentScope: covariates.experimentScope,
+          productionComparable: covariates.productionComparable,
+        },
       },
+      taskSpec: task.taskSpec,
       datasetProfile: {
         rowCount: profile.rowCount,
         targetCount: profile.targetCount,
@@ -2455,7 +1974,12 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
         crossLagCorrelation: context.statistics.crossLag.correlation,
       },
       instruction:
-        "Analyze the dataset characteristics and provide qualitative domain insights for guiding TSF model search.",
+        "Call the analyze_dataset tool first to get authoritative statistics, then analyze the dataset " +
+        "characteristics and provide qualitative domain insights for guiding TSF model search. " +
+        "Important: targetCount describes forecast targets only. Do not conclude the task is exogenous-free " +
+        "or production-infeasible when observedPastCovariates/knownFutureCovariates are listed above. " +
+        "When knownFutureCovariates are present, discuss their availability and whether the scope is a production candidate " +
+        "or an oracle upper-bound. The datasetProfile/extendedStatistics below are provided only as a fallback in case the tool is unavailable.",
     },
     null,
     2,
@@ -2506,40 +2030,7 @@ async function generateLLMQualitativeAnalysis(
 }
 
 function buildHypoPlannerSystemPrompt(): string {
-  return [
-    "You are the NeoResearch HypoPlanner agent for time series forecasting (TSF) model search.",
-    "Language policy: 用中文表达 statement、motivation、expectedOutcome、risk 等自然语言字段；保留 JSON 字段名、backbone 类型名、预处理类型名等技术术语的英文原文。",
-    "",
-    "## Input sections you will receive",
-    "1. taskDefinition — research objective, evaluation metric, and budget constraints.",
-    "2. dataAnalysis — dataset profile with statistical features (seasonality, trend, missing rate, horizon/context ratio, cross-variate correlation, etc.).",
-    "3. methodLibrary — available ModelRecipe components (backbones, preprocessing, embedding, fusion, head) with their phase eligibility and design preferences.",
-    "4. previousReflection — lessons and hypotheses from prior search windows (empty on first iteration).",
-    "5. abandonedHypotheses — statements of hypotheses that were dropped/abandoned in earlier rounds (empty on first iteration).",
-    "",
-    "## Output",
-    "Return exactly one JSON object: { \"hypotheses\": [...] }. No markdown fences. No prose outside JSON.",
-    "Each hypothesis object must have these fields:",
-    "  id: string (\"H1\", \"H2\", ...)",
-    "  statement: string (一句话说明该假设的核心思想)",
-    "  motivation: string[] (来自数据特征、历史结果或反思记忆的支持证据，至少引用一个具体数值或事实)",
-    "  expectedOutcome: string (预期结果：哪个指标会如何变化，量化或半定量描述)",
-    "  suggestedBackbones: string[] (subset of allowed backbones listed in methodLibrary)",
-    "  suggestedPreprocessing: string[] (subset of allowed preprocessing listed in methodLibrary)",
-    "  priority: \"high\" | \"medium\" | \"low\"",
-    "  risk: string (主要风险或局限)",
-    "  testable: true | false",
-    "",
-    "## Rules",
-    "- Produce 3–6 hypotheses ordered by priority (high first).",
-    "- Each hypothesis must be distinct, concrete, and directly testable within the current phase.",
-    "- Do not repeat backbone/preprocessing combinations already confirmed as failures in previousReflection.",
-    "- Do not regenerate any hypothesis whose statement restates or closely resembles an entry in abandonedHypotheses — those directions have already been ruled out.",
-    "- If you drop an existingHypothesis because previousReflection confirms it is exhausted or refuted, it has been abandoned: remove it from the output and add a new replacement hypothesis exploring a different idea/direction so the active hypothesis count does not shrink.",
-    "- Ground motivation in specific values from dataAnalysis or outcomes from previousReflection.",
-    "- expectedOutcome must reference val_avg_mse or a named metric and state the anticipated direction or magnitude of change.",
-    "- Generate hypotheses independently from the four input sections; do not rely on any external draft.",
-  ].join("\n")
+  return PROMPT_RESEARCH_HYPO_PLANNER
 }
 
 const MODEL_RECIPE_LIBRARY = {
@@ -2588,11 +2079,15 @@ function buildTaskDefinition(task: ResearchTask): Record<string, unknown> {
   return {
     id: task.id,
     title: task.title,
+    taskSpec: task.taskSpec,
     forecastObject: intentSlots.forecast_object ?? spec.forecastObject,
     dataset: {
       source: slotOr(dataset.path ?? dataset.loaderID, "data_source"),
       targetCols: slotOr(dataset.targetCols, "target_columns"),
       exogenousCols: intentSlots.exogenous_variables ?? dataset.exogenousCols,
+      observedPastCovariates: dataset.observedPastCovariates,
+      knownFutureCovariates: dataset.knownFutureCovariates,
+      staticCovariates: dataset.staticCovariates,
     },
     contextLength: slotOr(spec.contextLength, "lookback_window"),
     predictionLengths: slotOr(spec.predictionLengths, "prediction_horizon"),
@@ -2622,22 +2117,14 @@ function buildHypoPlannerUserPrompt(
   latestReflection: LatestReflectionSummary,
   llmSearchPreferences?: string[],
   abandonedHypotheses?: readonly { statement: string }[],
+  opts?: {
+    sessionMode?: boolean
+    baselineOptions?: readonly { recipeID: string; description: string }[]
+  },
 ): string {
   const primaryMetricName = typeof (task.objective as Record<string, unknown>)?.primaryMetric === "string"
     ? (task.objective as Record<string, unknown>).primaryMetric as string
     : "val_avg_mse"
-  const triedConfigurations = runs
-    .filter((r) => r.status === "succeeded" || r.status === "failed")
-    .map((r) => {
-      const metrics = r.metrics as Record<string, unknown> | null | undefined
-      const metricVal = metrics ? metrics[primaryMetricName] : undefined
-      return {
-        runID: r.id,
-        status: r.status,
-        ...(typeof metricVal === "number" ? { [primaryMetricName]: metricVal } : {}),
-        ...(r.error ? { error: r.error.slice(0, 120) } : {}),
-      }
-    })
   const recentMemoryLessons = memory.slice(-8).map((m) => {
     const cs = recordValue(m.candidateSummary)
     const actions = recordValue(cs.candidateActions)
@@ -2649,38 +2136,67 @@ function buildHypoPlannerUserPrompt(
       ...(typeof cs.recipeID === "string" ? { recipeID: cs.recipeID } : {}),
     }
   })
+  // In session mode the agent fetches reflection and run results via tools (read_reflection,
+  // experiment_results) — omit those fields from the prompt to avoid redundancy.
+  const includeInlineContext = !opts?.sessionMode
+  const triedConfigurations = includeInlineContext
+    ? runs
+        .filter((r) => r.status === "succeeded" || r.status === "failed")
+        .map((r) => {
+          const metrics = r.metrics as Record<string, unknown> | null | undefined
+          const metricVal = metrics ? metrics[primaryMetricName] : undefined
+          return {
+            runID: r.id,
+            status: r.status,
+            ...(typeof metricVal === "number" ? { [primaryMetricName]: metricVal } : {}),
+            ...(r.error ? { error: r.error.slice(0, 120) } : {}),
+          }
+        })
+    : undefined
   return JSON.stringify(
     {
+      taskSpec: task.taskSpec,
       taskDefinition: buildTaskDefinition(task),
       dataAnalysis: dataAnalysisSummary,
       methodLibrary: llmSearchPreferences && llmSearchPreferences.length > 0
         ? { ...MODEL_RECIPE_LIBRARY, preferences: llmSearchPreferences }
         : MODEL_RECIPE_LIBRARY,
-      previousReflection: latestReflection
+      ...(includeInlineContext
         ? {
-            decision: latestReflection.decision,
-            decisionReason: latestReflection.decisionReason,
-            suggestedNextHypotheses: latestReflection.nextHypotheses,
-            reflectionNotes: latestReflection.reflectionNotesMarkdown,
+            previousReflection: latestReflection
+              ? {
+                  decision: latestReflection.decision,
+                  decisionReason: latestReflection.decisionReason,
+                  reflectionNotes: latestReflection.reflectionNotesMarkdown,
+                }
+              : null,
           }
-        : null,
+        : {}),
       memoryLessons: recentMemoryLessons.length > 0 ? recentMemoryLessons : null,
-      triedConfigurations: triedConfigurations.length > 0 ? triedConfigurations : null,
+      ...(includeInlineContext && triedConfigurations && triedConfigurations.length > 0
+        ? { triedConfigurations }
+        : {}),
       existingHypotheses: existingHypotheses.length > 0
         ? existingHypotheses.map((h) => ({ statement: h.statement, status: h.status }))
         : null,
       abandonedHypotheses: abandonedHypotheses && abandonedHypotheses.length > 0
         ? abandonedHypotheses.map((h) => ({ statement: h.statement }))
         : null,
+      ...(opts?.baselineOptions && opts.baselineOptions.length > 0
+        ? { baselineOptions: opts.baselineOptions }
+        : {}),
       instruction:
-        "Review existingHypotheses in light of previousReflection and produce an updated hypothesis list. " +
-        "For each existing hypothesis: retain it if the reflection does not contradict it, refine its statement/expectedOutcome if reflection provides new evidence, or drop it if reflection confirms it is exhausted or refuted. " +
-        "If you drop an existingHypothesis (it is now abandoned), add a new replacement hypothesis exploring a different idea/direction so the active hypothesis count does not shrink. " +
+        "If previousReflection is null (first iteration), generate a fresh list of exactly 2-3 hypotheses grounded in dataAnalysis — do not add more. " +
+        "Otherwise, identify the single existingHypothesis most recently tested (the one triedConfigurations/previousReflection refers to) and act on that one only: " +
+        "refine its statement/expectedOutcome if reflection provides new evidence, or drop it if reflection confirms it is exhausted or refuted. " +
+        "If you drop it (it is now abandoned), add exactly one new replacement hypothesis exploring a different idea/direction so the active hypothesis count does not shrink. " +
+        "Leave every other existingHypothesis unchanged — they have not been tested yet and there is no new evidence about them. " +
         "abandonedHypotheses lists ideas already abandoned in earlier rounds — do not regenerate hypotheses that restate or closely resemble these. " +
-        "Then add new hypotheses for directions suggested in previousReflection.suggestedNextHypotheses that are not already covered. " +
-        "If previousReflection is null, generate a fresh list grounded in dataAnalysis. " +
         "Ground each hypothesis's motivation in specific values from dataAnalysis or outcomes from previousReflection. " +
-        "Set expectedOutcome to a concrete, metric-referenced prediction.",
+        "Set expectedOutcome to a concrete, metric-referenced prediction." +
+        (opts?.baselineOptions && opts.baselineOptions.length > 0
+          ? " After the hypothesis pool is updated, call pick_baseline exactly once to choose the single reference baseline from baselineOptions, citing specific dataAnalysis evidence."
+          : ""),
     },
     null,
     2,
@@ -2708,7 +2224,6 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
 }
 
 type LatestReflectionSummary = {
-  nextHypotheses: Array<{ title: string; rationale: string; expectedSignal: string }>
   reflectionNotesMarkdown: string
   decision: string
   decisionReason: string
@@ -2721,6 +2236,28 @@ async function loadLLMSearchPreferences(workspaceRoot: string, taskID: string): 
     const parsed = JSON.parse(raw)
     return Array.isArray(parsed) ? (parsed as unknown[]).filter((s): s is string => typeof s === "string") : undefined
   } catch { return undefined }
+}
+
+/**
+ * Parses an LLM-generated hypothesis list from raw response text. Returns undefined when the
+ * text doesn't contain a valid hypotheses array — callers should treat this as a failed attempt.
+ */
+function parseLLMHypothesesResult(
+  text: string,
+  usage: import("./llm-proposal").LLMTokenUsage,
+): { hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined {
+  try {
+    const parsed = extractJsonObject(text)
+    const parsedRec = recordValue(parsed)
+    if (!Array.isArray(parsedRec.hypotheses)) return undefined
+    const validated = (parsedRec.hypotheses as unknown[])
+      .map(validateLLMHypothesisItem)
+      .filter((h): h is HypothesisObject => h !== undefined)
+      .slice(0, 8)
+    return validated.length > 0 ? { hypotheses: validated, usage } : undefined
+  } catch {
+    return undefined
+  }
 }
 
 async function generateLLMHypotheses(
@@ -2762,79 +2299,15 @@ async function generateLLMHypotheses(
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
     const result = await Promise.race([llmPromise, timeoutPromise])
     if (!result) return undefined
-    const parsed = extractJsonObject(result.text)
-    const parsedRec = recordValue(parsed)
-    if (!Array.isArray(parsedRec.hypotheses)) return undefined
-    const validated = (parsedRec.hypotheses as unknown[])
-      .map(validateLLMHypothesisItem)
-      .filter((h): h is HypothesisObject => h !== undefined)
-      .slice(0, 8)
-    return validated.length > 0 ? { hypotheses: validated, usage: result.usage } : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function buildBaselineSelectionSystemPrompt(): string {
-  return [
-    "You are the NeoResearch HypoPlanner agent choosing the first baseline candidate to run for a TSF model search.",
-    "Given the task definition, dataset analysis, and a list of baseline options, pick exactly one baseline to run first — it will also serve as the reference/benchmark for later comparisons.",
-    "Language policy: rationale 用中文表达；保留 recipeID 等技术术语英文原文。",
-    "",
-    "## Output",
-    "Return exactly one JSON object: { \"referenceBaseline\": \"<recipeID>\", \"rationale\": \"<string>\" }. No markdown fences. No prose outside JSON.",
-    "referenceBaseline must be exactly one of the recipeID values listed in baselineOptions.",
-  ].join("\n")
-}
-
-function buildBaselineSelectionUserPrompt(
-  task: ResearchTask,
-  dataAnalysisSummary: string,
-  baselineOptions: readonly { recipeID: string; description: string }[],
-): string {
-  return JSON.stringify(
-    {
-      taskDefinition: buildTaskDefinition(task),
-      dataAnalysis: dataAnalysisSummary,
-      baselineOptions,
-      instruction:
-        "Choose the baseline most likely to perform best as the first experiment given the dataset characteristics described in dataAnalysis. " +
-        "Briefly justify the choice referencing specific dataset features.",
-    },
-    null,
-    2,
-  )
-}
-
-async function selectLLMReferenceBaseline(
-  task: ResearchTask,
-  dataAnalysisSummary: string,
-  baselineOptions: readonly { recipeID: string; description: string }[],
-  workspaceRoot: string,
-): Promise<{ referenceBaseline: string; rationale?: string; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
-  if (baselineOptions.length <= 1) return undefined
-  try {
-    const runtime = recordValue(recordValue(task.taskSpec).runtime)
-    const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
-    const llmContext = await resolveEffectiveLLMConfig({ workspaceRoot, neoCastProjectRoot })
-    if (!llmContext) return undefined
-    const system = buildBaselineSelectionSystemPrompt()
-    const user = buildBaselineSelectionUserPrompt(task, dataAnalysisSummary, baselineOptions)
-    const llmPromise = requestNeoCastLLM({ ...llmContext.config, maxTokens: 1024 }, llmContext.apiKey, system, user)
-    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 60_000))
-    const result = await Promise.race([llmPromise, timeoutPromise])
-    if (!result) return undefined
-    const parsed = recordValue(extractJsonObject(result.text))
-    const referenceBaseline = typeof parsed.referenceBaseline === "string" ? parsed.referenceBaseline.trim() : undefined
-    if (!referenceBaseline || !baselineOptions.some((option) => option.recipeID === referenceBaseline)) return undefined
-    const rationale = typeof parsed.rationale === "string" ? parsed.rationale : undefined
-    return { referenceBaseline, rationale, usage: result.usage }
+    return parseLLMHypothesesResult(result.text, result.usage)
   } catch {
     return undefined
   }
 }
 
 interface ReflectionLLMContext {
+  /** Full canonical task contract, including dataset role columns and metadata. */
+  readonly taskSpec: JsonRecord
   /** Objective statement derived from the task (metric name + direction + target). */
   readonly taskObjective: string
   /** Rationale of the most recent candidate — encodes the hypothesis being tested. */
@@ -2850,51 +2323,54 @@ interface ReflectionLLMContext {
 }
 
 function buildReflectionLLMSystemPrompt(): string {
-  return [
-    "You are the NeoResearch ReflectionAgent for time series forecasting (TSF) research.",
-    "Language policy: write in English; keep all technical terms, metric names, and module names in English.",
-    "",
-    "Your role: conduct a rigorous, structured post-experiment reflection for a single TSF NAS iteration.",
-    "You receive: the research objective, the original hypothesis this experiment was designed to test,",
-    "the model architecture and training configuration (experiment design), quantitative results,",
-    "a training curve (ordered array of { epoch, valLoss } data points), and a summary of relevant historical experiments.",
-    "",
-    "Output format: Return a single JSON object with EXACTLY these 7 keys. Each value is a concise",
-    "string (1-4 sentences). Do not add any text outside the JSON object.",
-    "",
-    "  trainingHealthAssessment  — Did training proceed normally? Use the trainingCurve array to assess:",
-    "    did valLoss converge (monotonically decreasing or stabilized); was there oscillation or divergence;",
-    "    was the best val point consistent with final performance; were there NaN or crash signals.",
-    "    Conclude whether the experiment provides credible evidence for or against the hypothesis.",
-    "",
-    "  hypothesisValidation  — Was the original hypothesis supported by the results? State yes/no/partial",
-    "    and explain what the evidence shows.",
-    "",
-    "  attributionAnalysis  — What caused the performance to improve or degrade? Identify the specific",
-    "    architectural or training factors responsible.",
-    "",
-    "  historicalComparison  — How does this iteration fit into the overall research trajectory?",
-    "    Compare with the best known result and recent experiments.",
-    "",
-    "  modelDesignReflection  — Which aspects of the architecture, training scheme, or data processing",
-    "    should be revisited, and why?",
-    "",
-    "  nextStepRecommendation  — Recommend: continue with the current direction, modify the approach,",
-    "    abandon this hypothesis, or pivot to a new direction. State which and explain why.",
-    "    IMPORTANT: if trainingHealthAssessment indicates the training process was unstable (loss spikes,",
-    "    oscillation, divergence, or NaNs) such that the result does not credibly reflect the model's true",
-    "    performance, do NOT recommend abandoning the hypothesis based on this run. Instead recommend first",
-    "    stabilizing training (e.g. lower training.learning_rate, add/increase training.warmup_ratio, enable",
-    "    gradient clipping) and re-running, then judge the hypothesis from the stabilized result.",
-    "",
-    "  distillableMemory  — A self-contained summary for future agents: what was tried, what the outcome",
-    "    was, what modification is proposed, and what risks or failure modes to watch for.",
-  ].join("\n")
+  return PROMPT_RESEARCH_REFLECTION
+}
+
+function buildReflectionSessionUserPrompt(
+  task: ResearchTask,
+  analysis: ReflectionAnalysis,
+  currentHypothesis?: string,
+): string {
+  const objectiveRecord = recordValue(task.objective)
+  const direction = analysis.direction
+  const taskObjective = [
+    `${direction === "minimize" ? "Minimize" : "Maximize"} ${analysis.primaryMetricName}`,
+    typeof objectiveRecord.targetMetricValue === "number"
+      ? `target ≤ ${objectiveRecord.targetMetricValue}`
+      : null,
+    typeof objectiveRecord.description === "string" ? objectiveRecord.description : null,
+  ].filter(Boolean).join(". ")
+  return JSON.stringify(
+    {
+      taskSpec: task.taskSpec,
+      taskObjective,
+      currentHypothesis: currentHypothesis ?? null,
+      structuralAnalysis: {
+        decision: analysis.decision,
+        decisionReason: analysis.decisionReason,
+        primaryMetricName: analysis.primaryMetricName,
+        direction: analysis.direction,
+        bestMetric: analysis.bestMetric ?? null,
+        latestMetric: analysis.latestMetric ?? null,
+        latestDelta: analysis.latestDelta ?? null,
+        succeededRuns: analysis.succeededRuns,
+        failedRuns: analysis.failedRuns,
+        rejectedRuns: analysis.rejectedRuns,
+        plateauStreak: analysis.plateauStreak,
+      },
+      instruction:
+        "Follow the 4-step tool workflow in the system prompt (experiment_results → read_reflection → " +
+        "read_training_curve → read_memory_lessons), then output the 7-key JSON analysis object.",
+    },
+    null,
+    2,
+  )
 }
 
 function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: ReflectionLLMContext): string {
   return JSON.stringify(
     {
+      taskSpec: context.taskSpec,
       taskObjective: context.taskObjective,
       originalHypothesis: context.currentHypothesis ?? null,
       experimentDesign: context.experimentDesign ?? null,
@@ -2974,6 +2450,24 @@ function parseReflectionLLMStructured(text: string): ReflectionLLMAnalysis | und
   }
 }
 
+function buildReflectionResultFromText(
+  baseResult: ReflectionAgentResult,
+  model: string,
+  text: string,
+  usage: import("./llm-proposal").LLMTokenUsage,
+): ReflectionAgentResult {
+  return {
+    ...baseResult,
+    llm: {
+      status: "used",
+      model,
+      text,
+      structured: parseReflectionLLMStructured(text),
+      usage,
+    },
+  }
+}
+
 async function generateLLMReflectionSynthesis(
   task: ResearchTask,
   result: ReflectionAgentResult,
@@ -3030,7 +2524,6 @@ function buildReflectionMemoryLesson(result: ReflectionAgentResult): string {
   const a = result.analysis
   const parts: string[] = [`[reflection] ${a.decision}: ${a.decisionReason}`]
   if (a.bestMetric !== undefined) parts.push(`best ${a.primaryMetricName}=${a.bestMetric}`)
-  if (a.nextHypotheses.length > 0) parts.push(`next: ${a.nextHypotheses.map((h) => h.title).join("; ")}`)
   if (result.llm.status === "used" && result.llm.structured) {
     parts.push(`memory: ${result.llm.structured.distillableMemory.slice(0, 400)}`)
   } else if (result.llm.status === "used" && result.llm.text) {
@@ -3050,7 +2543,7 @@ function buildDatasetAnalysisReports(
       kind: "dataset_quantitative_analysis_markdown",
       filename: "quantitative_analysis.md",
       role: "quantitative-data-analyst",
-      content: renderDatasetQuantitativeAnalysis(task, fingerprint, context),
+      content: analyzeDataset({ task, fingerprint, context }).reportMarkdown,
       metadata: {
         format: "markdown",
         role: "quantitative-data-analyst",
@@ -3333,6 +2826,8 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
   const taskSpec = recordValue(task.taskSpec)
   const dataset = recordValue(taskSpec.dataset)
   const runtime = recordValue(taskSpec.runtime)
+  const metadata = recordValue(taskSpec.metadata)
+  const availability = recordValue(metadata.knownFutureAvailability)
   const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
   const source = typeof dataset.path === "string" ? dataset.path.trim() : ""
   if (!root || !source) return undefined
@@ -3343,6 +2838,15 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
   const targetCols = Array.isArray(dataset.targetCols)
     ? dataset.targetCols.filter((item): item is string => typeof item === "string" && item.length > 0)
     : []
+  const observedPastCovariates = Array.isArray(dataset.observedPastCovariates)
+    ? dataset.observedPastCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
+  const knownFutureCovariates = Array.isArray(dataset.knownFutureCovariates)
+    ? dataset.knownFutureCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
+  const staticCovariates = Array.isArray(dataset.staticCovariates)
+    ? dataset.staticCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : []
   const loaderID = typeof dataset.loaderID === "string" && dataset.loaderID.length > 0 ? dataset.loaderID : "local_csv"
   return {
     root: path.resolve(root),
@@ -3351,6 +2855,14 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
     contextLength: contextLength === undefined ? undefined : Math.floor(contextLength),
     predictionLengths: predictionLengths.map((item) => Math.floor(item)),
     targetCols,
+    observedPastCovariates,
+    knownFutureCovariates,
+    staticCovariates,
+    knownFutureSource: typeof availability.source === "string" ? availability.source : undefined,
+    knownFutureAvailable: typeof availability.availableAtPredictionTime === "boolean"
+      ? availability.availableAtPredictionTime
+      : undefined,
+    experimentScope: typeof metadata.experimentScope === "string" ? metadata.experimentScope : undefined,
   }
 }
 
@@ -3506,22 +3018,29 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
   const warnings: string[] = []
   if (config.targetCols.length > 0) {
     const csvHeaders = csvHeaderColumns(config.source)
-    const validCols = csvHeaders.length > 0
-      ? config.targetCols.filter((col) => csvHeaders.includes(col))
-      : config.targetCols
-    if (csvHeaders.length > 0 && validCols.length === 0) {
+    const roleColumns = [...new Set([
+      ...config.targetCols,
+      ...config.observedPastCovariates,
+      ...config.knownFutureCovariates,
+      ...config.staticCovariates,
+    ])]
+    const missing = csvHeaders.length > 0 ? roleColumns.filter((col) => !csvHeaders.includes(col)) : []
+    if (missing.length > 0) {
       throw new Error(
-        `None of the requested target columns were found in ${config.source}. ` +
-          `Requested: ${config.targetCols.join(", ")}. CSV header: ${csvHeaders.join(", ")}.`,
+        `Dataset role columns were not found in ${config.source}: ${missing.join(", ")}. ` +
+          `CSV header: ${csvHeaders.join(", ")}.`,
       )
     }
-    if (csvHeaders.length > 0 && validCols.length < config.targetCols.length) {
-      const missing = config.targetCols.filter((col) => !csvHeaders.includes(col))
-      warnings.push(
-        `Only matched ${validCols.length}/${config.targetCols.length} requested target columns from CSV header; missing: ${missing.join(", ")}.`,
-      )
-    }
-    if (validCols.length > 0) args.push("--feature-cols", validCols.join(","))
+    args.push("--target-cols", config.targetCols.join(","))
+    if (config.observedPastCovariates.length > 0)
+      args.push("--observed-past-covariates", config.observedPastCovariates.join(","))
+    if (config.knownFutureCovariates.length > 0)
+      args.push("--known-future-covariates", config.knownFutureCovariates.join(","))
+    if (config.staticCovariates.length > 0) args.push("--static-covariates", config.staticCovariates.join(","))
+    if (config.knownFutureSource) args.push("--known-future-source", config.knownFutureSource)
+    if (config.knownFutureAvailable !== undefined)
+      args.push("--known-future-available", String(config.knownFutureAvailable))
+    if (config.experimentScope) args.push("--experiment-scope", config.experimentScope)
   }
   if (config.contextLength !== undefined) args.push("--input-len", String(config.contextLength))
   if (config.predictionLengths.length > 0) args.push("--horizons", config.predictionLengths.join(","))
@@ -3548,33 +3067,12 @@ async function readPreparedDatasetSpec(root: string) {
   throw new Error(`Neo-Cast dataset spec was not created under ${root}`)
 }
 
-const decodeTask = Schema.decodeUnknownSync(ResearchTask)
 const decodeApproval = Schema.decodeUnknownSync(ResearchApproval)
 const decodeCandidate = Schema.decodeUnknownSync(ResearchCandidate)
 const decodeRun = Schema.decodeUnknownSync(ResearchRun)
 const decodeArtifact = Schema.decodeUnknownSync(ResearchArtifact)
 const decodeMemory = Schema.decodeUnknownSync(ResearchMemory)
 const decodeChampion = Schema.decodeUnknownSync(ResearchChampion)
-
-function mapTask(row: ResearchTaskRow) {
-  return decodeTask({
-    id: row.id,
-    projectID: row.project_id,
-    sessionID: row.session_id ?? undefined,
-    title: row.title,
-    domainID: row.domain_id,
-    mode: row.mode,
-    interactionMode: taskInteractionModeFromFields(row.mode, row.task_spec),
-    status: row.status,
-    taskSpec: row.task_spec,
-    objective: row.objective,
-    budget: row.budget,
-    time: {
-      created: row.time_created,
-      updated: row.time_updated,
-    },
-  })
-}
 
 function mapApproval(row: ResearchApprovalRow) {
   return decodeApproval({
@@ -3723,13 +3221,91 @@ export interface Interface {
   readonly getResearchLLMStatus: () => Effect.Effect<ResearchLLMStatus>
 }
 
+const llmCallLog = Log.create({ service: "research.llm" })
+
+/** Logs which transport an agent-stage LLM call used — opencode session vs. direct API. */
+function logLLMCallPath(stage: string, taskID: string, path: "session" | "direct"): void {
+  llmCallLog.info(`${stage} LLM call via ${path}`, { stage, taskID, path })
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/Research") {}
 
-export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> = Layer.effect(
+export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | SessionPrompt.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const session = yield* Session.Service
+    const sessionPrompt = yield* SessionPrompt.Service
+
+    /**
+     * Routes a research-loop stage's user prompt through opencode's SessionPrompt machinery,
+     * in a fresh child session scoped to the task's root session. Returns undefined when the
+     * task has no root session, the LLM config doesn't map to an opencode provider, or the
+     * session-based call throws — callers should fall back to the direct LLM transport.
+     */
+    const requestViaSession = (input: {
+      readonly rootSessionID: string | undefined
+      readonly agent: string
+      readonly stageLabel: string
+      readonly taskID: string
+      readonly user: string
+      readonly modelRef: OpencodeModelRef | undefined
+      readonly onDelta?: (delta: string) => Effect.Effect<void>
+      readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>
+    }) =>
+      Effect.gen(function* () {
+        if (!input.rootSessionID || !input.modelRef) return undefined
+        const child = yield* session.create({
+          parentID: input.rootSessionID as Session.Info["id"],
+          title: `${input.stageLabel} · ${input.taskID}`,
+        })
+        const onDelta = input.onDelta
+        const onPartUpdated = input.onPartUpdated
+        const promptEffect = sessionPrompt.prompt({
+          sessionID: child.id,
+          agent: input.agent,
+          model: { providerID: ProviderID.make(input.modelRef.providerID), modelID: ModelID.make(input.modelRef.modelID) },
+          parts: [{ type: "text", text: input.user }],
+        })
+        const result = (onDelta || onPartUpdated)
+          ? yield* Effect.scoped(
+              Effect.gen(function* () {
+                if (onDelta) {
+                  yield* Effect.forkScoped(
+                    bus.subscribe(MessageV2.Event.PartDelta).pipe(
+                      Stream.filter((event) => event.properties.sessionID === child.id && event.properties.field === "text"),
+                      Stream.runForEach((event) => onDelta(event.properties.delta)),
+                    ),
+                  )
+                }
+                if (onPartUpdated) {
+                  yield* Effect.forkScoped(
+                    bus.subscribe(MessageV2.Event.PartUpdated).pipe(
+                      Stream.filter((event) => event.properties.sessionID === child.id),
+                      Stream.runForEach((event) => onPartUpdated(event.properties.part as MessageV2.Part)),
+                    ),
+                  )
+                }
+                return yield* promptEffect
+              }),
+            )
+          : yield* promptEffect
+        const text = result.parts
+          .filter((part) => part.type === "text")
+          .map((part) => (part as { text: string }).text)
+          .join("\n")
+        const tokens = result.info.role === "assistant" ? result.info.tokens : undefined
+        const usage: LLMTokenUsage = tokens
+          ? {
+              inputTokens: tokens.input,
+              outputTokens: tokens.output,
+              cacheReadTokens: tokens.cache.read,
+              cacheWriteTokens: tokens.cache.write,
+            }
+          : ZERO_USAGE
+        if (!text.trim()) return undefined
+        return { text, usage }
+      }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
 
     const reconcileStaleRuns = Effect.fn("Research.reconcileStaleRuns")(function* () {
       const cutoff = Date.now() - STALE_RUN_RECONCILE_MS
@@ -4003,7 +3579,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
                 priority: h.priority,
                 risk: h.risk,
                 testable: h.testable,
-                status: "pending" as const,
+                status: h.status ?? "pending",
                 time_created: time.created,
                 time_updated: time.updated,
               })),
@@ -4702,11 +4278,54 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 
       const stage = input.stage ?? "smoke"
       const candidateSpec = input.seed === undefined ? candidate.candidateSpec : candidateSpecWithSeed(candidate.candidateSpec, input.seed)
+      let runnerRunID = input.runnerRunID
+      if ((stage === "ref_test" || stage === "blind_test") && runnerRunID === undefined) {
+        const prerequisiteStage = stage === "ref_test" ? "full" : "ref_test"
+        const prerequisiteRuns = yield* db((d) =>
+          d
+            .select()
+            .from(ResearchRunTable)
+            .where(
+              and(
+                eq(ResearchRunTable.task_id, task.id),
+                eq(ResearchRunTable.candidate_id, candidate.id),
+                eq(ResearchRunTable.stage, prerequisiteStage),
+                eq(ResearchRunTable.status, "succeeded"),
+              ),
+            )
+            .orderBy(desc(ResearchRunTable.time_created))
+            .limit(1)
+            .all(),
+        )
+        const prerequisiteRun = prerequisiteRuns[0]
+        if (prerequisiteRun !== undefined) {
+          const artifacts = yield* db((d) =>
+            d
+              .select()
+              .from(ResearchArtifactTable)
+              .where(
+                and(
+                  eq(ResearchArtifactTable.task_id, task.id),
+                  eq(ResearchArtifactTable.run_id, prerequisiteRun.id),
+                  eq(ResearchArtifactTable.kind, "runner_artifact"),
+                ),
+              )
+              .all(),
+          )
+          runnerRunID = artifacts.map((artifact) => neoCastRunIDFromArtifactURI(artifact.uri)).find(Boolean)
+        }
+        if (runnerRunID === undefined) {
+          throw new Error(
+            `Cannot prepare ${stage}: no Neo-Cast runner artifact was found for candidate ${candidate.id} ${prerequisiteStage} run.`,
+          )
+        }
+      }
       const runPlan = DomainRegistry.createRunPlan(task.domainID, {
         taskSpec: task.taskSpec,
         candidateSpec,
         stage: stage as DomainRunStage,
         description: input.description,
+        runnerRunID,
       })
       if (!runPlan.validation.ok) {
         throw new Error(`Research candidate failed domain validation: ${runPlan.validation.issues[0]?.message}`)
@@ -5168,6 +4787,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
       readonly readyCandidateIDs: ResearchCandidateID[]
       readonly attemptedCandidateIDs: ResearchCandidateID[]
       readonly inconclusiveCandidateIDs: ResearchCandidateID[]
+      /** Set only when this iteration actually invoked ModelDesignerAgent (vs. reusing an existing candidate). */
+      readonly designerLLM?: {
+        readonly callPath?: "session" | "direct"
+        readonly text?: string
+        readonly metadata: JsonRecord
+      }
     }) {
       const dir = path.join(Instance.directory, ".neo-research", "candidate-selection", input.task.id)
       const file = path.join(dir, `${input.run.id}.json`)
@@ -5190,6 +4815,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         inconclusiveCandidateIDs: input.inconclusiveCandidateIDs,
         rankPredictor,
         rankings,
+        // Full design structure (architecture/recipe + training config) and rationale for the
+        // candidate this run actually executed.
+        candidateSpec: input.candidate.candidateSpec,
+        rationale: input.candidate.rationale,
+        riskLevel: input.candidate.riskLevel,
+        approvalStatus: input.candidate.approvalStatus,
+        generatedBy: input.candidate.generatedBy,
+        ...(input.designerLLM
+          ? {
+              designerLLM: {
+                callPath: input.designerLLM.callPath ?? null,
+                text: input.designerLLM.text ?? null,
+                ...input.designerLLM.metadata,
+              },
+            }
+          : {}),
       }
       yield* Effect.promise(async () => {
         await mkdir(dir, { recursive: true })
@@ -5409,37 +5050,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
     }) {
       const artifact = yield* writeAutonomousLoopArtifact(input)
 
+      // Run ReflectionAgent exactly once per loop completion — it persists its result (artifacts +
+      // reflection_result.json, including the LLM output) to disk. The outer pipeline re-reads that
+      // persisted result instead of calling ReflectionAgent again or threading it through memory.
       if (input.iterations.length > 0) {
-        const reflection = yield* runReflectionAgent({
+        yield* runReflectionAgent({
           taskID: input.task.id,
           stoppedReason: input.stoppedReason,
-        }).pipe(
-          Effect.catchCause(() =>
-            Effect.succeed({
-              agent: "ReflectionAgent" as const,
-              taskID: input.task.id,
-              reflectionNotesMarkdown: "",
-              nextExperimentPlanMarkdown: "",
-              failureLogMarkdown: "",
-              analysis: {
-                primaryMetricName: "val_avg_mse",
-                direction: "minimize" as const,
-                succeededRuns: 0,
-                failedRuns: 0,
-                rejectedRuns: 0,
-                plateauStreak: 0,
-                effectiveChanges: [],
-                ineffectiveChanges: [],
-                failures: [],
-                nextHypotheses: [],
-                decision: "continue" as const,
-                decisionReason: "Reflection failed",
-              },
-              llm: { status: "failed" as const },
-            }),
-          ),
-        )
-
+        }).pipe(Effect.catchCause(() => Effect.void))
       }
 
       return {
@@ -5472,8 +5090,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
             try {
               const raw = await readFile(jsonPath, "utf8")
               return JSON.parse(raw) as {
-                nextHypotheses: Array<{ title: string; rationale: string; expectedSignal: string }>
-                reflectionNotesMarkdown: string
+                  reflectionNotesMarkdown: string
               }
             } catch {
               continue
@@ -5484,7 +5101,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         }
         return null
       })
-      const reflectionHypotheses = latestReflection?.nextHypotheses.map((h) => h.title) ?? []
       const previousReflectionNotesMarkdown = latestReflection?.reflectionNotesMarkdown
       const hypotheses = yield* listHypotheses(input.taskID)
       const hypothesisPlan = experimentPlanFromDB(task, hypotheses)
@@ -5494,7 +5110,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         baseFingerprint,
         hypothesisPlan,
         selectedHypothesis,
-        reflectionHypotheses,
       })
       const taskFingerprintWithExploration = forceExplore
         ? ({
@@ -5520,7 +5135,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
           bridgeOnly: (taskFingerprintWithExploration as Record<string, unknown>).bridgeOnly,
           searchBiases: mergedSearchBiases,
           explorationMode: forceExplore ? "forced" : "balanced",
-          reflectionHypothesesCount: reflectionHypotheses.length,
         }),
       ]
 
@@ -5562,6 +5176,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
       let selectionSource: "existing_frontier" | "domain_proposal" = "existing_frontier"
       let rankings: DomainCandidateRanking[] = [...designerSelection.rankings]
       let llmMetadata: JsonRecord = {}
+      let modelDesignerRawText: string | undefined
+      let modelDesignerCallPath: "session" | "direct" | undefined
       if (!candidate) {
         const memory = yield* listRelatedMemory(task)
         const champion = yield* getChampion(task.id)
@@ -5611,17 +5227,51 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
             ? previousReflectionNotesMarkdown
             : undefined
         const authJsonKey = yield* Effect.promise(() => resolveApiKeyFromAuthJson())
-        const llmResult = yield* Effect.promise(() =>
-          proposeLLMCandidate({
+        const modelDesignerRuntime = recordValue(recordValue(task.taskSpec).runtime)
+        const modelDesignerNeoCastRoot =
+          typeof modelDesignerRuntime.neoCastProjectRoot === "string" ? modelDesignerRuntime.neoCastProjectRoot : undefined
+        const modelDesignerLLMContext = yield* Effect.promise(() =>
+          resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: modelDesignerNeoCastRoot }),
+        )
+        const modelDesignerConfig = modelDesignerLLMContext?.config ?? (yield* Effect.promise(() =>
+          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: modelDesignerNeoCastRoot }),
+        ))
+        const modelDesignerSessionAttempt = yield* requestViaSession({
+          rootSessionID: task.sessionID,
+          agent: "research-model-designer",
+          stageLabel: "ModelDesigner",
+          taskID: task.id,
+          user: buildUserPrompt({
             task,
             proposalContext,
-            workspaceRoot: Instance.directory,
             dataAnalysisMarkdown,
             ...(hypoPlanMarkdown ? { hypoPlanMarkdown } : {}),
             ...(previousReflectionMarkdown ? { previousReflectionMarkdown } : {}),
-            ...(authJsonKey ? { authJsonKey } : {}),
           }),
-        )
+          modelRef: mapToModelRef(modelDesignerConfig),
+        })
+        modelDesignerCallPath = modelDesignerSessionAttempt ? "session" : "direct"
+        logLLMCallPath("ModelDesigner", task.id, modelDesignerCallPath)
+        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "ModelDesigner", path: modelDesignerCallPath })
+        // Raw LLM text is only available via the session path — proposeLLMCandidate's direct-API
+        // fallback parses straight to a candidateSpec and never returns the underlying text.
+        modelDesignerRawText = modelDesignerSessionAttempt?.text
+        const modelDesignerSessionResult = modelDesignerSessionAttempt
+          ? buildLLMProposalFromText(modelDesignerSessionAttempt.text, modelDesignerSessionAttempt.usage, modelDesignerConfig)
+          : undefined
+        const llmResult = modelDesignerSessionResult
+          ? modelDesignerSessionResult
+          : yield* Effect.promise(() =>
+              proposeLLMCandidate({
+                task,
+                proposalContext,
+                workspaceRoot: Instance.directory,
+                dataAnalysisMarkdown,
+                ...(hypoPlanMarkdown ? { hypoPlanMarkdown } : {}),
+                ...(previousReflectionMarkdown ? { previousReflectionMarkdown } : {}),
+                ...(authJsonKey ? { authJsonKey } : {}),
+              }),
+            )
         llmMetadata = llmResult.metadata
         let proposal: DomainCandidateProposal | undefined
         if (llmResult.proposal) {
@@ -6015,6 +5665,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         readyCandidateIDs,
         attemptedCandidateIDs: [...attemptState.attemptedCandidateIDs],
         inconclusiveCandidateIDs: [...attemptState.inconclusiveCandidateIDs],
+        ...(proposalCreated
+          ? { designerLLM: { callPath: modelDesignerCallPath, text: modelDesignerRawText, metadata: llmMetadata } }
+          : {}),
       })
       const selectedRun = yield* attachArtifactRefToRun(finalRun, selectionArtifact.id)
 
@@ -6074,13 +5727,25 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
       const targetMetricValue = loopPolicyValue(input.targetMetricValue, task, "targetMetricValue", "target")
       const minRelativeImprovement =
         loopPolicyValue(input.minRelativeImprovement, task, "minRelativeImprovement", "minImprovement") ?? 0
-      const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds")
+      const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds") ?? 5
       const timeBudgetSeconds = loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS")
       const maxCrashStreak = loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak")
       const explorationRate = loopPolicyRate(input.explorationRate, task, "explorationRate", "exploration")
       const startedAt = Date.now()
-      let bestMetric: number | undefined
-      let noImproveStreak = 0
+      const stage = input.stage ?? "full"
+      const existingRuns = yield* listRuns(task.id)
+      const initialMetricState =
+        stage === "smoke"
+          ? { bestMetric: undefined, noImproveStreak: 0 }
+          : sessionLocalMetricState({
+              runs: existingRuns,
+              stage,
+              primaryMetricName,
+              direction,
+              minRelativeImprovement,
+            })
+      let bestMetric = initialMetricState.bestMetric
+      let noImproveStreak = initialMetricState.noImproveStreak
       let crashStreak = 0
       for (let index = 0; index < maxIterations; index++) {
         if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
@@ -6098,7 +5763,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
           input.description === undefined ? undefined : `${input.description} (iteration ${index + 1})`
         const iterationResult = yield* runAutonomousIteration({
           taskID: input.taskID,
-          stage: input.stage,
+          stage,
           description,
           forceExplore: shouldForceExplorationIteration(index, explorationRate),
         }).pipe(
@@ -6128,7 +5793,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         } else {
           crashStreak = 0
         }
-        const metric = metricValue(iterationResult.iteration.run.metrics, primaryMetricName)
+        const metric =
+          stage === "smoke" ? undefined : metricValue(iterationResult.iteration.run.metrics, primaryMetricName)
         if (metric !== undefined) {
           const improved =
             bestMetric === undefined ||
@@ -6291,6 +5957,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         stdout: execution.stdout.toString(),
         stderr: execution.stderr.toString(),
         datasetSpec,
+        requestedRoleConfig: tsfDatasetPreparationConfig(task),
+        effectiveRoleConfig: {
+          targetCols: datasetSpec.target_columns ?? datasetSpec.feature_columns ?? [],
+          observedPastCovariates: datasetSpec.observed_past_covariates ?? [],
+          knownFutureCovariates: datasetSpec.known_future_covariates ?? [],
+          staticCovariates: datasetSpec.static_covariates ?? [],
+        },
       }
       yield* Effect.promise(async () => {
         await mkdir(directory, { recursive: true })
@@ -6308,6 +5981,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
           inputLen: typeof datasetSpec.input_len === "number" ? datasetSpec.input_len : 0,
           horizons: Array.isArray(datasetSpec.horizons) ? datasetSpec.horizons.join(",") : "",
           featureColumns: Array.isArray(datasetSpec.feature_columns) ? datasetSpec.feature_columns.join(",") : "",
+          targetColumns: Array.isArray(datasetSpec.target_columns) ? datasetSpec.target_columns.join(",") : "",
+          observedPastCovariates: Array.isArray(datasetSpec.observed_past_covariates) ? datasetSpec.observed_past_covariates.join(",") : "",
+          knownFutureCovariates: Array.isArray(datasetSpec.known_future_covariates) ? datasetSpec.known_future_covariates.join(",") : "",
           warnings: command.warnings.join("\n"),
         },
       })
@@ -6766,9 +6442,63 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
       })
       const analysisDirectory = path.join(Instance.directory, ".neo-research", "sessions", task.id, "analysis")
       const analysisContext = yield* Effect.promise(() => buildDatasetAnalysisContext(task, fingerprint as JsonRecord))
-      const llmQualitative = yield* Effect.promise(() =>
-        generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory, input._onDeltaQualitative),
+      const dataAnalysisRuntime = recordValue(recordValue(task.taskSpec).runtime)
+      const dataAnalysisNeoCastRoot =
+        typeof dataAnalysisRuntime.neoCastProjectRoot === "string" ? dataAnalysisRuntime.neoCastProjectRoot : undefined
+      const dataAnalysisLLMContext = yield* Effect.promise(() =>
+        resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: dataAnalysisNeoCastRoot }),
       )
+      const dataAnalysisConfig = dataAnalysisLLMContext?.config ?? (yield* Effect.promise(() =>
+        resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: dataAnalysisNeoCastRoot }),
+      ))
+      const dataAnalysisSessionAttempt = yield* requestViaSession({
+        rootSessionID: task.sessionID,
+        agent: "research-data-analysis",
+        stageLabel: "DataAnalysis",
+        taskID: task.id,
+        user: buildQualitativeUserPrompt(task, fingerprint as JsonRecord, analysisContext),
+        modelRef: mapToModelRef(dataAnalysisConfig),
+        onDelta: (delta) => bus.publish(Event.DataAnalysisAgentStreamDelta, { taskID: task.id, agent: "DataAnalysisAgent", delta }),
+        onPartUpdated: (part) => {
+          if (part.type === "text") {
+            return bus.publish(Event.DataAnalysisAgentPartUpdated, {
+              taskID: task.id,
+              agent: "DataAnalysisAgent",
+              partID: part.id,
+              kind: "text",
+              text: part.text,
+            })
+          }
+          if (part.type === "tool") {
+            const s = part.state
+            return bus.publish(Event.DataAnalysisAgentPartUpdated, {
+              taskID: task.id,
+              agent: "DataAnalysisAgent",
+              partID: part.id,
+              kind: "tool",
+              toolName: part.tool,
+              toolInput: s.status !== "pending" ? s.input : undefined,
+              toolOutput: s.status === "completed" ? s.output : undefined,
+              toolState: s.status === "error" ? "error" : s.status === "completed" ? "completed" : s.status === "running" ? "running" : "pending",
+              toolDurationMs: s.status === "completed" ? s.time.end - s.time.start : undefined,
+              toolError: s.status === "error" ? s.error : undefined,
+            })
+          }
+          return Effect.void
+        },
+      })
+      const dataAnalysisCallPath: "session" | "direct" = dataAnalysisSessionAttempt ? "session" : "direct"
+      logLLMCallPath("DataAnalysis", task.id, dataAnalysisCallPath)
+      yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "DataAnalysis", path: dataAnalysisCallPath })
+      const llmQualitative = dataAnalysisSessionAttempt
+        ? {
+            text: dataAnalysisSessionAttempt.text,
+            usage: dataAnalysisSessionAttempt.usage,
+            searchPreferences: parseSearchPreferencesFromQualitative(dataAnalysisSessionAttempt.text),
+          }
+        : yield* Effect.promise(() =>
+            generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory, input._onDeltaQualitative),
+          )
       const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative?.text)
       if (llmQualitative?.searchPreferences && llmQualitative.searchPreferences.length > 0) {
         yield* Effect.promise(async () => {
@@ -6918,17 +6648,245 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	      })
 	    })
 
-	    const runIntentAgent = Effect.fn("Research.runIntentAgent")(function* (taskID: ResearchTaskID) {
+	    // Mirrors taskspec-store.ts's ASK_USER_CLARIFICATION_MARKER — service.ts doesn't import that
+    // module (see taskspec-store.ts's standalone-module note), so keep this string in sync by hand.
+    const INTENT_ASK_USER_MARKER = "需要澄清研究意图："
+
+    const intentSessionTitle = (taskID: ResearchTaskID) => `IntentAgent · ${taskID}`
+
+	    const findIntentAgentSessionID = Effect.fn("Research.findIntentAgentSessionID")(function* (task: ResearchTask) {
+	      if (!task.sessionID) return undefined
+	      const rows = yield* db((d) =>
+	        d
+	          .select({ id: SessionTable.id, created: SessionTable.time_created })
+	          .from(SessionTable)
+	          .where(and(eq(SessionTable.parent_id, task.sessionID as any), eq(SessionTable.title, intentSessionTitle(task.id))))
+	          .all(),
+	      )
+	      if (rows.length === 0) return undefined
+	      return rows.toSorted((a, b) => b.created - a.created)[0]!.id
+	    })
+
+	    const latestPendingIntentApproval = Effect.fn("Research.latestPendingIntentApproval")(function* (taskID: ResearchTaskID) {
+	      const row = yield* db((d) =>
+	        d
+	          .select()
+	          .from(ResearchApprovalTable)
+	          .where(
+	            and(
+	              eq(ResearchApprovalTable.task_id, taskID),
+	              eq(ResearchApprovalTable.kind, "protocol"),
+	              eq(ResearchApprovalTable.status, "pending"),
+	            ),
+	          )
+	          .orderBy(desc(ResearchApprovalTable.time_created))
+	          .limit(1)
+	          .get(),
+	      )
+	      return row?.reason
+	    })
+
+	    const onIntentAgentPartUpdated = (taskID: ResearchTaskID) => (part: MessageV2.Part) => {
+      if (part.type === "text") {
+        return bus.publish(Event.IntentAgentPartUpdated, {
+          taskID,
+          agent: "IntentAgent",
+          partID: part.id,
+          kind: "text",
+          text: part.text,
+        })
+      }
+      if (part.type === "tool") {
+        const s = part.state
+        return bus.publish(Event.IntentAgentPartUpdated, {
+          taskID,
+          agent: "IntentAgent",
+          partID: part.id,
+          kind: "tool",
+          toolName: part.tool,
+          toolInput: s.status !== "pending" ? s.input : undefined,
+          toolOutput: s.status === "completed" ? s.output : undefined,
+          toolState: s.status === "error" ? "error" : s.status === "completed" ? "completed" : s.status === "running" ? "running" : "pending",
+          toolDurationMs: s.status === "completed" ? s.time.end - s.time.start : undefined,
+          toolError: s.status === "error" ? s.error : undefined,
+        })
+      }
+      return Effect.void
+    }
+
+    function buildIntentAgentKickoffPrompt(task: ResearchTask) {
+	      return [
+	        `Begin intent gathering for research task "${task.title}" (domain: ${task.domainID}, id: ${task.id}).`,
+	        "Follow your workflow: analyze the dataset if available, read the taskspec, then ask about whatever required slots are still missing.",
+	      ].join("\n")
+	    }
+
+	    // Drives one turn of the research-intent-agent session: creates (or resumes) the
+	    // session, prompts it, and reports whether check_taskspec succeeded this turn.
+	    // See specs/research/intent-agent-tool-refactor.md §5.2-5.3 for the design.
+	    const runIntentAgentTurn = Effect.fn("Research.runIntentAgentTurn")(function* (input: {
+	      readonly task: ResearchTask
+	      readonly userMessage: string
+	      readonly modelRef: OpencodeModelRef | undefined
+	      readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>
+	      readonly onDelta?: (delta: string) => Effect.Effect<void>
+	    }) {
+	      // Both branches below used to fail silently — runFullPipeline would then fall through
+	      // to the deterministic analyzeIntentTask() approval with no indication the session
+	      // never ran, which from the TUI looked like the [IntentAgent] stream got skipped
+	      // straight to a canned "Next question". Publish IntentAgentFailed so the cause is
+	      // visible instead of an empty spinner forever.
+	      if (!input.task.sessionID || !input.modelRef) {
+	        yield* bus.publish(Event.IntentAgentFailed, {
+	          taskID: input.task.id,
+	          agent: "IntentAgent",
+	          stage: "intent_gathering",
+	          status: "failed",
+	          metadata: {
+	            reason: !input.task.sessionID ? "task has no session" : "no LLM model configured for IntentAgent",
+	          },
+	        })
+	        return undefined
+	      }
+	      const existingSessionID = yield* findIntentAgentSessionID(input.task)
+	      const sessionID =
+	        existingSessionID ??
+	        (yield* session.create({
+	          parentID: input.task.sessionID as Session.Info["id"],
+	          title: intentSessionTitle(input.task.id),
+	        })).id
+	      const onPartUpdated = input.onPartUpdated
+	      const onDelta = input.onDelta
+	      const promptEffect = sessionPrompt.prompt({
+	        sessionID,
+	        agent: "research-intent-agent",
+	        model: { providerID: ProviderID.make(input.modelRef.providerID), modelID: ModelID.make(input.modelRef.modelID) },
+	        parts: [{ type: "text", text: input.userMessage }],
+	      })
+	      const result = yield* (onPartUpdated || onDelta
+	        ? Effect.scoped(
+	            Effect.gen(function* () {
+	              if (onPartUpdated) {
+	                yield* Effect.forkScoped(
+	                  bus.subscribe(MessageV2.Event.PartUpdated).pipe(
+	                    Stream.filter((event) => event.properties.sessionID === sessionID),
+	                    Stream.runForEach((event) => onPartUpdated(event.properties.part as MessageV2.Part)),
+	                  ),
+	                )
+	              }
+	              if (onDelta) {
+	                yield* Effect.forkScoped(
+	                  bus.subscribe(MessageV2.Event.PartDelta).pipe(
+	                    Stream.filter((event) => event.properties.sessionID === sessionID && event.properties.field === "text"),
+	                    Stream.runForEach((event) => onDelta(event.properties.delta)),
+	                  ),
+	                )
+	              }
+	              return yield* promptEffect
+	            }),
+	          )
+	        : promptEffect
+	      ).pipe(
+	        Effect.catchCause((cause) =>
+	          bus
+	            .publish(Event.IntentAgentFailed, {
+	              taskID: input.task.id,
+	              agent: "IntentAgent",
+	              stage: "intent_gathering",
+	              status: "failed",
+	              metadata: errorMetadata(Cause.squash(cause)),
+	            })
+	            .pipe(Effect.andThen(Effect.succeed(undefined))),
+	        ),
+	      )
+	      if (!result) return { sessionID, checkOk: false }
+	      const checkOk = result.parts.some((part) => {
+	        if (part.type !== "tool" || part.tool !== "check_taskspec") return false
+	        const s = part.state
+	        if (s.status !== "completed") return false
+	        try {
+	          return (JSON.parse(s.output) as { ok?: boolean }).ok === true
+	        } catch {
+	          return false
+	        }
+	      })
+	      return { sessionID, checkOk }
+	    })
+
+	    // Runs runFullPipeline() after a successful check_taskspec, exactly like the legacy
+	    // rule-based path did — PipelineBlockedError just means it paused at the (existing,
+	    // unchanged) intent checkpoint, which is expected.
+	    const advanceFromIntentTurn: (input: {
+	      readonly taskID: ResearchTaskID
+	      readonly checkOk: boolean
+	    }) => Effect.Effect<void> = Effect.fn("Research.advanceFromIntentTurn")(function* (input: {
+	      readonly taskID: ResearchTaskID
+	      readonly checkOk: boolean
+	    }) {
+	      if (input.checkOk) {
+	        yield* runFullPipeline({ taskID: input.taskID }).pipe(
+	          Effect.catch((error: unknown) => (error instanceof PipelineBlockedError ? Effect.void : Effect.fail(error as never))),
+	        )
+	      } else {
+	        yield* updateTaskStatus({ taskID: input.taskID, status: "idle" })
+	      }
+	    })
+
+	    // Builds the legacy IntentAgentResult shape (REST/TUI contract) from the task's
+	    // current state, so existing callers (REST routes, research-cockpit-data.ts) don't
+	    // need to change in this step. analyzeIntentTask() is deterministic and already reads
+	    // taskSpec.intent.slots.* as its highest-priority source, so it picks up whatever
+	    // update_taskspec just wrote. clarifyingQuestions is overridden with whatever ask_user
+	    // most recently recorded, since that — not the old per-slot templates — is now the
+	    // actual question the user is being shown.
+	    const intentResultFromTask = Effect.fn("Research.intentResultFromTask")(function* (taskID: ResearchTaskID) {
+	      const task = yield* getTask(taskID)
+	      const base = analyzeIntentTask({ task })
+	      const pendingReason = yield* latestPendingIntentApproval(taskID)
+	      if (pendingReason === undefined) return base
+	      const questions = pendingReason
+	        .split("\n")
+	        .map((line) => line.trim())
+	        .filter((line) => line.startsWith("- "))
+	        .map((line) => line.slice(2).trim())
+	        .filter((line) => line.length > 0)
+	      if (questions.length === 0) return base
+	      return { ...base, clarifyingQuestions: questions }
+	    })
+
+	    const runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult> = Effect.fn(
+	      "Research.runIntentAgent",
+	    )(function* (taskID: ResearchTaskID) {
 	      yield* updateTaskStatus({ taskID, status: "intent_gathering" })
 	      yield* bus.publish(Event.IntentAgentStarted, {
 	        taskID,
-        agent: "IntentAgent",
+	        agent: "IntentAgent",
 	        stage: "intent_gathering",
 	        status: "started",
 	      })
 	      return yield* Effect.gen(function* () {
 	        const task = yield* getTask(taskID)
-	        const result = yield* Effect.promise(() => analyzeIntentTaskWithLLM({ task, workspaceRoot: Instance.directory }))
+	        // runFullPipeline() calls runIntentAgent() unconditionally on every invocation
+	        // (every resume, every checkpoint-driven continuation) — once intent is already
+	        // satisfied, skip spinning up another LLM session turn; just report current state.
+	        const alreadySatisfied = analyzeIntentTask({ task }).missingFields.length === 0
+	        // Do NOT call advanceFromIntentTurn()/runFullPipeline() from here: runIntentAgent()
+	        // is itself invoked from inside runFullPipeline() (see below), so doing so would
+	        // recurse. runFullPipeline()'s own existing logic (right after this call) already
+	        // decides whether to block on missing fields / the intent checkpoint, or continue.
+	        if (!alreadySatisfied) {
+	          const intentLLMContext = yield* Effect.promise(() => resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory }))
+	          const intentConfig =
+	            intentLLMContext?.config ?? (yield* Effect.promise(() => resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory })))
+	          yield* runIntentAgentTurn({
+	            task,
+	            userMessage: buildIntentAgentKickoffPrompt(task),
+	            modelRef: mapToModelRef(intentConfig),
+	            onPartUpdated: onIntentAgentPartUpdated(taskID),
+	            onDelta: (delta) => bus.publish(Event.IntentAgentStreamDelta, { taskID, agent: "IntentAgent", delta }),
+	          })
+	        }
+	        const result = yield* intentResultFromTask(taskID)
 	        const artifact = yield* writeIntentSpecArtifact(result)
 	        yield* bus.publish(Event.IntentAgentCompleted, {
 	          taskID,
@@ -6942,6 +6900,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	            artifactID: artifact.id,
 	            interactionMode: result.intentSpec.interaction_mode,
 	            llmStatus: result.llm.status,
+	            sessionStarted: !alreadySatisfied,
 	          },
 	        })
 	        return result
@@ -6963,150 +6922,42 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	      )
 	    })
 
-	    const answerIntentQuestion = Effect.fn("Research.answerIntentQuestion")(function* (input: AnswerIntentInput) {
+	    // Continues the IntentAgent session with a new user message — replaces the old
+	    // "rerun a stateless analyzeIntentTask() pass" behavior. Both answerIntentQuestion
+	    // (structured slot answers) and interpretAndApplySlotModification (free-text) now
+	    // funnel into this: the LLM in the session does the interpretation itself, so there's
+	    // no separate parseSlotInputsWithLLM/interpretSlotModificationWithLLM call anymore.
+	    const continueIntentAgentSession = Effect.fn("Research.continueIntentAgentSession")(function* (input: {
+	      readonly taskID: ResearchTaskID
+	      readonly message: string
+	    }) {
 	      const task = yield* getTask(input.taskID)
-	      const existingMeta =
-	        typeof task.taskSpec.metadata === "object" && task.taskSpec.metadata !== null && !Array.isArray(task.taskSpec.metadata)
-	          ? (task.taskSpec.metadata as Record<string, unknown>)
-	          : {}
-	      const existingIntentSlots =
-	        typeof existingMeta.intentSlots === "object" && existingMeta.intentSlots !== null && !Array.isArray(existingMeta.intentSlots)
-	          ? (existingMeta.intentSlots as Record<string, unknown>)
-	          : {}
-	      // Parse natural-language slot answers into typed values via a single LLM call when needed.
-	      // Falls back to the raw string if no API key is configured or parsing fails.
-	      const currentClarifyingQuestions = analyzeIntentTask({ task }).clarifyingQuestions
-	      const parsedInputSlots = yield* Effect.promise(() =>
-	        parseSlotInputsWithLLM({
-	          slots: input.slots as Record<string, unknown>,
-	          clarifyingQuestions: currentClarifyingQuestions,
-	          workspaceRoot: Instance.directory,
-	        }),
-	      )
-	      const mergedSlots = { ...existingIntentSlots, ...normalizeIntentSlotKeys(parsedInputSlots) }
-	      // Propagate resolved intent slots back to canonical taskSpec fields so that downstream
-	      // TSF parsing (TSFTaskSpec.parse) and checkpoint display both pick up the right values.
-	      const existingDataset =
-	        typeof task.taskSpec.dataset === "object" && task.taskSpec.dataset !== null && !Array.isArray(task.taskSpec.dataset)
-	          ? (task.taskSpec.dataset as Record<string, unknown>)
-	          : {}
-	      const datasetOverrides: Record<string, unknown> = {}
-	      const canonicalOverrides: Record<string, unknown> = {}
-	      const targetCols = (() => {
-	        const raw = mergedSlots.target_columns
-	        if (Array.isArray(raw) && (raw as unknown[]).length > 0) return raw as string[]
-	        if (typeof raw === "string" && raw.trim().length > 0)
-	          return raw.trim().split(/\s*,\s*/).filter((s) => s.length > 0)
-	        return undefined
-	      })()
-	      if (targetCols !== undefined) datasetOverrides.targetCols = targetCols
-	      const dataSource =
-	        typeof mergedSlots.data_source === "string" && mergedSlots.data_source.trim().length > 0
-	          ? mergedSlots.data_source.trim()
-	          : undefined
-	      if (dataSource !== undefined) datasetOverrides.path = dataSource
-	      const lookbackWindow = (() => {
-	        const raw = mergedSlots.lookback_window
-	        if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw
-	        if (typeof raw === "string") { const n = Number(raw.trim()); if (Number.isFinite(n) && n > 0) return n }
-	        return undefined
-	      })()
-	      if (lookbackWindow !== undefined) canonicalOverrides.contextLength = lookbackWindow
-	      const predictionHorizon = (() => {
-	        const raw = mergedSlots.prediction_horizon
-	        if (Array.isArray(raw) && (raw as unknown[]).length > 0) return raw as number[]
-	        if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return [raw]
-	        if (typeof raw === "string" && raw.trim().length > 0) {
-	          const parts = raw.trim().split(/\s*,\s*/).map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0)
-	          if (parts.length > 0) return parts
-	        }
-	        return undefined
-	      })()
-	      if (predictionHorizon !== undefined) canonicalOverrides.predictionLengths = predictionHorizon
-	      const timeGrain =
-	        typeof mergedSlots.time_grain === "string" && mergedSlots.time_grain.trim().length > 0
-	          ? mergedSlots.time_grain.trim()
-	          : undefined
-	      if (timeGrain !== undefined) canonicalOverrides.timeGrain = timeGrain
-	      const updatedDataset =
-	        Object.keys(datasetOverrides).length > 0 ? { ...existingDataset, ...datasetOverrides } : existingDataset
-	      // Clear intentPendingReview flag — the user has answered a slot, review cycle continues
-	      // via the normal missing-slot flow; flag will be gone once pipeline advances.
-	      const { intentPendingReview: _drop, ...cleanedMeta } = existingMeta as Record<string, unknown> & { intentPendingReview?: unknown }
-	      const updatedTaskSpec = {
-	        ...task.taskSpec,
-	        ...canonicalOverrides,
-	        dataset: updatedDataset,
-	        metadata: { ...cleanedMeta, intentSlots: mergedSlots },
-	      }
-	      yield* updateTaskSpec({ taskID: input.taskID, taskSpec: updatedTaskSpec as JsonRecord })
-	      const result = yield* runIntentAgent(input.taskID)
-	      // Use rule-based analysis (not LLM inferences) to decide whether to advance the pipeline.
-	      // The LLM in analyzeIntentTaskWithLLM may infer slot values that are not persisted to the DB,
-	      // causing result.missingFields to be empty even when the user hasn't answered all questions.
-	      const taskAfterSlot = yield* getTask(input.taskID)
-	      const ruleBasedCheck = analyzeIntentTask({ task: taskAfterSlot })
-	      if (ruleBasedCheck.missingFields.length === 0) {
-	        // All slots genuinely satisfied in the DB — advance the pipeline.
-	        // PipelineBlockedError means the pipeline paused at a checkpoint, which is expected.
-	        yield* runFullPipeline({ taskID: input.taskID }).pipe(
-	          Effect.catch((error: unknown) =>
-	            error instanceof PipelineBlockedError ? Effect.void : Effect.fail(error as never),
-	          ),
-	        )
-	      } else {
-	        // More slots still need user answers; reset status so the cockpit slot-fill path stays active.
-	        yield* updateTaskStatus({ taskID: input.taskID, status: "idle" })
-	      }
-	      return result
+	      const intentLLMContext = yield* Effect.promise(() => resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory }))
+	      const intentConfig =
+	        intentLLMContext?.config ?? (yield* Effect.promise(() => resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory })))
+	      const turn = yield* runIntentAgentTurn({
+        task,
+        userMessage: input.message,
+        modelRef: mapToModelRef(intentConfig),
+        onPartUpdated: onIntentAgentPartUpdated(input.taskID),
+        onDelta: (delta) => bus.publish(Event.IntentAgentStreamDelta, { taskID: input.taskID, agent: "IntentAgent", delta }),
+      })
+	      yield* advanceFromIntentTurn({ taskID: input.taskID, checkOk: turn?.checkOk ?? false })
+	      return yield* intentResultFromTask(input.taskID)
+	    })
+
+	    const answerIntentQuestion = Effect.fn("Research.answerIntentQuestion")(function* (input: AnswerIntentInput) {
+	      const message = `用户回答（结构化字段）：\n${JSON.stringify(input.slots, null, 2)}`
+	      return yield* continueIntentAgentSession({ taskID: input.taskID, message })
 	    })
 
 	    const interpretAndApplySlotModification = Effect.fn("Research.interpretAndApplySlotModification")(function* (input: {
 	      taskID: ResearchTaskID
 	      message: string
 	    }) {
-	      const task = yield* getTask(input.taskID)
-	      // Build currentSlots from the fully-merged intent spec so the LLM sees all slot values,
-	      // not just the subset stored in metadata.intentSlots (which may be empty on first reject).
-	      const base = analyzeIntentTask({ task })
-	      const s = base.intentSpec
-	      const currentSlots: Array<{ id: string; label: string; value?: string }> = [
-	        { id: "interaction_mode", label: "交互模式", value: s.interaction_mode },
-	        { id: "forecast_object", label: "预测对象", value: s.forecast_object },
-	        { id: "data_source", label: "数据来源", value: s.data_source },
-	        { id: "target_columns", label: "目标列", value: s.target_columns.length > 0 ? s.target_columns.join(", ") : undefined },
-	        { id: "lookback_window", label: "lookback window", value: s.lookback_window !== undefined ? String(s.lookback_window) : undefined },
-	        { id: "prediction_horizon", label: "预测 horizon", value: s.prediction_horizon.length > 0 ? s.prediction_horizon.join(", ") : undefined },
-	        { id: "time_grain", label: "时间粒度", value: s.time_grain },
-	        { id: "exogenous_variables", label: "外生变量", value: s.exogenous_variables !== undefined ? s.exogenous_variables.join(", ") : undefined },
-	        { id: "business_context", label: "业务背景", value: s.business_context },
-	        { id: "primary_metric", label: "主指标", value: s.primary_metric },
-	        { id: "secondary_metrics", label: "辅助指标", value: s.secondary_metrics.length > 0 ? s.secondary_metrics.join(", ") : undefined },
-	        { id: "error_preferences", label: "误差偏好", value: s.error_preferences },
-	        { id: "latency_budget", label: "延迟预算", value: s.latency_budget !== undefined ? String(s.latency_budget) : undefined },
-	        { id: "parameter_budget", label: "参数预算", value: s.parameter_budget !== undefined ? String(s.parameter_budget) : undefined },
-	        { id: "interpretability", label: "可解释性", value: s.interpretability },
-	        { id: "deployment_target", label: "部署目标", value: s.deployment_target },
-	      ]
-	      const llmResult = yield* Effect.promise(() =>
-	        interpretSlotModificationWithLLM({
-	          message: input.message,
-	          currentSlots,
-	          workspaceRoot: Instance.directory,
-	        }),
-	      )
-	      const llmMeta = {
-	        status: llmResult.status,
-	        provider: llmResult.provider,
-	        model: llmResult.model,
-	        ...(llmResult.error ? { error: llmResult.error } : {}),
-	      }
-	      if (llmResult.status !== "used" || Object.keys(llmResult.updates).length === 0) {
-	        return { ...analyzeIntentTask({ task }), llm: llmMeta }
-	      }
-	      const applied = yield* answerIntentQuestion({ taskID: input.taskID, slots: llmResult.updates as JsonRecord })
-	      return { ...applied, llm: llmMeta }
+	      return yield* continueIntentAgentSession({ taskID: input.taskID, message: input.message })
 	    })
+
 
 	    const runDataAnalysisAgent = Effect.fn("Research.runDataAnalysisAgent")(function* (input: ProfileTaskInput) {
 	      yield* updateTaskStatus({ taskID: input.taskID, status: "data_analysis" })
@@ -7230,8 +7081,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	              try {
 	                const raw = await readFile(path.join(sessionsDir, dirName, "reflection_result.json"), "utf8")
 	                return JSON.parse(raw) as {
-	                  nextHypotheses: Array<{ title: string; rationale: string; expectedSignal: string }>
-	                  reflectionNotesMarkdown: string
+		                  reflectionNotesMarkdown: string
 	                  decision: string
 	                  decisionReason: string
 	                }
@@ -7251,29 +7101,94 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	            }),
 	          ).catch(() => undefined)
 	        }
-	        const llmHypothesesResult = yield* Effect.promise(() =>
-	          generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses),
+	        const hypoRuntime = recordValue(recordValue(task.taskSpec).runtime)
+	        const hypoNeoCastRoot = typeof hypoRuntime.neoCastProjectRoot === "string" ? hypoRuntime.neoCastProjectRoot : undefined
+	        const hypoLLMContext = yield* Effect.promise(() =>
+	          resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: hypoNeoCastRoot }),
 	        )
-	        const llmHypoUsage = llmHypothesesResult?.usage
+	        const hypoConfig = hypoLLMContext?.config ?? (yield* Effect.promise(() =>
+	          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: hypoNeoCastRoot }),
+	        ))
+	        const hypoSearchPreferences = yield* Effect.promise(() => loadLLMSearchPreferences(Instance.directory, task.id))
 	        const isFirstHypoPlannerCall = runs.length === 0 && memory.length === 0
-	        const baselineSelectionResult = isFirstHypoPlannerCall
-	          ? yield* Effect.promise(() => {
-	              const baselineOptions = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
-	                .map((proposal) => {
-	                  const recipeID = candidateRecipeID(proposal.candidateSpec)
-	                  return recipeID === undefined ? undefined : { recipeID, description: proposal.rationale }
-	                })
-	                .filter((option): option is { recipeID: string; description: string } => option !== undefined)
-	              return selectLLMReferenceBaseline(task, dataAnalysisSummary, baselineOptions, Instance.directory)
-	            })
+	        // referenceBaseline is only ever picked on the first call (see comment on
+	        // ExperimentPlan.referenceBaseline) — only compute/offer options then.
+	        const baselineOptions = isFirstHypoPlannerCall
+	          ? DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
+	              .map((proposal) => {
+	                const recipeID = candidateRecipeID(proposal.candidateSpec)
+	                return recipeID === undefined ? undefined : { recipeID, description: proposal.rationale }
+	              })
+	              .filter((option): option is { recipeID: string; description: string } => option !== undefined)
+	          : []
+	        const hypoSessionAttempt = yield* requestViaSession({
+	          rootSessionID: task.sessionID,
+	          agent: "research-hypo-planner",
+	          stageLabel: "HypoPlanner",
+	          taskID: task.id,
+	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses, latestReflection, hypoSearchPreferences, abandonedHypotheses, { sessionMode: true, baselineOptions }),
+	          modelRef: mapToModelRef(hypoConfig),
+	          onDelta: (delta) => bus.publish(Event.HypoPlannerAgentStreamDelta, { taskID: task.id, agent: "HypoPlannerAgent", delta }),
+          onPartUpdated: (part) => {
+            if (part.type === "text") {
+              return bus.publish(Event.HypoPlannerAgentPartUpdated, {
+                taskID: task.id,
+                agent: "HypoPlannerAgent",
+                partID: part.id,
+                kind: "text",
+                text: part.text,
+              })
+            }
+            if (part.type === "tool") {
+              const s = part.state
+              return bus.publish(Event.HypoPlannerAgentPartUpdated, {
+                taskID: task.id,
+                agent: "HypoPlannerAgent",
+                partID: part.id,
+                kind: "tool",
+                toolName: part.tool,
+                toolInput: s.status !== "pending" ? s.input : undefined,
+                toolOutput: s.status === "completed" ? s.output : undefined,
+                toolState: s.status === "error" ? "error" : s.status === "completed" ? "completed" : s.status === "running" ? "running" : "pending",
+                toolDurationMs: s.status === "completed" ? s.time.end - s.time.start : undefined,
+                toolError: s.status === "error" ? s.error : undefined,
+              })
+            }
+            return Effect.void
+          },
+	        })
+	        const hypoCallPath: "session" | "direct" = hypoSessionAttempt ? "session" : "direct"
+	        logLLMCallPath("HypoPlanner", task.id, hypoCallPath)
+	        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "HypoPlanner", path: hypoCallPath })
+	        const llmHypothesesResult = hypoSessionAttempt
+	          ? undefined
+	          : yield* Effect.promise(() =>
+	              generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses),
+	            )
+	        const llmHypoUsage = hypoSessionAttempt ? hypoSessionAttempt.usage : llmHypothesesResult?.usage
+	        // Session mode: agent used hypothesis_* tools to write to DB; read current pool state.
+	        const sessionPoolHypotheses = hypoSessionAttempt
+	          ? (yield* listHypotheses(input.taskID)).filter((h) => h.status !== "abandoned")
 	          : undefined
+	        // The pick_baseline tool (if called during the session) wrote referenceBaseline/
+	        // referenceBaselineSource/referenceBaselineRationale straight to task_spec.metadata —
+	        // re-fetch to pick that up. Falls through to buildExperimentPlan's heuristic when the
+	        // tool was never called (e.g. no session, or the agent didn't call it).
+	        const refreshedTask = hypoSessionAttempt && isFirstHypoPlannerCall ? yield* getTask(input.taskID) : task
+	        const refreshedMetadata = recordValue(refreshedTask.taskSpec.metadata)
+	        const toolReferenceBaseline =
+	          typeof refreshedMetadata.referenceBaseline === "string" ? refreshedMetadata.referenceBaseline : undefined
+	        const toolReferenceBaselineRationale =
+	          typeof refreshedMetadata.referenceBaselineRationale === "string"
+	            ? refreshedMetadata.referenceBaselineRationale
+	            : undefined
 	        const result = buildHypoPlannerResult({
 	          task,
 	          dataAnalysisSummary,
 	          runs,
 	          memory,
-	          llmHypotheses: llmHypothesesResult?.hypotheses,
-	          llmReferenceBaseline: baselineSelectionResult?.referenceBaseline,
+	          llmHypotheses: sessionPoolHypotheses ?? llmHypothesesResult?.hypotheses,
+	          toolReferenceBaseline,
 	        })
 	        const outputDir = path.join(
 	          Instance.directory,
@@ -7298,12 +7213,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	            baselineStrategy: result.plan.baselineStrategy,
 	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
 	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
-	            ...(baselineSelectionResult?.rationale ? { referenceBaselineRationale: baselineSelectionResult.rationale } : {}),
+	            ...(toolReferenceBaselineRationale ? { referenceBaselineRationale: toolReferenceBaselineRationale } : {}),
 	            llmStatus: result.llm.status,
 	            ...(result.llm.status === "used" && result.plan.hypotheses.length > 0
 	              ? {
 	                  llmPreview: result.plan.hypotheses
-	                    .map((h) => `${h.id}: ${h.statement}`)
+	                    .map((h) => h.statement)
 	                    .join("\n"),
 	                }
 	              : {}),
@@ -7322,21 +7237,52 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	            baselineStrategy: result.plan.baselineStrategy,
 	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
 	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
-	            ...(baselineSelectionResult?.rationale ? { referenceBaselineRationale: baselineSelectionResult.rationale } : {}),
+	            ...(toolReferenceBaselineRationale ? { referenceBaselineRationale: toolReferenceBaselineRationale } : {}),
 	          },
 	        })
-	        const nextHypothesisStatements = new Set(result.plan.hypotheses.map((h) => h.statement))
-	        const newlyAbandoned = existingHypotheses
-	          .filter((h) => !nextHypothesisStatements.has(h.statement))
-	          .map((h) => ({ statement: h.statement }))
-	        const mergedAbandoned = [...abandonedHypotheses, ...newlyAbandoned]
-	          .filter((h, index, all) => all.findIndex((other) => other.statement === h.statement) === index)
-	          .slice(-MAX_ABANDONED_HYPOTHESES)
-	        yield* updateTaskHypothesisPlan({
-	          taskID: input.taskID,
-	          hypothesisPlan: result.plan,
-	          abandonedHypotheses: mergedAbandoned,
-	        })
+	        if (hypoSessionAttempt) {
+	          // Session mode: hypothesis rows managed by tools — update task metadata only.
+	          const t = yield* getTask(input.taskID)
+	          const meta = recordValue(t.taskSpec.metadata)
+	          const nextTaskSpec = {
+	            ...t.taskSpec,
+	            metadata: {
+	              ...meta,
+	              baselineStrategy: result.plan.baselineStrategy,
+	              searchBiases: result.plan.searchBiases,
+	              stopConditions: result.plan.stopConditions,
+	              ...(result.plan.referenceBaseline === undefined
+	                ? {}
+	                : { referenceBaseline: result.plan.referenceBaseline }),
+	              ...(result.plan.referenceBaselineSource === undefined
+	                ? {}
+	                : { referenceBaselineSource: result.plan.referenceBaselineSource }),
+	            } as unknown as JsonRecord,
+	          }
+	          const taskRow = yield* db((d) =>
+	            d
+	              .update(ResearchTaskTable)
+	              .set({ task_spec: nextTaskSpec, time_updated: Date.now() })
+	              .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
+	              .returning()
+	              .get(),
+	          )
+	          if (taskRow) yield* bus.publish(Event.TaskUpdated, { task: mapTask(taskRow) })
+	        } else {
+	          // Direct mode: full bulk-replace of hypothesis rows.
+	          const nextHypothesisStatements = new Set(result.plan.hypotheses.map((h) => h.statement))
+	          const newlyAbandoned = existingHypotheses
+	            .filter((h) => !nextHypothesisStatements.has(h.statement))
+	            .map((h) => ({ statement: h.statement }))
+	          const mergedAbandoned = [...abandonedHypotheses, ...newlyAbandoned]
+	            .filter((h, index, all) => all.findIndex((other) => other.statement === h.statement) === index)
+	            .slice(-MAX_ABANDONED_HYPOTHESES)
+	          yield* updateTaskHypothesisPlan({
+	            taskID: input.taskID,
+	            hypothesisPlan: result.plan,
+	            abandonedHypotheses: mergedAbandoned,
+	          })
+	        }
 	        yield* bus.publish(Event.HypoPlannerAgentCompleted, {
 	          taskID: input.taskID,
 	          agent: "HypoPlannerAgent",
@@ -7349,12 +7295,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	            baselineStrategy: result.plan.baselineStrategy,
 	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
 	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
-	            ...(baselineSelectionResult?.rationale ? { referenceBaselineRationale: baselineSelectionResult.rationale } : {}),
+	            ...(toolReferenceBaselineRationale ? { referenceBaselineRationale: toolReferenceBaselineRationale } : {}),
 	            llmStatus: result.llm.status,
 	            ...(result.llm.status === "used" && result.plan.hypotheses.length > 0
 	              ? {
 	                  llmPreview: result.plan.hypotheses
-	                    .map((h) => `${h.id}: ${h.statement}`)
+	                    .map((h) => h.statement)
 	                    .join("\n"),
 	                }
 	              : {}),
@@ -7593,7 +7539,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	          stoppedReason: input.stoppedReason,
 	        })
 
-	        // Build richer LLM context from current candidate, training logs, and history.
+	        // Minimal context: find latest candidate for current hypothesis (pure in-memory, no I/O).
 	        const orderedRuns = [...runs].sort((a, b) => a.time.created - b.time.created)
 	        const latestSucceededRun = [...orderedRuns].reverse().find((r) => r.status === "succeeded")
 	        const latestRun = orderedRuns[orderedRuns.length - 1]
@@ -7601,61 +7547,97 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	        const latestCandidate = latestRunForContext?.candidateID
 	          ? candidates.find((c) => c.id === latestRunForContext.candidateID)
 	          : undefined
-	        const progressArtifact = latestRunForContext
-	          ? artifacts.find((a) => a.kind === "runner_progress_jsonl" && a.runID === latestRunForContext.id)
-	          : undefined
-	        const trainingCurve = yield* Effect.promise(async () => {
-	          if (!progressArtifact) return []
-	          const filePath = progressArtifact.uri.startsWith("file://")
-	            ? progressArtifact.uri.slice("file://".length)
-	            : progressArtifact.uri
-	          return extractTrainingCurve(filePath)
-	        })
-	        const sortedMemories = [...memories].sort((a, b) => b.time.created - a.time.created)
-	        const recentLessons = sortedMemories.slice(0, 2).map((m) => m.lesson)
-	        const reflDir = baseResult.analysis.direction
-	        let bestMemory: (typeof sortedMemories)[0] | undefined
-	        let bestMemoryMetric: number | undefined
-	        for (const m of sortedMemories) {
-	          const ms = recordValue(m.candidateSummary).bestMetric
-	          const mv = typeof ms === "number" && Number.isFinite(ms) ? ms : undefined
-	          if (mv === undefined) continue
-	          if (
-	            bestMemoryMetric === undefined ||
-	            (reflDir === "minimize" ? mv < bestMemoryMetric : mv > bestMemoryMetric)
-	          ) {
-	            bestMemoryMetric = mv
-	            bestMemory = m
-	          }
-	        }
-	        const objectiveRecord = recordValue(task.objective)
-	        const taskObjective = [
-	          `${reflDir === "minimize" ? "Minimize" : "Maximize"} ${baseResult.analysis.primaryMetricName}`,
-	          typeof objectiveRecord.targetMetricValue === "number"
-	            ? `target ≤ ${objectiveRecord.targetMetricValue}`
-	            : null,
-	          typeof objectiveRecord.description === "string" ? objectiveRecord.description : null,
-	        ].filter(Boolean).join(". ")
-	        const llmContext: ReflectionLLMContext = {
-	          taskObjective,
-	          currentHypothesis: latestCandidate?.rationale || undefined,
-	          experimentDesign: latestCandidate?.candidateSpec,
-	          trainingCurve,
-	          recentMemories: recentLessons,
-	          bestMemoryLesson:
-	            bestMemory &&
-	            bestMemory.id !== sortedMemories[0]?.id &&
-	            bestMemory.id !== sortedMemories[1]?.id
-	              ? bestMemory.lesson
-	              : undefined,
-	        }
 
-	        const result = yield* Effect.promise(() =>
-	          generateLLMReflectionSynthesis(task, baseResult, llmContext).catch(() => ({
-	            ...baseResult,
-	            llm: { status: 'failed' as const },
-	          })),
+	        const reflectionRuntime = recordValue(recordValue(task.taskSpec).runtime)
+	        const reflectionNeoCastRoot =
+	          typeof reflectionRuntime.neoCastProjectRoot === "string" ? reflectionRuntime.neoCastProjectRoot : undefined
+	        const reflectionLLMContext = yield* Effect.promise(() =>
+	          resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: reflectionNeoCastRoot }),
 	        )
+	        const reflectionConfig = reflectionLLMContext?.config ?? (yield* Effect.promise(() =>
+	          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: reflectionNeoCastRoot }),
+	        ))
+	        const reflectionSessionAttempt = yield* requestViaSession({
+	          rootSessionID: task.sessionID,
+	          agent: "research-reflection",
+	          stageLabel: "Reflection",
+	          taskID: task.id,
+	          user: buildReflectionSessionUserPrompt(task, baseResult.analysis, latestCandidate?.rationale || undefined),
+	          modelRef: mapToModelRef(reflectionConfig),
+	          onDelta: (delta) => bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta }),
+	          onPartUpdated: (part) => {
+	            if (part.type === "text") {
+	              return bus.publish(Event.ReflectionAgentPartUpdated, {
+	                taskID: task.id, agent: "ReflectionAgent", partID: part.id, kind: "text", text: part.text,
+	              })
+	            }
+	            if (part.type === "tool") {
+	              const s = part.state
+	              return bus.publish(Event.ReflectionAgentPartUpdated, {
+	                taskID: task.id, agent: "ReflectionAgent", partID: part.id, kind: "tool",
+	                toolName: part.tool,
+	                toolInput: s.status !== "pending" ? s.input : undefined,
+	                toolOutput: s.status === "completed" ? s.output : undefined,
+	                toolState: s.status === "error" ? "error" : s.status === "completed" ? "completed" : s.status === "running" ? "running" : "pending",
+	                toolDurationMs: s.status === "completed" ? s.time.end - s.time.start : undefined,
+	                toolError: s.status === "error" ? s.error : undefined,
+	              })
+	            }
+	            return Effect.void
+	          },
+	        })
+	        const reflectionCallPath: "session" | "direct" = reflectionSessionAttempt ? "session" : "direct"
+	        logLLMCallPath("Reflection", task.id, reflectionCallPath)
+	        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "Reflection", path: reflectionCallPath })
+	        // Direct-path fallback: lazily build full LLM context (training curve + memories) for
+	        // the non-session code path that calls the LLM API directly without tool access.
+	        const result = reflectionSessionAttempt
+	          ? buildReflectionResultFromText(baseResult, reflectionConfig.model, reflectionSessionAttempt.text, reflectionSessionAttempt.usage)
+	          : yield* Effect.promise(async () => {
+	              const progressArtifact = latestRunForContext
+	                ? artifacts.find((a) => a.kind === "runner_progress_jsonl" && a.runID === latestRunForContext.id)
+	                : undefined
+	              const trainingCurve = await (async () => {
+	                if (!progressArtifact) return []
+	                const filePath = progressArtifact.uri.startsWith("file://")
+	                  ? progressArtifact.uri.slice("file://".length)
+	                  : progressArtifact.uri
+	                return extractTrainingCurve(filePath)
+	              })()
+	              const sortedMemories = [...memories].sort((a, b) => b.time.created - a.time.created)
+	              const recentLessons = sortedMemories.slice(0, 2).map((m) => m.lesson)
+	              const reflDir = baseResult.analysis.direction
+	              let bestMemory: (typeof sortedMemories)[0] | undefined
+	              let bestMemoryMetric: number | undefined
+	              for (const m of sortedMemories) {
+	                const ms = recordValue(m.candidateSummary).bestMetric
+	                const mv = typeof ms === "number" && Number.isFinite(ms) ? ms : undefined
+	                if (mv === undefined) continue
+	                if (bestMemoryMetric === undefined || (reflDir === "minimize" ? mv < bestMemoryMetric : mv > bestMemoryMetric)) {
+	                  bestMemoryMetric = mv
+	                  bestMemory = m
+	                }
+	              }
+	              const objectiveRecord = recordValue(task.objective)
+	              const taskObjective = [
+	                `${reflDir === "minimize" ? "Minimize" : "Maximize"} ${baseResult.analysis.primaryMetricName}`,
+	                typeof objectiveRecord.targetMetricValue === "number" ? `target ≤ ${objectiveRecord.targetMetricValue}` : null,
+	                typeof objectiveRecord.description === "string" ? objectiveRecord.description : null,
+	              ].filter(Boolean).join(". ")
+	              const llmContext: ReflectionLLMContext = {
+	                taskSpec: task.taskSpec,
+	                taskObjective,
+	                currentHypothesis: latestCandidate?.rationale || undefined,
+	                experimentDesign: latestCandidate?.candidateSpec,
+	                trainingCurve,
+	                recentMemories: recentLessons,
+	                bestMemoryLesson: bestMemory && bestMemory.id !== sortedMemories[0]?.id && bestMemory.id !== sortedMemories[1]?.id
+	                  ? bestMemory.lesson : undefined,
+	              }
+	              return generateLLMReflectionSynthesis(task, baseResult, llmContext).catch(() => ({
+	                ...baseResult, llm: { status: 'failed' as const },
+	              }))
+	            })
 	        const reflectRunId = `reflect_${Date.now()}`
 	        const directory = input.outputDir
 	          ? path.join(runnerPath(Instance.directory, input.outputDir), task.id, reflectRunId)
@@ -7676,7 +7658,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	              taskID: task.id,
 	              decision: result.analysis.decision,
 	              decisionReason: result.analysis.decisionReason,
-	              nextHypotheses: result.analysis.nextHypotheses,
 	              plateauStreak: result.analysis.plateauStreak,
 	              succeededRuns: result.analysis.succeededRuns,
 	              failedRuns: result.analysis.failedRuns,
@@ -7684,6 +7665,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	              reflectionNotesMarkdown: result.reflectionNotesMarkdown,
 	              nextExperimentPlanMarkdown: result.nextExperimentPlanMarkdown,
 	              failureLogMarkdown: result.failureLogMarkdown,
+	              llm: result.llm,
 	            }, null, 2),
 	            "utf8",
 	          )
@@ -7742,7 +7724,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	            succeededRuns: result.analysis.succeededRuns,
 	            failedRuns: result.analysis.failedRuns,
 	            bestMetric: result.analysis.bestMetric ?? null,
-	            nextHypotheses: result.analysis.nextHypotheses.map((h) => h.title),
 	            failureCategories: result.analysis.failures.map((f) => f.category),
 	            ...(result.llm.status === "used" && result.llm.text
 	              ? { llmNarrative: result.llm.text }
@@ -7816,11 +7797,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
                 status: "approved",
                 replyMessage: "Auto-approved by PublishAgent.",
               })
+              const artifacts = yield* listArtifacts(input.taskID)
+              const championRunnerArtifact = artifacts.find(
+                (artifact) => artifact.kind === "runner_artifact" && artifact.runID === publishChampion.runID,
+              )
+              const runnerRunID =
+                championRunnerArtifact === undefined
+                  ? undefined
+                  : neoCastRunIDFromArtifactURI(championRunnerArtifact.uri)
               yield* executeRun({
                 taskID: input.taskID,
                 candidateID: publishChampion.candidateID,
                 stage: "ref_test",
                 description: "Final reference test by PublishAgent.",
+                runnerRunID,
               })
             }).pipe(
               Effect.catchCause((cause) =>
@@ -7928,7 +7918,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 	      )
 	    })
 
-    const runFullPipeline = Effect.fn("Research.runFullPipeline")(function* (input: RunFullPipelineInput) {
+    const runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult> = Effect.fn(
+      "Research.runFullPipeline",
+    )(function* (input: RunFullPipelineInput) {
       const initialTask = yield* getTask(input.taskID)
       const initialInteractionMode = taskInteractionMode(initialTask)
       // Socratic mode requires autonomous task mode (fully autonomous after clarification).
@@ -8098,12 +8090,34 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
           const reflectionNotesMarkdown = yield* readArtifactContent(notesArtifact)
           const nextExperimentPlanMarkdown = yield* readArtifactContent(planArtifact)
           const failureLogMarkdown = yield* readArtifactContent(failureArtifact)
+          // The markdown artifacts above don't carry the LLM output — read it from the persisted
+          // reflection_result.json of the most recent reflect_* run instead of recomputing it.
+          const persistedLLM = yield* Effect.promise(async (): Promise<ReflectionAgentResult["llm"] | undefined> => {
+            try {
+              const sessionsDir = path.join(Instance.directory, ".neo-research", "sessions", task.id)
+              const entries = await readdir(sessionsDir, { withFileTypes: true })
+              const reflectDirs = entries
+                .filter((e) => e.isDirectory() && e.name.startsWith("reflect_"))
+                .map((e) => e.name)
+                .sort()
+                .reverse()
+              for (const dirName of reflectDirs) {
+                try {
+                  const raw = await readFile(path.join(sessionsDir, dirName, "reflection_result.json"), "utf8")
+                  const parsed = JSON.parse(raw) as { llm?: ReflectionAgentResult["llm"] }
+                  if (parsed.llm) return parsed.llm
+                } catch { continue }
+              }
+            } catch { /* sessions dir doesn't exist yet */ }
+            return undefined
+          })
           return {
             ...result,
             reflectionNotesMarkdown: reflectionNotesMarkdown.length === 0 ? result.reflectionNotesMarkdown : reflectionNotesMarkdown,
             nextExperimentPlanMarkdown:
               nextExperimentPlanMarkdown.length === 0 ? result.nextExperimentPlanMarkdown : nextExperimentPlanMarkdown,
             failureLogMarkdown: failureLogMarkdown.length === 0 ? result.failureLogMarkdown : failureLogMarkdown,
+            llm: persistedLLM ?? result.llm,
           } satisfies ReflectionAgentResult
         })
 
@@ -8127,14 +8141,24 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
 
       const intent = yield* runIntentAgent(input.taskID)
       if (intent.missingFields.length > 0) {
-        yield* ensurePendingApproval({
-          taskID: input.taskID,
-          kind: "protocol",
-          reason: [
-            "运行自主研究流水线前需要先澄清研究意图。",
-            ...intent.clarifyingQuestions.map((question) => `- ${question}`),
-          ].join("\n"),
-        })
+        // runIntentAgent() already drove the session-based ask_user tool when a session/model
+        // was available — that path creates its own pending "protocol" approval
+        // (taskspec-store.ts recordAskUserQuestions, marker "需要澄清研究意图：") carrying the
+        // LLM's actual live question. Only fall back to this deterministic
+        // analyzeIntentTask()-derived approval when no live one exists yet (e.g. the LLM/session
+        // genuinely couldn't run) — otherwise this used to fire unconditionally on every pipeline
+        // call and race the live approval on "most recently updated" lookups.
+        const livePendingReason = yield* latestPendingIntentApproval(input.taskID)
+        if (livePendingReason === undefined || !livePendingReason.startsWith(INTENT_ASK_USER_MARKER)) {
+          yield* ensurePendingApproval({
+            taskID: input.taskID,
+            kind: "protocol",
+            reason: [
+              "运行自主研究流水线前需要先澄清研究意图。",
+              ...intent.clarifyingQuestions.map((question) => `- ${question}`),
+            ].join("\n"),
+          })
+        }
         yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
         throw new PipelineBlockedError({
           taskID: input.taskID,
@@ -8213,7 +8237,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
       const shouldRunSearchSpaceCheckpoint = intent.intentSpec.interaction_mode === "companion" && !currentWorkflow.completedPhases.includes("searching")
       const shouldEmitSocraticSearchSpace = isSocratic && !currentWorkflow.completedPhases.includes("searching")
       if (shouldRunSearchSpaceCheckpoint || shouldEmitSocraticSearchSpace) {
-        const baselines = DomainRegistry.buildBaselines(currentTask.domainID, currentTask.taskSpec)
+        const allBaselines = DomainRegistry.buildBaselines(currentTask.domainID, currentTask.taskSpec)
+        const checkpointReferenceBaseline = recordValue(recordValue(currentTask.taskSpec).metadata).referenceBaseline
+        const referenceBaselines =
+          typeof checkpointReferenceBaseline === "string"
+            ? allBaselines.filter((proposal) => candidateRecipeID(proposal.candidateSpec) === checkpointReferenceBaseline)
+            : []
+        // HypoPlanner already picked the one baseline to run via pick_baseline (or the
+        // heuristic fallback) — show only that one, not every option it could have chosen.
+        const baselines = referenceBaselines.length > 0 ? referenceBaselines : allBaselines
         const ssSearchPreferences = yield* Effect.promise(() => loadLLMSearchPreferences(Instance.directory, currentTask.id))
         const baselineList = baselines
           .map((b) => {
@@ -8333,7 +8365,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
               taskID: input.taskID,
               stage: input.stage,
               description: input.description,
-              maxIterations: (input.maxIterations ?? 50) + 5,
+              maxIterations: (input.maxIterations ?? 20) + 5,
               targetMetricValue: input.targetMetricValue,
               minRelativeImprovement: input.minRelativeImprovement,
               maxNoImprove: input.maxNoImprove,
@@ -8393,7 +8425,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
             taskID: input.taskID,
             stage: input.stage,
             description: input.description,
-            maxIterations: (input.maxIterations ?? 50) + 5,
+            maxIterations: (input.maxIterations ?? 20) + 5,
             targetMetricValue: input.targetMetricValue,
             minRelativeImprovement: input.minRelativeImprovement,
             maxNoImprove: input.maxNoImprove,
@@ -8424,13 +8456,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
         yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
       }
 
-      const reflection = currentWorkflow.completedPhases.includes("reflection")
-        ? yield* recoverReflection(currentTask, nas.loop.stoppedReason)
-        : yield* runReflectionAgent({
-            taskID: input.taskID,
-            outputDir: input.outputDir === undefined ? undefined : path.join(input.outputDir, "reflection"),
-            stoppedReason: nas.loop.stoppedReason,
-          })
+      // ReflectionAgent already ran once as part of finishing the autonomous loop and persisted its
+      // result to disk (artifacts + reflection_result.json) — read that back instead of calling it again.
+      const reflection = yield* recoverReflection(currentTask, nas.loop.stoppedReason)
 
       if (reflection.analysis.decision === "request_human" && !currentWorkflow.completedPhases.includes("reflection")) {
         yield* markWorkflowPhase("reflection")
@@ -8669,4 +8697,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service> =
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Session.defaultLayer))
+export const defaultLayer = layer.pipe(
+  Layer.provide(Bus.layer),
+  Layer.provide(Session.defaultLayer),
+  Layer.provide(SessionPrompt.defaultLayer),
+)

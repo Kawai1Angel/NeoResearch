@@ -8,7 +8,7 @@ const { checkStoppingConditions, parseTimeBudget } = require("../src/loop");
 test("checkStoppingConditions stops when time budget is exhausted", () => {
   const result = checkStoppingConditions(
     { candidate_counter: 3, no_improve_streak: 2, crash_streak: 0 },
-    { timeBudgetMs: 1000, sessionStartMs: Date.now() - 2000, maxNoImprove: 8, maxCandidates: Infinity },
+    { timeBudgetMs: 1000, sessionStartMs: Date.now() - 2000, maxNoImprove: 5, maxCandidates: Infinity },
   );
 
   assert.deepEqual(result, { stop: true, reason: "time_budget_exhausted" });
@@ -16,12 +16,12 @@ test("checkStoppingConditions stops when time budget is exhausted", () => {
 
 test("checkStoppingConditions stops on no-improve plateau", () => {
   const result = checkStoppingConditions(
-    { candidate_counter: 10, no_improve_streak: 8, crash_streak: 0 },
-    { timeBudgetMs: null, sessionStartMs: Date.now(), maxNoImprove: 8, maxCandidates: Infinity },
+    { candidate_counter: 10, no_improve_streak: 5, crash_streak: 0 },
+    { timeBudgetMs: null, sessionStartMs: Date.now(), maxNoImprove: 5, maxCandidates: Infinity },
   );
 
   assert.equal(result.stop, true);
-  assert.match(result.reason, /^no_improve_plateau:8_rounds$/);
+  assert.match(result.reason, /^no_improve_plateau:5_rounds$/);
 });
 
 test("checkStoppingConditions stops on crash streak and finite candidate caps", () => {

@@ -64,6 +64,13 @@ ACTION_SPECS: dict[str, dict[str, dict[str, Any]]] = {
         "cosine": {"phase_min": "phase1", "bridge_supported": False},
         "one_cycle": {"phase_min": "phase2", "bridge_supported": False},
         "plateau": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_type1": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_type2": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_type3": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_3": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_4": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_5": {"phase_min": "phase2", "bridge_supported": False},
+        "lradj_6": {"phase_min": "phase2", "bridge_supported": False},
     },
 }
 
@@ -247,6 +254,11 @@ def validate_recipe_against_registry(
         errors.append(f"backbone.type='{backbone_type}' requires embedding.type='none'")
     if backbone_type == "rnn" and str(backbone.get("cell", "gru")) not in {"gru", "lstm", "rnn"}:
         errors.append("backbone.cell must be one of: gru, lstm, rnn")
+    if backbone_type == "mixer":
+        if str(backbone.get("temporal_mixing", "mlp")) not in {"mlp", "conv"}:
+            errors.append("backbone.temporal_mixing must be one of: mlp, conv")
+        if str(backbone.get("channel_mixing", "mlp")) not in {"mlp", "identity"}:
+            errors.append("backbone.channel_mixing must be one of: mlp, identity")
 
     errors.extend(validate_scheduler_warmup(recipe.get("training_strategy", {})))
 

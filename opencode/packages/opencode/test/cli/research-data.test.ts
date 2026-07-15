@@ -104,7 +104,7 @@ describe("research CLI data helpers", () => {
       domainID: "tsf",
       mode: "review",
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
-      budget: { maxRuns: 12, maxParallel: 1 },
+      budget: { maxRuns: 50, maxParallel: 1 },
     })
     expect(buildDefaultTsfResearchTaskInput({ mode: "review", interactionMode: "companion" })).toMatchObject({
       mode: "autonomous",
@@ -118,8 +118,8 @@ describe("research CLI data helpers", () => {
       mode: "autonomous",
       interactionMode: "socratic",
       taskSpec: {
-        contextLength: 96,
-        predictionLengths: [24],
+        contextLength: 336,
+        predictionLengths: [96],
         dataset: { loaderID: "etth1_tslib_v1", targetCols: ["OT"] },
         runtime: { bridgeOnly: true },
       },

@@ -485,7 +485,7 @@ export function ResearchDashboard() {
         `/research/tasks/${encodeURIComponent(task.id)}/autonomous/loop`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "smoke", maxIterations: 3, description: "dashboard autonomous loop" }),
+          body: JSON.stringify({ stage: "smoke", maxIterations: 50, description: "dashboard autonomous loop" }),
         },
       )
       return formatResearchLoopNotice(result)

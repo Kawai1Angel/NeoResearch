@@ -144,6 +144,20 @@ class RecipeFactoryTest(unittest.TestCase):
         )
         self.assert_forward_shape(recipe)
 
+    def test_dlinear_individual_recipe_forward(self) -> None:
+        recipe = make_recipe(
+            embedding={"type": "none"},
+            backbone={"type": "dlinear", "kernel_size": 9, "bias": True, "individual": True},
+        )
+        torch.manual_seed(7)
+        model = build_model({"recipe": recipe, "num_channels": 3}, input_len=32, horizon=8)
+        model.eval()
+        x = torch.randn(2, 32, 3)
+        with torch.no_grad():
+            y = model(x)
+        self.assertEqual(tuple(y.shape), (2, 8, 3))
+        self.assertTrue(torch.isfinite(y).all().item())
+
     def test_tcn_recipe_forward(self) -> None:
         recipe = make_recipe(
             embedding={"type": "none"},
@@ -284,6 +298,48 @@ class RecipeFactoryTest(unittest.TestCase):
         self.assertEqual(tuple(quantiles.shape), (2, 8, 3, 3))
         self.assertEqual(tuple(training_pred.shape), (2, 8, 3, 3))
         self.assertTrue(torch.isfinite(quantiles).all().item())
+
+    def test_structured_exogenous_inputs_are_native_and_target_only(self) -> None:
+        recipe = make_recipe(
+            fusion={"type": "temporal", "channel_mode": "independent"},
+            prediction_head={
+                "type": "quantile",
+                "output_distribution": "quantile",
+                "quantiles": [0.1, 0.5, 0.9],
+            },
+        )
+        model = build_model(
+            {
+                "recipe": recipe,
+                "num_channels": 3,
+                "num_target_channels": 1,
+                "num_past_covariate_channels": 2,
+                "num_future_covariate_channels": 1,
+                "num_input_channels": 3,
+                "num_output_channels": 1,
+                "future_covariate_mode": "none",
+            },
+            input_len=32,
+            horizon=8,
+        )
+        target_history = torch.randn(2, 32, 1)
+        exogenous_past = torch.randn(2, 32, 2)
+        exogenous_future = torch.randn(2, 8, 1)
+
+        with torch.no_grad():
+            point = model(
+                target_history=target_history,
+                exogenous_past=exogenous_past,
+                exogenous_future=exogenous_future,
+            )
+            quantiles = model.forward_quantiles(
+                target_history=target_history,
+                exogenous_past=exogenous_past,
+                exogenous_future=exogenous_future,
+            )
+
+        self.assertEqual(tuple(point.shape), (2, 8, 1))
+        self.assertEqual(tuple(quantiles.shape), (2, 8, 1, 3))
 
     def test_recipe_execution_summary_records_phase2_distribution_actions(self) -> None:
         recipe = make_recipe(
@@ -491,6 +547,38 @@ class RecipeFactoryTest(unittest.TestCase):
         optimizer.step()
         _step_scheduler(one_cycle, 1.0)
 
+    def test_datasci_lradj_schedulers_match_epoch_end_rules(self) -> None:
+        recipe = make_recipe(
+            training_strategy={
+                "loss": {"base": "mse", "horizon_weighting": "uniform"},
+                "optimizer": {"type": "adam", "lr": 0.0001, "weight_decay": 0.0},
+                "scheduler": {"type": "lradj_type1", "warmup_steps": 0},
+                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "budget": {"max_epochs": 10, "time_budget_s": 10, "batch_size": 2, "patience": 3, "seed": 42},
+            },
+        )
+        candidate = {"recipe": recipe}
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.Adam([parameter], lr=0.0001)
+        scheduler = _build_scheduler(optimizer, candidate, max_epochs=10)
+        self.assertIsNotNone(scheduler)
+
+        _step_scheduler(scheduler, 1.0)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.0001)
+        _step_scheduler(scheduler, 1.0)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.00005)
+
+        recipe["training_strategy"]["scheduler"] = {"type": "lradj_type3", "warmup_steps": 0}
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.Adam([parameter], lr=0.0001)
+        scheduler = _build_scheduler(optimizer, candidate, max_epochs=10)
+        self.assertIsNotNone(scheduler)
+        for _ in range(3):
+            _step_scheduler(scheduler, 1.0)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.0001)
+        _step_scheduler(scheduler, 1.0)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.00009)
+
     def test_distillation_loss_blends_supervised_and_teacher_targets(self) -> None:
         recipe = make_recipe(
             training_strategy={
@@ -550,6 +638,59 @@ class RecipeFactoryTest(unittest.TestCase):
             },
         )
         with self.assertRaisesRegex(ValueError, "divisible"):
+            build_model({"recipe": recipe}, input_len=32, horizon=8)
+
+    def test_mixer_temporal_conv_channel_mlp_recipe_forward(self) -> None:
+        recipe = make_recipe(
+            backbone={
+                "type": "mixer",
+                "hidden_dim": 16,
+                "depth": 1,
+                "dropout": 0.0,
+                "temporal_mixing": "conv",
+                "channel_mixing": "mlp",
+            },
+        )
+        self.assert_forward_shape(recipe)
+
+    def test_mixer_temporal_mlp_channel_identity_recipe_forward(self) -> None:
+        recipe = make_recipe(
+            backbone={
+                "type": "mixer",
+                "hidden_dim": 16,
+                "depth": 1,
+                "dropout": 0.0,
+                "temporal_mixing": "mlp",
+                "channel_mixing": "identity",
+            },
+        )
+        self.assert_forward_shape(recipe)
+
+    def test_mixer_temporal_conv_channel_identity_recipe_forward(self) -> None:
+        recipe = make_recipe(
+            backbone={
+                "type": "mixer",
+                "hidden_dim": 16,
+                "depth": 1,
+                "dropout": 0.0,
+                "temporal_mixing": "conv",
+                "channel_mixing": "identity",
+            },
+        )
+        self.assert_forward_shape(recipe)
+
+    def test_mixer_rejects_unsupported_mixing_value(self) -> None:
+        recipe = make_recipe(
+            backbone={
+                "type": "mixer",
+                "hidden_dim": 16,
+                "depth": 1,
+                "dropout": 0.0,
+                "temporal_mixing": "unsupported",
+                "channel_mixing": "mlp",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported mixer"):
             build_model({"recipe": recipe}, input_len=32, horizon=8)
 
     def test_raw_backbones_reject_patch_embedding(self) -> None:

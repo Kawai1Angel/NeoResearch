@@ -205,6 +205,7 @@ export interface ResearchDomain {
     candidateSpec: JsonRecord
     stage?: DomainRunStage
     description?: string
+    runnerRunID?: string
   }) => DomainRunPlan
 }
 

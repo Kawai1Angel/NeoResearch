@@ -286,7 +286,7 @@ For relay keys, `NEO_CAST_LLM_API_KEY`, `OPENAI_API_KEY`, or `AIGCBEST_API_KEY` 
 
 ## Input Contract
 
-`neo-cast` now uses a standardized `dataset.v1` loading contract. `prepare-data` materializes:
+`neo-cast` supports the legacy `dataset.v1` feature contract and the role-aware `dataset.v2` contract. `prepare-data` materializes:
 
 ```text
 .neo-cast/dataset/
@@ -332,6 +332,20 @@ node ./bin/neo-cast.js prepare-data \
 ```
 
 If `--feature-cols` is omitted for a non-ETTh1 task, numeric columns except the timestamp column are inferred. If row ranges are omitted for a non-ETTh1 task, `prepare-data` uses contiguous 60/20/20 splits when the dataset is long enough.
+
+Use `dataset.v2` whenever targets and exogenous variables have different roles:
+
+```bash
+node ./bin/neo-cast.js prepare-data \
+  --source /path/to/wind.csv \
+  --target-cols real_power \
+  --observed-past-covariates wind_speed,temperature \
+  --known-future-covariates wind_speed,temperature \
+  --known-future-source weather_forecast \
+  --known-future-available true
+```
+
+The same column may be both observed-past and known-future. It appears once in historical inputs, while forecasts, losses, metrics, and inverse transforms remain target-only. `--feature-cols` remains available for `dataset.v1` compatibility and cannot be combined with `--target-cols`.
 
 Missing values and timestamps:
 

@@ -788,7 +788,7 @@ export const ResearchLoopCommand = cmd({
           .option("max-iterations", {
             describe: "maximum autonomous iterations to run",
             type: "number",
-            default: 50,
+            default: 20,
           })
           .option("exploration", {
             describe: "forced exploration rate from 0 to 1",
@@ -869,7 +869,7 @@ export const ResearchPipelineCommand = cmd({
         .option("max-iterations", {
           describe: "maximum autonomous iterations to run",
           type: "number",
-          default: 50,
+          default: 20,
         })
         .option("exploration", {
           describe: "forced exploration rate from 0 to 1",
@@ -931,7 +931,7 @@ export const ResearchVibeCommand = cmd({
         .option("max-iterations", {
           describe: "maximum autonomous iterations to run",
           type: "number",
-          default: 50,
+          default: 20,
         })
         .option("exploration", {
           describe: "forced exploration rate from 0 to 1",

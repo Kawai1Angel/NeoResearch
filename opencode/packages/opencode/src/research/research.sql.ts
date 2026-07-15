@@ -178,7 +178,10 @@ export const ResearchHypothesisTable = sqliteTable(
     priority: text().notNull(),
     risk: text().notNull(),
     testable: integer({ mode: "boolean" }).notNull(),
+    // pending | active | testing | confirmed | rejected | abandoned
     status: text().notNull().default("pending"),
+    abandon_reason: text(),
+    abandoned_at: integer(),
     ...Timestamps,
   },
   (table) => [

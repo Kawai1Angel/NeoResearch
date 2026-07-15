@@ -113,7 +113,18 @@ describe("TSF research domain", () => {
 
   test("bridge-only mode rejects schedulers with bridgeSupported=false", () => {
     const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", taskSpec)
-    for (const schedulerType of ["cosine", "one_cycle", "plateau"] as const) {
+    for (const schedulerType of [
+      "cosine",
+      "one_cycle",
+      "plateau",
+      "lradj_type1",
+      "lradj_type2",
+      "lradj_type3",
+      "lradj_3",
+      "lradj_4",
+      "lradj_5",
+      "lradj_6",
+    ] as const) {
       const candidateSpec = {
         recipeVersion: "recipe_schema_v1",
         recipeID: `tsf_bridge_only_${schedulerType}_scheduler`,
@@ -214,6 +225,19 @@ describe("TSF research domain", () => {
     })
     expect(fingerprint.searchBiases).toContain("multivariate")
     expect(fingerprint.searchBiases).toContain("bridge_safe")
+  })
+
+  test("renders ref_test run plan with the bound Neo-Cast run id", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", taskSpec)
+    const runPlan = Research.DomainRegistry.createRunPlan("tsf", {
+      taskSpec: normalizedTask,
+      candidateSpec: Research.DomainRegistry.buildBaselines("tsf", normalizedTask)[0]!.candidateSpec,
+      stage: "ref_test",
+      runnerRunID: "20260629-063757-hbrp",
+    })
+
+    expect(runPlan.command.args).toContain("--run-id")
+    expect(runPlan.command.args).toContain("20260629-063757-hbrp")
   })
 
   test("accepts probabilistic TSF objectives and fingerprints their metrics", () => {
@@ -388,13 +412,52 @@ describe("TSF research domain", () => {
       },
     })
     const baselines = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)
+    const patchtst = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_baseline_patchtst")
     const dlinear = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_baseline_dlinear")
     const itransformer = baselines.find((item) => asRecord(item.candidateSpec).recipeID === "tsf_baseline_itransformer")
 
+    expect(patchtst?.candidateSpec.preprocessing).toMatchObject({
+      actions: [{ type: "instance_norm", affine: false }],
+    })
+    expect(patchtst?.candidateSpec.embedding).toMatchObject({ type: "patch", patchLen: 16, stride: 8, dModel: 512 })
+    expect(patchtst?.candidateSpec.backbone).toMatchObject({
+      type: "transformer",
+      dModel: 512,
+      nHeads: 8,
+      nLayers: 2,
+      dropout: 0.05,
+      ffnMult: 4,
+    })
+    expect(patchtst?.candidateSpec.trainingStrategy).toMatchObject({
+      optimizer: { type: "adam", lr: 0.0001 },
+      scheduler: { type: "lradj_type3", warmupSteps: 0 },
+      regularization: { dropout: 0.05 },
+      budget: { maxEpochs: 100, batchSize: 128, patience: 100, seed: 2021 },
+    })
     expect(dlinear?.candidateSpec.preprocessing).toMatchObject({
-      actions: [{ type: "series_decomposition" }],
+      actions: [{ type: "none" }],
+    })
+    expect(dlinear?.candidateSpec.backbone).toMatchObject({ type: "dlinear", kernelSize: 25, individual: false })
+    expect(dlinear?.candidateSpec.trainingStrategy).toMatchObject({
+      optimizer: { type: "adam", lr: 0.0001 },
+      scheduler: { type: "lradj_type1", warmupSteps: 0 },
+      budget: { maxEpochs: 10, batchSize: 32, patience: 3, seed: 2021 },
+    })
+    expect(itransformer?.candidateSpec.embedding).toMatchObject({ type: "invert", dModel: 512 })
+    expect(itransformer?.candidateSpec.backbone).toMatchObject({
+      type: "transformer",
+      dModel: 512,
+      nHeads: 8,
+      nLayers: 2,
+      dropout: 0.1,
+      ffnMult: 4,
     })
     expect(itransformer?.candidateSpec.fusion).toMatchObject({ type: "feature" })
+    expect(itransformer?.candidateSpec.trainingStrategy).toMatchObject({
+      optimizer: { type: "adam", lr: 0.0001 },
+      scheduler: { type: "lradj_type1", warmupSteps: 0 },
+      budget: { maxEpochs: 10, batchSize: 32, patience: 3, seed: 2023 },
+    })
   })
 
   test("does not classify pure trend as seasonality", async () => {
@@ -581,7 +644,7 @@ describe("TSF research domain", () => {
         hiddenDim: 32,
         depth: 2,
         temporalMixing: "mlp",
-        channelMixing: true,
+        channelMixing: "mlp",
         dropout: 0.1,
       },
       fusion: { type: "gated_hybrid", gateType: "channel" },
@@ -940,7 +1003,7 @@ describe("TSF research domain", () => {
       hypothesis: "Prior frequency mixer trial failed on this task family.",
       preprocessing: { actions: [{ type: "none" }] },
       embedding: { type: "frequency", nFreq: 8, complexMode: "magnitude", dModel: 32 },
-      backbone: { type: "mixer", hiddenDim: 64, depth: 2, temporalMixing: "mlp", channelMixing: true, dropout: 0.1 },
+      backbone: { type: "mixer", hiddenDim: 64, depth: 2, temporalMixing: "mlp", channelMixing: "mlp", dropout: 0.1 },
       fusion: { type: "gated_hybrid", gateType: "channel" },
       predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
       trainingStrategy: priorTraining,

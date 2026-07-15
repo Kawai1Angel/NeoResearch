@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "fs/promises"
 import { tmpdir as osTmpdir } from "os"
 import { Bus } from "../../src/bus"
 import { Session } from "../../src/session"
+import { SessionPrompt } from "../../src/session/prompt"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
@@ -19,7 +20,15 @@ function runResearch<A, E>(fx: Effect.Effect<A, E, Research.Service>) {
 
 function runResearchWithBus<A, E>(fx: Effect.Effect<A, E, Research.Service | Bus.Service>) {
   return Effect.runPromise(
-    fx.pipe(Effect.provide(Research.layer.pipe(Layer.provideMerge(Bus.layer), Layer.provideMerge(Session.defaultLayer)))),
+    fx.pipe(
+      Effect.provide(
+        Research.layer.pipe(
+          Layer.provideMerge(Bus.layer),
+          Layer.provideMerge(Session.defaultLayer),
+          Layer.provideMerge(SessionPrompt.defaultLayer),
+        ),
+      ),
+    ),
   )
 }
 
@@ -301,14 +310,21 @@ function value(flag) {
 const source = value("--source")
 const inputLen = Number(value("--input-len") || 96)
 const horizons = String(value("--horizons") || "24").split(",").map((item) => Number(item))
-const featureColumns = String(value("--feature-cols") || "OT").split(",").filter(Boolean)
+const targetColumns = String(value("--target-cols") || value("--feature-cols") || "OT").split(",").filter(Boolean)
+const observedPastCovariates = String(value("--observed-past-covariates") || "").split(",").filter(Boolean)
+const knownFutureCovariates = String(value("--known-future-covariates") || "").split(",").filter(Boolean)
 fs.mkdirSync(".neo-cast/dataset", { recursive: true })
 const spec = {
-  schema_version: "dataset.v1",
+  schema_version: value("--target-cols") ? "dataset.v2" : "dataset.v1",
   source_csv: path.resolve(source),
   task_id: value("--task-id") || "local_csv",
   timestamp_col: "date",
-  feature_columns: featureColumns,
+  ...(value("--target-cols") ? {
+    target_columns: targetColumns,
+    observed_past_covariates: observedPastCovariates,
+    known_future_covariates: knownFutureCovariates,
+    static_covariates: [],
+  } : { feature_columns: targetColumns }),
   input_len: inputLen,
   horizons,
   splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
@@ -717,7 +733,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "pipeline autonomous task",
           {
@@ -785,7 +801,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "pipeline resume autonomous task",
           {
@@ -845,7 +861,7 @@ describe("Research service", () => {
 
             const result = yield* svc.runFullPipeline({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               description: "pipeline smoke",
               maxIterations: 1,
               outputDir: ".neo-research/pipeline",
@@ -882,7 +898,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "pipeline spec change task",
           {
@@ -988,7 +1004,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "pipeline missing intent task",
           {
@@ -1423,7 +1439,8 @@ describe("Research service", () => {
           source_csv: path.resolve(datasetPath),
           input_len: 12,
           horizons: [8],
-          feature_columns: ["a", "b"],
+          schema_version: "dataset.v2",
+          target_columns: ["a", "b"],
         })
         const payload = JSON.parse(await readFile(prepared.path, "utf8"))
         expect(payload.command.args).toContain("--source")
@@ -1466,11 +1483,9 @@ describe("Research service", () => {
           ),
         )
 
-        const prepared = await runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id })))
-        expect(prepared.datasetSpec.feature_columns).toEqual(["a"])
-        expect(prepared.command.warnings).toEqual([
-          "Only matched 1/2 requested target columns from CSV header; missing: missing_target.",
-        ])
+        await expect(
+          runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id }))),
+        ).rejects.toThrow(/Dataset role columns were not found.*missing_target/)
 
         const invalidTask = await runResearch(
           Research.Service.use((svc) =>
@@ -1499,7 +1514,7 @@ describe("Research service", () => {
 
         await expect(
           runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: invalidTask.id }))),
-        ).rejects.toThrow(/None of the requested target columns were found/)
+        ).rejects.toThrow(/Dataset role columns were not found/)
       },
     })
   })
@@ -1572,7 +1587,7 @@ describe("Research service", () => {
             svc.prepareRun({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
+              stage: "full",
             }),
           ),
         )
@@ -1632,7 +1647,7 @@ describe("Research service", () => {
             svc.executeRun({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
+              stage: "full",
             }),
           ),
         )
@@ -1689,7 +1704,7 @@ describe("Research service", () => {
             svc.prepareRun({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
+              stage: "full",
               description: "durable handoff",
             }),
           ),
@@ -1760,7 +1775,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
 
         const task = await runResearch(
           Research.Service.use((svc) =>
@@ -2731,7 +2746,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         await writeFile(path.join(fakeNeoCastRoot, "pyproject.toml"), "[project]\nname = \"fake-neo-cast\"\n", "utf8")
         await writeFile(path.join(fakeNeoCastRoot, "py", "prepare_tsf.py"), "PREPROCESS_VERSION = 1\n", "utf8")
         const datasetPath = path.join(tmp.path, "train.csv")
@@ -2771,7 +2786,7 @@ describe("Research service", () => {
             svc.executeRun({
               taskID: task.id,
               candidateID: seeded.candidates[0]!.id,
-              stage: "smoke",
+              stage: "full",
               description: "fake runner smoke",
             }),
           ),
@@ -3616,7 +3631,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
 
         const task = await createTSFTask(
           "autonomous fake runner",
@@ -3755,7 +3770,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "existing frontier ranking",
           {
@@ -3771,7 +3786,7 @@ describe("Research service", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousIteration({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               description: "existing frontier",
             }),
           ),
@@ -3799,7 +3814,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
 
         const task = await createTSFTask(
           "autonomous loop fake runner",
@@ -3978,7 +3993,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "autonomous loop target",
           {
@@ -3993,7 +4008,7 @@ describe("Research service", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousLoop({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               maxIterations: 5,
               targetMetricValue: 0.2,
               description: "target stopped loop",
@@ -4014,7 +4029,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "autonomous loop plateau",
           {
@@ -4029,7 +4044,7 @@ describe("Research service", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousLoop({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               maxIterations: 5,
               maxNoImprove: 1,
               description: "plateau stopped loop",
@@ -4038,6 +4053,100 @@ describe("Research service", () => {
         )
 
         expect(loop.stoppedReason).toBe("plateau")
+        expect(loop.iterations).toHaveLength(2)
+      },
+    })
+  })
+
+  test("autonomous loop defaults plateau to 5 rounds against the current task best", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "autonomous loop current session plateau",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+        const sessionBestCandidate = await createCandidate({
+          taskID: task.id,
+          rationale: "current task/session best",
+        })
+        await createRun({
+          taskID: task.id,
+          candidateID: sessionBestCandidate.id,
+          status: "succeeded",
+          stage: "full",
+          metrics: { val_avg_mse: 0.05, val_avg_mae: 0.2 },
+        })
+
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({
+              taskID: task.id,
+              stage: "full",
+              maxIterations: 10,
+              description: "default plateau against current best",
+            }),
+          ),
+        )
+
+        expect(loop.stoppedReason).toBe("plateau")
+        expect(loop.iterations).toHaveLength(5)
+        expect(loop.iterations.every((iteration) => iteration.run.metrics.val_avg_mse === 0.101)).toBe(true)
+      },
+    })
+  })
+
+  test("autonomous loop does not use smoke metrics for no-improvement stopping", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        const task = await createTSFTask(
+          "autonomous loop smoke gate",
+          {
+            bridgeOnly: true,
+            neoCastProjectRoot: fakeNeoCastRoot,
+            pythonExecutable: "bash",
+          },
+          "autonomous",
+        )
+        const smokeBestCandidate = await createCandidate({
+          taskID: task.id,
+          rationale: "smoke-only best must not drive plateau",
+        })
+        await createRun({
+          taskID: task.id,
+          candidateID: smokeBestCandidate.id,
+          stage: "smoke",
+          status: "succeeded",
+          metrics: { val_avg_mse: 0.01, val_avg_mae: 0.02 },
+        })
+
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({
+              taskID: task.id,
+              stage: "smoke",
+              maxIterations: 2,
+              maxNoImprove: 1,
+              description: "smoke metrics ignored for plateau",
+            }),
+          ),
+        )
+
+        expect(loop.stoppedReason).toBe("max_iterations")
         expect(loop.iterations).toHaveLength(2)
       },
     })

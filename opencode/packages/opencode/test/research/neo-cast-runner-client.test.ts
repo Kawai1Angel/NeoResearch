@@ -128,6 +128,20 @@ describe("Neo-Cast runner client", () => {
     expect(command.executable).toBe(pythonPath)
   })
 
+  test("passes explicit Neo-Cast run IDs to privileged evaluation commands", async () => {
+    const runnerRoot = await createRunnerRoot()
+
+    const command = createNeoCastRunnerCommand({
+      stage: "ref_test",
+      runtime,
+      description: "reference test",
+      runnerRunID: "20260629-063757-hbrp",
+      explicitRoot: runnerRoot,
+    })
+
+    expect(command.args).toEqual(["py/runner.py", "ref-test", "--run-id", "20260629-063757-hbrp"])
+  })
+
   test("discovers a package-bundled runner and keeps project state in the caller cwd", async () => {
     const packageRoot = await mkdtemp(path.join(tmpdir(), "neo-research-runner-client-package-"))
     const runnerRoot = path.join(packageRoot, "runners", "neo_cast")

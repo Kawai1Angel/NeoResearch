@@ -92,18 +92,6 @@ test("analyzeReflection ranks improving runs as effective and regressing runs as
   expect(analysis.decision).toBe("continue")
 })
 
-test("analyzeReflection produces hypotheses driven by dataset profile and search biases", () => {
-  const analysis = analyzeReflection({
-    task: task(),
-    runs: [run({ id: "run_a", candidateID: "cand_a", status: "succeeded", metric: 0.4, created: 1 })],
-    candidates: [candidate("cand_a", "linear_baseline", "linear")],
-  })
-  const titles = analysis.nextHypotheses.map((item) => item.title)
-  expect(titles.some((title) => title.includes("series_decomposition"))).toBe(true)
-  expect(titles.some((title) => title.includes("channel-mixing"))).toBe(true)
-  expect(titles.some((title) => title.includes("prefer_decomposition_for_high_seasonality"))).toBe(true)
-})
-
 test("analyzeReflection requests human review after consecutive failures", () => {
   const c = candidate("cand_x", "patch_mlp_baseline", "mlp")
   const analysis = analyzeReflection({
@@ -118,9 +106,6 @@ test("analyzeReflection requests human review after consecutive failures", () =>
   expect(analysis.failedRuns).toBe(3)
   expect(analysis.failures.map((item) => item.category)).toEqual(["oom", "oom", "nan"])
   expect(analysis.decision).toBe("request_human")
-  const titles = analysis.nextHypotheses.map((item) => item.title)
-  expect(titles.some((title) => title.includes("batch size"))).toBe(true)
-  expect(titles.some((title) => title.includes("Huber"))).toBe(true)
 })
 
 test("summarizeReflectionAgent emits both reflection_notes and next_experiment_plan markdown", () => {

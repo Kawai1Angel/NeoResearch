@@ -34,12 +34,6 @@ export interface ReflectionFailure {
   readonly summary: string
 }
 
-export interface ReflectionHypothesis {
-  readonly title: string
-  readonly rationale: string
-  readonly expectedSignal: string
-}
-
 export interface ReflectionAnalysis {
   readonly primaryMetricName: string
   readonly direction: "minimize" | "maximize"
@@ -55,7 +49,6 @@ export interface ReflectionAnalysis {
   readonly effectiveChanges: ReflectionEffectiveChange[]
   readonly ineffectiveChanges: ReflectionIneffectiveChange[]
   readonly failures: ReflectionFailure[]
-  readonly nextHypotheses: ReflectionHypothesis[]
   readonly decision: ReflectionDecision
   readonly decisionReason: string
 }
@@ -177,91 +170,13 @@ function describeCandidate(candidate: ResearchCandidate | undefined) {
   return `${candidate.id} (${parts.join(", ")})`
 }
 
-function deriveHypotheses(input: {
-  readonly profile: Record<string, unknown>
-  readonly searchBiases: readonly string[]
-  readonly failures: readonly ReflectionFailure[]
-  readonly plateauStreak: number
-}): ReflectionHypothesis[] {
-  const hypotheses: ReflectionHypothesis[] = []
-  const { profile, searchBiases, failures, plateauStreak } = input
-
-  const seasonality = typeof profile.seasonalityStrength === "number" ? profile.seasonalityStrength : undefined
-  const trend = typeof profile.trendStrength === "number" ? profile.trendStrength : undefined
-  const drift = typeof profile.distributionShift === "number" ? profile.distributionShift : undefined
-  const crossVar = typeof profile.crossVarCorrelation === "number" ? profile.crossVarCorrelation : undefined
-
-  if (seasonality !== undefined && seasonality > 0.45) {
-    hypotheses.push({
-      title: "引入或加强 series_decomposition",
-      rationale: `seasonalityStrength=${seasonality.toFixed(3)} 偏高，分解残差后再建模通常能稳定长 horizon。`,
-      expectedSignal: "horizon ≥ 96 的 val_mse 下降",
-    })
-  }
-  if (drift !== undefined && drift > 0.3) {
-    hypotheses.push({
-      title: "强制 instance_norm 或滑窗归一化",
-      rationale: `distributionShift=${drift.toFixed(3)} 偏高，全局归一会被早期分布主导。`,
-      expectedSignal: "ref_test 与 val 之间的差距收敛",
-    })
-  }
-  if (crossVar !== undefined && crossVar > 0.5) {
-    hypotheses.push({
-      title: "尝试 channel-mixing 或 fusion=feature",
-      rationale: `crossVarCorrelation=${crossVar.toFixed(3)} 表明跨变量信号强，channel-independent 可能丢信息。`,
-      expectedSignal: "多变量任务上的 val_avg_mse 改善",
-    })
-  }
-  if (trend !== undefined && trend > 0.5 && seasonality !== undefined && seasonality < 0.2) {
-    hypotheses.push({
-      title: "降低 lookback 并切换到线性 / DLinear",
-      rationale: "趋势主导且季节性弱，过长上下文反而引入噪声。",
-      expectedSignal: "短 horizon val_mse 改善且参数量降低",
-    })
-  }
-
-  for (const bias of searchBiases) hypotheses.push({
-    title: `跟进 search bias: ${bias}`,
-    rationale: "数据分析阶段已识别该方向，仍未在搜索中得到充分验证。",
-    expectedSignal: "下一轮 candidate 触发该方向后 val 指标改善",
-  })
-
-  const recurringOOM = failures.filter((item) => item.category === "oom").length
-  if (recurringOOM >= 2) hypotheses.push({
-    title: "降低 batch size 或缩小模型规模",
-    rationale: `已观测到 ${recurringOOM} 次 OOM，当前预算无法承载该模型容量。`,
-    expectedSignal: "训练顺利完成且不再触发 OOM",
-  })
-  const recurringNan = failures.filter((item) => item.category === "nan").length
-  if (recurringNan >= 1) hypotheses.push({
-    title: "降低学习率或更换为 Huber loss",
-    rationale: "出现 NaN，通常来自过大学习率、异常样本或损失尾部。",
-    expectedSignal: "训练全程 loss 有限且收敛",
-  })
-  const recurringNotConverge = failures.filter((item) => item.category === "not_converge").length
-  if (recurringNotConverge >= 1) hypotheses.push({
-    title: "调整 optimizer / scheduler 或延长训练步数",
-    rationale: "训练未收敛，需要重新评估优化设置或预算。",
-    expectedSignal: "loss 曲线在 ref_test 前进入下降通道",
-  })
-
-  if (plateauStreak >= 3 && hypotheses.length === 0) hypotheses.push({
-    title: "扩大搜索空间或换 backbone family",
-    rationale: `连续 ${plateauStreak} 轮无显著提升，当前邻域可能已收敛到局部最优。`,
-    expectedSignal: "新 candidate 在 val_avg_mse 上突破 plateau 阈值",
-  })
-
-  return hypotheses
-}
-
 function decide(input: {
   readonly stoppedReason?: string
   readonly plateauStreak: number
   readonly failedStreak: number
   readonly succeededRuns: number
-  readonly hypothesesCount: number
 }): { decision: ReflectionDecision; reason: string } {
-  const { stoppedReason, plateauStreak, failedStreak, succeededRuns, hypothesesCount } = input
+  const { stoppedReason, plateauStreak, failedStreak, succeededRuns } = input
   if (stoppedReason === "target_reached") return { decision: "stop", reason: "已达到目标指标，反思建议停止迭代并发布。" }
   if (stoppedReason === "budget_exhausted")
     return { decision: "stop", reason: "预算已耗尽，反思建议停止迭代并整理产物。" }
@@ -277,17 +192,12 @@ function decide(input: {
       decision: "request_human",
       reason: "尚无成功 run，先确认数据准备与训练脚本是否健康。",
     }
-  if (plateauStreak >= 4 && hypothesesCount === 0)
+  if (plateauStreak >= 4)
     return {
       decision: "stop",
-      reason: "已连续多轮 plateau 且无可执行假设，建议固化当前 champion 并发布。",
+      reason: "已连续多轮 plateau，建议固化当前 champion 并发布。",
     }
-  return {
-    decision: "continue",
-    reason: hypothesesCount > 0
-      ? "存在新的可执行假设，建议继续执行 next_experiment_plan 中的下一步。"
-      : "",
-  }
+  return { decision: "continue", reason: "继续执行下一步实验。" }
 }
 
 export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
@@ -364,13 +274,6 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
     ? biasArray.filter((item): item is string => typeof item === "string")
     : []
 
-  const nextHypotheses = deriveHypotheses({
-    profile,
-    searchBiases,
-    failures,
-    plateauStreak,
-  })
-
   const succeededCount = succeeded.length
   const rejectedCount = ordered.filter((run) => run.status === "rejected").length
   const failedCount = ordered.filter((run) => run.status === "failed").length
@@ -380,7 +283,6 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
     plateauStreak,
     failedStreak,
     succeededRuns: succeededCount,
-    hypothesesCount: nextHypotheses.length,
   })
 
   return {
@@ -398,7 +300,6 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
     effectiveChanges: effective,
     ineffectiveChanges: ineffective,
     failures,
-    nextHypotheses,
     decision,
     decisionReason: reason,
   }
@@ -483,21 +384,7 @@ export function buildNextExperimentPlanMarkdown(input: {
     `- Decision: ${analysis.decision}`,
     `- Reason: ${analysis.decisionReason}`,
     "",
-    "## Hypotheses to Try",
-    "",
   ]
-  if (analysis.nextHypotheses.length === 0) {
-    lines.push(
-      analysis.decision === "stop"
-        ? "- No further hypothesis. Promote the current champion and proceed to publish."
-        : "- No data-driven hypothesis triggered. Continue with the existing mutation policy.",
-    )
-  } else {
-    for (let index = 0; index < analysis.nextHypotheses.length; index++) {
-      const hypothesis = analysis.nextHypotheses[index]!
-      lines.push(`### H${index + 1}. ${hypothesis.title}`, "", `- Rationale: ${hypothesis.rationale}`, `- Expected signal: ${hypothesis.expectedSignal}`, "")
-    }
-  }
   lines.push(
     "## Recommended Next Action",
     "",
@@ -593,6 +480,5 @@ export function reflectionAgentMetadata(result: ReflectionAgentResult): JsonReco
     rejectedRuns: result.analysis.rejectedRuns,
     failureCount: result.analysis.failures.length,
     failureCategories: result.analysis.failures.map((failure) => failure.category),
-    hypothesisCount: result.analysis.nextHypotheses.length,
   }
 }

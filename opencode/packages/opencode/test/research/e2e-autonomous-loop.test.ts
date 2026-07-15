@@ -63,14 +63,19 @@ function value(flag) {
 const source = value("--source")
 const inputLen = Number(value("--input-len") || 12)
 const horizons = String(value("--horizons") || "8").split(",").map((item) => Number(item))
-const featureColumns = String(value("--feature-cols") || "a,b").split(",").filter(Boolean)
+const targetColumns = String(value("--target-cols") || value("--feature-cols") || "a,b").split(",").filter(Boolean)
 fs.mkdirSync(".neo-cast/dataset", { recursive: true })
 const spec = {
-  schema_version: "dataset.v1",
+  schema_version: value("--target-cols") ? "dataset.v2" : "dataset.v1",
   source_csv: path.resolve(source),
   task_id: value("--task-id") || "local_csv",
   timestamp_col: "date",
-  feature_columns: featureColumns,
+  ...(value("--target-cols") ? {
+    target_columns: targetColumns,
+    observed_past_covariates: [],
+    known_future_covariates: [],
+    static_covariates: [],
+  } : { feature_columns: targetColumns }),
   input_len: inputLen,
   horizons,
   splits: { train: [0, 58], val: [58, 77], ref_test: [77, 96] },
@@ -155,7 +160,8 @@ describe("AutoResearch alpha e2e smoke", () => {
           source_csv: path.resolve(datasetPath),
           input_len: 12,
           horizons: [8],
-          feature_columns: ["a", "b"],
+          schema_version: "dataset.v2",
+          target_columns: ["a", "b"],
         })
 
         const loop = await runResearch(

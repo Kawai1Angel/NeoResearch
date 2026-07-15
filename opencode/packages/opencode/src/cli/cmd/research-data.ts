@@ -53,8 +53,8 @@ function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: str
     ...(input.maxRuns === undefined ? {} : { maxTrials: input.maxRuns }),
   }
   return {
-    contextLength: input.contextLength ?? 96,
-    predictionLengths: input.predictionLengths && input.predictionLengths.length > 0 ? input.predictionLengths : [24],
+    contextLength: input.contextLength ?? 336,
+    predictionLengths: input.predictionLengths && input.predictionLengths.length > 0 ? input.predictionLengths : [96],
     dataset: {
       loaderID: nonEmpty(input.datasetPreset) ?? "etth1_tslib_v1",
       ...(datasetPath ? { path: datasetPath } : {}),
@@ -92,10 +92,10 @@ export function buildDefaultTsfResearchTaskInput(input: {
       direction: "minimize",
     },
     budget: {
-      maxRuns: input.maxRuns ?? 200,
+      maxRuns: input.maxRuns ?? 50,
       maxParallel: 1,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
-      parameterBudget: "prefer lightweight models under 2M parameters when accuracy is close",
+      parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
       ...(input.maxTrainingSeconds === undefined ? {} : { loop: { timeBudgetSeconds: input.maxTrainingSeconds } }),
     },
   } as Research.CreateTaskInput

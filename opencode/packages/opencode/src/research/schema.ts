@@ -501,6 +501,7 @@ export class PrepareRunInput extends Schema.Class<PrepareRunInput>("ResearchPrep
   stage: Schema.optional(ExecutableRunStage),
   description: Schema.optional(Schema.String),
   seed: Schema.optional(Schema.Number),
+  runnerRunID: Schema.optional(Schema.String),
 }) {
   static readonly zod = zod(this)
 }

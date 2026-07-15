@@ -377,6 +377,9 @@ function metricText(metrics: JsonRecord) {
 function runFailureText(run: ResearchCockpitRun | undefined) {
   const value = run?.error?.trim()
   if (!value) return undefined
+  // baseline_comparison_verifier rejects are a soft regression signal, not a hard
+  // failure worth surfacing in the cockpit — the run already shows as "rejected".
+  if (value.startsWith("[baseline_comparison_verifier]")) return undefined
   return formatError(value)
 }
 
@@ -386,7 +389,7 @@ function runDurationText(run: ResearchCockpitRun) {
 }
 
 function runSummaryText(run: ResearchCockpitRun) {
-  return `${run.id} ${run.stage ?? "run"} ${run.status} / ${metricText(run.metrics)}${runDurationText(run)}`
+  return `${run.stage ?? "run"} ${run.status} / ${metricText(run.metrics)}${runDurationText(run)}`
 }
 
 function shortSeal(value: unknown, length: number) {
@@ -1176,9 +1179,13 @@ export function ResearchCockpit() {
   >([])
   const [promptValue, setPromptValue] = createSignal("")
   const [csvInputErrors, setCsvInputErrors] = createSignal<string[]>([])
-  const [promptEvents, setPromptEvents] = createSignal<Array<{ id: number; text: string; taskID?: string; detail?: string }>>(
-    [],
-  )
+  // intentTurn marks an echo as belonging to the IntentAgent dialogue (a Socratic/companion
+  // answer) — the [IntentAgent] block renders these inline, ordered against the agent's own
+  // streamed parts via the shared streamEventID counter, instead of the bottom timeline, which
+  // is what used to make the LLM's reply look disconnected from the answer that triggered it.
+  const [promptEvents, setPromptEvents] = createSignal<
+    Array<{ id: number; text: string; taskID?: string; detail?: string; intentTurn?: boolean }>
+  >([])
   const [streamingChat, setStreamingChat] = createSignal<StreamingChatTurn>()
   const [chatSessionByContext, setChatSessionByContext] = createSignal<Record<string, string>>({})
   const [chatUsageByContext, setChatUsageByContext] = createSignal<Record<string, Record<string, ChatUsageEntry>>>({})
@@ -1190,11 +1197,58 @@ export function ResearchCockpit() {
     text: string
     done: boolean
   } | undefined>()
+  type DaPartEntry =
+    | { partID: string; kind: "text"; text: string }
+    | { partID: string; kind: "tool"; toolName: string; toolInput?: Record<string, unknown>; toolOutput?: string; toolState: "pending" | "running" | "completed" | "error"; toolDurationMs?: number; toolError?: string }
+  const [daPartMap, setDaPartMap] = createSignal<Map<string, DaPartEntry>>(new Map())
+  const [daPartOrder, setDaPartOrder] = createSignal<string[]>([])
+  let currentDaTextPartID: string | undefined
   const [hypoPlannerStream, setHypoPlannerStream] = createSignal<{
     id: number
     taskID?: string
     text: string
     done: boolean
+  } | undefined>()
+  type HypoPartEntry =
+    | { partID: string; kind: "text"; text: string }
+    | { partID: string; kind: "tool"; toolName: string; toolInput?: Record<string, unknown>; toolOutput?: string; toolState: "pending" | "running" | "completed" | "error"; toolDurationMs?: number; toolError?: string }
+  const [hypoPartMap, setHypoPartMap] = createSignal<Map<string, HypoPartEntry>>(new Map())
+  const [hypoPartOrder, setHypoPartOrder] = createSignal<string[]>([])
+  let currentHypoTextPartID: string | undefined
+  const [reflectionStream, setReflectionStream] = createSignal<{
+    id: number
+    taskID?: string
+    text: string
+    done: boolean
+  } | undefined>()
+  type ReflPartEntry =
+    | { partID: string; kind: "text"; text: string }
+    | { partID: string; kind: "tool"; toolName: string; toolInput?: Record<string, unknown>; toolOutput?: string; toolState: "pending" | "running" | "completed" | "error"; toolDurationMs?: number; toolError?: string }
+  const [reflPartMap, setReflPartMap] = createSignal<Map<string, ReflPartEntry>>(new Map())
+  const [reflPartOrder, setReflPartOrder] = createSignal<string[]>([])
+  let currentReflTextPartID: string | undefined
+  const [intentStream, setIntentStream] = createSignal<{
+    id: number
+    taskID?: string
+    done: boolean
+  } | undefined>()
+  // seq stamps each part with the streamEventID counter value at first sight, so the
+  // [IntentAgent] render block can interleave it against promptEvents echoes (which use the
+  // same counter) in true chronological order, instead of always rendering parts before echoes.
+  type IntentPartEntry =
+    | { partID: string; kind: "text"; text: string; seq: number }
+    | { partID: string; kind: "tool"; toolName: string; toolInput?: Record<string, unknown>; toolOutput?: string; toolState: "pending" | "running" | "completed" | "error"; toolDurationMs?: number; toolError?: string; seq: number }
+  const [intentPartMap, setIntentPartMap] = createSignal<Map<string, IntentPartEntry>>(new Map())
+  const [intentPartOrder, setIntentPartOrder] = createSignal<string[]>([])
+  let currentIntentTextPartID: string | undefined
+  // Standing "intent_confirmed approved" banner: rendered in the same slot as the pending
+  // checkpoint (above DataAnalysis), not via appendDesignLLMLines — that buffer renders below
+  // the DataAnalysis/HypoPlanner blocks, which would make the confirmation appear to trail
+  // behind DataAnalysis instead of gating it.
+  const [intentConfirmedBanner, setIntentConfirmedBanner] = createSignal<{
+    id: number
+    taskID?: string
+    lines: string[]
   } | undefined>()
   const routedGoalsHandled = new Set<string>()
   const reportedRunIDs = new Set<string>()
@@ -1416,9 +1470,20 @@ export function ResearchCockpit() {
     setStreamingChat(undefined)
   }
 
-  const [tasks] = createResource(refresh, async () => {
+  const [tasks, { mutate: mutateTasks }] = createResource(refresh, async () => {
     return researchRequest<ResearchCockpitTask[]>(sdk, "/research/tasks?limit=30")
   })
+
+  // Makes a just-created task visible in the local list immediately, instead of waiting for
+  // the next /research/tasks refetch round-trip. Without this, setSelectedTaskID(task.id) right
+  // after creation races the selectedTaskID-pruning effect below (which clears selection back to
+  // undefined because the new task isn't in sortedTasks() yet) — so selectedTask() resolves to
+  // the wrong/stale task for the first second or two, and every live agent-stream event for the
+  // new task gets dropped by the `taskID !== task.id` guards in the SSE handlers below. IntentAgent
+  // is hit hardest since it kicks off immediately on creation and finishes its turn in ~1-2s.
+  function registerNewTask(task: ResearchCockpitTask) {
+    mutateTasks((prev) => [task, ...(prev ?? []).filter((t) => t.id !== task.id)])
+  }
 
   const [researchLLMStatus] = createResource(refresh, async () => {
     try {
@@ -1503,6 +1568,9 @@ export function ResearchCockpit() {
       }
       return
     }
+    if (researchPayload.type === "research.agent.llm.call_path") {
+      return
+    }
     if (researchPayload.type === "research.agent.dataAnalysis.started") {
       const data = researchPayload.properties as { taskID?: string } | undefined
       const taskID = data?.taskID
@@ -1510,6 +1578,9 @@ export function ResearchCockpit() {
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("DataAnalysis Agent")
       setDataAnalysisStream({ id: ++streamEventID, taskID, text: "", done: false })
+      setDaPartMap(new Map())
+      setDaPartOrder([])
+      currentDaTextPartID = undefined
       return
     }
     if (researchPayload.type === "research.agent.dataAnalysis.stream.delta") {
@@ -1520,7 +1591,59 @@ export function ResearchCockpit() {
       const delta = data?.delta
       if (delta) {
         setDataAnalysisStream((prev) => prev ? { ...prev, text: prev.text + delta } : prev)
+        if (currentDaTextPartID) {
+          const pid = currentDaTextPartID
+          setDaPartMap((prev) => {
+            const entry = prev.get(pid)
+            if (!entry || entry.kind !== "text") return prev
+            const next = new Map(prev)
+            next.set(pid, { ...entry, text: entry.text + delta })
+            return next
+          })
+        }
+        setRefresh((value) => value + 1)
       }
+      return
+    }
+    if (researchPayload.type === "research.agent.dataAnalysis.part.updated") {
+      const data = researchPayload.properties as {
+        taskID?: string; partID?: string; kind?: string
+        text?: string
+        toolName?: string; toolInput?: Record<string, unknown>; toolOutput?: string
+        toolState?: string; toolDurationMs?: number; toolError?: string
+      } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const partID = data?.partID
+      if (!partID || !data?.kind) return
+      if (data.kind === "text") {
+        currentDaTextPartID = partID
+        setDaPartMap((prev) => {
+          const next = new Map(prev)
+          const existing = prev.get(partID)
+          next.set(partID, { partID, kind: "text", text: data.text ?? (existing?.kind === "text" ? existing.text : "") })
+          return next
+        })
+        setDaPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      } else if (data.kind === "tool") {
+        setDaPartMap((prev) => {
+          const next = new Map(prev)
+          next.set(partID, {
+            partID,
+            kind: "tool",
+            toolName: data.toolName ?? "",
+            toolInput: data.toolInput,
+            toolOutput: data.toolOutput,
+            toolState: (data.toolState ?? "pending") as "pending" | "running" | "completed" | "error",
+            toolDurationMs: data.toolDurationMs,
+            toolError: data.toolError,
+          })
+          return next
+        })
+        setDaPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      }
+      setRefresh((value) => value + 1)
       return
     }
     if (researchPayload.type === "research.agent.hypoPlanner.started") {
@@ -1530,6 +1653,9 @@ export function ResearchCockpit() {
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("HypoPlanner Agent")
       setHypoPlannerStream({ id: ++streamEventID, taskID, text: "", done: false })
+      setHypoPartMap(new Map())
+      setHypoPartOrder([])
+      currentHypoTextPartID = undefined
       return
     }
     if (researchPayload.type === "research.agent.hypoPlanner.stream.delta") {
@@ -1540,7 +1666,59 @@ export function ResearchCockpit() {
       const delta = data?.delta
       if (delta) {
         setHypoPlannerStream((prev) => prev ? { ...prev, text: prev.text + delta } : prev)
+        if (currentHypoTextPartID) {
+          const pid = currentHypoTextPartID
+          setHypoPartMap((prev) => {
+            const entry = prev.get(pid)
+            if (!entry || entry.kind !== "text") return prev
+            const next = new Map(prev)
+            next.set(pid, { ...entry, text: entry.text + delta })
+            return next
+          })
+        }
+        setRefresh((value) => value + 1)
       }
+      return
+    }
+    if (researchPayload.type === "research.agent.hypoPlanner.part.updated") {
+      const data = researchPayload.properties as {
+        taskID?: string; partID?: string; kind?: string
+        text?: string
+        toolName?: string; toolInput?: Record<string, unknown>; toolOutput?: string
+        toolState?: string; toolDurationMs?: number; toolError?: string
+      } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const partID = data?.partID
+      if (!partID || !data?.kind) return
+      if (data.kind === "text") {
+        currentHypoTextPartID = partID
+        setHypoPartMap((prev) => {
+          const next = new Map(prev)
+          const existing = prev.get(partID)
+          next.set(partID, { partID, kind: "text", text: data.text ?? (existing?.kind === "text" ? existing.text : "") })
+          return next
+        })
+        setHypoPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      } else if (data.kind === "tool") {
+        setHypoPartMap((prev) => {
+          const next = new Map(prev)
+          next.set(partID, {
+            partID,
+            kind: "tool",
+            toolName: data.toolName ?? "",
+            toolInput: data.toolInput,
+            toolOutput: data.toolOutput,
+            toolState: (data.toolState ?? "pending") as "pending" | "running" | "completed" | "error",
+            toolDurationMs: data.toolDurationMs,
+            toolError: data.toolError,
+          })
+          return next
+        })
+        setHypoPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      }
+      setRefresh((value) => value + 1)
       return
     }
     if (researchPayload.type === "research.agent.reflection.started") {
@@ -1549,7 +1727,187 @@ export function ResearchCockpit() {
       const task = selectedTask()
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("Reflection Agent")
-      appendDesignLLMLines([{ id: ++streamEventID, taskID, text: "[Reflection] 分析中...", tone: "muted" as const }])
+      setReflectionStream({ id: ++streamEventID, taskID, text: "", done: false })
+      setReflPartMap(new Map())
+      setReflPartOrder([])
+      currentReflTextPartID = undefined
+      return
+    }
+    if (researchPayload.type === "research.agent.reflection.stream.delta") {
+      const data = researchPayload.properties as { taskID?: string; delta?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const delta = data?.delta
+      if (delta) {
+        setReflectionStream((prev) => prev ? { ...prev, text: prev.text + delta } : prev)
+        if (currentReflTextPartID) {
+          const pid = currentReflTextPartID
+          setReflPartMap((prev) => {
+            const entry = prev.get(pid)
+            if (!entry || entry.kind !== "text") return prev
+            const next = new Map(prev)
+            next.set(pid, { ...entry, text: entry.text + delta })
+            return next
+          })
+        }
+        setRefresh((value) => value + 1)
+      }
+      return
+    }
+    if (researchPayload.type === "research.agent.reflection.part.updated") {
+      const data = researchPayload.properties as {
+        taskID?: string; partID?: string; kind?: string
+        text?: string
+        toolName?: string; toolInput?: Record<string, unknown>; toolOutput?: string
+        toolState?: string; toolDurationMs?: number; toolError?: string
+      } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const partID = data?.partID
+      if (!partID || !data?.kind) return
+      if (data.kind === "text") {
+        currentReflTextPartID = partID
+        setReflPartMap((prev) => {
+          const next = new Map(prev)
+          const existing = prev.get(partID)
+          next.set(partID, { partID, kind: "text", text: data.text ?? (existing?.kind === "text" ? existing.text : "") })
+          return next
+        })
+        setReflPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      } else if (data.kind === "tool") {
+        setReflPartMap((prev) => {
+          const next = new Map(prev)
+          next.set(partID, {
+            partID,
+            kind: "tool",
+            toolName: data.toolName ?? "",
+            toolInput: data.toolInput,
+            toolOutput: data.toolOutput,
+            toolState: (data.toolState ?? "pending") as "pending" | "running" | "completed" | "error",
+            toolDurationMs: data.toolDurationMs,
+            toolError: data.toolError,
+          })
+          return next
+        })
+        setReflPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      }
+      setRefresh((value) => value + 1)
+      return
+    }
+    if (researchPayload.type === "research.agent.intent.started") {
+      const data = researchPayload.properties as { taskID?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      setLiveAgentEventStage("Intent Agent")
+      // IntentAgent is multi-turn: a new "started" event fires for every session turn (kickoff,
+      // then once per user reply). Only wipe the accumulated tool-call log when this is genuinely
+      // a different task — otherwise keep appending, so earlier turns in the same intent-gathering
+      // conversation stay visible instead of flashing back to "等待 IntentAgent 启动..." each turn.
+      const isNewTask = intentStream()?.taskID !== taskID
+      setIntentStream({ id: ++streamEventID, taskID, done: false })
+      if (isNewTask) {
+        setIntentPartMap(new Map())
+        setIntentPartOrder([])
+        currentIntentTextPartID = undefined
+      }
+      return
+    }
+    if (researchPayload.type === "research.agent.intent.stream.delta") {
+      const data = researchPayload.properties as { taskID?: string; delta?: string } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const delta = data?.delta
+      if (delta && currentIntentTextPartID) {
+        const pid = currentIntentTextPartID
+        setIntentPartMap((prev) => {
+          const entry = prev.get(pid)
+          if (!entry || entry.kind !== "text") return prev
+          const next = new Map(prev)
+          next.set(pid, { ...entry, text: entry.text + delta })
+          return next
+        })
+        setRefresh((value) => value + 1)
+      }
+      return
+    }
+    if (researchPayload.type === "research.agent.intent.part.updated") {
+      const data = researchPayload.properties as {
+        taskID?: string; partID?: string; kind?: string
+        text?: string
+        toolName?: string; toolInput?: Record<string, unknown>; toolOutput?: string
+        toolState?: string; toolDurationMs?: number; toolError?: string
+      } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      const partID = data?.partID
+      if (!partID || !data?.kind) return
+      if (data.kind === "text") {
+        currentIntentTextPartID = partID
+        setIntentPartMap((prev) => {
+          const next = new Map(prev)
+          const existing = prev.get(partID)
+          next.set(partID, {
+            partID,
+            kind: "text",
+            text: data.text ?? (existing?.kind === "text" ? existing.text : ""),
+            seq: existing?.seq ?? ++streamEventID,
+          })
+          return next
+        })
+        setIntentPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      } else if (data.kind === "tool") {
+        setIntentPartMap((prev) => {
+          const next = new Map(prev)
+          const existing = prev.get(partID)
+          next.set(partID, {
+            partID,
+            kind: "tool",
+            toolName: data.toolName ?? "",
+            toolInput: data.toolInput,
+            toolOutput: data.toolOutput,
+            toolState: (data.toolState ?? "pending") as "pending" | "running" | "completed" | "error",
+            toolDurationMs: data.toolDurationMs,
+            toolError: data.toolError,
+            seq: existing?.seq ?? ++streamEventID,
+          })
+          return next
+        })
+        setIntentPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
+      }
+      setRefresh((value) => value + 1)
+      return
+    }
+    if (
+      researchPayload.type === "research.agent.intent.completed" ||
+      researchPayload.type === "research.agent.intent.failed"
+    ) {
+      const data = researchPayload.properties as { taskID?: string; metadata?: Record<string, unknown> } | undefined
+      const taskID = data?.taskID
+      const task = selectedTask()
+      if (task && taskID && taskID !== task.id) return
+      if (researchPayload.type === "research.agent.intent.failed") {
+        // The session never produced any text/tool parts (no sessionID/model, or the prompt
+        // call itself errored) — without this, the [IntentAgent] block just sits on its loading
+        // spinner forever while a deterministic fallback question appears below it, with no clue
+        // why the live turn never happened. See runIntentAgentTurn's IntentAgentFailed publishes.
+        const reason = typeof data?.metadata?.reason === "string" ? data.metadata.reason : undefined
+        const error = typeof data?.metadata?.error === "string" ? data.metadata.error : undefined
+        const partID = `intent-failed-${++streamEventID}`
+        setIntentPartMap((prev) => {
+          const next = new Map(prev)
+          next.set(partID, { partID, kind: "text", text: `⚠ IntentAgent 未能启动：${reason ?? error ?? "未知错误"}`, seq: ++streamEventID })
+          return next
+        })
+        setIntentPartOrder((prev) => [...prev, partID])
+      }
+      setIntentStream((prev) => (prev ? { ...prev, done: true } : prev))
+      setLiveAgentEventStage(undefined)
+      setRefresh((value) => value + 1)
       return
     }
     if (
@@ -1594,6 +1952,27 @@ export function ResearchCockpit() {
       } else {
         newLines.push({ id: ++streamEventID, taskID, text: "[Reflection] failed", tone: "error" })
       }
+      // Flush any buffered part lines into the persistent designLLMLines
+      const reflPartOrderSnap = reflPartOrder()
+      const reflPartMapSnap = reflPartMap()
+      if (reflPartOrderSnap.length > 0) {
+        const toolStateIcon = (state: string) =>
+          state === "completed" ? "✓" : state === "error" ? "✗" : state === "running" ? "●" : "○"
+        for (const partID of reflPartOrderSnap) {
+          const part = reflPartMapSnap.get(partID)
+          if (!part) continue
+          if (part.kind === "text") {
+            for (const line of (part.text ?? "").split("\n").map((l: string) => l.trimEnd()).filter((l: string) => l.trim().length > 0)) {
+              newLines.push({ id: ++streamEventID, taskID, text: `  ${line}`, tone: "muted" })
+            }
+          } else {
+            const icon = toolStateIcon(part.toolState ?? "completed")
+            const durationPart = part.toolDurationMs !== undefined ? ` ${part.toolDurationMs}ms` : ""
+            newLines.push({ id: ++streamEventID, taskID, text: `  [${icon}] ${part.toolName}${durationPart}`, tone: "muted" })
+          }
+        }
+      }
+      setReflectionStream(undefined)
       appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
       setRefresh((value) => value + 1)
@@ -1610,7 +1989,6 @@ export function ResearchCockpit() {
       if (task && taskID && taskID !== task.id) return
       const meta = data?.metadata ?? {}
       const llmStatus = typeof meta.llmStatus === "string" ? meta.llmStatus : undefined
-      const llmPreview = typeof meta.llmPreview === "string" ? meta.llmPreview : undefined
       const newLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
       if (researchPayload.type === "research.agent.modelDesigner.completed") {
         const llmModel = typeof meta.llmModel === "string" ? meta.llmModel : undefined
@@ -1655,39 +2033,39 @@ export function ResearchCockpit() {
           }
         }
       } else if (researchPayload.type === "research.agent.dataAnalysis.completed") {
-        const llmContent = typeof meta.llmContent === "string" ? meta.llmContent : undefined
-        const fullText = llmContent ?? llmPreview
-        if (llmStatus === "used" && fullText) {
-          setDataAnalysisStream((prev) => ({
-            id: prev?.id ?? ++streamEventID,
-            taskID,
-            text: fullText,
-            done: true,
-          }))
-        } else if (llmStatus === "skipped") {
-          setDataAnalysisStream({ id: ++streamEventID, taskID, text: "(heuristic — LLM not configured)", done: true })
-        } else {
-          setDataAnalysisStream((prev) => prev ? { ...prev, done: true } : prev)
-        }
+        setDataAnalysisStream((prev) => prev ? { ...prev, done: true } : prev)
         setLiveAgentEventStage(undefined)
         setRefresh((value) => value + 1)
         return
       } else if (researchPayload.type === "research.agent.hypoPlanner.completed") {
-        const hypothesisLines = llmStatus === "used" && llmPreview
-          ? llmPreview
-          : llmStatus === "failed" ? "(LLM failed — heuristic hypotheses used)"
-          : llmStatus === "skipped" ? "(heuristic — LLM not configured)"
-          : undefined
-        const finalText = hypothesisLines ?? hypoPlannerStream()?.text ?? ""
         // Push HypoPlanner result into the chronological designLLMLines so it appears
         // after Reflection output at the bottom — not above it in the fixed stream block.
         const hypoNewLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
         hypoNewLines.push({ id: ++streamEventID, taskID, text: "[HypoPlanner] 假设已更新", tone: "muted" })
-        if (finalText) {
-          for (const part of finalText.split("\n\n")) {
-            const trimmed = part.trim()
-            if (trimmed)
-              hypoNewLines.push({ id: ++streamEventID, taskID, text: `  ${trimmed}`, tone: "muted" })
+        const partOrderSnap = hypoPartOrder()
+        const partMapSnap = hypoPartMap()
+        if (partOrderSnap.length > 0) {
+          // Retain all LLM-generated Part content — no summary collapse
+          const toolStateIcon = (state: string) =>
+            state === "completed" ? "✓" : state === "error" ? "✗" : state === "running" ? "●" : "○"
+          for (const partID of partOrderSnap) {
+            const part = partMapSnap.get(partID)
+            if (!part) continue
+            if (part.kind === "text") {
+              for (const line of part.text.split("\n").map((l) => l.trimEnd()).filter((l) => l.trim().length > 0)) {
+                hypoNewLines.push({ id: ++streamEventID, taskID, text: `  ${line}`, tone: "muted" })
+              }
+            } else {
+              const icon = toolStateIcon(part.toolState ?? "completed")
+              const durationPart = part.toolDurationMs !== undefined ? ` ${part.toolDurationMs}ms` : ""
+              hypoNewLines.push({ id: ++streamEventID, taskID, text: `  [${icon}] ${part.toolName}${durationPart}`, tone: "muted" })
+              if (part.toolInput && Object.keys(part.toolInput).length > 0) {
+                hypoNewLines.push({ id: ++streamEventID, taskID, text: `      → ${JSON.stringify(part.toolInput).slice(0, 120)}`, tone: "muted" })
+              }
+              if (part.toolOutput) {
+                hypoNewLines.push({ id: ++streamEventID, taskID, text: `      ← ${part.toolOutput.slice(0, 120)}`, tone: part.toolState === "error" ? "error" : "muted" })
+              }
+            }
           }
         }
         appendDesignLLMLines(hypoNewLines)
@@ -2221,10 +2599,28 @@ export function ResearchCockpit() {
         method: "POST",
         body: JSON.stringify(payload),
       })
+      registerNewTask(task)
       setSelectedIndex(0)
       setSelectedTaskID(task.id)
+      kickOffIntentAgent(task.id)
       return `${task.title} created`
     })
+  }
+
+  // runFullPipeline() runs the IntentAgent session first, before anything else — for a
+  // brand-new task with unfilled slots it always pauses there (PipelineBlockedError,
+  // "intent_clarification_required"), which is expected and not surfaced to the user; the
+  // point of this call is purely the side effect of starting the session so the cockpit's
+  // [IntentAgent] stream (read_taskspec / ask_user / ...) begins immediately instead of
+  // waiting for some other trigger. Fire-and-forget: nothing here should block task creation.
+  function kickOffIntentAgent(taskID: string) {
+    // Bound maxIterations so the rare "all slots already filled" case (e.g. a fully
+    // specified CSV input) can't silently run a long autonomous loop as a side effect of
+    // task creation — it should still stop and let the user drive iteration from there.
+    void researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/pipeline`, {
+      method: "POST",
+      body: JSON.stringify({ stage: "smoke", maxIterations: 1 }),
+    }).catch(() => undefined)
   }
 
   async function createCsvTask(mode?: ResearchCockpitTask["mode"], defaults: TsfResearchTaskDefaults = {}) {
@@ -2302,20 +2698,33 @@ export function ResearchCockpit() {
           body: JSON.stringify({ status }),
         },
       )
-      if (
-        status === "approved" &&
-        /\[checkpoint:(?:search_space_confirmed|final_model_selection)\]/.test(approval.reason)
-      ) {
-        const phaseMatch = approval.reason.match(/\[checkpoint:([^\]]+)\]/)
-        const phase = phaseMatch?.[1] ?? "checkpoint"
+      // Once approved, this approval drops out of pendingApproval() and its reason stops
+      // rendering via the streamLines "approval" branch — append a standing record here so
+      // the checkpoint content stays visible instead of vanishing. Matches any checkpoint
+      // phase (not just search_space_confirmed/final_model_selection), including
+      // intent_confirmed from check_taskspec.
+      const phaseMatch = approval.reason.match(/\[checkpoint:([^\]]+)\]/)
+      if (status === "approved" && phaseMatch) {
+        const phase = phaseMatch[1] ?? "checkpoint"
         const reasonLines = approval.reason
           .split(/\r?\n/)
           .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
         const taskID = selectedTask()?.id
-        appendDesignLLMLines([
-          { id: ++streamEventID, taskID, text: `[${phase}] approved ✓`, tone: "success" as const },
-          ...reasonLines.map((line) => ({ id: ++streamEventID, taskID, text: `  ${line}`, tone: "muted" as const })),
-        ])
+        if (phase === "intent_confirmed") {
+          // intent_confirmed gates DataAnalysis/HypoPlanner — keep its banner pinned in the
+          // dedicated checkpoint slot (above those streams) instead of the designLLMLines
+          // buffer, which renders below them and would make this banner appear to drift.
+          setIntentConfirmedBanner({
+            id: ++streamEventID,
+            taskID,
+            lines: [`[${phase}] approved ✓`, ...reasonLines.map((line) => `  ${line}`)],
+          })
+        } else {
+          appendDesignLLMLines([
+            { id: ++streamEventID, taskID, text: `[${phase}] approved ✓`, tone: "success" as const },
+            ...reasonLines.map((line) => ({ id: ++streamEventID, taskID, text: `  ${line}`, tone: "muted" as const })),
+          ])
+        }
       }
       return `${shortID(updated.id)} ${updated.status}`
     })
@@ -2353,10 +2762,11 @@ export function ResearchCockpit() {
       const reasonLines = reason
         .split(/\r?\n/)
         .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
-      appendDesignLLMLines([
-        { id: ++streamEventID, taskID: task.id, text: "[intent_confirmed] approved ✓", tone: "success" as const },
-        ...reasonLines.map((line) => ({ id: ++streamEventID, taskID: task.id, text: `  ${line}`, tone: "muted" as const })),
-      ])
+      setIntentConfirmedBanner({
+        id: ++streamEventID,
+        taskID: task.id,
+        lines: ["[intent_confirmed] approved ✓", ...reasonLines.map((line) => `  ${line}`)],
+      })
       return `${shortID(updated.id)} intent confirmed`
     })
   }
@@ -3274,6 +3684,7 @@ export function ResearchCockpit() {
         method: "POST",
         body: JSON.stringify(payload),
       })
+      registerNewTask(task)
       setSelectedTaskID(task.id)
       const runnerOptions = { validateRuntime: true }
       const executableTask = canExecuteResearchCockpitTask(task, runnerOptions) ? task : { ...task, taskSpec: payload.taskSpec }
@@ -3339,10 +3750,16 @@ export function ResearchCockpit() {
       promptInput?.focus()
       return
     }
+    const promptID = ++streamEventID
+    // markIntentTurn flips this echo's intentTurn flag after the fact, once we know which
+    // branch below actually handled it — the [IntentAgent] render block uses intentTurn to pull
+    // this echo into the agent's own stream (ordered by the shared streamEventID counter)
+    // instead of leaving it in the generic bottom timeline, decoupled from the question it answers.
+    const markIntentTurn = () => setPromptEvents((events) => events.map((e) => (e.id === promptID ? { ...e, intentTurn: true } : e)))
     setPromptEvents((events) => [
       ...events.slice(-(promptEventHistoryLimit - 1)),
       {
-        id: ++streamEventID,
+        id: promptID,
         text: value,
         taskID: task?.id,
       },
@@ -3359,6 +3776,7 @@ export function ResearchCockpit() {
     const isSocratic = interactionModeForTask(task) === "socratic"
     const isReviewMode = clarification.reviewMode === true && task.status === "idle"
     if (isReviewMode) {
+      markIntentTurn()
       // Snapshot before-state so we can diff after the LLM call
       const slotsBefore = new Map<string, string | undefined>(clarification.slots.map((s) => [s.id as string, s.value]))
       await runAction("intent-modify", async () => {
@@ -3404,19 +3822,41 @@ export function ResearchCockpit() {
     // Both companion and socratic modes: fill slots from chat input whenever idle, paused, or intent_gathering.
     // "intent_gathering" is also valid: after the first answer runIntentAgent sets this status while the
     // LLM runs; the second answer must still route to the slot-fill path, not fall through to chat.
-    if ((task.status === "paused" || task.status === "idle" || task.status === "intent_gathering") && (clarification.active || isCompanion || isSocratic) && clarification.nextQuestion) {
-      const slotID = slotFromSocraticQuestion(clarification.nextQuestion)
-      if (slotID !== "unknown") {
+    if (task.status === "paused" || task.status === "idle" || task.status === "intent_gathering") {
+      if (clarification.active) {
+        // A live IntentAgent session turn is mid-conversation (it called ask_user) — forward the
+        // user's free-text reply straight into that same session so the LLM interprets it itself
+        // (via update_taskspec/read_taskspec/check_taskspec) instead of guessing a single slot id
+        // from the LLM's own free-form question text, which the regex-based slotFromSocraticQuestion
+        // match can't reliably do. Without this, replies never reach the session, the LLM never gets
+        // a chance to call check_taskspec, and the intent checkpoint never opens.
+        markIntentTurn()
         try {
-          await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/answer`, {
+          await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/modify`, {
             method: "POST",
-            body: JSON.stringify({ slots: { [slotID]: value } }),
+            body: JSON.stringify({ message: value }),
           })
         } catch {
           // DB changes (task update, pending approval) propagate via SSE events
         }
         promptInput?.focus()
         return
+      }
+      if ((isCompanion || isSocratic) && clarification.nextQuestion) {
+        const slotID = slotFromSocraticQuestion(clarification.nextQuestion)
+        if (slotID !== "unknown") {
+          markIntentTurn()
+          try {
+            await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/answer`, {
+              method: "POST",
+              body: JSON.stringify({ slots: { [slotID]: value } }),
+            })
+          } catch {
+            // DB changes (task update, pending approval) propagate via SSE events
+          }
+          promptInput?.focus()
+          return
+        }
       }
     }
     if (task.mode === "autonomous" && runnerReady()) {
@@ -3874,6 +4314,90 @@ export function ResearchCockpit() {
     () => taskRuns().filter((run) => run.status === "succeeded" && run.stage !== "profile").length,
   )
   const latestRun = createMemo(() => (runs() ?? [])[0])
+
+  function pushHypoPartLines(
+    lines: StreamLine[],
+    order: string[],
+    map: Map<string, { partID: string; kind: "text" | "tool"; text?: string; toolName?: string; toolInput?: Record<string, unknown>; toolOutput?: string; toolState?: "pending" | "running" | "completed" | "error"; toolDurationMs?: number; toolError?: string }>,
+    streamID: number,
+    done: boolean,
+  ) {
+    const toolStateIcon = (state: string) =>
+      state === "completed" ? "✓" : state === "error" ? "✗" : state === "running" ? "●" : "○"
+    let idx = 0
+    for (const partID of order) {
+      const part = map.get(partID)
+      if (!part) continue
+      if (part.kind === "text") {
+        const textLines = compactStreamTextParts(part.text ?? "")
+        for (let i = 0; i < textLines.length; i++) {
+          lines.push({ id: `hypo-part-${streamID}-${partID}-t${i}`, text: `  ${textLines[i]}`, tone: "muted" })
+        }
+        if (!done && idx === order.length - 1 && (part.text ?? "").length === 0) {
+          lines.push({ id: `hypo-part-${streamID}-${partID}-loading`, text: "  ...", tone: "muted", spinner: true })
+        }
+      } else {
+        const icon = toolStateIcon(part.toolState ?? "pending")
+        const durationPart = part.toolDurationMs !== undefined ? ` ${part.toolDurationMs}ms` : ""
+        lines.push({ id: `hypo-part-${streamID}-${partID}-name`, text: `  [${icon}] ${part.toolName}${durationPart}`, tone: "muted" })
+        // ask_user's questions render like the "You:" reply line right below it, instead of the
+        // generic JSON dump — it's the actual question the user is being asked, not tool plumbing.
+        const askUserQuestions = part.toolName === "ask_user" ? part.toolInput?.questions : undefined
+        if (Array.isArray(askUserQuestions) && askUserQuestions.length > 0) {
+          askUserQuestions.forEach((question, qi) => {
+            if (typeof question !== "string" || question.trim().length === 0) return
+            lines.push({ id: `hypo-part-${streamID}-${partID}-question-${qi}`, text: `  Question: ${question}`, tone: "text" })
+          })
+        } else if (part.toolInput && Object.keys(part.toolInput).length > 0) {
+          const inputStr = JSON.stringify(part.toolInput).slice(0, 120)
+          lines.push({ id: `hypo-part-${streamID}-${partID}-input`, text: `      → ${inputStr}`, tone: "muted" })
+        }
+        if (part.toolOutput) {
+          const outputStr = part.toolOutput.slice(0, 120)
+          lines.push({ id: `hypo-part-${streamID}-${partID}-output`, text: `      ← ${outputStr}`, tone: part.toolState === "error" ? "error" : "muted" })
+        }
+        if (!done && part.toolState === "running") {
+          lines.push({ id: `hypo-part-${streamID}-${partID}-spinner`, text: `      ...`, tone: "muted", spinner: true })
+        }
+      }
+      idx++
+    }
+    if (!done && order.length === 0) {
+      lines.push({ id: `hypo-part-${streamID}-loading`, text: "  ...", tone: "muted", spinner: true })
+    }
+  }
+
+  // Interleaves the IntentAgent's streamed parts with the user's own answer echoes, ordered by
+  // the shared streamEventID counter (part.seq / echo.id), so a question → answer → next-LLM-turn
+  // exchange renders as one continuous conversation instead of the answer always trailing behind
+  // in the unrelated bottom timeline. Echoes run through pushHypoPartLines in same-seq batches
+  // (done=true for every batch but the last) so tool/text formatting stays identical to the other
+  // agent streams.
+  function pushIntentAgentLines(
+    lines: StreamLine[],
+    order: string[],
+    map: Map<string, IntentPartEntry>,
+    echoes: Array<{ id: number; text: string }>,
+    streamID: number,
+    done: boolean,
+  ) {
+    const merged = [
+      ...order.map((partID) => ({ seq: map.get(partID)?.seq ?? 0, kind: "part" as const, partID })),
+      ...echoes.map((echo) => ({ seq: echo.id, kind: "echo" as const, echo })),
+    ].sort((a, b) => a.seq - b.seq)
+    let batch: string[] = []
+    for (const item of merged) {
+      if (item.kind === "part") {
+        batch.push(item.partID)
+        continue
+      }
+      pushHypoPartLines(lines, batch, map, streamID, true)
+      batch = []
+      lines.push({ id: `intent-echo-${item.echo.id}`, text: `  You: ${item.echo.text}`, tone: "text" })
+    }
+    pushHypoPartLines(lines, batch, map, streamID, done)
+  }
+
   const streamLines = createMemo<StreamLine[]>(() => {
     const lines: StreamLine[] = []
     const ambientLines: StreamLine[] = []
@@ -3881,15 +4405,14 @@ export function ResearchCockpit() {
     const run = latestRun()
     const task = selectedTask()
     if (task) {
-      const candidateCount = taskCandidates().length
-      const candidatePosition = candidateCount > 0 ? `${selectedCandidateEffectiveIndex() + 1}/${candidateCount}` : "0/0"
-      const runStatus = run ? `latest ${run.stage ?? "run"} ${run.status}` : "no run yet"
-      ambientLines.push({
-        id: "research-session-context",
-        text: `Research Agent: 当前研究 ${task.title} / candidate ${candidatePosition} / ${runStatus}`,
-        tone: "primary",
-      })
+      // The live DataAnalysis stream below renders the full agent output for this task and is
+      // never cleared (only marked done) — once that artifact exists, its truncated
+      // "[DataAnalysis]" preview here would just duplicate it, so skip the preview while that
+      // live stream is present.
+      const daStreamForDedupe = dataAnalysisStream()
+      const hasLiveDaStream = !!daStreamForDedupe && (!task || !daStreamForDedupe.taskID || daStreamForDedupe.taskID === task.id)
       for (const item of formatResearchCockpitTaskAgentLLMLines(taskArtifacts())) {
+        if (hasLiveDaStream && item.id.startsWith("llm-data-")) continue
         ambientLines.push({ id: item.id, text: item.text, tone: item.tone })
       }
       const champ = validChampion()
@@ -3909,19 +4432,114 @@ export function ResearchCockpit() {
       return true
     })
     const liveDesignLines = designLLMLines().filter((item) => !task || !item.taskID || item.taskID === task.id)
+    // IntentAgent stream: rendered unconditionally (like DataAnalysis/HypoPlanner/Reflection
+    // below) so its tool-call log stays on screen after the agent finishes, instead of vanishing
+    // once clarification.active flips to false or a run starts.
+    // Intent checkpoint (clarification question, review-mode rejection, or the
+    // intent_confirmed approval gate) renders immediately below the IntentAgent log and above
+    // DataAnalysis — it gates DataAnalysis, so it must never appear to trail behind it.
+    const clarification = socraticClarification()
+    const approval = pendingApproval()
+    const isIntentCheckpointPending = !!approval && /\[checkpoint:intent_confirmed\]/.test(approval.reason)
+    const istreamPersistent = intentStream()
+    const istreamForTask = istreamPersistent && (!task || !istreamPersistent.taskID || istreamPersistent.taskID === task.id)
+    const intentPartMapSnap = intentPartMap()
+    const intentPartOrderSnap = intentPartOrder()
+    const hasLiveAskUserPart =
+      !!istreamForTask &&
+      intentPartOrderSnap.some((partID) => {
+        const part = intentPartMapSnap.get(partID)
+        return part?.kind === "tool" && part.toolName === "ask_user"
+      })
+    if (istreamForTask) {
+      lines.push({ id: `intent-stream-${istreamPersistent.id}-header`, text: "[IntentAgent]", tone: "muted" })
+      const intentEchoes = promptEvents()
+        .filter((event) => event.intentTurn && (!event.taskID || event.taskID === istreamPersistent.taskID))
+        .map((event) => ({ id: event.id, text: event.text }))
+      // The live IntentAgent session log (read_taskspec / ask_user / update_taskspec calls) is
+      // rendered unconditionally here — it replaces the old static 15-slot dump. See
+      // specs/research/intent-agent-tui-streaming.md §3.5. The ask_user tool call's own
+      // "Question: ..." lines (rendered inside pushHypoPartLines) cover the clarification
+      // question, right below the tool call and above the user's "You: ..." reply.
+      pushIntentAgentLines(lines, intentPartOrderSnap, intentPartMapSnap, intentEchoes, istreamPersistent.id, istreamPersistent.done)
+    }
+    if (clarification.active) {
+      if (clarification.reviewMode) {
+        lines.push(
+          {
+            id: "intent-review-header",
+            text: "Intent 已驳回 — 请描述你想修改的内容，LLM 会识别并更新对应字段；确认无误后输入 /confirm 继续",
+            tone: "warning",
+          },
+          ...clarification.slots.map((slot) => ({
+            id: `review-slot-${slot.id}`,
+            text: socraticSlotLine(slot),
+            tone: slot.status === "filled" ? ("success" as const) : ("muted" as const),
+          })),
+        )
+      } else if (!hasLiveAskUserPart) {
+        // No live ask_user tool call to anchor the question to yet (e.g. a paused task restored
+        // from the approval/poll state instead of a live SSE turn, or the IntentAgent is still
+        // mid-turn before calling ask_user) — render it standalone until the real tool call lands.
+        lines.push({
+          id: "socratic-next-question",
+          text: `Question: ${clarification.nextQuestion ?? "请确认缺失的研究意图。"}`,
+          tone: "text",
+        })
+      }
+    } else if (isIntentCheckpointPending) {
+      const intentReasonLines = approval.reason
+        .split(/\r?\n/)
+        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+      lines.push(
+        {
+          id: "approval-requested",
+          text: `Approval requested: ${approval.kind}${approval.candidateID ? ` for ${approval.candidateID}` : ""}. Type /approve to continue or /reject to stop.`,
+          tone: "warning",
+        },
+        ...intentReasonLines.map((line, i) => ({
+          id: `approval-reason-${i}`,
+          text: line,
+          tone: "muted" as const,
+        })),
+      )
+    } else {
+      // Once the checkpoint is confirmed, isIntentCheckpointPending flips false — render the
+      // standing "approved" banner in this same slot so it never drifts relative to
+      // DataAnalysis/HypoPlanner below (see intentConfirmedBanner setters in
+      // confirmIntentCheckpoint/replyPendingApproval).
+      const confirmedBanner = intentConfirmedBanner()
+      if (confirmedBanner && (!task || !confirmedBanner.taskID || confirmedBanner.taskID === task.id)) {
+        confirmedBanner.lines.forEach((line, i) => {
+          lines.push({
+            id: `intent-confirmed-banner-${confirmedBanner.id}-${i}`,
+            text: line,
+            tone: i === 0 ? "success" : "muted",
+          })
+        })
+      }
+    }
     const daStream = dataAnalysisStream()
+    const daPartOrderSnap = daPartOrder()
+    const daPartMapSnap = daPartMap()
     if (daStream && (!task || !daStream.taskID || daStream.taskID === task.id)) {
       lines.push({ id: `da-stream-${daStream.id}-header`, text: `[DataAnalysis]`, tone: "muted" })
-      const daLines = compactStreamTextParts(daStream.text)
-      for (let i = 0; i < daLines.length; i++) {
-        lines.push({ id: `da-stream-${daStream.id}-${i}`, text: `  ${daLines[i]}`, tone: "muted" })
-      }
-      if (!daStream.done) {
-        lines.push({ id: `da-stream-${daStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+      if (daPartOrderSnap.length > 0) {
+        pushHypoPartLines(lines, daPartOrderSnap, daPartMapSnap, daStream.id, daStream.done)
+      } else {
+        const daLines = compactStreamTextParts(daStream.text)
+        for (let i = 0; i < daLines.length; i++) {
+          lines.push({ id: `da-stream-${daStream.id}-${i}`, text: `  ${daLines[i]}`, tone: "muted" })
+        }
+        if (!daStream.done) {
+          lines.push({ id: `da-stream-${daStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+        }
       }
     }
     // Initial-phase HypoPlanner (before any training): render alongside DA stream, before design lines.
     const hypoStream = hypoPlannerStream()
+    const hypoPartOrderSnap = hypoPartOrder()
+    const hypoPartMapSnap = hypoPartMap()
     const hasCompletedTrainingRuns = taskRuns().some(
       (r) =>
         (r.stage === "low_fidelity" || r.stage === "full" || r.stage === "ref_test" || r.stage === "blind_test") &&
@@ -3929,12 +4547,16 @@ export function ResearchCockpit() {
     )
     if (hypoStream && !hasCompletedTrainingRuns && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
       lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
-      const hypoLines = compactStreamTextParts(hypoStream.text)
-      for (let i = 0; i < hypoLines.length; i++) {
-        lines.push({ id: `hypo-stream-${hypoStream.id}-${i}`, text: `  ${hypoLines[i]}`, tone: "muted" })
-      }
-      if (!hypoStream.done) {
-        lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+      if (hypoPartOrderSnap.length > 0) {
+        pushHypoPartLines(lines, hypoPartOrderSnap, hypoPartMapSnap, hypoStream.id, hypoStream.done)
+      } else {
+        const hypoLines = compactStreamTextParts(hypoStream.text)
+        for (let i = 0; i < hypoLines.length; i++) {
+          lines.push({ id: `hypo-stream-${hypoStream.id}-${i}`, text: `  ${hypoLines[i]}`, tone: "muted" })
+        }
+        if (!hypoStream.done) {
+          lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+        }
       }
     }
     const traceArtifact = run
@@ -3966,7 +4588,6 @@ export function ResearchCockpit() {
           })
           .filter((item): item is { id: string; text: string; tone: "muted" | "warning" } => item !== undefined && item.text !== null)
       : []
-    const approval = pendingApproval()
     const isFinalModelSelectionPending =
       !!approval && /\[checkpoint:final_model_selection\]/.test(approval.reason)
     // Merge design events and live runner epochs into one chronological stream.
@@ -3997,18 +4618,44 @@ export function ResearchCockpit() {
         }
       }
     }
+    // Reflection stream (fires after runner epochs, before HypoPlanner): tool-call progress display.
+    const reflStream = reflectionStream()
+    const reflPartOrderSnap = reflPartOrder()
+    const reflPartMapSnap = reflPartMap()
+    if (reflStream && (!task || !reflStream.taskID || reflStream.taskID === task.id)) {
+      lines.push({ id: `refl-stream-${reflStream.id}-header`, text: `[Reflection]`, tone: "muted" })
+      if (reflPartOrderSnap.length > 0) {
+        pushHypoPartLines(lines, reflPartOrderSnap, reflPartMapSnap, reflStream.id, reflStream.done)
+      } else {
+        const reflLines = compactStreamTextParts(reflStream.text)
+        for (let i = 0; i < reflLines.length; i++) {
+          lines.push({ id: `refl-stream-${reflStream.id}-${i}`, text: `  ${reflLines[i]}`, tone: "muted" })
+        }
+        if (!reflStream.done) {
+          lines.push({ id: `refl-stream-${reflStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+        }
+      }
+    }
     // Active HypoPlanner stream (fires after Reflection, between iterations): appears at the bottom
     if (hypoStream && hasCompletedTrainingRuns && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
       lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
-      const hypoLines = compactStreamTextParts(hypoStream.text)
-      for (let i = 0; i < hypoLines.length; i++) {
-        lines.push({ id: `hypo-stream-${hypoStream.id}-${i}`, text: `  ${hypoLines[i]}`, tone: "muted" })
-      }
-      if (!hypoStream.done) {
-        lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+      if (hypoPartOrderSnap.length > 0) {
+        pushHypoPartLines(lines, hypoPartOrderSnap, hypoPartMapSnap, hypoStream.id, hypoStream.done)
+      } else {
+        const hypoLines = compactStreamTextParts(hypoStream.text)
+        for (let i = 0; i < hypoLines.length; i++) {
+          lines.push({ id: `hypo-stream-${hypoStream.id}-${i}`, text: `  ${hypoLines[i]}`, tone: "muted" })
+        }
+        if (!hypoStream.done) {
+          lines.push({ id: `hypo-stream-${hypoStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
+        }
       }
     }
-    if (run) {
+    // The "profile" stage is the dataset-profiling run that backs DataAnalysis, not a model
+    // candidate run — every other run-count/summary helper already excludes it (see
+    // succeededRuns(), hasSucceededRun, etc.), so showing "profile succeeded" here would just be
+    // noise alongside the DataAnalysis stream above.
+    if (run && run.stage !== "profile") {
       const tone = run.status === "succeeded" ? "success" : run.status === "failed" ? "error" : "warning"
       ambientLines.push({
         id: `run-${run.id}`,
@@ -4024,42 +4671,9 @@ export function ResearchCockpit() {
         })
       }
     }
-    const clarification = socraticClarification()
-    if (clarification.active) {
-      // Socratic clarification takes highest priority — must resolve slots before pipeline can proceed
-      if (clarification.reviewMode) {
-        persistentLines.push(
-          {
-            id: "intent-review-header",
-            text: "Intent 已驳回 — 请描述你想修改的内容，LLM 会识别并更新对应字段；确认无误后输入 /confirm 继续",
-            tone: "warning",
-          },
-          ...clarification.slots.map((slot) => ({
-            id: `review-slot-${slot.id}`,
-            text: socraticSlotLine(slot),
-            tone: slot.status === "filled" ? ("success" as const) : ("muted" as const),
-          })),
-        )
-      } else {
-        persistentLines.push(
-          {
-            id: "socratic-clarification",
-            text: `Socratic clarification: slots: ${clarification.missingSlots.join(", ") || "unknown"}`,
-            tone: "warning",
-          },
-          {
-            id: "socratic-next-question",
-            text: `Next question: ${clarification.nextQuestion ?? "请确认缺失的研究意图。"}`,
-            tone: "primary",
-          },
-          ...clarification.slots.map((slot) => ({
-            id: `socratic-slot-${slot.id}`,
-            text: socraticSlotLine(slot),
-            tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
-          })),
-        )
-      }
-    } else if (approval) {
+    // The intent checkpoint (clarification.active, or the intent_confirmed approval) is already
+    // rendered right after the IntentAgent stream, above DataAnalysis — see isIntentCheckpointPending.
+    if (!clarification.active && approval && !isIntentCheckpointPending) {
       // Show checkpoint/approval reason regardless of run state — checkpoints like
       // final_model_selection fire after NAS runs exist, so the old !run gate hid them.
       const reasonLines = approval.reason
@@ -4077,29 +4691,16 @@ export function ResearchCockpit() {
           tone: "muted" as const,
         })),
       )
-    } else if (!run) {
+    } else if (!clarification.active && !isIntentCheckpointPending && !run) {
       if (task) {
         const mode = taskInteractionMode()
         if (mode === "socratic" || mode === "companion") {
-          const title = mode === "socratic" ? "Socratic" : "Companion"
-          persistentLines.push(
-            {
-              id: `idle-task-${mode}`,
-              text: `${title} onboarding: 先确认数据集、目标列、horizon 和指标，再开始 autonomous loop。`,
-              tone: "primary",
-            },
-            ...clarification.slots.map((slot) => ({
-              id: `idle-${mode}-slot-${slot.id}`,
-              text: socraticSlotLine(slot),
-              tone: slot.status === "filled" ? ("success" as const) : ("warning" as const),
-            })),
-          )
-          if (clarification.nextQuestion) {
-            persistentLines.push({
-              id: `idle-task-${mode}-next`,
-              text: `Next question: ${clarification.nextQuestion}`,
-              tone: "primary",
-            })
+          // The live IntentAgent log (same as the clarification.active branch) is rendered
+          // unconditionally above, in the istreamPersistent block — the task may already be
+          // running its first intent-gathering turn (reading the dataset, reading the taskspec)
+          // before any ask_user checkpoint exists, so clarification.active is still false here.
+          if (!istreamPersistent) {
+            persistentLines.push({ id: `idle-task-${mode}-waiting`, text: "等待 IntentAgent 启动...", tone: "muted", spinner: true })
           }
         } else {
           persistentLines.push(
@@ -4119,14 +4720,35 @@ export function ResearchCockpit() {
       }
     }
     const timeline = [
-      ...promptEvents().map((event) => ({ id: event.id, kind: "prompt" as const, event })),
+      // intentTurn echoes already render inline inside the [IntentAgent] block above
+      // (pushIntentAgentLines) — keeping them here too would show the answer twice.
+      ...promptEvents()
+        .filter((event) => !event.intentTurn)
+        .map((event) => ({ id: event.id, kind: "prompt" as const, event })),
       ...(streamingChat()?.text
         ? [{ id: streamingChat()!.id, kind: "streaming-chat" as const, event: streamingChat()! }]
         : []),
       ...(streamingChat() && !streamingChat()?.text
         ? [{ id: streamingChat()!.id, kind: "chat-loading" as const, event: streamingChat()! }]
         : []),
-      ...actionEvents().map((event) => ({ id: event.id, kind: "action" as const, event })),
+      // Most actionEvents (task created / pipeline ran / export done / seed-baselines / etc.)
+      // are one-off operation confirmations already surfaced via toast.show() in runAction —
+      // echoing them again here as "Research Agent: X created" was just feed noise alongside
+      // the actual AskUser/clarification dialogue. Two kinds are kept: chat-flavored actions
+      // ("chat"/"chat-status" are runChatAction's own success messages including local replies
+      // that never touch streamingChat, "chat-stream"/"action-proposal" are persistStreamingChat's
+      // archive of a just-finished streamingChat turn — without these the conversation itself,
+      // not just a status ping, would disappear once the next turn starts) and "shortcut" (direct
+      // feedback for a removed keybind the user just pressed, not an agent status update).
+      ...actionEvents()
+        .filter((event) =>
+          event.action === "chat" ||
+          event.action === "chat-status" ||
+          event.action === "chat-stream" ||
+          event.action === "action-proposal" ||
+          event.action === "shortcut",
+        )
+        .map((event) => ({ id: event.id, kind: "action" as const, event })),
       ...errorEvents()
         .slice(-errorEventHistoryLimit)
         .map((event) => ({ id: event.id, kind: "error" as const, event })),

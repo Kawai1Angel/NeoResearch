@@ -66,12 +66,17 @@ ACTIVE_SPEC = load_dataset_spec(DATA_ROOT)
 DATASET = ACTIVE_SPEC.task_id
 TIMESTAMP_COL = ACTIVE_SPEC.timestamp_col
 FEATURE_COLUMNS = ACTIVE_SPEC.feature_columns
+TARGET_COLUMNS = ACTIVE_SPEC.target_columns
+OBSERVED_PAST_COVARIATES = ACTIVE_SPEC.observed_past_covariates
+KNOWN_FUTURE_COVARIATES = ACTIVE_SPEC.known_future_covariates
+PAST_COVARIATE_COLUMNS = tuple(dict.fromkeys((*OBSERVED_PAST_COVARIATES, *KNOWN_FUTURE_COVARIATES)))
+STATIC_COVARIATES = ACTIVE_SPEC.static_covariates
 TRAIN_DATA_PATH = train_data_path(DATA_ROOT, DATASET)
 VISIBLE_DATA_PATH = visible_data_path(DATA_ROOT, DATASET)
 REF_TEST_DATA_PATH = ref_test_data_path(DATA_ROOT, DATASET)
 DEFAULT_RAW_DATA_PATH = DATA_ROOT / "ETTh1.csv"
 
-NUM_CHANNELS = len(FEATURE_COLUMNS)
+NUM_CHANNELS = len(TARGET_COLUMNS)
 INPUT_LEN = ACTIVE_SPEC.input_len
 HORIZONS = ACTIVE_SPEC.horizons
 
@@ -94,6 +99,11 @@ class VisibleDataBundle:
     frame: pd.DataFrame
     scaled_values: np.ndarray
     scaler: StandardScaler
+    target_values: np.ndarray
+    past_covariate_values: np.ndarray
+    future_covariate_values: np.ndarray
+    target_scaler: StandardScaler
+    covariate_scaler: StandardScaler | None
     profile: dict[str, object]
 
 
@@ -105,6 +115,11 @@ def _apply_spec(spec: DatasetSpec) -> None:
     global DATASET
     global TIMESTAMP_COL
     global FEATURE_COLUMNS
+    global TARGET_COLUMNS
+    global OBSERVED_PAST_COVARIATES
+    global KNOWN_FUTURE_COVARIATES
+    global PAST_COVARIATE_COLUMNS
+    global STATIC_COVARIATES
     global TRAIN_DATA_PATH
     global VISIBLE_DATA_PATH
     global REF_TEST_DATA_PATH
@@ -120,10 +135,15 @@ def _apply_spec(spec: DatasetSpec) -> None:
     DATASET = spec.task_id
     TIMESTAMP_COL = spec.timestamp_col
     FEATURE_COLUMNS = spec.feature_columns
+    TARGET_COLUMNS = spec.target_columns
+    OBSERVED_PAST_COVARIATES = spec.observed_past_covariates
+    KNOWN_FUTURE_COVARIATES = spec.known_future_covariates
+    PAST_COVARIATE_COLUMNS = tuple(dict.fromkeys((*OBSERVED_PAST_COVARIATES, *KNOWN_FUTURE_COVARIATES)))
+    STATIC_COVARIATES = spec.static_covariates
     TRAIN_DATA_PATH = train_data_path(DATA_ROOT, DATASET)
     VISIBLE_DATA_PATH = visible_data_path(DATA_ROOT, DATASET)
     REF_TEST_DATA_PATH = ref_test_data_path(DATA_ROOT, DATASET)
-    NUM_CHANNELS = len(FEATURE_COLUMNS)
+    NUM_CHANNELS = len(TARGET_COLUMNS)
     INPUT_LEN = spec.input_len
     HORIZONS = spec.horizons
     BORDER_TRAIN = spec.train
@@ -333,17 +353,24 @@ def _build_materialize_spec(
     task_id: str | None,
     timestamp_col: str | None,
     feature_columns: list[str] | None,
-    input_len: int | None,
-    horizons: list[int] | None,
-    train_rows: tuple[int, int] | None,
-    val_rows: tuple[int, int] | None,
-    ref_test_rows: tuple[int, int] | None,
+    target_columns: list[str] | None = None,
+    observed_past_covariates: list[str] | None = None,
+    known_future_covariates: list[str] | None = None,
+    static_covariates: list[str] | None = None,
+    known_future_source: str | None = None,
+    known_future_available: bool | None = None,
+    experiment_scope: str | None = None,
+    input_len: int | None = None,
+    horizons: list[int] | None = None,
+    train_rows: tuple[int, int] | None = None,
+    val_rows: tuple[int, int] | None = None,
+    ref_test_rows: tuple[int, int] | None = None,
     split_strategy: str | None = None,
-    missing_strategy: str | None,
-    missing_limit: int | None,
-    frequency: str | None,
-    allow_irregular: bool | None,
-    irregular_ratio_warn: float | None,
+    missing_strategy: str | None = None,
+    missing_limit: int | None = None,
+    frequency: str | None = None,
+    allow_irregular: bool | None = None,
+    irregular_ratio_warn: float | None = None,
 ) -> DatasetSpec:
     default_payload = dataset_preset_payload(dataset_preset)
     use_preset_policy = dataset_preset is not None
@@ -364,6 +391,13 @@ def _build_materialize_spec(
     )
     selected_input_len = input_len or default_spec.input_len
     selected_horizons = horizons or list(default_spec.horizons)
+    use_role_contract = target_columns is not None
+    if use_role_contract and feature_columns is not None:
+        raise ValueError("--feature-cols cannot be combined with dataset.v2 role columns")
+    selected_target_columns = target_columns or selected_feature_columns
+    selected_observed = observed_past_covariates or []
+    selected_known_future: list[str] = []
+    selected_static = static_covariates or []
 
     preset_split_strategy = default_payload.get("split_strategy") if use_preset_policy else None
     effective_split_strategy = split_strategy or (
@@ -389,12 +423,23 @@ def _build_materialize_spec(
     else:
         raise ValueError(f"Unsupported split_strategy: {effective_split_strategy}")
 
+    role_payload = (
+        {
+            "target_columns": selected_target_columns,
+            "observed_past_covariates": selected_observed,
+            "known_future_covariates": selected_known_future,
+            "static_covariates": selected_static,
+            **({"experiment_scope": experiment_scope} if experiment_scope else {}),
+        }
+        if use_role_contract
+        else {"feature_columns": selected_feature_columns}
+    )
     return DatasetSpec.from_payload(
         {
-            "schema_version": "dataset.v1",
+            "schema_version": "dataset.v2" if use_role_contract else "dataset.v1",
             "task_id": selected_task_id,
             "timestamp_col": selected_timestamp_col,
-            "feature_columns": selected_feature_columns,
+            **role_payload,
             "input_len": selected_input_len,
             "horizons": selected_horizons,
             "splits": {
@@ -432,6 +477,13 @@ def materialize_visible_splits(
     task_id: str | None = None,
     timestamp_col: str | None = None,
     feature_columns: list[str] | None = None,
+    target_columns: list[str] | None = None,
+    observed_past_covariates: list[str] | None = None,
+    known_future_covariates: list[str] | None = None,
+    static_covariates: list[str] | None = None,
+    known_future_source: str | None = None,
+    known_future_available: bool | None = None,
+    experiment_scope: str | None = None,
     input_len: int | None = None,
     horizons: list[int] | None = None,
     train_rows: tuple[int, int] | None = None,
@@ -464,6 +516,13 @@ def materialize_visible_splits(
         task_id=task_id,
         timestamp_col=timestamp_col,
         feature_columns=feature_columns,
+        target_columns=target_columns,
+        observed_past_covariates=observed_past_covariates,
+        known_future_covariates=known_future_covariates,
+        static_covariates=static_covariates,
+        known_future_source=known_future_source,
+        known_future_available=known_future_available,
+        experiment_scope=experiment_scope,
         input_len=input_len,
         horizons=horizons,
         train_rows=train_rows,
@@ -496,7 +555,7 @@ def materialize_visible_splits(
                 )
 
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    write_dataset_spec(spec, DATA_ROOT)
+    write_dataset_spec(spec, DATA_ROOT, PROJECT_ROOT)
     for spec_path in (dataset_spec_path(DATA_ROOT), project_dataset_spec_path(PROJECT_ROOT)):
         payload = json.loads(spec_path.read_text(encoding="utf-8"))
         payload["source_csv"] = str(source_path.expanduser().resolve())
@@ -541,12 +600,46 @@ def _load_visible_bundle() -> VisibleDataBundle:
     _validate_frame(df, expected_rows=BORDER_VAL[1], context="visible dataset")
 
     feature_values = df[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
-    scaler = StandardScaler()
-    scaler.fit(feature_values[BORDER_TRAIN[0] : BORDER_TRAIN[1]])
-    scaled_values = scaler.transform(feature_values).astype(np.float32)
+    target_raw = df[list(TARGET_COLUMNS)].to_numpy(dtype=np.float32)
+    target_scaler = StandardScaler()
+    target_scaler.fit(target_raw[BORDER_TRAIN[0] : BORDER_TRAIN[1]])
+    target_values = target_scaler.transform(target_raw).astype(np.float32)
+
+    covariate_columns = tuple(dict.fromkeys((*PAST_COVARIATE_COLUMNS, *STATIC_COVARIATES)))
+    covariate_scaler: StandardScaler | None = None
+    scaled_covariates = np.empty((len(df), 0), dtype=np.float32)
+    if covariate_columns:
+        covariate_raw = df[list(covariate_columns)].to_numpy(dtype=np.float32)
+        covariate_scaler = StandardScaler()
+        covariate_scaler.fit(covariate_raw[BORDER_TRAIN[0] : BORDER_TRAIN[1]])
+        scaled_covariates = covariate_scaler.transform(covariate_raw).astype(np.float32)
+    covariate_index = {column: index for index, column in enumerate(covariate_columns)}
+    past_covariate_values = (
+        scaled_covariates[:, [covariate_index[column] for column in PAST_COVARIATE_COLUMNS]]
+        if PAST_COVARIATE_COLUMNS
+        else np.empty((len(df), 0), dtype=np.float32)
+    )
+    future_covariate_values = (
+        scaled_covariates[:, [covariate_index[column] for column in KNOWN_FUTURE_COVARIATES]]
+        if KNOWN_FUTURE_COVARIATES
+        else np.empty((len(df), 0), dtype=np.float32)
+    )
+    # Retain the v1 aliases used by existing callers.
+    scaler = target_scaler
+    scaled_values = target_values
     profile = _build_dataset_profile(df)
 
-    _VISIBLE_BUNDLE = VisibleDataBundle(frame=df, scaled_values=scaled_values, scaler=scaler, profile=profile)
+    _VISIBLE_BUNDLE = VisibleDataBundle(
+        frame=df,
+        scaled_values=scaled_values,
+        scaler=scaler,
+        target_values=target_values,
+        past_covariate_values=past_covariate_values,
+        future_covariate_values=future_covariate_values,
+        target_scaler=target_scaler,
+        covariate_scaler=covariate_scaler,
+        profile=profile,
+    )
     return _VISIBLE_BUNDLE
 
 
@@ -559,6 +652,9 @@ class WindowDataset(Dataset):
 
         bundle = _load_visible_bundle()
         self.values = bundle.scaled_values
+        self.target_values = bundle.target_values
+        self.past_covariate_values = bundle.past_covariate_values
+        self.future_covariate_values = bundle.future_covariate_values
         self.horizon = horizon
         self.split = split
 
@@ -580,14 +676,21 @@ class WindowDataset(Dataset):
     def __len__(self) -> int:
         return self.num_windows
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int):
         start = self.context_start + index
         end = start + INPUT_LEN
         target_end = end + self.horizon
 
-        x = self.values[start:end]
-        y = self.values[end:target_end]
-        return torch.from_numpy(x), torch.from_numpy(y)
+        if ACTIVE_SPEC.schema_version == "dataset.v1":
+            x = self.values[start:end]
+            y = self.values[end:target_end]
+            return torch.from_numpy(x), torch.from_numpy(y)
+        return {
+            "target_history": torch.from_numpy(self.target_values[start:end]),
+            "exogenous_past": torch.from_numpy(self.past_covariate_values[start:end]),
+            "exogenous_future": torch.from_numpy(self.future_covariate_values[end:target_end]),
+            "target": torch.from_numpy(self.target_values[end:target_end]),
+        }
 
 
 def make_dataloader(split: str, horizon: int, batch_size: int, shuffle: bool | None = None) -> DataLoader:
@@ -617,6 +720,30 @@ def _quantile_levels(model) -> list[float]:
         return []
 
 
+def _move_batch(batch, device: torch.device):
+    if isinstance(batch, dict):
+        moved = {key: value.to(device) for key, value in batch.items()}
+        return moved, moved["target"]
+    x, y = batch
+    return x.to(device), y.to(device)
+
+
+def _model_inputs(x):
+    if isinstance(x, dict):
+        return {
+            "target_history": x["target_history"],
+            "exogenous_past": x["exogenous_past"],
+            "exogenous_future": x["exogenous_future"],
+        }
+    return x
+
+
+def _forward_model(model, x, *, quantiles: bool = False):
+    method = model.forward_quantiles if quantiles else model
+    inputs = _model_inputs(x)
+    return method(**inputs) if isinstance(inputs, dict) else method(inputs)
+
+
 def _empty_probabilistic_state() -> dict[str, object]:
     return {
         "pinball_sum": 0.0,
@@ -631,7 +758,7 @@ def _empty_probabilistic_state() -> dict[str, object]:
 def _update_probabilistic_state(
     state: dict[str, object],
     model,
-    x: torch.Tensor,
+    x,
     y: torch.Tensor,
     *,
     horizon: int,
@@ -643,7 +770,7 @@ def _update_probabilistic_state(
     if not quantile_levels:
         return
 
-    pred_quantiles = model.forward_quantiles(x)
+    pred_quantiles = _forward_model(model, x, quantiles=True)
     if isinstance(pred_quantiles, (tuple, list)):
         pred_quantiles = pred_quantiles[0]
     expected_shape = (*y.shape, len(quantile_levels))
@@ -734,9 +861,8 @@ def evaluate_val_tsf(model_or_models, device: torch.device, horizons: Iterable[i
         probabilistic_state = _empty_probabilistic_state()
 
         with torch.no_grad():
-            for x, y in loader:
-                x = x.to(device)
-                y = y.to(device)
+            for batch in loader:
+                x, y = _move_batch(batch, device)
 
                 _update_probabilistic_state(
                     probabilistic_state,
@@ -747,7 +873,7 @@ def evaluate_val_tsf(model_or_models, device: torch.device, horizons: Iterable[i
                     prefix="Validation",
                 )
 
-                pred = model(x)
+                pred = _forward_model(model, x)
                 if isinstance(pred, (tuple, list)):
                     pred = pred[0]
                 if pred.shape != y.shape:
@@ -784,12 +910,16 @@ def evaluate_val_tsf(model_or_models, device: torch.device, horizons: Iterable[i
 
 def build_preprocess_spec() -> dict[str, object]:
     bundle = _load_visible_bundle()
-    scaler = bundle.scaler
-    return {
-        "schema_version": "preprocess.v1",
+    target_scaler = bundle.target_scaler
+    payload: dict[str, object] = {
+        "schema_version": "preprocess.v2" if ACTIVE_SPEC.schema_version == "dataset.v2" else "preprocess.v1",
         "task_id": DATASET,
         "timestamp_col": TIMESTAMP_COL,
         "feature_names": list(FEATURE_COLUMNS),
+        "target_names": list(TARGET_COLUMNS),
+        "observed_past_covariate_names": list(OBSERVED_PAST_COVARIATES),
+        "known_future_covariate_names": list(KNOWN_FUTURE_COVARIATES),
+        "static_covariate_names": list(STATIC_COVARIATES),
         "input_len": INPUT_LEN,
         "horizons": list(HORIZONS),
         "splits": {
@@ -803,9 +933,24 @@ def build_preprocess_spec() -> dict[str, object]:
         "input_space": "raw",
         "model_input_space": "standard_scaled",
         "output_space": "standard_scaled",
-        "scaler_mean": scaler.mean_.astype(float).tolist(),
-        "scaler_std": scaler.scale_.astype(float).tolist(),
+        "scaler_mean": target_scaler.mean_.astype(float).tolist(),
+        "scaler_std": target_scaler.scale_.astype(float).tolist(),
+        "target_scaler": {
+            "mean": target_scaler.mean_.astype(float).tolist(),
+            "scale": target_scaler.scale_.astype(float).tolist(),
+        },
+        "target_channels": len(TARGET_COLUMNS),
+        "past_exogenous_channels": len(PAST_COVARIATE_COLUMNS),
+        "future_exogenous_channels": len(KNOWN_FUTURE_COVARIATES),
+        "model_input_channels": len(TARGET_COLUMNS) + len(PAST_COVARIATE_COLUMNS),
+        "model_output_channels": len(TARGET_COLUMNS),
     }
+    if bundle.covariate_scaler is not None:
+        payload["covariate_scaler"] = {
+            "mean": bundle.covariate_scaler.mean_.astype(float).tolist(),
+            "scale": bundle.covariate_scaler.scale_.astype(float).tolist(),
+        }
+    return payload
 
 
 def _load_ref_test_frame() -> pd.DataFrame:
@@ -823,16 +968,34 @@ def _load_ref_test_frame() -> pd.DataFrame:
     return df
 
 
-def _build_ref_test_scaled_values() -> np.ndarray:
+def _build_ref_test_scaled_values() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     bundle = _load_visible_bundle()
     ref_test_df = _load_ref_test_frame()
-    ref_values = ref_test_df[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
-    ref_scaled = bundle.scaler.transform(ref_values).astype(np.float32)
-    return np.concatenate([bundle.scaled_values, ref_scaled], axis=0)
+    target_ref = bundle.target_scaler.transform(
+        ref_test_df[list(TARGET_COLUMNS)].to_numpy(dtype=np.float32)
+    ).astype(np.float32)
+    target_values = np.concatenate([bundle.target_values, target_ref], axis=0)
+    if not PAST_COVARIATE_COLUMNS:
+        empty = np.empty((len(target_values), 0), dtype=np.float32)
+        return target_values, empty, empty
+    if bundle.covariate_scaler is None:
+        raise ValueError("Covariate scaler is missing for configured covariates")
+    covariate_columns = tuple(dict.fromkeys((*PAST_COVARIATE_COLUMNS, *STATIC_COVARIATES)))
+    ref_cov = bundle.covariate_scaler.transform(
+        ref_test_df[list(covariate_columns)].to_numpy(dtype=np.float32)
+    ).astype(np.float32)
+    covariate_index = {column: index for index, column in enumerate(covariate_columns)}
+    past_ref = ref_cov[:, [covariate_index[column] for column in PAST_COVARIATE_COLUMNS]]
+    future_ref = ref_cov[:, [covariate_index[column] for column in KNOWN_FUTURE_COVARIATES]]
+    return (
+        target_values,
+        np.concatenate([bundle.past_covariate_values, past_ref], axis=0),
+        np.concatenate([bundle.future_covariate_values, future_ref], axis=0),
+    )
 
 
 def _iter_scaled_windows(
-    values: np.ndarray,
+    values: tuple[np.ndarray, np.ndarray, np.ndarray],
     *,
     horizon: int,
     batch_size: int,
@@ -847,27 +1010,44 @@ def _iter_scaled_windows(
         )
 
     starts = range(context_start, context_start + num_windows)
+    target_values, past_values, future_values = values
     batch_x: list[np.ndarray] = []
     batch_y: list[np.ndarray] = []
+    batch_past: list[np.ndarray] = []
+    batch_future: list[np.ndarray] = []
     for start in starts:
         end = start + INPUT_LEN
         target_end = end + horizon
-        batch_x.append(values[start:end])
-        batch_y.append(values[end:target_end])
+        batch_x.append(target_values[start:end])
+        batch_y.append(target_values[end:target_end])
+        batch_past.append(past_values[start:end])
+        batch_future.append(future_values[end:target_end])
 
         if len(batch_x) == batch_size:
-            yield (
-                torch.from_numpy(np.stack(batch_x).astype(np.float32)),
-                torch.from_numpy(np.stack(batch_y).astype(np.float32)),
-            )
+            if ACTIVE_SPEC.schema_version == "dataset.v1":
+                yield (torch.from_numpy(np.stack(batch_x)), torch.from_numpy(np.stack(batch_y)))
+            else:
+                yield {
+                    "target_history": torch.from_numpy(np.stack(batch_x)),
+                    "exogenous_past": torch.from_numpy(np.stack(batch_past)),
+                    "exogenous_future": torch.from_numpy(np.stack(batch_future)),
+                    "target": torch.from_numpy(np.stack(batch_y)),
+                }
             batch_x.clear()
             batch_y.clear()
+            batch_past.clear()
+            batch_future.clear()
 
     if batch_x:
-        yield (
-            torch.from_numpy(np.stack(batch_x).astype(np.float32)),
-            torch.from_numpy(np.stack(batch_y).astype(np.float32)),
-        )
+        if ACTIVE_SPEC.schema_version == "dataset.v1":
+            yield (torch.from_numpy(np.stack(batch_x)), torch.from_numpy(np.stack(batch_y)))
+        else:
+            yield {
+                "target_history": torch.from_numpy(np.stack(batch_x)),
+                "exogenous_past": torch.from_numpy(np.stack(batch_past)),
+                "exogenous_future": torch.from_numpy(np.stack(batch_future)),
+                "target": torch.from_numpy(np.stack(batch_y)),
+            }
 
 
 def evaluate_ref_test_tsf(model_or_models, device: torch.device, horizons: Iterable[int] | None = None) -> dict[str, float]:
@@ -892,9 +1072,8 @@ def evaluate_ref_test_tsf(model_or_models, device: torch.device, horizons: Itera
         probabilistic_state = _empty_probabilistic_state()
 
         with torch.no_grad():
-            for x, y in _iter_scaled_windows(scaled_values, horizon=horizon, batch_size=EVAL_BATCH_SIZE):
-                x = x.to(device)
-                y = y.to(device)
+            for batch in _iter_scaled_windows(scaled_values, horizon=horizon, batch_size=EVAL_BATCH_SIZE):
+                x, y = _move_batch(batch, device)
 
                 _update_probabilistic_state(
                     probabilistic_state,
@@ -905,7 +1084,7 @@ def evaluate_ref_test_tsf(model_or_models, device: torch.device, horizons: Itera
                     prefix="Reference test",
                 )
 
-                pred = model(x)
+                pred = _forward_model(model, x)
                 if isinstance(pred, (tuple, list)):
                     pred = pred[0]
                 if pred.shape != y.shape:
@@ -964,8 +1143,15 @@ def query_ref_test(artifact_uri: str, task_id: str, promotion_token: str) -> dic
         raise FileNotFoundError(f"Artifact checkpoint not found: {model_path}")
 
     checkpoint = torch.load(model_path, map_location="cpu")
+    metadata_path = artifact_dir / "metadata.json"
+    metadata: dict[str, object] = {}
+    if metadata_path.exists():
+        metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if isinstance(metadata_payload, dict):
+            metadata = metadata_payload
     candidate = checkpoint.get("candidate")
     model_family = checkpoint.get("model_family")
+    artifact_schema_version = metadata.get("dataset_schema_version") or checkpoint.get("dataset_schema_version")
     state_dict_layout = checkpoint.get("state_dict_layout")
     state_dicts = checkpoint.get("state_dicts")
 
@@ -979,6 +1165,12 @@ def query_ref_test(artifact_uri: str, task_id: str, promotion_token: str) -> dic
         )
     if not isinstance(state_dicts, dict):
         raise ValueError(f"Artifact missing state_dicts: {model_path}")
+    if artifact_schema_version is not None and artifact_schema_version != ACTIVE_SPEC.schema_version:
+        raise ValueError(
+            "Artifact dataset schema does not match the active ref-test dataset: "
+            f"artifact={artifact_schema_version!r}, active={ACTIVE_SPEC.schema_version!r}. "
+            "Pass the exact run artifact for the current task instead of relying on runner state."
+        )
 
     from families import FAMILY_REGISTRY
 
@@ -994,8 +1186,26 @@ def query_ref_test(artifact_uri: str, task_id: str, promotion_token: str) -> dic
         state_key = str(horizon)
         if state_key not in state_dicts:
             raise ValueError(f"Artifact missing state_dict for horizon={horizon}")
-        model = family_module.build_model(candidate["model_config"], INPUT_LEN, horizon).to(device)
-        model.load_state_dict(state_dicts[state_key])
+        state_dict = state_dicts[state_key]
+        if ACTIVE_SPEC.schema_version == "dataset.v2":
+            if any(str(key).startswith(("backbone.", "target_head.", "concat_head.", "future_")) for key in state_dict):
+                raise ValueError(
+                    "Legacy CovariateConditionedForecaster checkpoints are no longer supported. "
+                    "Re-train the candidate with native fusion."
+                )
+            model_config = dict(candidate["model_config"])
+            model_config.pop("covariate_fusion", None)
+            model_config["num_target_channels"] = len(TARGET_COLUMNS)
+            model_config["num_past_covariate_channels"] = len(PAST_COVARIATE_COLUMNS)
+            model_config["num_future_covariate_channels"] = len(KNOWN_FUTURE_COVARIATES)
+            model_config["num_input_channels"] = len(TARGET_COLUMNS) + len(PAST_COVARIATE_COLUMNS)
+            model_config["num_output_channels"] = len(TARGET_COLUMNS)
+            model_config["num_channels"] = model_config["num_input_channels"]
+            model_config["future_covariate_mode"] = str(model_config.get("future_covariate_mode", "none"))
+        else:
+            model_config = candidate["model_config"]
+        model = family_module.build_model(model_config, INPUT_LEN, horizon).to(device)
+        model.load_state_dict(state_dict)
         model.eval()
         models[horizon] = model
 
@@ -1116,6 +1326,22 @@ def main() -> None:
         default=None,
         help="Comma-separated numeric feature columns. Custom tasks infer numeric columns if omitted.",
     )
+    parser.add_argument("--target-cols", type=str, default=None, help="Comma-separated dataset.v2 prediction targets.")
+    parser.add_argument(
+        "--observed-past-covariates", type=str, default=None,
+        help="Comma-separated covariates available in the historical context.",
+    )
+    parser.add_argument(
+        "--known-future-covariates", type=str, default=None,
+        help="Comma-separated covariates available throughout the forecast horizon.",
+    )
+    parser.add_argument(
+        "--static-covariates", type=str, default=None,
+        help="Comma-separated static covariate columns.",
+    )
+    parser.add_argument("--known-future-source", type=str, default=None)
+    parser.add_argument("--known-future-available", choices=["true", "false"], default=None)
+    parser.add_argument("--experiment-scope", type=str, default=None)
     parser.add_argument(
         "--input-len",
         type=int,
@@ -1199,6 +1425,11 @@ def main() -> None:
             parser.error("--train-rows, --val-rows, and --ref-test-rows must be provided together")
         if args.allow_irregular and args.reject_irregular:
             parser.error("--allow-irregular and --reject-irregular are mutually exclusive")
+        role_args = [args.observed_past_covariates, args.known_future_covariates, args.static_covariates]
+        if any(role_args) and not args.target_cols:
+            parser.error("--target-cols is required when covariate role arguments are used")
+        if args.target_cols and args.feature_cols:
+            parser.error("--target-cols cannot be combined with --feature-cols")
 
         paths = materialize_visible_splits(
             args.source_csv,
@@ -1207,6 +1438,17 @@ def main() -> None:
             task_id=args.task_id,
             timestamp_col=args.timestamp_col,
             feature_columns=parse_column_list(args.feature_cols) if args.feature_cols else None,
+            target_columns=parse_column_list(args.target_cols) if args.target_cols else None,
+            observed_past_covariates=(
+                parse_column_list(args.observed_past_covariates) if args.observed_past_covariates else []
+            ),
+            known_future_covariates=(
+                parse_column_list(args.known_future_covariates) if args.known_future_covariates else []
+            ),
+            static_covariates=parse_column_list(args.static_covariates) if args.static_covariates else [],
+            known_future_source=args.known_future_source,
+            known_future_available=(args.known_future_available == "true" if args.known_future_available else None),
+            experiment_scope=args.experiment_scope,
             input_len=args.input_len,
             horizons=parse_int_list(args.horizons) if args.horizons else None,
             train_rows=parse_row_range(args.train_rows) if args.train_rows else None,

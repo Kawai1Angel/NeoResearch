@@ -101,6 +101,13 @@ test("LLM system prompt requires the high-level model_recipe.v1 DSL", () => {
   assert.match(prompt, /latency_sensitive/);
 });
 
+test("LLM system prompt discourages redundant dlinear decomposition", () => {
+  const prompt = _buildSystemPrompt();
+
+  assert.match(prompt, /dlinear backbone already includes decomposition/);
+  assert.match(prompt, /do not combine it with preprocessing series_decomposition/);
+});
+
 test("LLM system prompt includes active user correction memory", () => {
   const prompt = _buildSystemPrompt({
     task_id: "energy_hourly",

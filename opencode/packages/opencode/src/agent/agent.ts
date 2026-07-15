@@ -12,6 +12,11 @@ import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
+import PROMPT_RESEARCH_DATA_ANALYSIS from "./prompt/research-data-analysis.txt"
+import PROMPT_RESEARCH_INTENT_AGENT from "./prompt/research-intent-agent.txt"
+import PROMPT_RESEARCH_HYPO_PLANNER from "./prompt/research-hypo-planner.txt"
+import PROMPT_RESEARCH_REFLECTION from "./prompt/research-reflection.txt"
+import PROMPT_RESEARCH_MODEL_DESIGNER from "./prompt/research-model-designer.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@opencode-ai/core/global"
@@ -229,6 +234,124 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_SUMMARY,
+          },
+          "research-data-analysis": {
+            name: "research-data-analysis",
+            description: "NeoResearch autonomous loop — qualitative dataset analysis stage. Invoked programmatically.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                read: "allow",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                webfetch: "allow",
+                analyze_dataset: "allow",
+              }),
+              user,
+            ),
+            prompt: PROMPT_RESEARCH_DATA_ANALYSIS,
+          },
+          "research-intent-agent": {
+            name: "research-intent-agent",
+            description: "NeoResearch autonomous loop — intent gathering stage. Invoked programmatically.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                read_taskspec: "allow",
+                update_taskspec: "allow",
+                check_taskspec: "allow",
+                ask_user: "allow",
+                bash: "allow",
+              }),
+              user,
+            ),
+            prompt: PROMPT_RESEARCH_INTENT_AGENT,
+          },
+          "research-hypo-planner": {
+            name: "research-hypo-planner",
+            description: "NeoResearch autonomous loop — hypothesis planning stage. Invoked programmatically.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                read: "allow",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                webfetch: "allow",
+                hypothesis_add: "allow",
+                hypothesis_update: "allow",
+                hypothesis_abandon: "allow",
+                hypothesis_list: "allow",
+                pick_baseline: "allow",
+                load_baseline: "allow",
+                experiment_results: "allow",
+                read_reflection: "allow",
+              }),
+              user,
+            ),
+            prompt: PROMPT_RESEARCH_HYPO_PLANNER,
+          },
+          "research-reflection": {
+            name: "research-reflection",
+            description: "NeoResearch autonomous loop — post-experiment reflection stage. Invoked programmatically.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                read: "allow",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                webfetch: "allow",
+                experiment_results: "allow",
+                read_reflection: "allow",
+                read_training_curve: "allow",
+                read_memory_lessons: "allow",
+              }),
+              user,
+            ),
+            prompt: PROMPT_RESEARCH_REFLECTION,
+          },
+          "research-model-designer": {
+            name: "research-model-designer",
+            description: "NeoResearch autonomous loop — TSF candidate design stage. Invoked programmatically.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                read: "allow",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                webfetch: "allow",
+              }),
+              user,
+            ),
+            prompt: PROMPT_RESEARCH_MODEL_DESIGNER,
           },
         }
 

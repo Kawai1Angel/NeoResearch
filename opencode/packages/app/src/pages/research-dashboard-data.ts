@@ -480,8 +480,9 @@ export function buildDefaultTsfTaskInput(
       direction: "minimize",
     },
     budget: {
-      maxRuns: 12,
+      maxRuns: 100,
       maxParallel: 1,
+      parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
     },
   }
 }

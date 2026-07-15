@@ -52,7 +52,6 @@ export type {
   ReflectionAgentResult,
   ReflectionAnalysis,
   ReflectionDecision,
-  ReflectionHypothesis,
 } from "./agents/reflection-agent"
 export type { PublishAgentResult } from "./agents/publish-agent"
 export * as Research from "."

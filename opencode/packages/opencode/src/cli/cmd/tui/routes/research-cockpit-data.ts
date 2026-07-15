@@ -634,7 +634,11 @@ function hasRequirementsConfirmation(input: Pick<ResearchCockpitWorkflowInput, "
 }
 
 function modelDesignerIteration(input: Pick<ResearchCockpitWorkflowInput, "task" | "runs">) {
-  const maxRuns = typeof input.task?.budget.maxRuns === "number" ? Math.max(1, Math.floor(input.task.budget.maxRuns)) : undefined
+  // Capped at the autonomous loop's default maxIterations (20, see autonomousLoopMaxIterations
+  // in research/service.ts) so the displayed denominator never promises more iterations than the
+  // loop will actually run.
+  const maxRuns =
+    typeof input.task?.budget.maxRuns === "number" ? Math.min(20, Math.max(1, Math.floor(input.task.budget.maxRuns))) : undefined
   if (!maxRuns) return undefined
   const candidateIDs = new Set(
     input.runs
@@ -1046,6 +1050,7 @@ function formatBackboneDetail(bb: Record<string, unknown>): string {
     params.push(fmt("layers", bb.numLayers ?? bb.num_layers))
   } else if (type === "dlinear") {
     params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+    params.push(fmt("individual", bb.individual))
   } else if (type === "tcn") {
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
@@ -1802,18 +1807,8 @@ export function formatResearchCockpitTaskAgentLLMLines(
     }
   }
 
-  const hypoPlanArtifact = artifacts.find((a) => a.kind === "hypo_plan_md")
-  if (hypoPlanArtifact) {
-    const status = typeof hypoPlanArtifact.metadata.llmStatus === "string" ? hypoPlanArtifact.metadata.llmStatus : undefined
-    const preview = typeof hypoPlanArtifact.metadata.llmPreview === "string" ? hypoPlanArtifact.metadata.llmPreview : undefined
-    if (status === "used" && preview) {
-      lines.push({ id: `llm-hypo-${hypoPlanArtifact.id}-label`, text: `[HypoPlanner]`, tone: "muted" })
-      for (const [i, part] of preview.split(" | ").entries()) {
-        const clipped = part.length > 120 ? `${part.slice(0, 117)}...` : part
-        lines.push({ id: `llm-hypo-${hypoPlanArtifact.id}-${i}`, text: `  ${clipped}`, tone: "muted" })
-      }
-    }
-  }
+  // No hypo_plan_md preview here: HypoPlanner's full output is persisted into designLLMLines
+  // on completion (research.agent.hypoPlanner.completed), so a preview here would duplicate it.
 
   return lines
 }
@@ -2146,14 +2141,26 @@ export function buildSocraticClarificationState(
     }
   }
 
+  // includeSlotOverview above already restricts us to "socratic" or (companion with
+  // includeCompanion) — so look up the pending protocol approval for either mode. Gating
+  // this to "socratic" only used to mean companion tasks fell through to the static
+  // taskMissingSlots fallback below instead of clarification.active=true, which hid the
+  // live IntentAgent stream (tool calls, real LLM questions) behind the bare approval-reason
+  // text in the cockpit's render path.
+  //
+  // ask_user creates a new pending "protocol" approval per question and never resolves the
+  // previous one, so several can be pending at once. Only the most-recently-updated pending
+  // protocol approval reflects the agent's current state — if we matched ANY pending
+  // ask_user approval regardless of recency, a stale one would keep clarification.active=true
+  // forever and mask the newer check_taskspec/intent_confirmed checkpoint approval that's
+  // supposed to render instead once intent gathering finishes.
+  const latestPendingProtocol = approvals
+    .filter((item) => item.status === "pending" && item.kind === "protocol")
+    .toSorted((a, b) => b.time.updated - a.time.updated)[0]
   const approval =
-    interactionMode === "socratic"
-      ? approvals.find(
-        (item) =>
-          item.status === "pending" &&
-          item.kind === "protocol" &&
-          (/Intent clarification required/i.test(item.reason) || /澄清研究意图/.test(item.reason)),
-      )
+    latestPendingProtocol &&
+    (/Intent clarification required/i.test(latestPendingProtocol.reason) || /澄清研究意图/.test(latestPendingProtocol.reason))
+      ? latestPendingProtocol
       : undefined
   const questions = approval
     ? approval.reason
@@ -2217,7 +2224,7 @@ function socraticSlotsForTask(task: ResearchCockpitTask | undefined, forcedMissi
   const metadata = asRecord(taskSpec.metadata)
   const intentSlots = asRecord(metadata.intentSlots)
   return socraticIntentSlotDefinitions.map((slot) => {
-    // intentSlots (from answerIntentQuestion) override everything
+    // intentSlots (from update_taskspec / legacy answerIntentQuestion) override everything
     const answeredValue = intentSlots[slot.id] !== undefined
       ? String(intentSlots[slot.id])
       : undefined
@@ -2384,9 +2391,9 @@ export function buildDefaultTsfResearchTask(
     mode: resolvedMode,
     interactionMode,
     taskSpec: {
-      contextLength: defaults.contextLength ?? 96,
+      contextLength: defaults.contextLength ?? 336,
       predictionLengths:
-        defaults.predictionLengths && defaults.predictionLengths.length > 0 ? defaults.predictionLengths : [24],
+        defaults.predictionLengths && defaults.predictionLengths.length > 0 ? defaults.predictionLengths : [96],
       dataset: {
         loaderID: nonEmpty(defaults.datasetPreset) ?? (datasetPath ? "local_csv" : "etth1_tslib_v1"),
         ...(datasetPath ? { path: datasetPath } : {}),
@@ -2406,10 +2413,10 @@ export function buildDefaultTsfResearchTask(
       direction: "minimize",
     },
     budget: {
-      maxRuns: defaults.maxRuns ?? 200,
+      maxRuns: defaults.maxRuns ?? 50,
       maxParallel: 1,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
-      parameterBudget: "prefer lightweight models under 2M parameters when accuracy is close",
+      parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
       ...(defaults.maxTrainingSeconds === undefined
         ? {}
         : { loop: { timeBudgetSeconds: defaults.maxTrainingSeconds } }),

@@ -281,9 +281,14 @@ def infer_tsl_custom_splits(total_rows: int, input_len: int, max_horizon: int) -
 
 @dataclass(frozen=True)
 class DatasetSpec:
+    schema_version: str
     task_id: str
     timestamp_col: str
     feature_columns: tuple[str, ...]
+    target_columns: tuple[str, ...]
+    observed_past_covariates: tuple[str, ...]
+    known_future_covariates: tuple[str, ...]
+    static_covariates: tuple[str, ...]
     input_len: int
     horizons: tuple[int, ...]
     train: tuple[int, int]
@@ -292,15 +297,35 @@ class DatasetSpec:
     normalization: dict[str, Any]
     missing: dict[str, Any]
     time: dict[str, Any]
+    known_future_availability: dict[str, Any] | None = None
+    experiment_scope: str | None = None
+    production_comparable: bool | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "DatasetSpec":
-        if payload.get("schema_version") != "dataset.v1":
-            raise ValueError("dataset spec schema_version must be dataset.v1")
+        schema_version = str(payload.get("schema_version", ""))
+        if schema_version not in {"dataset.v1", "dataset.v2"}:
+            raise ValueError("dataset spec schema_version must be dataset.v1 or dataset.v2")
 
         task_id = safe_task_id(str(payload["task_id"]))
         timestamp_col = str(payload["timestamp_col"])
-        feature_columns = tuple(str(item) for item in payload["feature_columns"])
+        if schema_version == "dataset.v1":
+            feature_columns = tuple(str(item) for item in payload["feature_columns"])
+            target_columns = feature_columns
+            observed_past_covariates: tuple[str, ...] = ()
+            known_future_covariates: tuple[str, ...] = ()
+            static_covariates: tuple[str, ...] = ()
+        else:
+            target_columns = tuple(str(item) for item in payload["target_columns"])
+            observed_past_covariates = tuple(str(item) for item in payload.get("observed_past_covariates", []))
+            known_future_covariates = tuple(str(item) for item in payload.get("known_future_covariates", []))
+            static_covariates = tuple(str(item) for item in payload.get("static_covariates", []))
+            feature_columns = tuple(dict.fromkeys((
+                *target_columns,
+                *observed_past_covariates,
+                *known_future_covariates,
+                *static_covariates,
+            )))
         horizons = tuple(int(item) for item in payload["horizons"])
         input_len = int(payload["input_len"])
         splits = payload["splits"]
@@ -313,10 +338,21 @@ class DatasetSpec:
 
         if not timestamp_col:
             raise ValueError("timestamp_col must not be empty")
-        if not feature_columns:
-            raise ValueError("feature_columns must not be empty")
-        if len(set(feature_columns)) != len(feature_columns):
-            raise ValueError("feature_columns must be unique")
+        if not target_columns:
+            raise ValueError("target_columns must not be empty")
+        for name, columns in (
+            ("target_columns", target_columns),
+            ("observed_past_covariates", observed_past_covariates),
+            ("known_future_covariates", known_future_covariates),
+            ("static_covariates", static_covariates),
+        ):
+            if len(set(columns)) != len(columns):
+                raise ValueError(f"{name} must be unique")
+        target_overlap = set(target_columns).intersection(
+            (*observed_past_covariates, *known_future_covariates, *static_covariates)
+        )
+        if target_overlap:
+            raise ValueError(f"target columns must not also be covariates: {sorted(target_overlap)}")
         if timestamp_col in feature_columns:
             raise ValueError("timestamp_col must not also be a feature column")
         if input_len <= 0:
@@ -348,9 +384,14 @@ class DatasetSpec:
         cls._validate_splits(train, val, ref_test, input_len, max(horizons))
 
         return cls(
+            schema_version=schema_version,
             task_id=task_id,
             timestamp_col=timestamp_col,
             feature_columns=feature_columns,
+            target_columns=target_columns,
+            observed_past_covariates=observed_past_covariates,
+            known_future_covariates=known_future_covariates,
+            static_covariates=static_covariates,
             input_len=input_len,
             horizons=horizons,
             train=(train[0], train[1]),
@@ -359,6 +400,17 @@ class DatasetSpec:
             normalization=normalization,
             missing=missing,
             time=time,
+            known_future_availability=(
+                dict(payload["known_future_availability"])
+                if isinstance(payload.get("known_future_availability"), dict)
+                else None
+            ),
+            experiment_scope=(str(payload["experiment_scope"]) if payload.get("experiment_scope") else None),
+            production_comparable=(
+                bool(payload["production_comparable"])
+                if "production_comparable" in payload
+                else None
+            ),
         )
 
     @staticmethod
@@ -383,11 +435,10 @@ class DatasetSpec:
             raise ValueError("ref_test split is too short for reference test windows")
 
     def to_payload(self) -> dict[str, Any]:
-        return {
-            "schema_version": "dataset.v1",
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
             "task_id": self.task_id,
             "timestamp_col": self.timestamp_col,
-            "feature_columns": list(self.feature_columns),
             "input_len": self.input_len,
             "horizons": list(self.horizons),
             "splits": {
@@ -399,6 +450,22 @@ class DatasetSpec:
             "missing": dict(self.missing),
             "time": dict(self.time),
         }
+        if self.schema_version == "dataset.v1":
+            payload["feature_columns"] = list(self.feature_columns)
+        else:
+            payload.update({
+                "target_columns": list(self.target_columns),
+                "observed_past_covariates": list(self.observed_past_covariates),
+                "known_future_covariates": list(self.known_future_covariates),
+                "static_covariates": list(self.static_covariates),
+            })
+            if self.known_future_availability is not None:
+                payload["known_future_availability"] = dict(self.known_future_availability)
+            if self.experiment_scope is not None:
+                payload["experiment_scope"] = self.experiment_scope
+            if self.production_comparable is not None:
+                payload["production_comparable"] = self.production_comparable
+        return payload
 
 
 def load_dataset_spec(data_root: Path | None = None) -> DatasetSpec:
@@ -411,13 +478,17 @@ def load_dataset_spec(data_root: Path | None = None) -> DatasetSpec:
     return DatasetSpec.from_payload(DEFAULT_ETTH1_SPEC)
 
 
-def write_dataset_spec(spec: DatasetSpec, data_root: Path | None = None) -> Path:
+def write_dataset_spec(
+    spec: DatasetSpec,
+    data_root: Path | None = None,
+    project_root: Path | None = None,
+) -> Path:
     root = data_root or resolve_data_root()
     root.mkdir(parents=True, exist_ok=True)
     path = dataset_spec_path(root)
     path.write_text(f"{json.dumps(spec.to_payload(), indent=2, sort_keys=True)}\n", encoding="utf-8")
 
-    project_path = project_dataset_spec_path()
+    project_path = project_dataset_spec_path(project_root or PROJECT_ROOT)
     project_path.parent.mkdir(parents=True, exist_ok=True)
     project_path.write_text(f"{json.dumps(spec.to_payload(), indent=2, sort_keys=True)}\n", encoding="utf-8")
     return path

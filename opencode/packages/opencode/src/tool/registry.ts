@@ -28,6 +28,11 @@ import { Log } from "@/util"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
+import { HypothesisAddTool, HypothesisAbandonTool, HypothesisListTool, HypothesisUpdateTool } from "./research-hypothesis"
+import { BaselinePickTool, BaselineLoadTool } from "./research-baseline"
+import { ReadReflectionTool, ExperimentResultsTool, ReadTrainingCurveTool, ReadMemoryLessonsTool } from "./research-context"
+import { AnalyzeDatasetTool } from "./research-data-analysis"
+import { ReadTaskspecTool, UpdateTaskspecTool, CheckTaskspecTool, AskUserTool } from "./research-taskspec"
 import { Glob } from "@opencode-ai/core/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -115,6 +120,21 @@ export const layer: Layer.Layer<
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const hypoAdd = yield* HypothesisAddTool
+    const hypoUpdate = yield* HypothesisUpdateTool
+    const hypoAbandon = yield* HypothesisAbandonTool
+    const hypoList = yield* HypothesisListTool
+    const pickBaseline = yield* BaselinePickTool
+    const loadBaseline = yield* BaselineLoadTool
+    const readReflection = yield* ReadReflectionTool
+    const experimentResults = yield* ExperimentResultsTool
+    const readTrainingCurve = yield* ReadTrainingCurveTool
+    const readMemoryLessons = yield* ReadMemoryLessonsTool
+    const analyzeDataset = yield* AnalyzeDatasetTool
+    const readTaskspec = yield* ReadTaskspecTool
+    const updateTaskspec = yield* UpdateTaskspecTool
+    const checkTaskspec = yield* CheckTaskspecTool
+    const askUser = yield* AskUserTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -204,6 +224,21 @@ export const layer: Layer.Layer<
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
+          hypoAdd: Tool.init(hypoAdd),
+          hypoUpdate: Tool.init(hypoUpdate),
+          hypoAbandon: Tool.init(hypoAbandon),
+          hypoList: Tool.init(hypoList),
+          pickBaseline: Tool.init(pickBaseline),
+          loadBaseline: Tool.init(loadBaseline),
+          readReflection: Tool.init(readReflection),
+          experimentResults: Tool.init(experimentResults),
+          readTrainingCurve: Tool.init(readTrainingCurve),
+          readMemoryLessons: Tool.init(readMemoryLessons),
+          analyzeDataset: Tool.init(analyzeDataset),
+          readTaskspec: Tool.init(readTaskspec),
+          updateTaskspec: Tool.init(updateTaskspec),
+          checkTaskspec: Tool.init(checkTaskspec),
+          askUser: Tool.init(askUser),
         })
 
         return {
@@ -226,6 +261,21 @@ export const layer: Layer.Layer<
             tool.patch,
             ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [tool.lsp] : []),
             ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [tool.plan] : []),
+            tool.hypoAdd,
+            tool.hypoUpdate,
+            tool.hypoAbandon,
+            tool.hypoList,
+            tool.pickBaseline,
+            tool.loadBaseline,
+            tool.readReflection,
+            tool.experimentResults,
+            tool.readTrainingCurve,
+            tool.readMemoryLessons,
+            tool.analyzeDataset,
+            tool.readTaskspec,
+            tool.updateTaskspec,
+            tool.checkTaskspec,
+            tool.askUser,
           ],
           task: tool.task,
           read: tool.read,

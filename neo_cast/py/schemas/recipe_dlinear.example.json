@@ -15,7 +15,8 @@
   "backbone": {
     "type": "dlinear",
     "kernel_size": 25,
-    "bias": true
+    "bias": true,
+    "individual": false
   },
   "fusion": {
     "type": "temporal",

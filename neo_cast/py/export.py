@@ -14,7 +14,17 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from prepare_tsf import DATASET, FEATURE_COLUMNS, HORIZONS, INPUT_LEN, NUM_CHANNELS, build_preprocess_spec
+from prepare_tsf import (
+    ACTIVE_SPEC,
+    DATASET,
+    FEATURE_COLUMNS,
+    HORIZONS,
+    INPUT_LEN,
+    KNOWN_FUTURE_COVARIATES,
+    NUM_CHANNELS,
+    PAST_COVARIATE_COLUMNS,
+    build_preprocess_spec,
+)
 from research_trace import build_research_trace
 
 
@@ -136,6 +146,7 @@ def build_metadata(
         feature_names = list(FEATURE_COLUMNS)
     metadata = {
         "artifact_version": "artifact.v1",
+        "dataset_schema_version": ACTIVE_SPEC.schema_version,
         "run_id": run_id,
         "task_id": DATASET,
         "model_family": model_family,
@@ -146,6 +157,26 @@ def build_metadata(
         "num_channels": NUM_CHANNELS,
         "normalization_space": "standard_scaled",
         "feature_names": feature_names,
+        "target_columns": list(ACTIVE_SPEC.target_columns),
+        "used_observed_past_covariates": list(ACTIVE_SPEC.observed_past_covariates),
+        "used_known_future_covariates": list(ACTIVE_SPEC.known_future_covariates),
+        "target_channels": NUM_CHANNELS,
+        "past_exogenous_channels": len(PAST_COVARIATE_COLUMNS),
+        "future_exogenous_channels": len(KNOWN_FUTURE_COVARIATES),
+        "model_input_channels": NUM_CHANNELS + len(PAST_COVARIATE_COLUMNS),
+        "model_output_channels": NUM_CHANNELS,
+        "experiment_scope": ACTIVE_SPEC.experiment_scope or (
+            "target_past_future_exogenous"
+            if ACTIVE_SPEC.known_future_covariates
+            else "target_past_exogenous"
+            if ACTIVE_SPEC.observed_past_covariates
+            else "target_only_baseline"
+        ),
+        "production_comparable": (
+            ACTIVE_SPEC.production_comparable
+            if ACTIVE_SPEC.production_comparable is not None
+            else True
+        ),
         "preprocess_entry": DEFAULT_FILES["preprocess_json"],
         "val_metrics": val_metrics,
         "files": DEFAULT_FILES.copy(),
@@ -214,8 +245,9 @@ def build_model_spec(metadata: dict[str, Any], candidate: dict[str, Any] | None)
         else training_summary.get("quantiles", [])
     )
     horizon = max(int(item) for item in metadata["horizons"])
-    num_channels = int(metadata["num_channels"])
-    output_shape: list[Any] = [None, horizon, num_channels]
+    input_channels = int(metadata.get("model_input_channels", metadata["num_channels"]))
+    output_channels = int(metadata.get("model_output_channels", metadata["num_channels"]))
+    output_shape: list[Any] = [None, horizon, output_channels]
     if output_distribution == "quantile" and isinstance(quantiles, list) and quantiles:
         output_shape.append(len(quantiles))
 
@@ -233,7 +265,7 @@ def build_model_spec(metadata: dict[str, Any], candidate: dict[str, Any] | None)
             "prediction_head": _recipe_module_type(recipe, "prediction_head")
             or str(training_summary.get("prediction_head", "unknown")),
         },
-        "input_shape": [None, int(metadata["input_len"]), num_channels],
+        "input_shape": [None, int(metadata["input_len"]), input_channels],
         "output_shape": output_shape,
         "train_objective": training_strategy.get("loss", {"base": training_summary.get("loss", "unknown")})
         if isinstance(training_strategy, dict)
@@ -335,6 +367,8 @@ def render_eval_report(metadata: dict[str, Any], research_trace: dict[str, Any] 
         f"- num_channels: `{metadata['num_channels']}`",
         f"- normalization_space: `{metadata['normalization_space']}`",
         f"- feature_names: `{metadata['feature_names']}`",
+        f"- experiment_scope: `{metadata.get('experiment_scope', 'unspecified')}`",
+        f"- production_comparable: `{metadata.get('production_comparable', True)}`",
         f"- preprocess_entry: `{metadata['preprocess_entry']}`",
         "",
         "## Model",
@@ -402,17 +436,18 @@ import torch
 ARTIFACT_DIR = Path(__file__).resolve().parent
 
 
-def _load_build_model():
+def _load_model_impl():
     model_impl_path = ARTIFACT_DIR / "model_impl.py"
     spec = importlib.util.spec_from_file_location("artifact_model_impl", model_impl_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load model_impl.py from {model_impl_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.build_model
+    return module
 
 
-BUILD_MODEL = _load_build_model()
+MODEL_IMPL = _load_model_impl()
+BUILD_MODEL = MODEL_IMPL.build_model
 
 
 def _load_json(name: str):
@@ -420,7 +455,38 @@ def _load_json(name: str):
         return json.load(handle)
 
 
+def _native_model_config(candidate, metadata):
+    config = dict(candidate["model_config"])
+    if metadata.get("dataset_schema_version") != "dataset.v2":
+        return config
+    config.pop("covariate_fusion", None)
+    config["num_target_channels"] = metadata["target_channels"]
+    config["num_past_covariate_channels"] = metadata["past_exogenous_channels"]
+    config["num_future_covariate_channels"] = metadata["future_exogenous_channels"]
+    config["num_input_channels"] = metadata["model_input_channels"]
+    config["num_output_channels"] = metadata["model_output_channels"]
+    config["num_channels"] = metadata["model_input_channels"]
+    config["future_covariate_mode"] = str(config.get("future_covariate_mode", "none"))
+    return config
+
+
 def _normalize_history(history, preprocess):
+    if isinstance(history, dict):
+        target = np.asarray(history["target_history"], dtype=np.float32)
+        past = np.asarray(history.get("exogenous_past", []), dtype=np.float32)
+        future = np.asarray(history.get("exogenous_future", []), dtype=np.float32)
+        target_scaler = preprocess["target_scaler"]
+        target = (target - np.asarray(target_scaler["mean"], dtype=np.float32)) / np.asarray(target_scaler["scale"], dtype=np.float32)
+        covariate_scaler = preprocess.get("covariate_scaler")
+        if covariate_scaler is not None:
+            mean = np.asarray(covariate_scaler["mean"], dtype=np.float32)
+            std = np.asarray(covariate_scaler["scale"], dtype=np.float32)
+            past = (past - mean[:past.shape[-1]]) / std[:past.shape[-1]]
+            future_names = preprocess["known_future_covariate_names"]
+            all_names = list(dict.fromkeys(preprocess["observed_past_covariate_names"] + future_names))
+            indices = [all_names.index(name) for name in future_names]
+            future = (future - mean[indices]) / std[indices]
+        return {"target_history": target, "exogenous_past": past, "exogenous_future": future}
     array = np.asarray(history, dtype=np.float32)
     mean = np.asarray(preprocess["scaler_mean"], dtype=np.float32)
     std = np.asarray(preprocess["scaler_std"], dtype=np.float32)
@@ -437,8 +503,14 @@ def load_model(device: str | None = None):
     device_obj = torch.device(device or "cpu")
     models = {}
     for horizon in metadata["horizons"]:
-        model = BUILD_MODEL(candidate["model_config"], metadata["input_len"], horizon).to(device_obj)
-        model.load_state_dict(state_dicts[str(horizon)])
+        state_dict = state_dicts[str(horizon)]
+        if any(str(key).startswith(("backbone.", "target_head.", "concat_head.", "future_")) for key in state_dict):
+            raise ValueError(
+                "Legacy CovariateConditionedForecaster checkpoints are no longer supported. "
+                "Re-train the candidate with native fusion."
+            )
+        model = BUILD_MODEL(_native_model_config(candidate, metadata), metadata["input_len"], horizon).to(device_obj)
+        model.load_state_dict(state_dict)
         model.eval()
         models[horizon] = model
     return {
@@ -454,6 +526,26 @@ def predict_normalized(bundle, history, horizon: int):
     metadata = bundle["metadata"]
     if horizon not in metadata["horizons"]:
         raise ValueError(f"Unsupported horizon: {horizon}")
+    if bundle["metadata"].get("dataset_schema_version") == "dataset.v2":
+        if not isinstance(history, dict):
+            raise ValueError("Covariate model input must provide target_history, exogenous_past, and exogenous_future")
+        required = {"target_history", "exogenous_past", "exogenous_future"}
+        missing = sorted(required.difference(history))
+        if missing:
+            raise ValueError(f"Missing required covariate inputs: {missing}")
+        arrays = {key: np.asarray(value, dtype=np.float32) for key, value in history.items()}
+        expected = {
+            "target_history": (metadata["input_len"], metadata["target_channels"]),
+            "exogenous_past": (metadata["input_len"], metadata["past_exogenous_channels"]),
+            "exogenous_future": (horizon, metadata["future_exogenous_channels"]),
+        }
+        for key, shape in expected.items():
+            if arrays[key].shape != shape:
+                raise ValueError(f"Expected {key} shape {shape}, got {arrays[key].shape}")
+        inputs = {key: torch.from_numpy(value).unsqueeze(0).to(bundle["device"]) for key, value in arrays.items()}
+        with torch.no_grad():
+            pred = bundle["models"][horizon](**inputs)
+        return pred.squeeze(0).cpu().numpy()
     array = np.asarray(history, dtype=np.float32)
     if array.shape != (metadata["input_len"], metadata["num_channels"]):
         raise ValueError(
@@ -469,6 +561,27 @@ def predict_quantiles_normalized(bundle, history, horizon: int):
     metadata = bundle["metadata"]
     if horizon not in metadata["horizons"]:
         raise ValueError(f"Unsupported horizon: {horizon}")
+    if bundle["metadata"].get("dataset_schema_version") == "dataset.v2":
+        if not isinstance(history, dict):
+            raise ValueError("Covariate model input must provide target_history, exogenous_past, and exogenous_future")
+        required = {"target_history", "exogenous_past", "exogenous_future"}
+        missing = sorted(required.difference(history))
+        if missing:
+            raise ValueError(f"Missing required covariate inputs: {missing}")
+        arrays = {key: np.asarray(value, dtype=np.float32) for key, value in history.items()}
+        expected = {
+            "target_history": (metadata["input_len"], metadata["target_channels"]),
+            "exogenous_past": (metadata["input_len"], metadata["past_exogenous_channels"]),
+            "exogenous_future": (horizon, metadata["future_exogenous_channels"]),
+        }
+        for key, shape in expected.items():
+            if arrays[key].shape != shape:
+                raise ValueError(f"Expected {key} shape {shape}, got {arrays[key].shape}")
+        inputs = {key: torch.from_numpy(value).unsqueeze(0).to(bundle["device"]) for key, value in arrays.items()}
+        with torch.no_grad():
+            model = bundle["models"][horizon]
+            pred = model.forward_quantiles(**inputs) if hasattr(model, "forward_quantiles") else model(**inputs).unsqueeze(-1)
+        return pred.squeeze(0).cpu().numpy()
     array = np.asarray(history, dtype=np.float32)
     if array.shape != (metadata["input_len"], metadata["num_channels"]):
         raise ValueError(
@@ -486,12 +599,28 @@ def predict_quantiles_normalized(bundle, history, horizon: int):
 
 def predict_raw(bundle, history, horizon: int):
     normalized = _normalize_history(history, bundle["preprocess"])
-    return predict_normalized(bundle, normalized, horizon)
+    prediction = predict_normalized(bundle, normalized, horizon)
+    scaler = bundle["preprocess"].get("target_scaler")
+    if scaler is None:
+        mean = np.asarray(bundle["preprocess"]["scaler_mean"], dtype=np.float32)
+        std = np.asarray(bundle["preprocess"]["scaler_std"], dtype=np.float32)
+    else:
+        mean = np.asarray(scaler["mean"], dtype=np.float32)
+        std = np.asarray(scaler["scale"], dtype=np.float32)
+    return prediction * std + mean
 
 
 def predict_quantiles_raw(bundle, history, horizon: int):
     normalized = _normalize_history(history, bundle["preprocess"])
-    return predict_quantiles_normalized(bundle, normalized, horizon)
+    prediction = predict_quantiles_normalized(bundle, normalized, horizon)
+    scaler = bundle["preprocess"].get("target_scaler")
+    if scaler is None:
+        mean = np.asarray(bundle["preprocess"]["scaler_mean"], dtype=np.float32)
+        std = np.asarray(bundle["preprocess"]["scaler_std"], dtype=np.float32)
+    else:
+        mean = np.asarray(scaler["mean"], dtype=np.float32)
+        std = np.asarray(scaler["scale"], dtype=np.float32)
+    return prediction * std[:, None] + mean[:, None]
 """
 
 

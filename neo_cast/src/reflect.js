@@ -48,8 +48,11 @@ function buildReflectionContext(previousCandidate = {}, previousRow = {}, histor
 
 function formatTaskContext(taskContext = {}) {
   const taskId = taskContext.task_id || "etth1";
-  const featureColumns = Array.isArray(taskContext.feature_columns)
-    ? taskContext.feature_columns
+  const targetColumns = Array.isArray(taskContext.target_columns) ? taskContext.target_columns : taskContext.feature_columns;
+  const pastCovariates = Array.isArray(taskContext.observed_past_covariates) ? taskContext.observed_past_covariates : [];
+  const futureCovariates = Array.isArray(taskContext.known_future_covariates) ? taskContext.known_future_covariates : [];
+  const featureColumns = Array.isArray(targetColumns)
+    ? [...new Set([...targetColumns, ...pastCovariates, ...futureCovariates])]
     : ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"];
   const inputLen = taskContext.input_len || 512;
   const horizons = Array.isArray(taskContext.horizons) ? taskContext.horizons : [96, 192, 336, 720];
@@ -62,6 +65,9 @@ function formatTaskContext(taskContext = {}) {
   const lines = [
     `- Dataset/task: ${taskId}`,
     `- Channels: ${featureColumns.length} (${featureColumns.join(", ")})`,
+    `- Prediction targets: ${(targetColumns || featureColumns).join(", ")}`,
+    `- Observed-past covariates: ${pastCovariates.join(", ") || "none"}`,
+    `- Known-future covariates: ${futureCovariates.join(", ") || "none"}`,
     `- Input window: ${inputLen} time steps`,
     `- Prediction horizons evaluated: ${horizons.join(", ")} (averaged)`,
     `- Train rows: [${trainRows[0]}, ${trainRows[1]})`,
