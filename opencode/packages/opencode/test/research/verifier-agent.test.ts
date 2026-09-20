@@ -322,6 +322,18 @@ test("data_leakage_verifier rejects non-fixed-split protocol", () => {
   expect(result.reason).toContain("rolling_window")
 })
 
+test("data_leakage_verifier accepts ordered expanding-window CV", () => {
+  const report = runVerifiers(ctx({
+    task: {
+      ...task({ primaryMetric: "cv_avg_mse" }),
+      taskSpec: { evaluation: { protocol: "expanding_window_ratio" } },
+    } as ResearchTask,
+    run: run({ id: "r_cv", status: "succeeded", metrics: { cv_avg_mse: 0.4, val_avg_mse: 0.42 } }),
+  }))
+  const result = report.results.find((r) => r.name === "data_leakage_verifier")!
+  expect(result.accepted).toBe(true)
+})
+
 test("data_leakage_verifier rejects when max_horizon >= context_length", () => {
   const report = runVerifiers(ctx({
     run: run({ id: "r_ctx", status: "succeeded", metrics: { val_avg_mse: 0.4 } }),

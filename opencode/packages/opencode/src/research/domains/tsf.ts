@@ -100,7 +100,16 @@ const LEARNED_RANK_MIN_EXAMPLES = 2
 
 const PositiveInt = z.number().int().min(1)
 const JsonObject = z.record(z.string(), z.unknown())
-const ValidationMetric = z.enum(["val_avg_mse", "val_avg_mae", "val_avg_pinball", "val_avg_crps_approx"])
+const ValidationMetric = z.enum([
+  "cv_avg_mse",
+  "cv_avg_mae",
+  "cv_avg_pinball",
+  "cv_avg_crps_approx",
+  "val_avg_mse",
+  "val_avg_mae",
+  "val_avg_pinball",
+  "val_avg_crps_approx",
+])
 const ReferenceMetric = z.enum([
   "ref_test_avg_mse",
   "ref_test_avg_mae",
@@ -152,13 +161,13 @@ export const TSFTaskSpec = z
       .strict(),
     evaluation: z
       .object({
-        protocol: z.literal("fixed_split").default("fixed_split"),
-        metricPrimary: ValidationMetric.default("val_avg_mse"),
+        protocol: z.enum(["expanding_window_ratio", "fixed_split"]).default("expanding_window_ratio"),
+        metricPrimary: ValidationMetric.default("cv_avg_mse"),
         metricReference: ReferenceMetric.optional(),
         seeds: z.array(z.number().int().min(0)).min(1).default([42]),
       })
       .strict()
-      .default({ protocol: "fixed_split", metricPrimary: "val_avg_mse", seeds: [42] }),
+      .default({ protocol: "expanding_window_ratio", metricPrimary: "cv_avg_mse", seeds: [42] }),
     constraints: z
       .object({
         maxParams: PositiveInt.optional(),
@@ -918,7 +927,8 @@ function commandTimeoutForRecipe(stage: DomainRunStage, recipe?: TSFCandidateRec
   if (stage !== "low_fidelity" && stage !== "full") return undefined
   const timeBudgetS = recipe?.trainingStrategy.budget.timeBudgetS
   if (typeof timeBudgetS !== "number" || !Number.isFinite(timeBudgetS)) return undefined
-  return Math.max(120, timeBudgetS + 120) * 1000
+  const recipeTimeoutMs = Math.max(120, timeBudgetS + 120) * 1000
+  return stage === "full" ? Math.max(3_600_000, recipeTimeoutMs) : recipeTimeoutMs
 }
 
 function commandForStage(
@@ -990,7 +1000,9 @@ export function createTSFRunPlan(input: {
         ? ["ref_test_avg_mse", "ref_test_avg_mae"]
         : stage === "blind_test"
           ? ["blind_test_avg_mse", "blind_test_avg_mae"]
-          : ["val_avg_mse", "val_avg_mae"],
+          : stage === "smoke"
+            ? ["val_avg_mse", "val_avg_mae"]
+            : ["cv_avg_mse", "cv_std_mse", "val_avg_mse", "val_avg_mae"],
     expectedArtifacts: expectedArtifacts(stage),
     notes:
       "Run plan only renders the Neo-Cast bridge payload and subprocess command; caller owns file writes and process execution.",
@@ -1997,7 +2009,16 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
 
 type RankHistoryContext = Pick<DomainProposalContext, "candidates" | "runs" | "memory" | "champion">
 
-const RANK_METRIC_PRIORITY = ["val_avg_mse", "val_avg_mae", "ref_test_avg_mse", "ref_test_avg_mae", "mse", "mae"]
+const RANK_METRIC_PRIORITY = [
+  "cv_avg_mse",
+  "cv_avg_mae",
+  "val_avg_mse",
+  "val_avg_mae",
+  "ref_test_avg_mse",
+  "ref_test_avg_mae",
+  "mse",
+  "mae",
+]
 
 function rankRunMetric(run: RankHistoryContext["runs"][number]) {
   const metrics = run.metrics as Record<string, unknown>
@@ -2759,8 +2780,9 @@ function probabilisticMetricName(candidateSpec: JsonRecord, fallbackMetric: stri
   const parsed = TSFCandidateRecipe.safeParse(candidateSpec)
   if (!parsed.success) return fallbackMetric
   const distribution = parsed.data.predictionHead.outputDistribution
-  if (distribution === "quantile") return "val_avg_pinball"
-  if (distribution === "gaussian") return "val_avg_crps_approx"
+  const prefix = fallbackMetric.startsWith("cv_") ? "cv" : "val"
+  if (distribution === "quantile") return `${prefix}_avg_pinball`
+  if (distribution === "gaussian") return `${prefix}_avg_crps_approx`
   return fallbackMetric
 }
 
@@ -2772,7 +2794,7 @@ function evaluateTSFRun(input: DomainRunEvaluationContext): DomainRunEvaluation 
       ? objective.primaryMetric
       : typeof objective.metric === "string"
         ? objective.metric
-        : ((task.success ? task.data.evaluation.metricPrimary : undefined) ?? "val_avg_mse")
+        : ((task.success ? task.data.evaluation.metricPrimary : undefined) ?? "cv_avg_mse")
   const primaryMetricName = probabilisticMetricName(input.candidate.candidateSpec, fallbackMetricName)
   const direction = objective.direction === "maximize" ? "maximize" : "minimize"
   const value = input.run.metrics[primaryMetricName]

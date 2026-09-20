@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/literature_source_paper_record.json",
+  "title": "NeoResearch Literature Source Paper Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "paper_id",
+    "title",
+    "year",
+    "venue",
+    "venue_tier",
+    "pool",
+    "publication_status",
+    "publication_track",
+    "publication_verification",
+    "official_proceedings",
+    "paper_urls",
+    "code_urls",
+    "discovery_sources",
+    "identifiers",
+    "open_access",
+    "download"
+  ],
+  "properties": {
+    "paper_id": {
+      "type": "string",
+      "pattern": "^tsf-[0-9]{4}-[a-f0-9]{12}$"
+    },
+    "title": {"type": "string", "minLength": 5},
+    "year": {"type": "integer", "minimum": 1900},
+    "venue": {"type": "string", "minLength": 2},
+    "venue_tier": {"enum": ["A", "B", "C", "unranked"]},
+    "pool": {
+      "enum": [
+        "historical_foundation",
+        "accepted_core",
+        "accepted_adjacent",
+        "influential_external",
+        "watchlist"
+      ]
+    },
+    "publication_status": {"enum": ["peer_reviewed", "preprint", "unknown"]},
+    "publication_track": {
+      "enum": ["main", "special", "journal", "workshop", "preprint", "external", "unknown"]
+    },
+    "publication_verification": {
+      "enum": [
+        "curated_venue_claim",
+        "official_proceedings",
+        "publisher_metadata",
+        "unverified_external"
+      ]
+    },
+    "official_proceedings": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "record_id",
+        "authority",
+        "title",
+        "landing_url",
+        "pdf_url",
+        "track",
+        "title_similarity",
+        "snapshot_sha256"
+      ],
+      "properties": {
+        "source_id": {"type": "string"},
+        "record_id": {"type": "string"},
+        "authority": {"enum": ["official_proceedings", "publisher_metadata"]},
+        "title": {"type": "string"},
+        "landing_url": {"type": "string", "format": "uri"},
+        "pdf_url": {"type": ["string", "null"], "format": "uri"},
+        "track": {"type": "string"},
+        "title_similarity": {"type": "number", "minimum": 0.88, "maximum": 1},
+        "snapshot_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "paper_urls": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "format": "uri"}
+    },
+    "code_urls": {
+      "type": "array",
+      "items": {"type": "string", "format": "uri"}
+    },
+    "discovery_sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "section", "source_label", "paper_url"],
+        "properties": {
+          "source_id": {"type": "string"},
+          "section": {"type": "string"},
+          "source_label": {"type": "string"},
+          "paper_url": {"type": "string", "format": "uri"}
+        }
+      }
+    },
+    "identifiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["openalex", "doi", "arxiv"],
+      "properties": {
+        "openalex": {"type": ["string", "null"]},
+        "doi": {"type": ["string", "null"]},
+        "arxiv": {"type": ["string", "null"]}
+      }
+    },
+    "open_access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["is_oa", "oa_status", "pdf_url"],
+      "properties": {
+        "is_oa": {"type": ["boolean", "null"]},
+        "oa_status": {"type": ["string", "null"]},
+        "pdf_url": {"type": ["string", "null"], "format": "uri"}
+      }
+    },
+    "download": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "path", "source_url", "final_url", "sha256", "bytes", "error"],
+      "properties": {
+        "status": {"enum": ["not_attempted", "downloaded", "no_public_pdf", "failed"]},
+        "path": {"type": ["string", "null"]},
+        "source_url": {"type": ["string", "null"]},
+        "final_url": {"type": ["string", "null"], "format": "uri"},
+        "sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": ["integer", "null"], "minimum": 0},
+        "error": {"type": ["string", "null"]}
+      }
+    },
+    "openalex_error": {"type": "string"}
+  }
+}

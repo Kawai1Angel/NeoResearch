@@ -108,6 +108,8 @@ export const Event = {
   TaskUpdated: BusEvent.define("research.task.updated", ResearchTaskChanged),
   CandidateCreated: BusEvent.define("research.candidate.created", ResearchCandidateChanged),
   CandidateUpdated: BusEvent.define("research.candidate.updated", ResearchCandidateChanged),
+  ExecutionContractViolation: BusEvent.define("research.execution_contract.violation", ResearchAgentStageChanged),
+  ExecutionContractVerified: BusEvent.define("research.execution_contract.verified", ResearchAgentStageChanged),
   RunCreated: BusEvent.define("research.run.created", ResearchRunChanged),
   RunUpdated: BusEvent.define("research.run.updated", ResearchRunChanged),
   ArtifactCreated: BusEvent.define("research.artifact.created", ResearchArtifactChanged),

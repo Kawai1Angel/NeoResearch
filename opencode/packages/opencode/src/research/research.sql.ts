@@ -50,6 +50,7 @@ export const ResearchCandidateTable = sqliteTable(
       .$type<ResearchTaskID>()
       .notNull()
       .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+    hypothesis_id: text(),
     parent_candidate_id: text().$type<ResearchCandidateID>(),
     domain_id: text().notNull(),
     candidate_spec: text({ mode: "json" }).notNull().$type<JsonRecord>(),

@@ -71,7 +71,13 @@ def _format_metric(value: Any) -> str:
 
 
 def _metric_evidence(metrics: dict[str, Any], horizons: list[int]) -> list[str]:
-    evidence = [f"Validation average MSE is {_format_metric(metrics.get('val_avg_mse'))}."]
+    evidence = []
+    if "cv_avg_mse" in metrics:
+        evidence.append(
+            f"Cross-validation average MSE is {_format_metric(metrics.get('cv_avg_mse'))} "
+            f"with population std {_format_metric(metrics.get('cv_std_mse'))}."
+        )
+    evidence.append(f"Final-checkpoint validation average MSE is {_format_metric(metrics.get('val_avg_mse'))}.")
     horizon_parts = []
     for horizon in horizons:
         key = f"val_h{horizon}_mse"
@@ -128,8 +134,8 @@ def build_model_design_trace(
         "evidence": evidence,
         "expected_effect": hypothesis or "Improve validation forecasting metrics under the task contract.",
         "verification_plan": (
-            "Run the smoke/full training harness, compare val_avg_mse against the current session best, "
-            "and inspect per-horizon validation metrics for regressions."
+            "Run the smoke/CV/full training harness, compare cv_avg_mse against the current session best "
+            "under the same protocol, and inspect cv_std_mse plus final-checkpoint validation metrics."
         ),
         "created_at": created_at or _now_iso(),
     }

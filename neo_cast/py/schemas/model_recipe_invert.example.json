@@ -1,0 +1,13 @@
+{
+  "schema_version": "model_recipe.v1",
+  "model_name": "VariateTokenForecaster",
+  "hypothesis": "Self-attention over variable tokens captures cross-variable dependencies before per-variable horizon projection.",
+  "input": {"history_window": 96, "prediction_horizon": 24, "covariates": false},
+  "architecture": {
+    "backbone": "transformer", "embedding": "invert", "attention": "full",
+    "d_model": 32, "heads": 4, "layers": 2, "dropout": 0.1,
+    "channel_fusion": "independent", "output_distribution": "point"
+  },
+  "training": {"loss": "mse", "optimizer": "adamw", "learning_rate": 0.001, "batch_size": 32},
+  "constraints": {"max_params": "5M", "latency_sensitive": false}
+}

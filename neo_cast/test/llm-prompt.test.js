@@ -141,8 +141,18 @@ test("heuristic mock candidate emits a high-level model recipe", () => {
   assert.equal(candidate.input.history_window, 96);
   assert.equal(candidate.input.prediction_horizon, 24);
   assert.equal(candidate.architecture.backbone, "temporal_conv");
-  assert.equal(candidate.architecture.multiscale_blocks, 3);
+  assert.equal(candidate.architecture.multiscale_blocks, 0);
   assert.equal(candidate.constraints.latency_sensitive, true);
+});
+
+test("ModelRecipe defaults preserve options and select a matching probabilistic loss", () => {
+  for (const [distribution, loss] of [["gaussian", "gaussian_nll"], ["quantile", "quantile"]]) {
+    const candidate = _ensureCandidateDefaults({schema_version: "model_recipe.v1", architecture: {backbone: "transformer", embedding: "calendar", output_distribution: distribution}}, "test", 1);
+    assert.equal(candidate.architecture.attention, "full");
+    assert.equal(candidate.architecture.embedding, "calendar");
+    assert.equal(candidate.architecture.output_distribution, distribution);
+    assert.equal(candidate.training.loss, loss);
+  }
 });
 
 test("heuristic mock candidate preserves the full task horizon objective", () => {

@@ -55,3 +55,6 @@ export type {
 } from "./agents/reflection-agent"
 export type { PublishAgentResult } from "./agents/publish-agent"
 export * as Research from "."
+
+export { buildExecutionContract, validateCandidateAgainstHypothesis, verifyExecutionRecords } from "./execution-contract"
+export type { ExecutionContract, ContractMismatch, ExecutedModelManifest } from "./execution-contract"

@@ -144,7 +144,7 @@ export const ExperimentResultsTool = Tool.define(
         const candidateRows = candidateIds.length > 0
           ? Database.use((d) =>
               d
-                .select({ id: ResearchCandidateTable.id, candidate_spec: ResearchCandidateTable.candidate_spec })
+                .select({ id: ResearchCandidateTable.id, candidate_spec: ResearchCandidateTable.candidate_spec, hypothesis_id: ResearchCandidateTable.hypothesis_id })
                 .from(ResearchCandidateTable)
                 .where(inArray(ResearchCandidateTable.id, candidateIds))
                 .all(),
@@ -152,10 +152,7 @@ export const ExperimentResultsTool = Tool.define(
           : []
         const hypoIDByCandidate = new Map<string, string>()
         for (const c of candidateRows) {
-          const spec = c.candidate_spec as Record<string, unknown> | null | undefined
-          const hypothesisField = typeof spec?.hypothesis === "string" ? spec.hypothesis : undefined
-          const match = hypothesisField?.match(/^\s*([^:\s]+)\s*:/)
-          if (match) hypoIDByCandidate.set(c.id, match[1]!)
+          if (c.hypothesis_id) hypoIDByCandidate.set(c.id, c.hypothesis_id)
         }
 
         const results = runs.map((r) => {
@@ -166,8 +163,9 @@ export const ExperimentResultsTool = Tool.define(
             runID: r.id,
             stage: r.stage,
             status: r.status,
-            ...(hypoID ? { hypoID } : {}),
-            ...(typeof metricVal === "number" ? { [primaryMetric]: metricVal } : {}),
+            ...(hypoID ? { hypoID, hypothesisID: hypoID } : {}),
+            ...(r.status === "invalid" ? { evidence_disposition: "inconclusive" } : {}),
+            ...(r.status !== "invalid" && typeof metricVal === "number" ? { [primaryMetric]: metricVal } : {}),
             ...(r.error ? { error: r.error.slice(0, 160) } : {}),
           }
         })

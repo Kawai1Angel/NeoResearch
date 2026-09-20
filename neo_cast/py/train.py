@@ -184,9 +184,12 @@ def run_epoch(
     predict_fn=None,
     on_batch=None,
     batch_report_interval: int = 50,
+    deadline: float | None = None,
 ) -> None:
     model.train()
     for batch_idx, batch in enumerate(loader):
+        if deadline is not None and time.time() >= deadline:
+            break
         x, y = _move_batch(batch, device)
 
         pred = predict_fn(model, x) if predict_fn is not None else model(x)
@@ -299,6 +302,8 @@ def _reduce_loss(loss: torch.Tensor, weighting: str, sample_scheme: str, target:
 
 
 def _point_prediction(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if isinstance(pred, tuple):
+        return pred[0]
     if pred.dim() == target.dim() + 1:
         return pred[..., pred.size(-1) // 2]
     return pred
@@ -321,8 +326,15 @@ def _build_train_loss(candidate: dict[str, Any]):
     strategy = _recipe_training_strategy(candidate)
     loss_cfg = strategy.get("loss", {})
     loss_base = loss_cfg.get("base", "mse")
+    if _recipe_prediction_head(candidate).get("output_distribution") == "gaussian" and loss_base != "gaussian_nll":
+        raise ValueError("Gaussian output requires gaussian_nll loss")
     horizon_weighting = str(loss_cfg.get("horizon_weighting", "uniform"))
     sample_scheme = _sample_reweighting_scheme(candidate)
+    if loss_base == "gaussian_nll":
+        def gaussian_loss(pred, target, context=None):
+            mean, scale = pred
+            return _reduce_loss(F.gaussian_nll_loss(mean, target, scale.square(), full=True, reduction="none"), horizon_weighting, sample_scheme, target)
+        return gaussian_loss
     if loss_base == "mse":
         return lambda pred, target, context=None: _reduce_loss(
             F.mse_loss(_point_prediction(pred, target), target, reduction="none"),
@@ -398,10 +410,15 @@ def _predict_for_training(model: nn.Module, candidate: dict[str, Any], x) -> tor
             "target_history": x["target_history"],
             "exogenous_past": x["exogenous_past"],
             "exogenous_future": x["exogenous_future"],
+            **({"calendar_features": x["calendar_features"]} if "calendar_features" in x else {}),
         }
+        if loss_base == "gaussian_nll":
+            return model.forward_distribution(**inputs)
         if wants_quantiles and hasattr(model, "forward_quantiles"):
             return model.forward_quantiles(**inputs)
         return model(**inputs)
+    if loss_base == "gaussian_nll":
+        return model.forward_distribution(x)
     if wants_quantiles and hasattr(model, "forward_quantiles"):
         return model.forward_quantiles(x)
     return model(x)
@@ -413,10 +430,47 @@ def _slice_context_window(x: torch.Tensor, input_len: int) -> torch.Tensor:
             **x,
             "target_history": x["target_history"][:, -input_len:, :],
             "exogenous_past": x["exogenous_past"][:, -input_len:, :],
+            **({"calendar_features": x["calendar_features"][:, -input_len:, :]} if "calendar_features" in x else {}),
         }
     if x.size(1) > input_len:
         return x[:, -input_len:, :]
     return x
+
+
+@torch.no_grad()
+def measure_latency_ms(model: nn.Module, inputs, repeats: int = 10) -> float:
+    """Median batch-one model call after three warmups, including device completion."""
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+    def predict():
+        if isinstance(inputs, dict):
+            kwargs = {key: value[:1] for key, value in inputs.items() if key != "target"}
+            if getattr(model, "head_cfg", {}).get("type") == "gaussian":
+                model.forward_distribution(**kwargs)
+            elif getattr(model, "head_cfg", {}).get("type") == "quantile":
+                model.forward_quantiles(**kwargs)
+            else:
+                model(**kwargs)
+        elif getattr(model, "head_cfg", {}).get("type") == "gaussian":
+            model.forward_distribution(inputs[:1])
+        elif getattr(model, "head_cfg", {}).get("type") == "quantile":
+            model.forward_quantiles(inputs[:1])
+        else:
+            model(inputs[:1])
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    try:
+        for _ in range(3):
+            predict()
+        samples = []
+        for _ in range(repeats):
+            start = time.perf_counter()
+            predict()
+            samples.append((time.perf_counter() - start) * 1000)
+        return sorted(samples)[len(samples) // 2]
+    finally:
+        model.train(was_training)
 
 
 def _build_runtime_model(family_module, candidate: dict[str, Any], input_len: int, horizon: int) -> nn.Module:
@@ -465,9 +519,9 @@ def _recipe_execution_summary(candidate: dict[str, Any]) -> dict[str, Any]:
         "fusion": str(recipe.get("fusion", {}).get("type", "unknown")),
         "prediction_head": str(head_cfg.get("type", "unknown")) if isinstance(head_cfg, dict) else "unknown",
         "output_distribution": output_distribution,
-        "training_prediction": "quantile_distribution"
-        if loss_base == "quantile" or output_distribution == "quantile"
-        else "point_forecast",
+        "training_prediction": "gaussian_distribution" if output_distribution == "gaussian" else (
+            "quantile_distribution" if loss_base == "quantile" or output_distribution == "quantile" else "point_forecast"
+        ),
         "loss": str(loss_base),
     }
     if quantiles is not None:
@@ -689,6 +743,9 @@ def train_models(
     candidate: dict[str, Any],
     smoke: bool,
     artifact_root: Path,
+    execution_contract_path: str | None = None,
+    candidate_path: str | None = None,
+    verification_path: str | None = None,
 ) -> int:
     train_config = candidate["train_config"]
     constraints = candidate["constraints"]
@@ -720,6 +777,30 @@ def train_models(
     t_start = time.time()
     input_len = int(candidate.get("task", {}).get("input_len", INPUT_LEN))
     models = {h: _build_runtime_model(family_module, candidate, input_len, h).to(device) for h in horizons}
+    if execution_contract_path:
+        from execution_contract import load_contract, verify_models, digest
+        try:
+            contract = load_contract(execution_contract_path)
+            if not candidate_path:
+                raise ValueError("Missing candidate path for execution contract")
+            manifests, mismatches = verify_models(contract, list(models.values()), candidate_path, candidate)
+            for manifest in manifests:
+                emit("executed_model_manifest", **{k: v for k, v in manifest.items() if k != "event"})
+            if not smoke:
+                verification = json.loads(Path(verification_path or "").read_text())
+                if verification.get("contract_digest") != digest(contract) or verification.get("candidate_id") != contract["candidate_id"] or verification.get("status") != "verified":
+                    mismatches.append({"path": "smoke_verification", "expected": digest(contract), "actual": verification})
+            if mismatches:
+                emit("execution_contract_violation", status="invalid", contract_digest=digest(contract), mismatches=mismatches)
+                return 5
+            verification = {"event": "execution_contract_verified", "status": "verified", "candidate_id": contract["candidate_id"], "candidate_spec_sha256": contract["candidate_spec_sha256"], "contract_digest": digest(contract), "manifest": manifests[-1]}
+            emit("execution_contract_verified", **{k: v for k, v in verification.items() if k != "event"})
+            if smoke and verification_path:
+                Path(verification_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(verification_path).write_text(json.dumps(verification) + "\n", encoding="utf-8")
+        except Exception as exc:
+            emit("execution_contract_violation", status="invalid", mismatches=[{"path": "contract", "expected": "valid contract and verification", "actual": str(exc)}])
+            return 5
     num_params = sum(param.numel() for model in models.values() for param in model.parameters())
     num_params_m = num_params / 1e6
     param_budget_m = float(constraints["param_budget_m"])
@@ -746,8 +827,20 @@ def train_models(
         h: _build_scheduler(optimizers[h], candidate, max_epochs=max_epochs)
         for h in horizons
     }
-    train_loaders = {h: make_dataloader("train", h, batch_size, shuffle=True) for h in horizons}
-    val_loaders = {h: make_dataloader("val", h, batch_size, shuffle=False) for h in horizons}
+    calendar = {"include_calendar": True} if any(getattr(m, "embedding_type", None) == "calendar" for m in models.values()) else {}
+    train_loaders = {h: make_dataloader("train", h, batch_size, shuffle=True, **calendar) for h in horizons}
+    val_loaders = {h: make_dataloader("val", h, batch_size, shuffle=False, **calendar) for h in horizons}
+    latency_by_horizon = {}
+    if "max_latency_ms" in constraints:
+        for h, model in models.items():
+            inputs, _ = _move_batch(next(iter(val_loaders[h])), device)
+            latency_by_horizon[h] = measure_latency_ms(model, _slice_context_window(inputs, input_len))
+        measured = max(latency_by_horizon.values())
+        emit("latency_measured", batch_size=1, statistic="median_10_after_3_warmups", latency_ms=measured, by_horizon=latency_by_horizon, device=str(device))
+        if measured > float(constraints["max_latency_ms"]):
+            emit("error", kind="latency_budget_exceeded", measured_ms=measured, allowed_ms=constraints["max_latency_ms"])
+            emit("done", status="smoke_fail" if smoke else "full_fail")
+            return 3
     first_batch = next(iter(train_loaders[horizons[0]]))
     if isinstance(first_batch, dict):
         first_batch_shapes = {key: list(value.shape) for key, value in first_batch.items()}
@@ -793,6 +886,7 @@ def train_models(
                 grad_clip,
                 predict_fn,
                 on_batch=_on_batch,
+                deadline=t_start + time_budget_s,
             )
             val_loss = compute_val_loss(models[horizon], val_loaders[horizon], device, predict_fn)
             if schedulers[horizon] is not None:
@@ -848,6 +942,7 @@ def train_models(
         "model_output_channels": NUM_CHANNELS,
         "future_covariate_mode": candidate["model_config"].get("future_covariate_mode", "none"),
         "first_batch_shapes": first_batch_shapes,
+        "latency_ms_by_horizon": latency_by_horizon,
     }
 
     run_id = _make_run_id()
@@ -875,6 +970,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolved-candidate", default=str(DEFAULT_RESOLVED_CANDIDATE))
     parser.add_argument("--artifacts-dir", default=str(DEFAULT_ARTIFACTS_DIR))
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--execution-contract", default=os.environ.get("NEO_CAST_EXECUTION_CONTRACT"))
+    parser.add_argument("--candidate-path", default=os.environ.get("NEO_CAST_CONTRACT_CANDIDATE"))
+    parser.add_argument("--contract-verification", default=os.environ.get("NEO_CAST_CONTRACT_VERIFICATION"))
     return parser
 
 
@@ -888,7 +986,7 @@ def main() -> None:
     try:
         candidate = _normalize_candidate_model_config(load_resolved_candidate(resolved_candidate_path))
         set_seed(int(candidate["train_config"]["seed"]))
-        exit_code = train_models(candidate=candidate, smoke=args.smoke, artifact_root=artifacts_dir)
+        exit_code = train_models(candidate=candidate, smoke=args.smoke, artifact_root=artifacts_dir, execution_contract_path=args.execution_contract, candidate_path=args.candidate_path, verification_path=args.contract_verification)
     except Exception as exc:  # pragma: no cover - defensive CLI path
         emit("error", kind=exc.__class__.__name__.lower(), message=str(exc))
         emit("done", status="crash")

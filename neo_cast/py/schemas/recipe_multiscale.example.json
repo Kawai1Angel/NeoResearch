@@ -27,6 +27,7 @@
         "stride": 16
       }
     ],
+    "num_blocks": 2,
     "d_model": 64
   },
   "backbone": {

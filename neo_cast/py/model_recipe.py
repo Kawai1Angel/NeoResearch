@@ -11,6 +11,7 @@ DEFAULT_SCALES = [
     {"patch_len": 8, "stride": 4},
     {"patch_len": 16, "stride": 8},
     {"patch_len": 32, "stride": 16},
+    {"patch_len": 64, "stride": 32},
 ]
 
 BACKBONE_MAP = {
@@ -106,7 +107,7 @@ def prediction_horizons_from_input(model_input: dict[str, Any]) -> list[int]:
 
 
 def _compile_preprocessing(architecture: dict[str, Any]) -> dict[str, Any]:
-    if architecture.get("decomposition"):
+    if architecture.get("decomposition") and architecture["backbone"] != "dlinear":
         return {
             "actions": [
                 {
@@ -119,18 +120,29 @@ def _compile_preprocessing(architecture: dict[str, Any]) -> dict[str, Any]:
     return {"actions": [{"type": "none"}]}
 
 
-def _compile_embedding(architecture: dict[str, Any], low_backbone: str) -> dict[str, Any]:
+def _compile_embedding(architecture: dict[str, Any], low_backbone: str, input_len: int) -> dict[str, Any]:
     requested = architecture.get("embedding", "auto")
+    if low_backbone in RAW_BACKBONES and requested not in {"auto", "none"}:
+        raise ValueError(f"embedding={requested} is incompatible with backbone={low_backbone}")
+    blocks = int(architecture.get("multiscale_blocks", 0))
+    if blocks and (low_backbone in RAW_BACKBONES or requested not in {"auto", "multiscale_patch"}):
+        raise ValueError("multiscale_blocks requires a compatible multiscale embedding; use layers for backbone depth")
     if low_backbone in RAW_BACKBONES or requested == "none":
         return {"type": "none"}
 
     d_model = _positive_int(architecture.get("d_model"), _positive_int(architecture.get("hidden_dim"), 64))
     multiscale_blocks = _positive_int(architecture.get("multiscale_blocks"), 0)
-    if requested == "multiscale_patch" or multiscale_blocks >= 2:
+    if requested == "multiscale_patch" or (requested == "auto" and multiscale_blocks > 0):
+        # Scale selection depends only on the available history; multiscale_blocks
+        # controls the depth of cross-scale processing rather than the scale count.
+        scales = [dict(scale) for scale in DEFAULT_SCALES if int(scale["patch_len"]) <= input_len]
+        if not scales:
+            raise ValueError("multiscale_patch requires history_window >= 8")
         return {
             "type": "multiscale_patch",
-            "scales": DEFAULT_SCALES[: min(max(multiscale_blocks, 2), len(DEFAULT_SCALES))],
+            "scales": scales,
             "d_model": d_model,
+            "num_blocks": multiscale_blocks or 1,
         }
     if requested == "invert":
         return {"type": "invert", "d_model": d_model}
@@ -138,7 +150,7 @@ def _compile_embedding(architecture: dict[str, Any], low_backbone: str) -> dict[
         return {"type": "frequency", "n_freq": 16, "d_model": d_model, "complex_mode": "magnitude"}
     if requested == "calendar":
         return {"type": "calendar", "fields": ["hour", "dayofweek", "month"], "embed_dim": d_model}
-    if low_backbone == "linear":
+    if low_backbone == "linear" and requested == "auto":
         return {"type": "none"}
     return {
         "type": "patch",
@@ -151,7 +163,7 @@ def _compile_embedding(architecture: dict[str, Any], low_backbone: str) -> dict[
 def _compile_backbone(architecture: dict[str, Any], low_backbone: str) -> dict[str, Any]:
     hidden_dim = _positive_int(architecture.get("hidden_dim"), 64)
     d_model = _positive_int(architecture.get("d_model"), hidden_dim)
-    layers = _positive_int(architecture.get("layers"), _positive_int(architecture.get("multiscale_blocks"), 1))
+    layers = _positive_int(architecture.get("layers"), 1)
     dropout = _number(architecture.get("dropout"), 0.1)
     kernel_size = _positive_int(architecture.get("kernel_size"), 3)
 
@@ -161,8 +173,8 @@ def _compile_backbone(architecture: dict[str, Any], low_backbone: str) -> dict[s
         return {"type": "mlp", "depth": layers, "hidden_dim": hidden_dim, "activation": "gelu", "dropout": dropout}
     if low_backbone == "transformer":
         heads = _positive_int(architecture.get("heads"), 4)
-        while heads > 1 and d_model % heads != 0:
-            heads -= 1
+        if d_model % heads:
+            raise ValueError("architecture.d_model must be divisible by architecture.heads")
         return {
             "type": "transformer",
             "d_model": d_model,
@@ -224,7 +236,7 @@ def _compile_fusion(model_input: dict[str, Any], architecture: dict[str, Any]) -
         return {"type": "gated_hybrid", "gate_type": "learned", "residual": True}
     return {
         "type": "temporal",
-        "channel_mode": "shared" if requested == "shared" or model_input.get("covariates") else "independent",
+        "channel_mode": requested if requested in {"shared", "independent"} else ("shared" if model_input.get("covariates") else "independent"),
     }
 
 
@@ -260,7 +272,7 @@ def _compile_training(training: dict[str, Any]) -> dict[str, Any]:
             "time_budget_s": _positive_int(training.get("time_budget_s"), 600),
             "batch_size": _positive_int(training.get("batch_size"), 32),
             "patience": _positive_int(training.get("patience"), 5),
-            "seed": _positive_int(training.get("seed"), 42),
+            "seed": int(training.get("seed", 42)),
         },
     }
 
@@ -269,7 +281,7 @@ def _compile_constraints(constraints: dict[str, Any]) -> dict[str, Any]:
     latency_sensitive = bool(constraints.get("latency_sensitive", False))
     return {
         "max_params": parse_max_params(constraints["max_params"]),
-        "max_latency_ms": float(constraints.get("max_latency_ms", 50 if latency_sensitive else 100)),
+        **({"max_latency_ms": float(constraints["max_latency_ms"])} if "max_latency_ms" in constraints else {}),
         "latency_priority": "high" if latency_sensitive else "medium",
     }
 
@@ -286,6 +298,13 @@ def compile_model_recipe(model_recipe: dict[str, Any]) -> dict[str, Any]:
     low_backbone = BACKBONE_MAP.get(str(architecture["backbone"]))
     if low_backbone is None:
         raise ValueError(f"Unsupported architecture.backbone: {architecture['backbone']}")
+    distribution = architecture.get("output_distribution", "point")
+    allowed_losses = {"point": {"mse", "mae", "huber", "distillation"}, "quantile": {"quantile"}, "gaussian": {"gaussian_nll"}}
+    if training["loss"] not in allowed_losses[distribution]:
+        raise ValueError(f"output_distribution={distribution} requires loss in {sorted(allowed_losses[distribution])}")
+    backbone = _compile_backbone(architecture, low_backbone)
+    if "attention" in architecture:
+        backbone["attention"] = architecture["attention"]
 
     notes = [
         "compiled_from=model_recipe.v1",
@@ -302,8 +321,8 @@ def compile_model_recipe(model_recipe: dict[str, Any]) -> dict[str, Any]:
         "recipe_id": f"recipe_{_safe_model_slug(model_recipe['model_name'])}",
         "hypothesis": model_recipe["hypothesis"],
         "preprocessing": _compile_preprocessing(architecture),
-        "embedding": _compile_embedding(architecture, low_backbone),
-        "backbone": _compile_backbone(architecture, low_backbone),
+        "embedding": _compile_embedding(architecture, low_backbone, int(model_input["history_window"])),
+        "backbone": backbone,
         "fusion": _compile_fusion(model_input, architecture),
         "prediction_head": _compile_prediction_head(architecture),
         "post_processing": {"type": "auto"},

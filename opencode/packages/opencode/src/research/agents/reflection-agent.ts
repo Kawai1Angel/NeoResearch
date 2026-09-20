@@ -205,7 +205,7 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
   const direction = objectiveDirection(input.task.objective)
   const candidatesByID = new Map(input.candidates.map((candidate) => [candidate.id, candidate] as const))
 
-  const ordered = [...input.runs].sort((a, b) => a.time.created - b.time.created)
+  const ordered = input.runs.filter((run) => run.status !== "invalid").sort((a, b) => a.time.created - b.time.created)
   const succeeded: { run: ResearchRun; metric: number }[] = []
   const ineffective: ReflectionIneffectiveChange[] = []
   const effective: ReflectionEffectiveChange[] = []

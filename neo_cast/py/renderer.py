@@ -47,6 +47,8 @@ def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | Non
     budget = strategy["budget"]
     constraints = normalized_recipe.get("constraints") or {}
     max_params = constraints.get("max_params")
+    if max_params and max_params > DEFAULT_PARAM_BUDGET_M * 1_000_000:
+        raise ValueError(f"max_params exceeds system limit {int(DEFAULT_PARAM_BUDGET_M * 1_000_000)}")
     model_input = model_recipe.get("input", {}) if model_recipe else {}
     task_input_len = int(model_input.get("history_window", INPUT_LEN)) if model_recipe else INPUT_LEN
     task_horizons = prediction_horizons_from_input(model_input) if model_recipe else list(HORIZONS)
@@ -68,10 +70,11 @@ def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | Non
             "seed": int(budget.get("seed", SEED)),
         },
         "constraints": {
-            "param_budget_m": min(float(max_params) / 1_000_000, DEFAULT_PARAM_BUDGET_M)
+            "param_budget_m": float(max_params) / 1_000_000
             if max_params
             else DEFAULT_PARAM_BUDGET_M,
-            "time_budget_s": DEFAULT_TIME_BUDGET_S,
+            "time_budget_s": int(budget.get("time_budget_s", DEFAULT_TIME_BUDGET_S)),
+            **({"max_latency_ms": float(constraints["max_latency_ms"])} if "max_latency_ms" in constraints else {}),
             "latency_priority": constraints.get("latency_priority", "medium"),
         },
         "smoke_config": smoke_config,

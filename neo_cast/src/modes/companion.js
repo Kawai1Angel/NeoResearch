@@ -180,8 +180,10 @@ function printCompanionResult(row, attempt = null) {
   // machine-readable (required by e2e)
   // human-readable narrative
   const verdict = row.status === "keep" ? "✓ KEEP" : row.status === "discard" ? "✗ DISCARD" : `⚠ ${row.status.toUpperCase()}`;
-  const mse = row.val_avg_mse === "NA" ? "N/A" : `${parseFloat(row.val_avg_mse).toFixed(6)}`;
-  _tag(`${statusPrefix}:VAL`, mse);
+  const mse = row.cv_avg_mse === "NA" ? "N/A" : `${parseFloat(row.cv_avg_mse).toFixed(6)}`;
+  _tag(`${statusPrefix}:CV`, mse);
+  _tag(`${statusPrefix}:CVSTD`, row.cv_std_mse === "NA" ? "N/A" : `${parseFloat(row.cv_std_mse).toFixed(6)}`);
+  _tag(`${statusPrefix}:VAL`, row.val_avg_mse === "NA" ? "N/A" : `${parseFloat(row.val_avg_mse).toFixed(6)}`);
   _tag(`${statusPrefix}:DEC`, verdict);
   // Session-local best signal — Python's status="keep" means this run improved
   // over the previous local best. The global champion authority lives in the TS
@@ -204,6 +206,8 @@ function printCompanionFinalSummary(bestRow) {
   // machine-readable (required by e2e)
   // human-readable
   _tag("BEST:MODEL", bestRow.model_family);
+  _tag("BEST:CV", parseFloat(bestRow.cv_avg_mse).toFixed(6));
+  _tag("BEST:CVSTD", parseFloat(bestRow.cv_std_mse).toFixed(6));
   _tag("BEST:VAL", parseFloat(bestRow.val_avg_mse).toFixed(6));
   _tag("BEST:RUN", bestRow.run_id);
   const artifactDir = `.neo-cast/artifacts/run_${bestRow.run_id}/`;

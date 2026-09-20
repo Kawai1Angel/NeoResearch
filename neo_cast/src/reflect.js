@@ -28,6 +28,8 @@ function buildReflectionContext(previousCandidate = {}, previousRow = {}, histor
     },
     previous_result: {
       status: previousRow?.status ?? null,
+      cv_avg_mse: numberOrNull(previousRow?.cv_avg_mse),
+      cv_std_mse: numberOrNull(previousRow?.cv_std_mse),
       val_avg_mse: numberOrNull(previousRow?.val_avg_mse),
       val_h96_mse: numberOrNull(previousRow?.val_h96_mse),
       val_h720_mse: numberOrNull(previousRow?.val_h720_mse),
@@ -38,6 +40,8 @@ function buildReflectionContext(previousCandidate = {}, previousRow = {}, histor
     experiment_history: history.slice(-6).map((row) => ({
       candidate_id: row.candidate_id ?? null,
       model_family: row.model_family ?? null,
+      cv_avg_mse: numberOrNull(row.cv_avg_mse),
+      cv_std_mse: numberOrNull(row.cv_std_mse),
       val_avg_mse: numberOrNull(row.val_avg_mse),
       val_h96_mse: numberOrNull(row.val_h96_mse),
       val_h720_mse: numberOrNull(row.val_h720_mse),
@@ -74,7 +78,7 @@ function formatTaskContext(taskContext = {}) {
     `- Validation rows: [${valRows[0]}, ${valRows[1]})`,
     `- Missing value strategy: ${missingStrategy}`,
     `- Frequency policy: ${frequency}`,
-    "- Primary metric: val_avg_mse (lower is better, StandardScaler-normalised space)",
+    "- Primary metric: cv_avg_mse (lower is better); cv_std_mse diagnoses temporal stability; val_avg_mse describes the final checkpoint",
     "- Parameter budget: soft limit 1M params total across all horizon models",
     "- Training budget: 10 minutes wall-clock per run",
   ];

@@ -59,7 +59,7 @@ def _metric(metrics: dict[str, Any], key: str) -> float | None:
 
 
 def make_policy_from_state(state_dict: dict[str, Any]) -> MutationPolicy:
-    best = _metric(state_dict, "best_val_avg_mse")
+    best = _metric(state_dict, "best_cv_avg_mse")
     if best is None:
         return MutationPolicy()
     return MutationPolicy(baseline_val_mse=best)
@@ -247,6 +247,8 @@ def _switch_optimizer(recipe: dict[str, Any], policy: MutationPolicy, *, directi
 
 
 def _switch_loss(recipe: dict[str, Any]) -> str | None:
+    if recipe.get("prediction_head", {}).get("output_distribution") in {"quantile", "gaussian"}:
+        return None
     _ensure_training_defaults(recipe)
     loss = recipe["training_strategy"]["loss"]
     if loss.get("base") == "huber":
@@ -294,7 +296,7 @@ def _mutation_steps(
     index: int = 1,
     search_biases: list[str] | None = None,
 ) -> list[str]:
-    val_avg_mse = _metric(metrics, "val_avg_mse")
+    cv_avg_mse = _metric(metrics, "cv_avg_mse")
     poor_threshold, good_threshold = _get_thresholds(policy)
     status = str(metrics.get("status", "")).lower()
     model_family = recipe.get("backbone", {}).get("type", "")
@@ -311,7 +313,7 @@ def _mutation_steps(
         if note:
             return [note]
 
-    if index >= 1 and (val_avg_mse is None or val_avg_mse > good_threshold):
+    if index >= 1 and (cv_avg_mse is None or cv_avg_mse > good_threshold):
         note = _explore_alternate_raw_backbone(recipe)
         if note:
             return [note]
@@ -334,12 +336,12 @@ def _mutation_steps(
         if note:
             return [note]
 
-    if model_family == "mlp" and (val_avg_mse is None or val_avg_mse > good_threshold):
+    if model_family == "mlp" and (cv_avg_mse is None or cv_avg_mse > good_threshold):
         note = _increase_mlp_capacity(recipe, policy)
         if note:
             return [note]
 
-    if model_family == "transformer" and val_avg_mse is not None and val_avg_mse > poor_threshold:
+    if model_family == "transformer" and cv_avg_mse is not None and cv_avg_mse > poor_threshold:
         note = _reduce_transformer_cost(recipe)
         if note:
             return [note]
@@ -348,7 +350,7 @@ def _mutation_steps(
     if note:
         return [note]
 
-    if val_avg_mse is None or val_avg_mse > poor_threshold:
+    if cv_avg_mse is None or cv_avg_mse > poor_threshold:
         for switch in (_switch_to_dlinear, _switch_to_tcn, _switch_to_nbeats, _switch_to_timesnet):
             note = switch(recipe)
             if note:

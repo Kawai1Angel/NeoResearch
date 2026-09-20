@@ -45,6 +45,8 @@ RESULTS_HEADER = [
     "run_id",
     "candidate_id",
     "model_family",
+    "cv_avg_mse",
+    "cv_std_mse",
     "val_avg_mse",
     "val_h96_mse",
     "val_h720_mse",
@@ -67,6 +69,8 @@ class RunnerState:
     session_started_at: str
     no_improve_streak: int = 0
     last_improve_at: str | None = None
+    best_cv_avg_mse: float | None = None
+    best_cv_protocol_id: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RunnerState":
@@ -74,6 +78,8 @@ class RunnerState:
             payload = {**payload, "session_started_at": payload.get("initialized_at", _now_iso())}
         payload.setdefault("no_improve_streak", 0)
         payload.setdefault("last_improve_at", None)
+        payload.setdefault("best_cv_avg_mse", None)
+        payload.setdefault("best_cv_protocol_id", None)
         return cls(**payload)
 
 
@@ -120,6 +126,8 @@ def init_state(force: bool) -> RunnerState:
         session_id=_make_session_id(),
         best_run_id=None,
         best_val_avg_mse=None,
+        best_cv_avg_mse=None,
+        best_cv_protocol_id=None,
         keep_count=0,
         crash_streak=0,
         candidate_counter=0,
@@ -273,12 +281,13 @@ def _parse_artifact_record(records: list[dict[str, Any]]) -> tuple[str | None, P
 
 
 def _parse_eval_metrics(records: list[dict[str, Any]]) -> dict[str, float] | None:
-    for record in reversed(records):
-        if record.get("event") in {"eval_done", "smoke_eval_done"}:
+    for event_name in ("cv_eval_done", "eval_done", "smoke_eval_done"):
+      for record in reversed(records):
+        if record.get("event") == event_name:
             return {
                 key: value
                 for key, value in record.items()
-                if key.startswith("val_") and isinstance(value, (int, float))
+                if (key.startswith("val_") or key.startswith("cv_")) and isinstance(value, (int, float, str))
             }
     return None
 
@@ -349,6 +358,12 @@ def _best_is_comparable(state: RunnerState, current_horizons: list[int]) -> bool
     if not best_horizons or not current_horizons:
         return True
     return best_horizons == sorted(current_horizons)
+
+
+def _cv_improved(state: RunnerState, cv_avg_mse: float, protocol_id: str) -> tuple[bool, bool]:
+    comparable = state.best_cv_protocol_id in {None, protocol_id}
+    improved = state.best_cv_avg_mse is None or not comparable or cv_avg_mse < state.best_cv_avg_mse
+    return improved, comparable
 
 
 def _write_training_curves(records: list[dict[str, Any]], artifact_dir: Path | None) -> None:
@@ -469,6 +484,7 @@ def _write_result_row(
     candidate_id: str,
     model_family: str,
     val_metrics: dict[str, float] | None,
+    cv_metrics: dict[str, Any] | None = None,
     params_m: float | None,
     status: str,
 ) -> None:
@@ -478,6 +494,8 @@ def _write_result_row(
             "run_id": run_id,
             "candidate_id": candidate_id,
             "model_family": model_family,
+            "cv_avg_mse": format_metric(cv_metrics.get("cv_avg_mse") if cv_metrics else None),
+            "cv_std_mse": format_metric(cv_metrics.get("cv_std_mse") if cv_metrics else None),
             "val_avg_mse": format_metric(val_metrics.get("val_avg_mse") if val_metrics else None),
             "val_h96_mse": format_metric(val_metrics.get("val_h96_mse") if val_metrics else None),
             "val_h720_mse": format_metric(val_metrics.get("val_h720_mse") if val_metrics else None),
@@ -501,6 +519,19 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         print(f"runner_checkpoint_status={block_reason['status']}")
         print(f"runner_checkpoint_reason={block_reason['reason']}")
         return 5
+
+    contract_path = os.environ.get("NEO_CAST_EXECUTION_CONTRACT")
+    if contract_path and skip_smoke:
+        from execution_contract import load_contract, digest, compare
+        try:
+            contract = load_contract(contract_path)
+            proof = read_json(Path(os.environ.get("NEO_CAST_CONTRACT_VERIFICATION", "")))
+            current_digest = digest(read_json(CURRENT_CANDIDATE_PATH))
+            if proof.get("status") != "verified" or proof.get("candidate_id") != contract["candidate_id"] or proof.get("contract_digest") != digest(contract) or current_digest != contract["candidate_spec_sha256"] or compare(contract, proof.get("manifest", {})):
+                raise ValueError("No matching verified smoke contract")
+        except Exception as exc:
+            print(json.dumps({"event": "execution_contract_violation", "status": "invalid", "mismatches": [{"path": "smoke_verification", "expected": "matching verified smoke", "actual": str(exc)}]}), flush=True)
+            return 5
 
     state.candidate_counter += 1
     save_state(state)
@@ -532,7 +563,7 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
 
         if smoke_exit != 0:
             candidate_id, model_family = _candidate_context_from_current(f"smoke_{state.candidate_counter}")
-            status = "invalid" if smoke_exit == 2 else "smoke_fail"
+            status = "invalid" if smoke_exit in {2, 5} else "smoke_fail"
             state.crash_streak = state.crash_streak + 1 if status == "smoke_fail" else state.crash_streak
             save_state(state)
             run_id, _ = _parse_artifact_record(smoke_records)
@@ -551,17 +582,23 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
 
     train_cmd = [
         sys.executable,
-        str(PY_ROOT / "train.py"),
+        str(PY_ROOT / "cv_train.py"),
         "--resolved-candidate",
         str(RESOLVED_CANDIDATE_PATH),
         "--artifacts-dir",
         str(ARTIFACTS_DIR),
+        "--num-folds",
+        "4",
+        "--max-parallel-folds",
+        "4",
     ]
     train_exit, train_records = _run_and_capture(train_cmd)
     candidate_id, model_family = _candidate_context()
     run_id, artifact_dir = _parse_artifact_record(train_records)
     val_metrics = _parse_eval_metrics(train_records)
 
+    if any(record.get("event") == "execution_contract_violation" for record in train_records):
+        return 5
     if train_exit != 0 or run_id is None or artifact_dir is None or val_metrics is None:
         state.crash_streak += 1
         save_state(state)
@@ -577,9 +614,12 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         return _candidate_safe_exit_code(train_exit if train_exit != 0 else 1, train_records)
 
     training_summary = read_json(artifact_dir / "training_summary.json")
+    cv_metrics = read_json(artifact_dir / "cv_metrics.json")
     resolved_candidate = read_json(RESOLVED_CANDIDATE_PATH)
     params_m = float(training_summary.get("num_params_M", 0.0))
     val_avg_mse = float(val_metrics["val_avg_mse"])
+    cv_avg_mse = float(cv_metrics["cv_avg_mse"])
+    cv_protocol_id = str(cv_metrics["protocol"]["protocol_id"])
     _write_training_curves(train_records, artifact_dir)
 
     export_exit = _export_artifact(state=state, run_id=run_id, artifact_dir=artifact_dir)
@@ -599,14 +639,14 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
     _append_artifact_trace(artifact_dir)
 
     current_horizons = _metric_horizons(val_metrics) or _candidate_task_horizons(resolved_candidate)
-    comparable = _best_is_comparable(state, current_horizons)
+    improved, comparable = _cv_improved(state, cv_avg_mse, cv_protocol_id)
     if not comparable:
         print(f"runner_champion_standoff=current_horizons:{_horizon_signature(current_horizons)}")
-    improved = state.best_val_avg_mse is None or not comparable or val_avg_mse < state.best_val_avg_mse
     status = "keep" if improved else "discard"
 
     if improved:
-        state.best_val_avg_mse = val_avg_mse
+        state.best_cv_avg_mse = cv_avg_mse
+        state.best_cv_protocol_id = cv_protocol_id
         state.best_run_id = run_id
         state.keep_count += 1
         state.crash_streak = 0
@@ -624,6 +664,7 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         candidate_id=candidate_id,
         model_family=model_family,
         val_metrics=val_metrics,
+        cv_metrics=cv_metrics,
         params_m=params_m,
         status=status,
     )
@@ -632,6 +673,8 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
     print(f"runner_description={description}")
     print(f"runner_run_id={run_id}")
     print(f"runner_val_avg_mse={val_avg_mse:.6f}")
+    print(f"runner_cv_avg_mse={cv_avg_mse:.6f}")
+    print(f"runner_cv_std_mse={float(cv_metrics['cv_std_mse']):.6f}")
     if state.crash_streak >= 3:
         print("runner_pause_reason=crash_streak")
     return 0 if improved else 1
@@ -722,6 +765,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run the current candidate through smoke + full training.")
     run_parser.add_argument("--description", required=True)
     run_parser.add_argument("--skip-smoke", action="store_true")
+    run_parser.add_argument("--execution-contract", default=os.environ.get("NEO_CAST_EXECUTION_CONTRACT"))
+    run_parser.add_argument("--contract-verification", default=os.environ.get("NEO_CAST_CONTRACT_VERIFICATION"))
 
     ref_test_parser = subparsers.add_parser(
         "ref-test",
@@ -753,6 +798,11 @@ def main() -> None:
             return
         if args.command == "run":
             state = load_state()
+            if args.execution_contract:
+                os.environ["NEO_CAST_EXECUTION_CONTRACT"] = args.execution_contract
+                os.environ["NEO_CAST_CONTRACT_CANDIDATE"] = str(CURRENT_CANDIDATE_PATH)
+            if args.contract_verification:
+                os.environ["NEO_CAST_CONTRACT_VERIFICATION"] = args.contract_verification
             raise SystemExit(run_experiment(state, description=args.description, skip_smoke=args.skip_smoke))
         if args.command == "ref-test":
             state = load_state()

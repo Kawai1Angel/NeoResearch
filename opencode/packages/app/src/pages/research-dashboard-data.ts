@@ -10,7 +10,7 @@ export type ResearchTaskStatus =
   | "completed"
   | "failed"
 export type ResearchRunStage = "profile" | "baseline" | "smoke" | "low_fidelity" | "full" | "ref_test" | "blind_test"
-export type ResearchRunStatus = "queued" | "running" | "succeeded" | "failed" | "rejected"
+export type ResearchRunStatus = "queued" | "running" | "succeeded" | "failed" | "rejected" | "invalid"
 export type CandidateRiskLevel = "low" | "medium" | "high"
 export type CandidateApprovalStatus = "pending" | "approved" | "auto_approved" | "rejected"
 export type CandidateGenerator = "llm" | "heuristic" | "mutation" | "human"

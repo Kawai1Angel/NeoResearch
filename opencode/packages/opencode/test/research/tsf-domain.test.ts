@@ -220,7 +220,7 @@ describe("TSF research domain", () => {
       contextLength: 96,
       maxPredictionLength: 48,
       horizonContextRatio: 0.5,
-      metricPrimary: "val_avg_mse",
+      metricPrimary: "cv_avg_mse",
       bridgeOnly: true,
     })
     expect(fingerprint.searchBiases).toContain("multivariate")
@@ -238,6 +238,17 @@ describe("TSF research domain", () => {
 
     expect(runPlan.command.args).toContain("--run-id")
     expect(runPlan.command.args).toContain("20260629-063757-hbrp")
+  })
+
+  test("defaults full TSF runs to expanding-window CV metrics while smoke stays fixed-split", () => {
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", taskSpec)
+    const evaluation = asRecord(normalizedTask.evaluation)
+    expect(evaluation).toMatchObject({ protocol: "expanding_window_ratio", metricPrimary: "cv_avg_mse" })
+    const candidateSpec = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)[0]!.candidateSpec
+    const smokePlan = Research.DomainRegistry.createRunPlan("tsf", { taskSpec: normalizedTask, candidateSpec, stage: "smoke" })
+    const fullPlan = Research.DomainRegistry.createRunPlan("tsf", { taskSpec: normalizedTask, candidateSpec, stage: "full" })
+    expect(smokePlan.expectedMetrics).toEqual(["val_avg_mse", "val_avg_mae"])
+    expect(fullPlan.expectedMetrics).toEqual(["cv_avg_mse", "cv_std_mse", "val_avg_mse", "val_avg_mae"])
   })
 
   test("accepts probabilistic TSF objectives and fingerprints their metrics", () => {
@@ -743,9 +754,9 @@ describe("TSF research domain", () => {
 
     expect(plan.validation.ok).toBe(true)
     expect(plan.runnerID).toBe("neo-cast-python")
-    expect(plan.command.cwd).toBe("/work/neo_cast")
+    expect(plan.command.cwd).toBe(process.cwd())
     expect(plan.command.args).toEqual([
-      "py/validate.py",
+      "/work/neo_cast/py/validate.py",
       "smoke",
       "--candidate-path",
       ".neo-cast/current_candidate.json",
@@ -754,6 +765,10 @@ describe("TSF research domain", () => {
       "--artifacts-dir",
       ".neo-cast/artifacts",
     ])
+    expect(plan.command.env).toEqual({
+      NEO_CAST_PROJECT_ROOT: process.cwd(),
+      NEO_CAST_PACKAGE_ROOT: "/work/neo_cast",
+    })
 
     const payload = plan.writes[0]!.content
     expect(payload.recipe_version).toBe("recipe_schema_v1")
@@ -823,8 +838,8 @@ describe("TSF research domain", () => {
 
     expect(plan.validation.ok).toBe(true)
     expect(plan.approvalRequired).toBe(true)
-    expect(plan.command.cwd).toBe("/work/neo_cast")
-    expect(plan.command.args).toEqual(["py/runner.py", "blind-test"])
+    expect(plan.command.cwd).toBe(process.cwd())
+    expect(plan.command.args).toEqual(["/work/neo_cast/py/runner.py", "blind-test"])
     expect(plan.expectedEvents).toEqual(["blind_test_done"])
     expect(plan.expectedArtifacts).toEqual(["blind_test_metrics.json"])
     expect(plan.expectedMetrics).toEqual(["blind_test_avg_mse", "blind_test_avg_mae"])

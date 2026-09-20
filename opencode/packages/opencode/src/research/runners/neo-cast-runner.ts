@@ -61,7 +61,9 @@ const DEFAULT_NEO_CAST_MANIFEST: NeoCastRunnerManifest = {
     run: {
       script: "py/runner.py",
       args: ["run", "--description", "{description}", "--skip-smoke"],
-      timeout_ms: 900000,
+      // Four CV folds plus one standard train/val run can each consume the
+      // candidate's 600s training budget. Leave headroom for orchestration.
+      timeout_ms: 3600000,
     },
     ref_test: {
       script: "py/runner.py",
@@ -118,10 +120,10 @@ function renderTemplate(value: string, variables: Record<string, string>) {
   })
 }
 
-function commandEnvironment(runnerRoot: string | undefined) {
+function commandEnvironment(runnerRoot: string | undefined, projectRoot: string) {
   if (runnerRoot === undefined) return undefined
   return {
-    NEO_CAST_PROJECT_ROOT: process.cwd(),
+    NEO_CAST_PROJECT_ROOT: projectRoot,
     NEO_CAST_PACKAGE_ROOT: runnerRoot,
   }
 }
@@ -155,17 +157,13 @@ export function createNeoCastRunnerCommand(input: {
     artifactsDir: input.runtime.artifactsDir,
     description: input.description,
   }
+  const projectRoot = path.resolve(process.env.NEO_CAST_PROJECT_ROOT ?? process.cwd())
   const script =
-    input.explicitRoot === undefined && runnerRoot !== undefined
-      ? path.join(runnerRoot, renderTemplate(command.script, variables))
-      : renderTemplate(command.script, variables)
-  const cwd =
-    input.explicitRoot === undefined && runnerRoot !== undefined
-      ? { cwd: process.cwd() }
-      : input.explicitRoot === undefined
-        ? {}
-        : { cwd: path.resolve(input.explicitRoot) }
-  const env = input.explicitRoot === undefined ? commandEnvironment(runnerRoot) : undefined
+    runnerRoot === undefined
+      ? renderTemplate(command.script, variables)
+      : path.join(runnerRoot, renderTemplate(command.script, variables))
+  const cwd = runnerRoot === undefined ? {} : { cwd: projectRoot }
+  const env = commandEnvironment(runnerRoot, projectRoot)
 
   const args = [script, ...command.args.map((arg) => renderTemplate(arg, variables))]
   if ((input.stage === "ref_test" || input.stage === "blind_test") && input.runnerRunID !== undefined) {

@@ -1,3 +1,4 @@
+import { buildExecutionContract, digest, validateCandidateAgainstHypothesis, verifyExecutionRecords, type ExecutionContract, type ContractMismatch } from "./execution-contract"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema, Stream } from "effect"
 import { cp, mkdir, readdir, readFile, writeFile } from "fs/promises"
@@ -130,6 +131,13 @@ import {
 } from "./agents/hypo-planner-agent"
 import { buildNASAgentResult, summarizeNASAgentLoop, type NASAgentResult } from "./agents/nas-agent"
 import { summarizePublishAgent, type PublishAgentResult } from "./agents/publish-agent"
+import {
+  buildPublishReportPrompt,
+  buildPublishReportSnapshot,
+  renderDeterministicFinalReport,
+  stripMarkdownFence,
+  validateFinalReport,
+} from "./publish-report"
 import { buildTrainEvalResult, type TrainEvalResult } from "./agents/train-eval-agent"
 import {
   analyzeReflection,
@@ -291,10 +299,16 @@ export const PipelineBlockedError = NamedError.create(
       "human_checkpoint_required",
       "reflection_requested_human_review",
       "runner_not_configured",
+      "execution_contract_violation",
     ]),
     missingFields: z.array(z.string()).optional(),
     clarifyingQuestions: z.array(z.string()).optional(),
     checkpointPhase: z.string().optional(),
+    blockerArtifactID: z.string().optional(),
+    candidateID: z.string().optional(),
+    hypothesisID: z.string().optional(),
+    invalidRunID: z.string().optional(),
+    mismatches: z.array(z.object({ path: z.string(), expected: z.unknown(), actual: z.unknown() })).optional(),
   }),
 )
 
@@ -347,7 +361,7 @@ function missing(kind: string, id: string) {
 }
 
 function isTerminal(status: ResearchRun["status"]) {
-  return status === "succeeded" || status === "failed" || status === "rejected"
+  return status === "succeeded" || status === "failed" || status === "rejected" || status === "invalid"
 }
 
 function runnerPath(cwd: string, target: string) {
@@ -558,7 +572,9 @@ function metricsFromRecords(records: Record<string, unknown>[], stage?: DomainRu
           ? key.startsWith("ref_test_")
           : stage === undefined
             ? key.startsWith("val_") || key.startsWith("ref_test_")
-            : key.startsWith("val_")
+            : stage === "smoke"
+              ? key.startsWith("val_")
+              : key.startsWith("cv_") || key.startsWith("val_")
       if (acceptsStageMetric && typeof value === "number") {
         metrics[key] = value
       }
@@ -571,7 +587,7 @@ function objectiveMetricName(objective: ResearchTask["objective"]) {
   const record = objective as Record<string, unknown>
   if (typeof record.primaryMetric === "string") return record.primaryMetric
   if (typeof record.metric === "string") return record.metric
-  return "val_avg_mse"
+  return "cv_avg_mse"
 }
 
 function objectiveSecondaryMetricName(objective: ResearchTask["objective"], primaryMetricName: string) {
@@ -1657,7 +1673,7 @@ function renderResearchReportMarkdown(input: {
     lines.push(
       `- Candidate ID: ${champion.candidateID}`,
       `- Run ID: ${champion.runID}`,
-      `- Primary metric (val_avg_mse): ${formatMetricValue(champion.primaryMetric)}`,
+      `- Primary metric (${objectiveMetricName(task.objective)}): ${formatMetricValue(champion.primaryMetric)}`,
       `- Utility: ${formatMetricValue(champion.utility)}`,
       `- Accepted at: ${new Date(champion.acceptedAt).toISOString()}`,
     )
@@ -2124,7 +2140,7 @@ function buildHypoPlannerUserPrompt(
 ): string {
   const primaryMetricName = typeof (task.objective as Record<string, unknown>)?.primaryMetric === "string"
     ? (task.objective as Record<string, unknown>).primaryMetric as string
-    : "val_avg_mse"
+    : "cv_avg_mse"
   const recentMemoryLessons = memory.slice(-8).map((m) => {
     const cs = recordValue(m.candidateSummary)
     const actions = recordValue(cs.candidateActions)
@@ -2997,12 +3013,12 @@ function hashFilePrefix(filePath: string) {
   }
 }
 
-function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
+function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectRoot: string) {
   const config = tsfDatasetPreparationConfig(task)
   if (!config) {
     throw new Error("TSF dataset preparation requires taskSpec.dataset.path and taskSpec.runtime.neoCastProjectRoot")
   }
-  const args = ["./bin/neo-cast.js", "prepare-data", "--source", config.source]
+  const args = [path.join(config.root, "bin", "neo-cast.js"), "prepare-data", "--source", config.source]
   const preset = datasetPresetFromLoader(config.loaderID)
   if (preset) args.push("--dataset-preset", preset)
   else {
@@ -3045,10 +3061,24 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean) {
   if (config.contextLength !== undefined) args.push("--input-len", String(config.contextLength))
   if (config.predictionLengths.length > 0) args.push("--horizons", config.predictionLengths.join(","))
   if (force) args.push("--force")
+  const sharedVenv = path.join(config.root, ".neo-cast", "runtime", ".venv")
+  const sharedPython = path.join(sharedVenv, "bin", "python")
+  const sharedPythonBin = path.dirname(sharedPython)
   return {
-    executable: process.execPath,
+    executable: process.env.NEO_CAST_NODE ?? "node",
     args,
-    cwd: config.root,
+    cwd: path.resolve(projectRoot),
+    env: {
+      NEO_CAST_PROJECT_ROOT: path.resolve(projectRoot),
+      NEO_CAST_PACKAGE_ROOT: config.root,
+      ...(existsSync(sharedPython)
+        ? {
+            PATH: `${sharedPythonBin}${path.delimiter}${process.env.PATH ?? ""}`,
+            VIRTUAL_ENV: sharedVenv,
+          }
+        : {}),
+    },
+    runnerRoot: config.root,
     source: config.source,
     warnings,
   }
@@ -3096,6 +3126,7 @@ function mapCandidate(row: ResearchCandidateRow) {
     id: row.id,
     taskID: row.task_id,
     parentCandidateID: row.parent_candidate_id ?? undefined,
+    hypothesisID: row.hypothesis_id ?? undefined,
     domainID: row.domain_id,
     candidateSpec: row.candidate_spec,
     rationale: row.rationale,
@@ -3201,8 +3232,10 @@ export interface Interface {
   readonly replyApproval: (input: ReplyApprovalInput) => Effect.Effect<ResearchApproval>
   readonly seedBaselines: (input: SeedBaselinesInput) => Effect.Effect<SeedBaselinesResult>
   readonly prepareRun: (input: PrepareRunInput) => Effect.Effect<PreparedRun>
+  readonly executePreparedRun: (input: PreparedRun) => Effect.Effect<PreparedRun>
   readonly executeRun: (input: PrepareRunInput) => Effect.Effect<PreparedRun>
   readonly executeSeedSweep: (input: ExecuteSeedSweepInput) => Effect.Effect<SeedSweepResult>
+  readonly resumeExecutionContractCheckpoint: (taskID: ResearchTaskID) => Effect.Effect<PreparedRun | undefined>
   readonly runAutonomousIteration: (input: AutonomousIterationInput) => Effect.Effect<AutonomousIterationResult>
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
@@ -3596,6 +3629,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const task = yield* getTask(input.taskID)
       if (input.parentCandidateID) yield* getCandidateForTask(input.taskID, input.parentCandidateID)
       const candidateSpec = validatedCandidateSpec(task, input)
+      const currentHypotheses = yield* listHypotheses(task.id)
+      const hypothesisID = input.hypothesisID ?? selectHypothesisForDesign(experimentPlanFromDB(task, currentHypotheses))?.id
       const time = nowTime()
       const row = yield* db((d) =>
         d
@@ -3604,6 +3639,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             id: ResearchCandidateID.ascending(),
             task_id: input.taskID,
             parent_candidate_id: input.parentCandidateID,
+            hypothesis_id: hypothesisID,
             domain_id: input.domainID,
             candidate_spec: candidateSpec,
             rationale: input.rationale,
@@ -3868,7 +3904,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           d
             .select({ id: ResearchRunTable.id })
             .from(ResearchRunTable)
-            .where(and(eq(ResearchRunTable.task_id, task.id), notInArray(ResearchRunTable.stage, ["profile", "ref_test", "blind_test"])))
+            .where(and(eq(ResearchRunTable.task_id, task.id), notInArray(ResearchRunTable.stage, ["profile", "ref_test", "blind_test"]), ne(ResearchRunTable.status, "invalid")))
             .all(),
         ).pipe(Effect.map((rows) => rows.length))
         if (used >= maxRuns) {
@@ -4209,7 +4245,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             and(
               eq(ResearchRunTable.task_id, task.id),
               eq(ResearchRunTable.stage, stage),
-              ne(ResearchRunTable.status, "rejected"),
+              notInArray(ResearchRunTable.status, ["rejected", "invalid"]),
             ),
           )
           .all(),
@@ -4228,7 +4264,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const candidate = yield* getCandidateForTask(input.taskID, input.candidateID)
       assertCandidateApproved(task.id, candidate)
       const status = input.status ?? "queued"
-      if (input.stage !== "ref_test" && input.stage !== "blind_test") {
+      if (task.domainID === "tsf" && ["baseline", "low_fidelity", "full"].includes(input.stage) && (status === "queued" || status === "running")) {
+        yield* assertExecutionCheckpoint(task.id, candidate.id, input.stage)
+        const spec = typeof input.resourceUsage?.seed === "number" ? candidateSpecWithSeed(candidate.candidateSpec, input.resourceUsage.seed) : candidate.candidateSpec
+        const plan = DomainRegistry.createRunPlan(task.domainID, { taskSpec: task.taskSpec, candidateSpec: spec, stage: input.stage as DomainRunStage })
+        yield* requireVerifiedSmoke(task, candidate, buildExecutionContract(task, candidate, plan.writes[0].content))
+      }
+      if (status !== "invalid" && input.stage !== "ref_test" && input.stage !== "blind_test") {
         yield* ensureRunBudget(task, status, candidate)
       }
       yield* ensureRunApprovalGates(task, candidate, input.stage)
@@ -4242,7 +4284,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             candidate_id: input.candidateID,
             stage: input.stage,
             status,
-            metrics: input.metrics ?? {},
+            metrics: status === "invalid" ? {} : input.metrics ?? {},
             resource_usage: input.resourceUsage ?? {},
             artifact_refs: input.artifactRefs ? [...input.artifactRefs] : [],
             time_created: time.created,
@@ -4266,6 +4308,194 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (run.status === "succeeded") yield* evaluateSucceededRun(run)
       if (run.status === "failed" || run.status === "rejected") yield* recordFailedRunMemory(run)
       return run
+    })
+
+    const latestExecutionBlocker = Effect.fn("Research.latestExecutionBlocker")(function* (taskID: ResearchTaskID) {
+      const rows = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchArtifactTable)
+          .where(
+            and(
+              eq(ResearchArtifactTable.task_id, taskID),
+              eq(ResearchArtifactTable.kind, "execution_contract_violation_json"),
+            ),
+          )
+          .orderBy(desc(ResearchArtifactTable.time_created))
+          .limit(1)
+          .all(),
+      )
+      if (!rows[0] || rows[0].metadata.status === "resolved") return undefined
+      return mapArtifact(rows[0])
+    })
+
+    const assertExecutionCheckpoint = Effect.fn("Research.assertExecutionCheckpoint")(function* (
+      taskID: ResearchTaskID,
+      candidateID?: ResearchCandidateID,
+      stage?: string,
+    ) {
+      const blocker = yield* latestExecutionBlocker(taskID)
+      if (!blocker) return undefined
+      const approvals = yield* listApprovals({ taskID, limit: 10000 })
+      const approval = approvals.find((item) => item.id === blocker.metadata.approvalID)
+      if (
+        approval?.status !== "approved" ||
+        (candidateID && candidateID !== blocker.metadata.candidateID) ||
+        (stage && stage !== "smoke")
+      ) {
+        throw new PipelineBlockedError({
+          taskID,
+          reason: "execution_contract_violation",
+          blockerArtifactID: blocker.id,
+          candidateID: String(blocker.metadata.candidateID),
+          hypothesisID: typeof blocker.metadata.hypothesisID === "string" ? blocker.metadata.hypothesisID : undefined,
+          invalidRunID: blocker.runID,
+        })
+      }
+      return blocker
+    })
+
+    const blockExecutionContract = Effect.fn("Research.blockExecutionContract")(function* (
+      task: ResearchTask,
+      candidate: ResearchCandidate,
+      contract: ExecutionContract,
+      mismatches: ContractMismatch[],
+      invalidRun?: ResearchRun,
+    ) {
+      const previous = yield* db((d) =>
+        d
+          .select({ id: ResearchArtifactTable.id })
+          .from(ResearchArtifactTable)
+          .where(
+            and(
+              eq(ResearchArtifactTable.task_id, task.id),
+              eq(ResearchArtifactTable.kind, "execution_contract_violation_json"),
+            ),
+          )
+          .all(),
+      )
+      const contractDigest = digest(contract)
+      const blockerID = `ecb_${invalidRun?.id ?? candidate.id}_${previous.length + 1}`
+      const file = path.join(Instance.directory, ".neo-research", "execution-contracts", task.id, `${blockerID}.json`)
+      const payload = {
+        schema_version: "execution_contract_violation.v1",
+        blocker_id: blockerID,
+        type: "execution_contract_violation",
+        status: "open",
+        task_id: task.id,
+        hypothesis_id: candidate.hypothesisID ?? null,
+        candidate_id: candidate.id,
+        invalid_run_id: invalidRun?.id ?? null,
+        stage: "smoke",
+        contract_digest: contractDigest,
+        expected: contract.expected,
+        actual: Object.fromEntries(mismatches.map((item) => [item.path, item.actual])),
+        mismatches,
+        evidence_disposition: "inconclusive",
+        recommended_owner: "pipeline_maintainer",
+        resume_requirement: {
+          same_hypothesis: true,
+          same_candidate: true,
+          required_stage: "smoke",
+          required_event: "execution_contract_verified",
+        },
+      }
+      yield* Effect.promise(async () => {
+        await mkdir(path.dirname(file), { recursive: true })
+        await writeFile(file, JSON.stringify(payload, null, 2) + "\n")
+      })
+      const artifact = yield* createArtifact({
+        taskID: task.id,
+        runID: invalidRun?.id,
+        kind: "execution_contract_violation_json",
+        uri: `file://${file}`,
+        metadata: {
+          status: "open",
+          candidateID: candidate.id,
+          hypothesisID: candidate.hypothesisID ?? null,
+          contractDigest,
+          blockerID,
+          attempt: previous.length + 1,
+          seed: typeof invalidRun?.resourceUsage.seed === "number" ? invalidRun.resourceUsage.seed : null,
+        },
+      })
+      yield* updateTaskStatus({ taskID: task.id, status: "paused" })
+      const approval = yield* createApproval({
+        taskID: task.id,
+        candidateID: candidate.id,
+        kind: "protocol",
+        reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n实验执行契约不一致，任务已暂停。\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\n修复后 approve 以启动原 candidate 的 smoke verification。`,
+      })
+      yield* db((d) =>
+        d
+          .update(ResearchArtifactTable)
+          .set({ metadata: { ...artifact.metadata, approvalID: approval.id } })
+          .where(eq(ResearchArtifactTable.id, artifact.id))
+          .run(),
+      )
+      yield* bus.publish(Event.ExecutionContractViolation, {
+        taskID: task.id,
+        agent: "ContractChecker",
+        stage: "smoke",
+        status: "failed",
+        metadata: {
+          blockerArtifactID: artifact.id,
+          candidateID: candidate.id,
+          mismatches: mismatches as unknown as JsonRecord["mismatches"],
+        },
+      })
+      throw new PipelineBlockedError({
+        taskID: task.id,
+        reason: "execution_contract_violation",
+        blockerArtifactID: artifact.id,
+        candidateID: candidate.id,
+        hypothesisID: candidate.hypothesisID,
+        invalidRunID: invalidRun?.id,
+        mismatches,
+      })
+    })
+
+    const requireVerifiedSmoke = Effect.fn("Research.requireVerifiedSmoke")(function* (
+      task: ResearchTask,
+      candidate: ResearchCandidate,
+      contract: ExecutionContract,
+    ) {
+      const contractDigest = digest(contract)
+      const proofs = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchArtifactTable)
+          .where(
+            and(
+              eq(ResearchArtifactTable.task_id, task.id),
+              eq(ResearchArtifactTable.kind, "execution_contract_verified_json"),
+            ),
+          )
+          .all(),
+      )
+      for (const proof of proofs) {
+        if (
+          proof.metadata.contractDigest !== contractDigest ||
+          proof.metadata.candidateID !== candidate.id ||
+          !proof.run_id
+        )
+          continue
+        const smoke = yield* getRunForTask(task.id, proof.run_id)
+        if (smoke.status !== "succeeded" || smoke.stage !== "smoke" || smoke.candidateID !== candidate.id || buildModelCompilerResult({ taskID: task.id, candidateID: candidate.id, smokeRun: smoke }).status !== "passed") continue
+        const payload = yield* Effect.promise(async () => {
+          try {
+            return JSON.parse(await readFile(proof.uri.slice(7), "utf8")) as Record<string, unknown>
+          } catch {
+            return undefined
+          }
+        })
+        if (
+          payload &&
+          verifyExecutionRecords(contract, [payload.manifest as Record<string, unknown>, payload]).length === 0
+        )
+          return payload
+      }
+      throw new Error(`No verified smoke contract for candidate ${candidate.id} and contract digest ${contractDigest}.`)
     })
 
     const prepareRunInternal = Effect.fn("Research.prepareRunInternal")(function* (
@@ -4329,6 +4559,27 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
       if (!runPlan.validation.ok) {
         throw new Error(`Research candidate failed domain validation: ${runPlan.validation.issues[0]?.message}`)
+      }
+      if (task.domainID === "tsf" && stage !== "ref_test" && stage !== "blind_test") {
+        runPlan.command.cwd = Instance.directory
+        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_PROJECT_ROOT: Instance.directory }
+        const blocker = yield* assertExecutionCheckpoint(task.id, candidate.id, stage)
+        if (blocker && (candidate.hypothesisID ?? null) !== blocker.metadata.hypothesisID) throw new Error("Recovery must retain the original hypothesis identity.")
+        const contract = buildExecutionContract(task, candidate, runPlan.writes[0].content)
+        const hypotheses = yield* listHypotheses(task.id)
+        const hypothesis = hypotheses.find((item) => item.id === candidate.hypothesisID)
+        const gateA = hypothesis ? validateCandidateAgainstHypothesis(hypothesis, candidate, undefined, task.taskSpec) : [{ path: "hypothesis_id", expected: "existing structured hypothesis", actual: candidate.hypothesisID ?? null, source: "hypothesis_candidate_gate" }]
+        if (gateA.length) yield* blockExecutionContract(task, candidate, contract, gateA)
+        const contractDigest = digest(contract)
+        const contractPath = path.join(Instance.directory, ".neo-research", "execution-contracts", task.id, `${candidate.id}-${contractDigest}.json`)
+        const proofPath = `${contractPath}.verified.json`
+        if (stage !== "smoke") {
+          const proof = yield* requireVerifiedSmoke(task, candidate, contract)
+          runPlan.writes.push({ path: proofPath, content: proof as JsonRecord })
+        }
+        runPlan.writes.push({ path: contractPath, content: contract as unknown as JsonRecord })
+        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_EXECUTION_CONTRACT: contractPath, NEO_CAST_CONTRACT_CANDIDATE: runnerPath(Instance.directory, runPlan.writes[0].path), NEO_CAST_CONTRACT_VERIFICATION: proofPath }
+        if (stage === "smoke") runPlan.command.args.push("--execution-contract", contractPath, "--contract-verification", proofPath)
       }
       yield* ensureRunApprovalGates(task, candidate, stage)
 
@@ -4444,6 +4695,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const evaluateSucceededRun = Effect.fn("Research.evaluateSucceededRun")(function* (run: ResearchRun) {
       const task = yield* getTask(run.taskID)
       if (!run.candidateID) return
+      if (task.domainID === "tsf" && (!((run.resourceUsage as any).executionContract?.status === "verified") || run.stage !== "full")) return
       const candidate = yield* getCandidateForTask(task.id, run.candidateID)
       const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
       const evaluation =
@@ -4606,6 +4858,29 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         })
       }
 
+      let recoveryBlocker: ResearchArtifact | undefined
+      const executionTask = yield* getTask(prepared.run.taskID)
+      if (executionTask.domainID === "tsf" && prepared.run.stage !== "ref_test" && prepared.run.stage !== "blind_test") {
+        recoveryBlocker = yield* assertExecutionCheckpoint(executionTask.id, prepared.run.candidateID, prepared.run.stage)
+        const candidate = yield* getCandidateForTask(executionTask.id, prepared.run.candidateID!)
+        const spec = typeof prepared.run.resourceUsage.seed === "number" ? candidateSpecWithSeed(candidate.candidateSpec, prepared.run.resourceUsage.seed) : candidate.candidateSpec
+        const currentPlan = DomainRegistry.createRunPlan(executionTask.domainID, { taskSpec: executionTask.taskSpec, candidateSpec: spec, stage: prepared.run.stage as DomainRunStage })
+        const currentContract = buildExecutionContract(executionTask, candidate, currentPlan.writes[0].content)
+        const contractWrite = prepared.runPlan.writes.find((write) => write.content.schema_version === "research_execution_contract.v1")
+        const mismatches: ContractMismatch[] = []
+        if (!prepared.runPlan.command.env?.NEO_CAST_EXECUTION_CONTRACT || !contractWrite || digest(contractWrite.content) !== digest(currentContract)) mismatches.push({ path: "prepared_contract", expected: digest(currentContract), actual: contractWrite ? digest(contractWrite.content) : null })
+        const hypotheses = yield* listHypotheses(executionTask.id)
+        const hypothesis = hypotheses.find((item) => item.id === candidate.hypothesisID)
+        mismatches.push(...(hypothesis ? validateCandidateAgainstHypothesis(hypothesis, candidate) : [{ path: "hypothesis_id", expected: "existing structured hypothesis", actual: candidate.hypothesisID ?? null }]))
+        if (prepared.run.stage !== "smoke") {
+          const proofError = yield* requireVerifiedSmoke(executionTask, candidate, currentContract).pipe(Effect.map(() => undefined), Effect.catchCause((cause) => Effect.succeed(String(Cause.squash(cause)))))
+          if (proofError) mismatches.push({ path: "smoke_verification", expected: digest(currentContract), actual: proofError })
+        }
+        if (mismatches.length) {
+          const invalidRun = yield* updateRunStatus({ runID: prepared.run.id, status: "invalid", metrics: {} })
+          yield* blockExecutionContract(executionTask, candidate, currentContract, mismatches, invalidRun)
+        }
+      }
       const running = yield* updateRunStatus({ runID: prepared.run.id, status: "running" })
       let progressPublishQueue = Promise.resolve()
       const persistedProgressLines: JsonRecord[] = []
@@ -4725,21 +5000,25 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         artifactRefs.push(artifact.id)
       }
 
-      const runnerTrainingSucceeded = execution.records.some(
-        (r) => r["event"] === "done" && r["status"] === "success",
-      )
-      const succeeded = execution.exitCode === 0 || runnerTrainingSucceeded
+      const runnerDone = execution.records.findLast((r) => r["event"] === "done")
+      const runnerTrainingSucceeded = runnerDone?.["status"] === "success"
+      const contractWrite = prepared.runPlan.writes.find((write) => write.content.schema_version === "research_execution_contract.v1")
+      const contract = contractWrite?.content as unknown as ExecutionContract | undefined
+      const contractMismatches = contract ? verifyExecutionRecords(contract, execution.records) : []
+      const contractInvalid = contractMismatches.length > 0
+      const succeeded = !contractInvalid && (execution.exitCode === 0 || runnerTrainingSucceeded)
       const task = yield* getTask(running.taskID)
       const reproducibility = succeeded
         ? yield* Effect.promise(() => buildReproducibilitySeal(task, prepared.runPlan, Instance.directory))
         : undefined
       const run = yield* updateRunStatus({
         runID: running.id,
-        status: succeeded ? "succeeded" : "failed",
-        metrics: metrics as ResearchRun["metrics"],
+        status: contractInvalid ? "invalid" : succeeded ? "succeeded" : "failed",
+        metrics: (contractInvalid ? {} : metrics) as ResearchRun["metrics"],
         resourceUsage: {
           ...running.resourceUsage,
           exitCode: execution.exitCode,
+          executionContract: contract ? { status: contractInvalid ? "invalid" : "verified", contractDigest: digest(contract), candidateID: contract.candidate_id, manifest: execution.records.findLast((record) => record.event === "executed_model_manifest"), verified: execution.records.findLast((record) => record.event === "execution_contract_verified") } : undefined,
           runnerID: prepared.runPlan.runnerID,
           ...(reproducibility === undefined ? {} : { reproducibility }),
         } as ResearchRun["resourceUsage"],
@@ -4747,6 +5026,30 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         error: succeeded ? undefined : execution.stderr || `Runner exited with code ${execution.exitCode}`,
       })
 
+      if (contractInvalid && contract && running.candidateID) {
+        const candidate = yield* getCandidateForTask(task.id, running.candidateID)
+        yield* blockExecutionContract(task, candidate, contract, contractMismatches, run)
+      }
+      if (succeeded && contract) {
+        const latestBlocker = yield* latestExecutionBlocker(task.id)
+        const blocker = recoveryBlocker && latestBlocker?.id === recoveryBlocker.id ? latestBlocker : undefined
+        const verification = execution.records.findLast((record) => record.event === "execution_contract_verified")!
+        const file = path.join(executionLogDirectory, `${run.id}.contract-verified.json`)
+        const payload = { ...verification, blocker_id: blocker?.metadata.blockerID ?? null, verification_smoke_run_id: run.stage === "smoke" ? run.id : null, smoke_metric: run.stage === "smoke" ? run.metrics.val_avg_mse : null, expected: contract.expected, verified_timestamp: new Date().toISOString() }
+        yield* Effect.promise(() => writeFile(file, JSON.stringify(payload, null, 2) + "\n"))
+        const proof = yield* createArtifact({ taskID: task.id, runID: run.id, kind: "execution_contract_verified_json", uri: `file://${file}`, metadata: { candidateID: contract.candidate_id, contractDigest: digest(contract), blockerID: blocker?.id ?? null } })
+        if (blocker && run.stage === "smoke" && buildModelCompilerResult({ taskID: task.id, candidateID: run.candidateID!, smokeRun: run }).status === "passed") {
+          const incidents = yield* db((d) => d.select().from(ResearchArtifactTable).where(and(eq(ResearchArtifactTable.task_id, task.id), eq(ResearchArtifactTable.kind, "execution_contract_violation_json"))).all())
+          for (const incident of incidents.filter((item) => item.metadata.candidateID === run.candidateID && item.metadata.status === "open")) {
+            const payload = yield* Effect.promise(async () => JSON.parse(await readFile(incident.uri.slice(7), "utf8")))
+            yield* Effect.promise(() => writeFile(incident.uri.slice(7), JSON.stringify({ ...payload, status: "resolved", verification_smoke_run_id: run.id, resolved_timestamp: new Date().toISOString() }, null, 2) + "\n"))
+            yield* db((d) => d.update(ResearchArtifactTable).set({ metadata: { ...incident.metadata, status: "resolved", verificationRunID: run.id }, time_updated: Date.now() }).where(eq(ResearchArtifactTable.id, incident.id)).run())
+          }
+          yield* updateTaskStatus({ taskID: task.id, status: "searching" })
+        }
+        yield* bus.publish(Event.ExecutionContractVerified, { taskID: task.id, agent: "ContractChecker", stage: run.stage, status: "completed", metadata: { candidateID: contract.candidate_id, contractDigest: digest(contract), artifactID: proof.id } })
+        return { run: yield* attachArtifactRefToRun(run, proof.id), runPlan: prepared.runPlan }
+      }
       return { run, runPlan: prepared.runPlan }
     })
 
@@ -4758,6 +5061,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return yield* executePreparedRun(prepared)
     })
 
+    const resumeExecutionContractCheckpoint = Effect.fn("Research.resumeExecutionContractCheckpoint")(function* (taskID: ResearchTaskID) {
+      const blocker = yield* assertExecutionCheckpoint(taskID)
+      if (!blocker) return undefined
+      const candidateID = String(blocker.metadata.candidateID) as ResearchCandidateID
+      const seed = typeof blocker.metadata.seed === "number" ? blocker.metadata.seed : undefined
+      const smoke = yield* executeRun({ taskID, candidateID, stage: "smoke", seed })
+      if (smoke.run.status !== "succeeded") throw new Error("Original candidate smoke verification failed; task remains paused.")
+      const full = yield* executeRun({ taskID, candidateID, stage: "full", seed })
+      yield* updateTaskStatus({ taskID, status: "searching" })
+      return full
+    })
+
     const executeSeedSweep = Effect.fn("Research.executeSeedSweep")(function* (input: ExecuteSeedSweepInput) {
       const task = yield* getTask(input.taskID)
       const seeds = taskEvaluationSeeds(task, input.seeds)
@@ -4765,6 +5080,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       for (const seed of seeds) {
         const description =
           input.description === undefined ? undefined : `${input.description} (seed ${seed})`
+        if (task.domainID === "tsf" && input.stage !== "smoke" && input.stage !== "ref_test" && input.stage !== "blind_test") {
+          const smoke = yield* executeRun({ taskID: task.id, candidateID: input.candidateID, stage: "smoke", description, seed })
+          if (buildModelCompilerResult({ taskID: task.id, candidateID: input.candidateID, smokeRun: smoke.run }).status !== "passed") throw new Error(`Seed ${seed} has no successful smoke contract verification.`)
+        }
         const prepared = yield* executeRun({
           taskID: input.taskID,
           candidateID: input.candidateID,
@@ -5072,6 +5391,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     ) {
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
+      const resumeBlocker = yield* assertExecutionCheckpoint(task.id)
+      const resumeCandidate = resumeBlocker ? yield* getCandidateForTask(task.id, String(resumeBlocker.metadata.candidateID) as ResearchCandidateID) : undefined
+      const resumeSeed = typeof resumeBlocker?.metadata.seed === "number" ? resumeBlocker.metadata.seed : undefined
       yield* ensureRunBudget(task, "queued")
       const forceExplore = input.forceExplore === true
       const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
@@ -5104,7 +5426,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const previousReflectionNotesMarkdown = latestReflection?.reflectionNotesMarkdown
       const hypotheses = yield* listHypotheses(input.taskID)
       const hypothesisPlan = experimentPlanFromDB(task, hypotheses)
-      const selectedHypothesis = selectHypothesisForDesign(hypothesisPlan)
+      const selectedHypothesis = resumeCandidate ? hypotheses.find((item) => item.id === resumeCandidate.hypothesisID) : selectHypothesisForDesign(hypothesisPlan)
 
       const taskFingerprint = buildModelDesignerTaskFingerprint({
         baseFingerprint,
@@ -5168,7 +5490,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         attemptedCandidateIDs: new Set(designerSelection.attemptedCandidateIDs),
         inconclusiveCandidateIDs: new Set(designerSelection.inconclusiveCandidateIDs),
       }
-      let candidate = forceExplore ? undefined : designerSelection.candidate
+      let candidate = resumeCandidate ?? (forceExplore ? undefined : designerSelection.candidate)
 
       const proposalApprovals: ResearchApproval[] = []
       let proposalCreated = false
@@ -5298,6 +5620,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           const approvalStatus =
             task.mode === "autonomous" ? "auto_approved" : proposal.approvalStatus
           candidate = yield* createCandidate({
+            hypothesisID: selectedHypothesis?.id,
             taskID: task.id,
             domainID: task.domainID,
             candidateSpec: proposal.candidateSpec,
@@ -5306,6 +5629,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             approvalStatus,
             generatedBy: proposal.generatedBy,
           })
+          if (selectedHypothesis && task.domainID === "tsf") {
+            const mismatches = validateCandidateAgainstHypothesis(selectedHypothesis, candidate, proposal.candidateSpec, task.taskSpec)
+            if (mismatches.length) {
+              const plan = DomainRegistry.createRunPlan(task.domainID, { taskSpec: task.taskSpec, candidateSpec: candidate.candidateSpec, stage: "smoke" })
+              yield* blockExecutionContract(task, candidate, buildExecutionContract(task, candidate, plan.writes[0].content), mismatches)
+            }
+          }
           candidates = [candidate, ...candidates]
 
           if (candidate.approvalStatus === "pending") {
@@ -5327,6 +5657,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
       if (!candidate) throw new Error(`No approved autonomous candidate is ready for task: ${task.id}`)
 
+      if (selectedHypothesis && !resumeCandidate) {
+        const contract = buildExecutionContract(task, candidate, DomainRegistry.createRunPlan(task.domainID, { taskSpec: task.taskSpec, candidateSpec: candidate.candidateSpec, stage: "smoke" }).writes[0].content)
+        const mismatches = validateCandidateAgainstHypothesis(selectedHypothesis, candidate)
+        if (mismatches.length) yield* blockExecutionContract(task, candidate, contract, mismatches)
+      }
       const rankPredictor = rankPredictorArtifactRecord(rankings)
       const topRanking = rankings[0]
       const topRankedRecipeID = topRanking === undefined ? undefined : rankingRecipeID(topRanking)
@@ -5425,6 +5760,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         taskID: task.id,
         candidateID: candidate.id,
         stage: "smoke",
+        seed: resumeSeed,
         description: input.description,
       })
       const compilerResult = buildModelCompilerResult({
@@ -5458,6 +5794,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           taskID: task.id,
           candidateID: candidate.id,
           stage: requestedStage,
+          seed: resumeSeed,
           description: input.description,
         })
       }
@@ -5719,6 +6056,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const runAutonomousLoop = Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
       const iterations: AutonomousIterationResult[] = []
+      yield* assertExecutionCheckpoint(input.taskID)
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
       const maxIterations = autonomousLoopMaxIterations(input.maxIterations, task)
@@ -5727,7 +6065,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const targetMetricValue = loopPolicyValue(input.targetMetricValue, task, "targetMetricValue", "target")
       const minRelativeImprovement =
         loopPolicyValue(input.minRelativeImprovement, task, "minRelativeImprovement", "minImprovement") ?? 0
-      const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds") ?? 5
+      const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds") ?? 25
       const timeBudgetSeconds = loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS")
       const maxCrashStreak = loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak")
       const explorationRate = loopPolicyRate(input.explorationRate, task, "explorationRate", "exploration")
@@ -5850,7 +6188,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .update(ResearchRunTable)
           .set({
             status: input.status,
-            metrics: input.metrics ?? existingRow.metrics,
+            metrics: input.status === "invalid" ? {} : input.metrics ?? existingRow.metrics,
             resource_usage: input.resourceUsage ?? existingRow.resource_usage,
             artifact_refs: input.artifactRefs ? [...input.artifactRefs] : existingRow.artifact_refs,
             error,
@@ -5927,10 +6265,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const prepareTaskDataset = Effect.fn("Research.prepareTaskDataset")(function* (input: PrepareTaskDatasetInput) {
       const task = yield* getTask(input.taskID)
-      const command = buildPrepareDatasetCommand(task, input.force ?? true)
+      const command = buildPrepareDatasetCommand(task, input.force ?? true, Instance.directory)
       const execution = yield* Effect.promise(() =>
         Process.run([command.executable, ...command.args], {
           cwd: command.cwd,
+          env: command.env,
           nothrow: true,
           timeout: 300_000,
         }),
@@ -5977,7 +6316,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           format: "json",
           taskID: task.id,
           source: command.source,
-          runnerRoot: command.cwd,
+          runnerRoot: command.runnerRoot,
           inputLen: typeof datasetSpec.input_len === "number" ? datasetSpec.input_len : 0,
           horizons: Array.isArray(datasetSpec.horizons) ? datasetSpec.horizons.join(",") : "",
           featureColumns: Array.isArray(datasetSpec.feature_columns) ? datasetSpec.feature_columns.join(",") : "",
@@ -6140,6 +6479,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                   ([k, v]) => k.startsWith("ref_test_") && typeof v === "number",
                 ),
               )
+        const publishFinalReportArtifact =
+          champion === undefined || championRefTestRun === undefined
+            ? undefined
+            : artifacts.find(
+                (artifact) =>
+                  artifact.kind === "final_report_md" &&
+                  artifact.metadata.championRunID === champion.runID &&
+                  artifact.metadata.refTestRunID === championRefTestRun.id,
+              )
+        const publishFinalReportSource =
+          publishFinalReportArtifact === undefined ? undefined : filePathFromURI(publishFinalReportArtifact.uri)
         const championArtifactDir =
           championRunnerArtifact === undefined ? undefined : filePathFromURI(championRunnerArtifact.uri)
         const championRefTestRunnerArtifact =
@@ -6201,7 +6551,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           await mkdir(traceDirectory, { recursive: true })
           await mkdir(refTestDirectory, { recursive: true })
           await writeFile(reportPath, `${sections.join("\n\n")}\n`, "utf8")
-          await writeFile(finalReportPath, `${sections.join("\n\n")}\n`, "utf8")
+          if (publishFinalReportSource !== undefined && existsSync(publishFinalReportSource)) {
+            await cp(publishFinalReportSource, finalReportPath, { force: true })
+          } else {
+            await writeFile(finalReportPath, `${sections.join("\n\n")}\n`, "utf8")
+          }
           await writeFile(runsPath, `${JSON.stringify(runs, null, 2)}\n`, "utf8")
           await writeFile(candidatesPath, `${JSON.stringify(candidates, null, 2)}\n`, "utf8")
           await writeFile(championPath, `${JSON.stringify(champion ?? null, null, 2)}\n`, "utf8")
@@ -6280,6 +6634,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             files: copiedFiles,
             reproducibility:
               Object.keys(championReproducibility).length === 0 ? null : championReproducibility,
+            publishReport:
+              publishFinalReportArtifact === undefined
+                ? null
+                : {
+                    artifactID: publishFinalReportArtifact.id,
+                    inputSnapshotArtifactID: publishFinalReportArtifact.metadata.inputSnapshotArtifactID,
+                    validationStatus: publishFinalReportArtifact.metadata.validationStatus,
+                    callPath: publishFinalReportArtifact.metadata.callPath,
+                  },
           }
           await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
         })
@@ -7052,6 +7415,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      readonly taskID: ResearchTaskID
 	      readonly outputDir?: string
 	    }) {
+      yield* assertExecutionCheckpoint(input.taskID, undefined, "hypoplanner")
 	      yield* updateTaskStatus({ taskID: input.taskID, status: "hypo_planning" })
 	      yield* bus.publish(Event.HypoPlannerAgentStarted, {
 	        taskID: input.taskID,
@@ -7325,6 +7689,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    })
 
 	    const runNASAgent = Effect.fn("Research.runNASAgent")(function* (input: AutonomousLoopInput) {
+      yield* assertExecutionCheckpoint(input.taskID)
       yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
       yield* bus.publish(Event.NASAgentStarted, {
         taskID: input.taskID,
@@ -7461,6 +7826,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             const error = Cause.squash(cause)
+            if (PipelineBlockedError.isInstance(error)) return yield* Effect.failCause(cause)
             yield* updateTaskStatus({ taskID: input.taskID, status: "failed" })
             yield* bus.publish(Event.NASAgentFailed, {
               taskID: input.taskID,
@@ -7475,6 +7841,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       )
     })
 	    const runVerifierAgent = Effect.fn("Research.runVerifierAgent")(function* (input: VerifierAgentRunInput) {
+      yield* assertExecutionCheckpoint(input.taskID, undefined, "verifier")
 	      const task = yield* getTask(input.taskID)
 	      const run = yield* getRunForTask(input.taskID, input.runID)
 	      const candidate =
@@ -7518,6 +7885,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    })
 
 	    const runReflectionAgent = Effect.fn("Research.runReflectionAgent")(function* (input: ReflectionAgentInput) {
+      yield* assertExecutionCheckpoint(input.taskID, undefined, "reflection")
 	      yield* bus.publish(Event.ReflectionAgentStarted, {
 	        taskID: input.taskID,
 	        agent: "ReflectionAgent",
@@ -7756,6 +8124,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    })
 
 	    const runPublishAgent = Effect.fn("Research.runPublishAgent")(function* (input: ExportTaskArtifactInput) {
+      yield* assertExecutionCheckpoint(input.taskID, undefined, "publish")
       yield* updateTaskStatus({ taskID: input.taskID, status: "publishing" })
       yield* bus.publish(Event.PublishAgentStarted, {
         taskID: input.taskID,
@@ -7764,74 +8133,178 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        status: "started",
 	      })
 	      return yield* Effect.gen(function* () {
-        // Run ref_test on champion before export so the result lands in the report.
-        const publishChampion = yield* getChampion(input.taskID)
-        if (publishChampion !== undefined) {
-          const existingRuns = yield* listRuns(input.taskID)
-          const hasRefTest = existingRuns.some(
-            (r) =>
-              r.candidateID === publishChampion.candidateID &&
-              r.stage === "ref_test" &&
-              r.status === "succeeded",
-          )
-          if (!hasRefTest) {
-            yield* Effect.gen(function* () {
-              const pendingApprovals = yield* listApprovals({
-                taskID: input.taskID,
-                status: "pending",
-              })
-              const existingPending = pendingApprovals.find(
-                (a) => a.kind === "ref_test" && a.candidateID === publishChampion.candidateID,
-              )
-              const approval =
-                existingPending !== undefined
-                  ? existingPending
-                  : yield* createApproval({
-                      taskID: input.taskID,
-                      candidateID: publishChampion.candidateID,
-                      kind: "ref_test",
-                      reason: "Auto-approved by PublishAgent for final reference test evaluation.",
-                    })
-              yield* replyApproval({
-                approvalID: approval.id,
-                status: "approved",
-                replyMessage: "Auto-approved by PublishAgent.",
-              })
-              const artifacts = yield* listArtifacts(input.taskID)
-              const championRunnerArtifact = artifacts.find(
-                (artifact) => artifact.kind === "runner_artifact" && artifact.runID === publishChampion.runID,
-              )
-              const runnerRunID =
-                championRunnerArtifact === undefined
-                  ? undefined
-                  : neoCastRunIDFromArtifactURI(championRunnerArtifact.uri)
-              yield* executeRun({
-                taskID: input.taskID,
-                candidateID: publishChampion.candidateID,
-                stage: "ref_test",
-                description: "Final reference test by PublishAgent.",
-                runnerRunID,
-              })
-            }).pipe(
-              Effect.catchCause((cause) =>
-                Effect.gen(function* () {
-                  const error = Cause.squash(cause)
-                  yield* bus.publish(Event.PublishAgentFailed, {
-                    taskID: input.taskID,
-                    agent: "PublishAgent",
-                    stage: "publishing",
-                    status: "failed",
-                    metadata: {
-                      ...errorMetadata(error),
-                      refTestSkipped: true,
-                      reason: "ref_test failed and was skipped; export will proceed without ref_test metrics.",
-                    },
-                  })
-                }),
-              ),
-            )
-          }
-        }
+	        // A formal publish is only valid after the frozen champion has a successful ref_test.
+	        const publishChampion = yield* getChampion(input.taskID)
+	        if (publishChampion === undefined) throw new Error("PublishAgent requires a champion")
+	        let publishRuns = yield* listRuns(input.taskID)
+	        let publishRefTestRun = publishRuns.find(
+	          (run) =>
+	            run.candidateID === publishChampion.candidateID &&
+	            run.stage === "ref_test" &&
+	            run.status === "succeeded",
+	        )
+	        if (publishRefTestRun === undefined) {
+	          const pendingApprovals = yield* listApprovals({ taskID: input.taskID, status: "pending" })
+	          const existingPending = pendingApprovals.find(
+	            (approval) => approval.kind === "ref_test" && approval.candidateID === publishChampion.candidateID,
+	          )
+	          const approval =
+	            existingPending ??
+	            (yield* createApproval({
+	              taskID: input.taskID,
+	              candidateID: publishChampion.candidateID,
+	              kind: "ref_test",
+	              reason: "Auto-approved by PublishAgent for final reference test evaluation.",
+	            }))
+	          yield* replyApproval({
+	            approvalID: approval.id,
+	            status: "approved",
+	            replyMessage: "Auto-approved by PublishAgent.",
+	          })
+	          const currentArtifacts = yield* listArtifacts(input.taskID)
+	          const championRunnerArtifact = currentArtifacts.find(
+	            (artifact) => artifact.kind === "runner_artifact" && artifact.runID === publishChampion.runID,
+	          )
+	          yield* executeRun({
+	            taskID: input.taskID,
+	            candidateID: publishChampion.candidateID,
+	            stage: "ref_test",
+	            description: "Final reference test by PublishAgent.",
+	            runnerRunID:
+	              championRunnerArtifact === undefined
+	                ? undefined
+	                : neoCastRunIDFromArtifactURI(championRunnerArtifact.uri),
+	          })
+	          publishRuns = yield* listRuns(input.taskID)
+	          publishRefTestRun = publishRuns.find(
+	            (run) =>
+	              run.candidateID === publishChampion.candidateID &&
+	              run.stage === "ref_test" &&
+	              run.status === "succeeded",
+	          )
+	        }
+	        if (publishRefTestRun === undefined) throw new Error("Champion ref_test did not succeed; formal publish aborted")
+
+	        const publishTask = yield* getTask(input.taskID)
+	        const publishCandidates = yield* listCandidates(input.taskID)
+	        const publishCandidate = publishCandidates.find((candidate) => candidate.id === publishChampion.candidateID)
+	        if (publishCandidate === undefined) throw new Error("PublishAgent champion candidate is missing")
+	        const publishApprovals = yield* listApprovals({ taskID: input.taskID })
+	        const publishArtifacts = yield* listArtifacts(input.taskID)
+	        const publishMemories = yield* listMemory(input.taskID)
+	        const reportSnapshot = buildPublishReportSnapshot({
+	          task: publishTask,
+	          champion: publishChampion,
+	          championCandidate: publishCandidate,
+	          refTestRun: publishRefTestRun,
+	          candidates: publishCandidates,
+	          runs: publishRuns,
+	          approvals: publishApprovals,
+	          artifacts: publishArtifacts,
+	          memories: publishMemories,
+	        })
+	        const publishDirectory = path.join(Instance.directory, ".neo-research", "sessions", publishTask.id, "publish")
+	        const reportInputPath = path.join(publishDirectory, "report_input.json")
+	        const finalReportPath = path.join(publishDirectory, "final_report.md")
+	        const validationPath = path.join(publishDirectory, "report_validation.json")
+	        const publishTracePath = path.join(publishDirectory, "publish_trace.json")
+	        const existingFinalReport = publishArtifacts.find(
+	          (artifact) =>
+	            artifact.kind === "final_report_md" &&
+	            artifact.metadata.inputDigest === reportSnapshot.digest &&
+	            artifact.metadata.validationStatus === "passed" &&
+	            filePathFromURI(artifact.uri) !== undefined &&
+	            existsSync(filePathFromURI(artifact.uri)!),
+	        )
+	        let finalReportArtifact = existingFinalReport
+	        let reportCallPath = String(existingFinalReport?.metadata.callPath ?? "reused")
+	        let validationStatus = String(existingFinalReport?.metadata.validationStatus ?? "passed")
+	        let inputSnapshotArtifactID = String(existingFinalReport?.metadata.inputSnapshotArtifactID ?? "")
+	        if (finalReportArtifact === undefined) {
+	          yield* Effect.promise(async () => {
+	            await mkdir(publishDirectory, { recursive: true })
+	            await writeFile(reportInputPath, `${JSON.stringify(reportSnapshot, null, 2)}\n`, "utf8")
+	          })
+	          const inputArtifact = yield* createArtifact({
+	            taskID: publishTask.id,
+	            runID: publishRefTestRun.id,
+	            kind: "publish_report_input_snapshot_json",
+	            uri: `file://${reportInputPath}`,
+	            metadata: { format: "json", inputDigest: reportSnapshot.digest, championRunID: publishChampion.runID, refTestRunID: publishRefTestRun.id },
+	          })
+	          inputSnapshotArtifactID = inputArtifact.id
+	          const publishRuntime = recordValue(recordValue(publishTask.taskSpec).runtime)
+	          const publishNeoCastRoot =
+	            typeof publishRuntime.neoCastProjectRoot === "string" ? publishRuntime.neoCastProjectRoot : undefined
+	          const publishLLMContext = yield* Effect.promise(() =>
+	            resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: publishNeoCastRoot }),
+	          )
+	          const publishConfig = publishLLMContext?.config ?? (yield* Effect.promise(() =>
+	            resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: publishNeoCastRoot }),
+	          ))
+	          const sessionReport = yield* requestViaSession({
+	            rootSessionID: publishTask.sessionID,
+	            agent: "research-publish",
+	            stageLabel: "PublishReport",
+	            taskID: publishTask.id,
+	            user: buildPublishReportPrompt(reportSnapshot),
+	            modelRef: mapToModelRef(publishConfig),
+	          })
+	          let report = sessionReport ? stripMarkdownFence(sessionReport.text) : renderDeterministicFinalReport(reportSnapshot)
+	          let validationErrors = validateFinalReport(report, reportSnapshot)
+	          reportCallPath = sessionReport ? "session" : "deterministic"
+	          if (validationErrors.length > 0) {
+	            report = renderDeterministicFinalReport(reportSnapshot)
+	            validationErrors = validateFinalReport(report, reportSnapshot)
+	            reportCallPath = "deterministic"
+	            validationStatus = "degraded"
+	          } else {
+	            validationStatus = "passed"
+	          }
+	          yield* Effect.promise(async () => {
+	            await writeFile(finalReportPath, report, "utf8")
+	            await writeFile(validationPath, `${JSON.stringify({ status: validationStatus, errors: validationErrors }, null, 2)}\n`, "utf8")
+	            await writeFile(publishTracePath, `${JSON.stringify({
+	              schemaVersion: "neo_research_publish_agent_trace.v1",
+	              taskID: publishTask.id,
+	              championRunID: publishChampion.runID,
+	              refTestRunID: publishRefTestRun.id,
+	              inputDigest: reportSnapshot.digest,
+	              callPath: reportCallPath,
+	              validationStatus,
+	            }, null, 2)}\n`, "utf8")
+	          })
+	          yield* createArtifact({
+	            taskID: publishTask.id,
+	            runID: publishRefTestRun.id,
+	            kind: "report_validation_json",
+	            uri: `file://${validationPath}`,
+	            metadata: { format: "json", status: validationStatus, inputSnapshotArtifactID },
+	          })
+	          finalReportArtifact = yield* createArtifact({
+	            taskID: publishTask.id,
+	            runID: publishRefTestRun.id,
+	            kind: "final_report_md",
+	            uri: `file://${finalReportPath}`,
+	            metadata: {
+	              format: "markdown",
+	              generator: "publish-agent",
+	              callPath: reportCallPath,
+	              inputDigest: reportSnapshot.digest,
+	              inputSnapshotArtifactID,
+	              validationStatus,
+	              championRunID: publishChampion.runID,
+	              refTestRunID: publishRefTestRun.id,
+	            },
+	          })
+	          yield* createArtifact({
+	            taskID: publishTask.id,
+	            runID: publishRefTestRun.id,
+	            kind: "publish_agent_trace_json",
+	            uri: `file://${publishTracePath}`,
+	            metadata: { format: "json", inputSnapshotArtifactID, finalReportArtifactID: finalReportArtifact.id },
+	          })
+	        }
 	        const exportResult = yield* exportTaskArtifact({
 	          ...input,
 	          kind: input.kind ?? "model_export_package",
@@ -7894,6 +8367,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	                }
 	              : {}),
 	            ...(finalRefTestMetrics !== undefined ? { refTestMetrics: finalRefTestMetrics } : {}),
+	            refTestRunID: publishRefTestRun.id,
+	            finalReportArtifactID: finalReportArtifact.id,
+	            inputSnapshotArtifactID,
+	            callPath: reportCallPath,
+	            validationStatus,
+	            reportPath: finalReportArtifact.uri,
 	            ...(recipeIDStr !== undefined ? { recipeID: recipeIDStr } : {}),
 	            ...(embeddingType !== undefined ? { embeddingType } : {}),
 	            ...(backboneType !== undefined ? { backboneType } : {}),
@@ -7922,6 +8401,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       "Research.runFullPipeline",
     )(function* (input: RunFullPipelineInput) {
       const initialTask = yield* getTask(input.taskID)
+      yield* resumeExecutionContractCheckpoint(input.taskID)
       const initialInteractionMode = taskInteractionMode(initialTask)
       // Socratic mode requires autonomous task mode (fully autonomous after clarification).
       // Companion mode can run in any task mode (pauses at human checkpoints).
@@ -8581,6 +9061,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       yield* getCandidateForTask(input.taskID, input.candidateID)
       const run = yield* getRunForTask(input.taskID, input.runID)
       if (run.candidateID !== input.candidateID) throw missing("Research run", input.runID)
+      if (run.status !== "succeeded" || (run.resourceUsage as any).executionContract?.status !== "verified" || run.stage !== "full") throw new Error("Champion requires a succeeded, contract-verified full run.")
       const existing = yield* db((d) =>
         d.select().from(ResearchChampionTable).where(eq(ResearchChampionTable.task_id, input.taskID)).get(),
       )
@@ -8622,6 +9103,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const row = yield* db((d) =>
         d.select().from(ResearchChampionTable).where(eq(ResearchChampionTable.task_id, taskID)).get(),
       )
+      if (row) {
+        const run = yield* getRunForTask(taskID, row.run_id)
+        if (run.status === "invalid") return undefined
+      }
       return row ? mapChampion(row) : undefined
     })
 
@@ -8639,8 +9124,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       replyApproval,
       seedBaselines,
       prepareRun,
+      executePreparedRun,
       executeRun,
       executeSeedSweep,
+      resumeExecutionContractCheckpoint,
       runAutonomousIteration,
       runAutonomousLoop,
       runIntentAgent,

@@ -564,6 +564,7 @@ export type ResearchCandidate = {
   id: string
   taskID: string
   parentCandidateID?: string
+  hypothesisID?: string
   domainID: string
   candidateSpec: ResearchJsonRecord
   rationale: string
@@ -589,7 +590,7 @@ export type EventResearchCandidateUpdated = {
 
 export type ResearchRunStage = "profile" | "baseline" | "smoke" | "low_fidelity" | "full" | "ref_test"
 
-export type ResearchRunStatus = "queued" | "running" | "succeeded" | "failed" | "rejected"
+export type ResearchRunStatus = "queued" | "running" | "succeeded" | "failed" | "rejected" | "invalid"
 
 export type ResearchRun = {
   id: string
@@ -2155,6 +2156,7 @@ export type ResearchExecutableRunStage = "baseline" | "smoke" | "low_fidelity" |
 export type ResearchCreateCandidateInput = {
   taskID: string
   parentCandidateID?: string
+  hypothesisID?: string
   domainID: string
   candidateSpec: ResearchJsonRecord
   rationale: string

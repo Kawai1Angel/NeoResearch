@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   buildDefaultTsfResearchTaskInput,
+  buildDefaultTsfResearchTaskInputFromGoal,
   formatResearchApprovalsTable,
   formatResearchArtifactsTable,
   formatResearchExport,
@@ -12,6 +13,7 @@ import {
   formatResearchSeedSweep,
   formatResearchStatus,
   formatResearchTasksTable,
+  pipelineStageForInteractionMode,
 } from "../../src/cli/cmd/research-data"
 import { Research } from "../../src/research"
 
@@ -103,7 +105,11 @@ describe("research CLI data helpers", () => {
       title: "TSF Review Research",
       domainID: "tsf",
       mode: "review",
-      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      objective: {
+        primaryMetric: "cv_avg_mse",
+        secondaryMetrics: ["cv_std_mse", "val_avg_mse"],
+        direction: "minimize",
+      },
       budget: { maxRuns: 50, maxParallel: 1 },
     })
     expect(buildDefaultTsfResearchTaskInput({ mode: "review", interactionMode: "companion" })).toMatchObject({
@@ -121,7 +127,7 @@ describe("research CLI data helpers", () => {
         contextLength: 336,
         predictionLengths: [96],
         dataset: { loaderID: "etth1_tslib_v1", targetCols: ["OT"] },
-        runtime: { bridgeOnly: true },
+        runtime: { bridgeOnly: false },
       },
     })
   })
@@ -131,12 +137,40 @@ describe("research CLI data helpers", () => {
       {
         taskSpec: {
           runtime: {
-            bridgeOnly: true,
+            bridgeOnly: false,
             neoCastProjectRoot: "/tmp/neo-cast",
           },
         },
       },
     )
+  })
+
+  test("uses the full recipe space and full-run stage for Socratic research", () => {
+    expect(
+      buildDefaultTsfResearchTaskInputFromGoal({
+        goal: "forecast ETTh1 target=OT",
+        mode: "autonomous",
+        interactionMode: "socratic",
+      }),
+    ).toMatchObject({
+      mode: "autonomous",
+      interactionMode: "socratic",
+      taskSpec: {
+        runtime: { bridgeOnly: false },
+        metadata: { interactionMode: "socratic" },
+      },
+    })
+    expect(pipelineStageForInteractionMode("socratic")).toBe("full")
+  })
+
+  test("preserves an explicitly requested bridge-only goal", () => {
+    expect(
+      buildDefaultTsfResearchTaskInputFromGoal({
+        goal: "forecast ETTh1 bridge",
+        mode: "autonomous",
+        interactionMode: "socratic",
+      }),
+    ).toMatchObject({ taskSpec: { runtime: { bridgeOnly: true } } })
   })
 
   test("builds TSF create payloads with explicit dataset settings", () => {

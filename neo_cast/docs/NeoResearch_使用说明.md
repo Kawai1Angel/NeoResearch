@@ -425,8 +425,8 @@ LLM 生成的候选必须符合 `recipe_schema_v1`，支持以下组合：
 |---|---|
 | `none` | 不嵌入，直接送 backbone |
 | `patch` | 固定 patch 分割 + 线性投影 |
-| `multiscale_patch` | 多尺度 patch（2-4 个尺度） |
-| `invert` | iTransformer 风格，对通道建 token |
+| `multiscale_patch` | 多尺度 patch 分支 + 跨尺度融合；`num_blocks` 控制处理深度 |
+| `invert` | iTransformer 风格：逐变量归一化、对通道建 token；Transformer 路径不使用变量位置编码 |
 | `frequency` | FFT 频域特征 |
 | `calendar` | 时间特征（小时/星期/月） |
 

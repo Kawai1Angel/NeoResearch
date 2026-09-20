@@ -11,7 +11,7 @@
   "architecture": {
     "backbone": "temporal_conv",
     "decomposition": true,
-    "multiscale_blocks": 3,
+    "layers": 3,
     "attention": "lightweight",
     "hidden_dim": 32,
     "kernel_size": 3,

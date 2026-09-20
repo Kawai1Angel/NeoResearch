@@ -67,7 +67,7 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
   const horizons = _taskHorizons(taskContext);
   const multiscaleBlocks = embedding.type === "multiscale_patch"
     ? embedding.scales?.length || 3
-    : Math.max(Number(architecture.n_layers || architecture.n_blocks || architecture.depth || 1), options.useMultiscale ? 3 : 0);
+    : 0;
 
   return {
     schema_version: "model_recipe.v1",
@@ -306,7 +306,7 @@ function _formatTaskContext(taskContext = {}) {
     `- Validation rows: [${valRows[0]}, ${valRows[1]})`,
     `- Missing value strategy: ${missingStrategy}`,
     `- Frequency policy: ${frequency}`,
-    "- Primary metric: val_avg_mse (lower is better, StandardScaler-normalised space)",
+    "- Primary metric: cv_avg_mse (lower is better); cv_std_mse diagnoses temporal stability; val_avg_mse describes the final checkpoint",
     "- Parameter budget: soft limit 1M params total across all horizon models",
     "- Training budget: 10 minutes wall-clock per run",
   ];
@@ -335,7 +335,7 @@ The runtime will compile model_recipe.v1 into the executable recipe_schema_v1 fa
 - fusion: temporal, feature, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
 - prediction_head: linear, direct_multi_horizon, quantile, gaussian, residual_correction
 - output_distribution: point, quantile, gaussian
-- loss: mse, mae, huber, quantile, distillation
+- loss: mse, mae, huber, quantile, distillation, gaussian_nll
 - optimizer: adam, adamw, or sgd
 - scheduler: none, cosine, one_cycle, plateau
 
@@ -367,7 +367,7 @@ Action parameters:
 - prediction_head quantile: { "type": "quantile", "output_distribution": "quantile", "quantiles": [0.1, 0.5, 0.9] }
 - prediction_head gaussian: { "type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.000001 }
 - prediction_head residual_correction: { "type": "residual_correction", "output_distribution": "point", "base_head": "linear", "correction_dim": 32|64|128 }
-- training_strategy.loss.base: "mse" | "mae" | "huber" | "quantile" | "distillation"
+- training_strategy.loss.base: "mse" | "mae" | "huber" | "quantile" | "distillation" | "gaussian_nll"
 - quantile loss should include quantiles: [0.1, 0.5, 0.9]
 - distillation loss should include supervised_weight, teacher_weight, and teacher: { "type": "last_value"|"moving_average", "window": 24 }
 - training_strategy.optimizer.type: "adam" | "adamw" | "sgd"
@@ -379,7 +379,7 @@ Return a single JSON object and nothing else. No markdown, no explanation outsid
 Required fields:
   schema_version: "model_recipe.v1"
   model_name: PascalCase model name, e.g. "MultiScaleTinyForecaster"
-  hypothesis: 1-2 sentence rationale for why this candidate may improve val_avg_mse
+  hypothesis: 1-2 sentence rationale for why this candidate may improve cv_avg_mse
   input: { history_window, prediction_horizon, prediction_horizons, covariates }
   architecture: { backbone, decomposition, multiscale_blocks, attention, channel_fusion, hidden_dim, d_model, layers, heads, kernel_size, patch_len, stride, dropout, output_distribution }
   training: { loss, optimizer, learning_rate, batch_size, max_epochs, time_budget_s, patience, seed, weight_decay, grad_clip }
@@ -389,6 +389,11 @@ Use history_window, prediction_horizon, and prediction_horizons from the task co
 Set input.prediction_horizons to the full task horizon list, not just the first horizon.
 constraints.max_params may be an integer or a human-readable string like "5M".
 constraints.latency_sensitive should be true when deployment, inference speed, or compact serving is important.
+attention=none disables attention, lightweight uses linear-complexity attention, and full uses softmax attention. On non-transformer backbones attention is an input temporal residual module.
+multiscale_blocks controls only the number of embedding scales (1-4, 0 disables auto-selection); use layers for backbone depth. Raw backbones require embedding auto/none and multiscale_blocks=0.
+Explicit incompatible embeddings are rejected. Transformer d_model must be divisible by heads. Even decomposition_kernel uses asymmetric edge padding without changing the requested size. DLinear uses its own single decomposition.
+Use loss=gaussian_nll for Gaussian output and loss=quantile for quantile output; point output uses mse/mae/huber/distillation. Gaussian inference exposes mean and positive scale.
+calendar embedding requires actual history timestamps; invert feeds variable tokens into the backbone. max_latency_ms is enforced using median batch-one inference latency per horizon after warmup on the current device.
 
 ## Design principles
 - Avoid repeating module combinations that already appeared in recent history
@@ -410,6 +415,8 @@ function _buildUserMessage(requirement, history, attempt, taskContext = {}) {
   const recentHistory = history.slice(-6).map((row) => ({
     candidate_id: row.candidate_id,
     model_family: row.model_family,
+    cv_avg_mse: row.cv_avg_mse === "NA" ? null : Number(row.cv_avg_mse),
+    cv_std_mse: row.cv_std_mse === "NA" ? null : Number(row.cv_std_mse),
     val_avg_mse: row.val_avg_mse === "NA" ? null : Number(row.val_avg_mse),
     status: row.status,
   }));
@@ -462,10 +469,10 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
     if (!candidate.architecture.backbone) candidate.architecture.backbone = "linear";
     if (candidate.architecture.decomposition === undefined) candidate.architecture.decomposition = false;
     if (candidate.architecture.multiscale_blocks === undefined) candidate.architecture.multiscale_blocks = 0;
-    if (!candidate.architecture.attention) candidate.architecture.attention = "none";
+    if (!candidate.architecture.attention) candidate.architecture.attention = candidate.architecture.backbone === "transformer" ? "full" : "none";
     if (!candidate.training) {
       candidate.training = {
-        loss: "mse",
+        loss: candidate.architecture.output_distribution === "gaussian" ? "gaussian_nll" : candidate.architecture.output_distribution === "quantile" ? "quantile" : "mse",
         optimizer: "adam",
         learning_rate: 0.001,
         batch_size: 32,
@@ -475,7 +482,7 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
         seed: 42,
       };
     }
-    if (!candidate.training.loss) candidate.training.loss = "mse";
+    if (!candidate.training.loss) candidate.training.loss = candidate.architecture.output_distribution === "gaussian" ? "gaussian_nll" : candidate.architecture.output_distribution === "quantile" ? "quantile" : "mse";
     if (!candidate.training.optimizer) candidate.training.optimizer = "adam";
     if (candidate.training.learning_rate === undefined) candidate.training.learning_rate = 0.001;
     if (candidate.training.batch_size === undefined) candidate.training.batch_size = 32;

@@ -1,6 +1,6 @@
 import type { ResearchCandidateID, ResearchRun, ResearchRunID, ResearchTaskID } from "../schema"
 
-export type ModelCompilerStatus = "passed" | "failed" | "timeout"
+export type ModelCompilerStatus = "passed" | "failed" | "timeout" | "contract_invalid"
 
 export interface ModelCompilerResult {
   readonly agent: "ModelCompilerAgent"
@@ -34,16 +34,31 @@ function compilerDecision(run: ResearchRun): {
   readonly smokeMetric?: number
   readonly failureReason?: string
 } {
-  if (isTimeout(run)) {
-    return { status: "timeout", failureReason: run.error ?? "Smoke run timeout." }
-  }
-  if (run.status !== "succeeded") {
+  if (run.status === "invalid") return { status: "contract_invalid", failureReason: "Execution contract violation." }
+  if (isTimeout(run)) return { status: "timeout", failureReason: run.error ?? "Smoke run timeout." }
+  if (run.status !== "succeeded")
     return { status: "failed", failureReason: run.error ?? `Smoke run status was ${run.status}.` }
+  const proof = (run.resourceUsage as Record<string, any>).executionContract
+  if (
+    !proof ||
+    proof.status !== "verified" ||
+    !proof.manifest ||
+    !proof.verified ||
+    proof.manifest.contract_digest !== proof.contractDigest ||
+    proof.verified.contract_digest !== proof.contractDigest ||
+    proof.manifest.candidate_id !== run.candidateID ||
+    proof.verified.candidate_id !== run.candidateID
+  ) {
+    return {
+      status: "contract_invalid",
+      failureReason: "Missing or mismatched executed model manifest / contract verification.",
+    }
   }
   if (hasNonFiniteMetric(run.metrics, "val_avg_mse")) {
     return { status: "failed", failureReason: "Smoke metric val_avg_mse was non-finite." }
   }
   const smokeMetric = finiteMetric(run.metrics, "val_avg_mse")
+  if (smokeMetric === undefined) return { status: "failed", failureReason: "Smoke metric val_avg_mse is missing." }
   if (smokeMetric !== undefined && smokeMetric >= 1_000_000) {
     return {
       status: "failed",

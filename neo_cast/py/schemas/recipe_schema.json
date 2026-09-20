@@ -188,7 +188,7 @@
         },
         "scales": {
           "type": "array",
-          "minItems": 2,
+          "minItems": 1,
           "maxItems": 4,
           "items": {
             "type": "object",
@@ -207,6 +207,12 @@
               }
             }
           }
+        },
+        "num_blocks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "description": "Number of per-scale processing and cross-scale fusion blocks."
         },
         "n_freq": {
           "type": "integer",
@@ -291,6 +297,10 @@
         },
         "shared": {
           "type": "boolean"
+        },
+        "attention": {
+          "type": "string",
+          "enum": ["none", "lightweight", "full"]
         },
         "bias": {
           "type": "boolean"
@@ -547,7 +557,7 @@
           "properties": {
             "base": {
               "type": "string",
-              "enum": ["mse", "mae", "huber", "quantile", "distillation"]
+              "enum": ["mse", "mae", "huber", "quantile", "distillation", "gaussian_nll"]
             },
             "horizon_weighting": {
               "type": "string",

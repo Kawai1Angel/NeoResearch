@@ -33,6 +33,10 @@ export function researchModeForInteractionMode(mode: ResearchInteractionMode): R
   return "autonomous"
 }
 
+export function pipelineStageForInteractionMode(_mode: ResearchInteractionMode): "full" {
+  return "full"
+}
+
 function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: string }): Research.JsonRecord {
   const root = nonEmpty(input.neoCastProjectRoot)
   const datasetPath = nonEmpty(input.datasetPath)
@@ -66,7 +70,7 @@ function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: str
     ...(Object.keys(constraints).length === 0 ? {} : { constraints }),
     metadata,
     runtime: {
-      bridgeOnly: input.bridgeOnly ?? true,
+      bridgeOnly: input.bridgeOnly ?? false,
       ...(root ? { neoCastProjectRoot: root } : {}),
     },
   }
@@ -86,9 +90,9 @@ export function buildDefaultTsfResearchTaskInput(input: {
     interactionMode,
     taskSpec: tsfTaskSpec({ ...input, interactionMode }),
     objective: {
-      primaryMetric: "val_avg_mse",
-      secondaryMetrics: ["val_avg_mae"],
-      errorPreferences: "minimize average validation error while watching long-horizon degradation",
+      primaryMetric: "cv_avg_mse",
+      secondaryMetrics: ["cv_std_mse", "val_avg_mse"],
+      errorPreferences: "minimize time-ordered cross-validation error while monitoring temporal stability and final-checkpoint validation",
       direction: "minimize",
     },
     budget: {
@@ -521,7 +525,7 @@ export function formatResearchAutonomousLoop(input: {
 
 function metricText(run: Research.ResearchRun | undefined, primaryMetric: unknown) {
   if (!run) return undefined
-  const metric = typeof primaryMetric === "string" ? primaryMetric : "val_avg_mse"
+  const metric = typeof primaryMetric === "string" ? primaryMetric : "cv_avg_mse"
   const value = run.metrics[metric]
   if (typeof value === "number") return `${metric}=${Number.isInteger(value) ? value : Number(value.toPrecision(6))}`
   return undefined

@@ -112,10 +112,16 @@ class TrainExecutionTest(unittest.TestCase):
     def train_and_load_summary(self, candidate: dict[str, Any]) -> dict[str, Any]:
         torch.manual_seed(9)
 
-        def fake_loader(split: str, horizon: int, batch_size: int, shuffle: bool) -> DataLoader:
+        def fake_loader(split: str, horizon: int, batch_size: int, shuffle: bool, include_calendar: bool = False) -> DataLoader:
             del split, shuffle
             x = torch.randn(4, 16, 3)
             y = torch.randn(4, horizon, 3)
+            if include_calendar:
+                return DataLoader([{
+                    "target_history": x[i], "exogenous_past": torch.empty(16, 0),
+                    "exogenous_future": torch.empty(horizon, 0), "target": y[i],
+                    "calendar_features": torch.tensor([[12., 2., 15., 6.]]).expand(16, 4),
+                } for i in range(4)], batch_size=batch_size)
             return DataLoader(TensorDataset(x, y), batch_size=batch_size)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,6 +159,24 @@ class TrainExecutionTest(unittest.TestCase):
         self.assertEqual(summary["training_prediction"], "quantile_distribution")
         self.assertEqual(summary["loss"], "quantile")
         self.assertEqual(summary["quantiles"], [0.1, 0.5, 0.9])
+
+    def test_calendar_gaussian_trains_and_writes_distribution_summary(self) -> None:
+        candidate = phase2_invert_rnn_candidate()
+        recipe = candidate["recipe"]
+        recipe["embedding"] = {"type": "calendar", "fields": ["hour", "dayofweek", "month"], "embed_dim": 8}
+        recipe["preprocessing"] = {"actions": [{"type": "none"}]}
+        recipe["prediction_head"] = {"type": "gaussian", "output_distribution": "gaussian", "variance_floor": 1e-6}
+        recipe["training_strategy"]["loss"] = {"base": "gaussian_nll"}
+        summary = self.train_and_load_summary(candidate)
+        self.assertEqual(summary["training_prediction"], "gaussian_distribution")
+        self.assertEqual(summary["embedding"], "calendar")
+
+    def test_latency_limit_rejects_candidate(self) -> None:
+        candidate = phase2_invert_rnn_candidate()
+        candidate["constraints"]["max_latency_ms"] = 1
+        loader = DataLoader(TensorDataset(torch.randn(2, 16, 3), torch.randn(2, 4, 3)), batch_size=2)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(train_module, "make_dataloader", return_value=loader), patch.object(train_module, "measure_latency_ms", return_value=2.):
+            self.assertEqual(train_module.train_models(candidate=candidate, smoke=True, artifact_root=Path(tmp)), 3)
 
     def test_phase2_invert_rnn_feature_recipe_trains_and_writes_execution_summary(self) -> None:
         summary = self.train_and_load_summary(phase2_invert_rnn_candidate())

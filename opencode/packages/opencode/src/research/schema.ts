@@ -127,7 +127,7 @@ export const ResearchRunStage = Schema.Literals([
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type ResearchRunStage = Schema.Schema.Type<typeof ResearchRunStage>
 
-export const ResearchRunStatus = Schema.Literals(["queued", "running", "succeeded", "failed", "rejected"])
+export const ResearchRunStatus = Schema.Literals(["queued", "running", "succeeded", "failed", "rejected", "invalid"])
   .annotate({ identifier: "ResearchRunStatus" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type ResearchRunStatus = Schema.Schema.Type<typeof ResearchRunStatus>
@@ -198,6 +198,7 @@ export class ResearchCandidate extends Schema.Class<ResearchCandidate>("Research
   id: ResearchCandidateID,
   taskID: ResearchTaskID,
   parentCandidateID: Schema.optional(ResearchCandidateID),
+  hypothesisID: Schema.optional(Schema.String),
   domainID: Schema.String,
   candidateSpec: JsonRecord,
   rationale: Schema.String,
@@ -330,6 +331,7 @@ export class AnswerIntentInput extends Schema.Class<AnswerIntentInput>("Research
 export class CreateCandidateInput extends Schema.Class<CreateCandidateInput>("ResearchCreateCandidateInput")({
   taskID: ResearchTaskID,
   parentCandidateID: Schema.optional(ResearchCandidateID),
+  hypothesisID: Schema.optional(Schema.String),
   domainID: Schema.String,
   candidateSpec: JsonRecord,
   rationale: Schema.String,

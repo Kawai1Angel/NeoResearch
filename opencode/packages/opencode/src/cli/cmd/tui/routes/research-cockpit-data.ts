@@ -39,7 +39,7 @@ export type ResearchCockpitRun = {
   id: string
   candidateID?: string
   stage?: "profile" | "baseline" | "smoke" | "low_fidelity" | "full" | "ref_test" | "blind_test"
-  status: "queued" | "running" | "succeeded" | "failed" | "rejected"
+  status: "queued" | "running" | "succeeded" | "failed" | "rejected" | "invalid"
   metrics: JsonRecord
   error?: string
   resourceUsage?: JsonRecord
@@ -866,7 +866,7 @@ export function findBestResearchCockpitMetric(
   runs: ResearchCockpitRun[],
   champion?: ResearchCockpitChampion | null,
 ) {
-  const metricName = typeof objective.primaryMetric === "string" ? objective.primaryMetric : "val_avg_mse"
+  const metricName = typeof objective.primaryMetric === "string" ? objective.primaryMetric : "cv_avg_mse"
   if (champion && typeof champion.primaryMetric === "number") {
     return `best ${metricName}=${formatMetric(champion.primaryMetric)}`
   }
@@ -1033,7 +1033,8 @@ function formatBackboneDetail(bb: Record<string, unknown>): string {
   const type = typeof bb.type === "string" ? bb.type : "?"
   const params: Array<string | undefined> = []
   if (type === "linear") {
-    if (bb.shared) params.push("shared")
+    params.push(fmt("shared", bb.shared))
+    params.push(fmt("bias", bb.bias))
   } else if (type === "mlp") {
     params.push(fmt("depth", bb.depth))
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
@@ -1044,32 +1045,44 @@ function formatBackboneDetail(bb: Record<string, unknown>): string {
     params.push(fmt("heads", bb.nHeads ?? bb.n_heads))
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
     params.push(fmt("drop", bb.dropout))
+    params.push(fmt("ffn", bb.ffnMult ?? bb.ffn_mult))
   } else if (type === "rnn") {
     params.push(fmt("cell", bb.cell))
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("layers", bb.numLayers ?? bb.num_layers))
+    params.push(fmt("drop", bb.dropout))
   } else if (type === "dlinear") {
     params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+    params.push(fmt("bias", bb.bias))
     params.push(fmt("individual", bb.individual))
   } else if (type === "tcn") {
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
     params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+    params.push(fmt("act", bb.activation))
+    params.push(fmt("drop", bb.dropout))
   } else if (type === "ssm") {
     params.push(fmt("state", bb.stateDim ?? bb.state_dim))
     params.push(fmt("depth", bb.depth))
+    params.push(fmt("drop", bb.dropout))
   } else if (type === "mixer") {
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("depth", bb.depth))
     params.push(fmt("tmix", bb.temporalMixing ?? bb.temporal_mixing))
+    params.push(fmt("cmix", bb.channelMixing ?? bb.channel_mixing))
+    params.push(fmt("drop", bb.dropout))
   } else if (type === "nbeats") {
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("blocks", bb.nBlocks ?? bb.n_blocks))
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
+    params.push(fmt("act", bb.activation))
+    params.push(fmt("drop", bb.dropout))
   } else if (type === "timesnet") {
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
     params.push(fmt("topK", bb.topK ?? bb.top_k))
+    params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+    params.push(fmt("drop", bb.dropout))
   }
   const p = params.filter(Boolean).join(",")
   return p ? `${type}(${p})` : type
@@ -1188,20 +1201,7 @@ export function formatResearchCockpitCandidateArchitectureExpandedLines(candidat
   }
   lines.push(`  embedding:      ${embType}${embParams.length ? `(${embParams.join(", ")})` : ""}`)
 
-  const bb = asRecord(spec.backbone)
-  const bbType = typeof bb.type === "string" ? bb.type : "?"
-  const bbParams: string[] = []
-  const bbDModel = bb.dModel ?? bb.d_model
-  const nHeads = bb.nHeads ?? bb.n_heads
-  const nLayers = bb.nLayers ?? bb.n_layers
-  const hiddenDim = bb.hiddenDim ?? bb.hidden_dim
-  const bbDropout = bb.dropout
-  if (bbDModel !== undefined) bbParams.push(`d_model=${bbDModel}`)
-  if (nHeads !== undefined) bbParams.push(`n_heads=${nHeads}`)
-  if (nLayers !== undefined) bbParams.push(`n_layers=${nLayers}`)
-  if (hiddenDim !== undefined) bbParams.push(`h=${hiddenDim}`)
-  if (typeof bbDropout === "number" && bbDropout > 0) bbParams.push(`dropout=${bbDropout}`)
-  lines.push(`  backbone:       ${bbType}${bbParams.length ? `(${bbParams.join(", ")})` : ""}`)
+  lines.push(`  backbone:       ${formatBackboneDetail(asRecord(spec.backbone))}`)
 
   const fusion = asRecord(spec.fusion)
   const fusionType = typeof fusion.type === "string" ? fusion.type : "?"
@@ -1353,6 +1353,7 @@ export type ResearchCockpitRunnerStatus = {
 
 type ResearchCockpitRunnerStatusOptions = {
   validateRuntime?: boolean
+  projectRoot?: string
 }
 
 function parsePythonVersion(raw: string) {
@@ -1552,7 +1553,8 @@ export function getResearchCockpitRunnerStatus(
       detail: `Neo-Cast requires Python >= 3.10; detected ${versionText || "unknown"}.`,
     }
   }
-  if (!preparedDatasetSpecMatchesTask(task, resolvedRoot)) {
+  const projectRoot = path.resolve(options.projectRoot ?? process.env.NEO_CAST_PROJECT_ROOT ?? resolvedRoot)
+  if (!preparedDatasetSpecMatchesTask(task, projectRoot)) {
     return {
       configured: true,
       ready: false,
@@ -1629,7 +1631,7 @@ function formatMetric(value: unknown) {
 }
 
 function primaryMetricText(metrics: JsonRecord) {
-  for (const key of ["val_avg_mse", "test_avg_mse", "mse", "loss"]) {
+  for (const key of ["cv_avg_mse", "val_avg_mse", "test_avg_mse", "mse", "loss"]) {
     const value = metrics[key]
     if (typeof value === "number") return `${key}=${formatMetric(value)}`
   }
@@ -2407,9 +2409,9 @@ export function buildDefaultTsfResearchTask(
       runtime: tsfRuntime(neoCastProjectRoot, defaults.bridgeOnly ?? false),
     },
     objective: {
-      primaryMetric: "val_avg_mse",
-      secondaryMetrics: ["val_avg_mae"],
-      errorPreferences: "minimize average validation error while watching long-horizon degradation",
+      primaryMetric: "cv_avg_mse",
+      secondaryMetrics: ["cv_std_mse", "val_avg_mse"],
+      errorPreferences: "minimize time-ordered cross-validation error while monitoring temporal stability and final-checkpoint validation",
       direction: "minimize",
     },
     budget: {

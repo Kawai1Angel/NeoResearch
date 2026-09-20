@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "hypothesis_id",
+    "candidate_id",
+    "candidate_spec_sha256",
+    "expected"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "research_execution_contract.v1"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hypothesis_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "candidate_spec_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recipe_version",
+        "embedding",
+        "backbone",
+        "fusion",
+        "channel_mode",
+        "prediction_head",
+        "preprocessing",
+        "target_channels",
+        "past_exogenous_channels",
+        "future_exogenous_channels",
+        "output_channels"
+      ],
+      "properties": {
+        "recipe_version": {
+          "const": "recipe_schema_v1"
+        },
+        "embedding": {
+          "type": "string"
+        },
+        "backbone": {
+          "type": "string"
+        },
+        "fusion": {
+          "type": "string"
+        },
+        "channel_mode": {
+          "type": "string"
+        },
+        "prediction_head": {
+          "type": "string"
+        },
+        "preprocessing": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "target_channels": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "past_exogenous_channels": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "future_exogenous_channels": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_channels": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

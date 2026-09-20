@@ -432,7 +432,7 @@ function pushUniqueBy<T>(items: T[], item: T | undefined, key: (item: T) => stri
 }
 
 function metricSortValue(run: DomainProposalContext["runs"][number]) {
-  const value = run.metrics.val_avg_mse
+  const value = run.metrics.cv_avg_mse ?? run.metrics.val_avg_mse
   return typeof value === "number" && Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
 }
 

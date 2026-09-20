@@ -29,6 +29,7 @@
     "bin/",
     "src/",
     "py/",
+    "literature_source/",
     "pyproject.toml",
     "uv.lock",
     "README.md",

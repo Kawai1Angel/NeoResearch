@@ -95,7 +95,8 @@
         "multiscale_blocks": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 4
+          "maximum": 4,
+          "description": "Number of multi-scale branch and cross-scale fusion blocks; 0 disables automatic multiscale selection."
         },
         "attention": {
           "type": "string",
@@ -162,7 +163,7 @@
       "properties": {
         "loss": {
           "type": "string",
-          "enum": ["mse", "mae", "huber", "quantile", "distillation"]
+          "enum": ["mse", "mae", "huber", "quantile", "distillation", "gaussian_nll"]
         },
         "optimizer": {
           "type": "string",
@@ -245,5 +246,16 @@
       "type": "string",
       "maxLength": 2000
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"architecture": {"required": ["output_distribution"], "properties": {"output_distribution": {"const": "gaussian"}}}}},
+      "then": {"properties": {"training": {"properties": {"loss": {"const": "gaussian_nll"}}}}},
+      "else": {
+        "if": {"properties": {"architecture": {"required": ["output_distribution"], "properties": {"output_distribution": {"const": "quantile"}}}}},
+        "then": {"properties": {"training": {"properties": {"loss": {"const": "quantile"}}}}},
+        "else": {"properties": {"training": {"properties": {"loss": {"enum": ["mse", "mae", "huber", "distillation"]}}}}}
+      }
+    }
+  ]
 }

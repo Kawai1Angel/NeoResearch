@@ -170,7 +170,7 @@ export function candidateAttemptStateFromRuns(input: {
   const attemptedCandidateIDs = new Set<ResearchCandidateID>()
   const inconclusiveCandidateIDs = new Set<ResearchCandidateID>()
   for (const run of input.runs) {
-    if (run.candidateID === undefined) continue
+    if (run.candidateID === undefined || run.status === "invalid") continue
     if (run.status === "failed") {
       retryableCounts.set(run.candidateID, (retryableCounts.get(run.candidateID) ?? 0) + 1)
       continue

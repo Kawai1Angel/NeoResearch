@@ -83,6 +83,55 @@ HORIZONS = ACTIVE_SPEC.horizons
 BORDER_TRAIN = ACTIVE_SPEC.train
 BORDER_VAL = ACTIVE_SPEC.val
 BORDER_TEST = ACTIVE_SPEC.ref_test
+# The materialized visible file always represents the original train+val
+# interval. CV overrides only change the active training/evaluation boundaries.
+VISIBLE_DATA_ROWS = (ACTIVE_SPEC.train[0], ACTIVE_SPEC.val[1])
+
+CV_TRAIN_ROWS_ENV = "NEO_CAST_TRAIN_ROWS"
+CV_VAL_ROWS_ENV = "NEO_CAST_VAL_ROWS"
+CV_FOLD_INDEX_ENV = "NEO_CAST_CV_FOLD_INDEX"
+
+
+def _parse_cv_row_override(name: str, value: str) -> tuple[int, int]:
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"{name} must use start:end integer syntax, got {value!r}")
+    try:
+        start, end = (int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"{name} must use start:end integer syntax, got {value!r}") from exc
+    if start < 0 or end <= start:
+        raise ValueError(f"{name} must be a non-empty non-negative range, got {value!r}")
+    return start, end
+
+
+def _split_bounds_with_cv_override(
+    train_rows: tuple[int, int],
+    val_rows: tuple[int, int],
+    ref_test_rows: tuple[int, int],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    train_raw = os.environ.get(CV_TRAIN_ROWS_ENV)
+    val_raw = os.environ.get(CV_VAL_ROWS_ENV)
+    if (train_raw is None) != (val_raw is None):
+        raise ValueError(f"{CV_TRAIN_ROWS_ENV} and {CV_VAL_ROWS_ENV} must be provided together")
+    if train_raw is None:
+        return train_rows, val_rows
+
+    override_train = _parse_cv_row_override(CV_TRAIN_ROWS_ENV, train_raw)
+    override_val = _parse_cv_row_override(CV_VAL_ROWS_ENV, val_raw or "")
+    visible_start, visible_end = train_rows[0], val_rows[1]
+    if not (visible_start <= override_train[0] < override_train[1] <= visible_end):
+        raise ValueError(f"CV train override {override_train} is outside visible rows {(visible_start, visible_end)}")
+    if not (visible_start <= override_val[0] < override_val[1] <= visible_end):
+        raise ValueError(f"CV val override {override_val} is outside visible rows {(visible_start, visible_end)}")
+    if override_train[1] > override_val[0]:
+        raise ValueError(f"CV train must end at or before val start, got {override_train} and {override_val}")
+    if override_val[1] > ref_test_rows[0]:
+        raise ValueError(f"CV val override {override_val} touches ref-test starting at {ref_test_rows[0]}")
+    return override_train, override_val
+
+
+BORDER_TRAIN, BORDER_VAL = _split_bounds_with_cv_override(BORDER_TRAIN, BORDER_VAL, BORDER_TEST)
 
 TIME_BUDGET = 600
 PARAM_BUDGET = 10_000_000
@@ -129,6 +178,7 @@ def _apply_spec(spec: DatasetSpec) -> None:
     global BORDER_TRAIN
     global BORDER_VAL
     global BORDER_TEST
+    global VISIBLE_DATA_ROWS
     global _VISIBLE_BUNDLE
 
     ACTIVE_SPEC = spec
@@ -149,6 +199,7 @@ def _apply_spec(spec: DatasetSpec) -> None:
     BORDER_TRAIN = spec.train
     BORDER_VAL = spec.val
     BORDER_TEST = spec.ref_test
+    VISIBLE_DATA_ROWS = (spec.train[0], spec.val[1])
     _VISIBLE_BUNDLE = None
 
 
@@ -564,7 +615,7 @@ def materialize_visible_splits(
     profile_path.write_text(f"{json.dumps(prepared_profile, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
     train_df = df.iloc[BORDER_TRAIN[0] : BORDER_TRAIN[1]].copy()
-    visible_df = df.iloc[: BORDER_VAL[1]].copy()
+    visible_df = df.iloc[: VISIBLE_DATA_ROWS[1]].copy()
     ref_test_df = df.iloc[BORDER_TEST[0] : BORDER_TEST[1]].copy()
 
     train_df.to_csv(TRAIN_DATA_PATH, index=False)
@@ -597,7 +648,7 @@ def _load_visible_bundle() -> VisibleDataBundle:
         )
 
     df = pd.read_csv(VISIBLE_DATA_PATH)
-    _validate_frame(df, expected_rows=BORDER_VAL[1], context="visible dataset")
+    _validate_frame(df, expected_rows=VISIBLE_DATA_ROWS[1], context="visible dataset")
 
     feature_values = df[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
     target_raw = df[list(TARGET_COLUMNS)].to_numpy(dtype=np.float32)
@@ -643,14 +694,22 @@ def _load_visible_bundle() -> VisibleDataBundle:
     return _VISIBLE_BUNDLE
 
 
+def calendar_values(timestamps) -> np.ndarray:
+    dates = pd.DatetimeIndex(pd.to_datetime(timestamps, errors="raise", utc=True))
+    if dates.isna().any():
+        raise ValueError("calendar embedding requires valid timestamps")
+    return np.stack([dates.hour, dates.dayofweek, dates.day, dates.month], axis=-1).astype(np.float32)
+
+
 class WindowDataset(Dataset):
-    def __init__(self, split: str, horizon: int) -> None:
+    def __init__(self, split: str, horizon: int, include_calendar: bool = False) -> None:
         if split not in {"train", "val"}:
             raise ValueError(f"Unsupported split: {split}. Agent-visible splits are only 'train' and 'val'.")
         if horizon not in HORIZONS:
             raise ValueError(f"Unsupported horizon: {horizon}. Supported horizons: {HORIZONS}")
 
         bundle = _load_visible_bundle()
+        self.calendar = calendar_values(bundle.frame[TIMESTAMP_COL]) if include_calendar else None
         self.values = bundle.scaled_values
         self.target_values = bundle.target_values
         self.past_covariate_values = bundle.past_covariate_values
@@ -681,7 +740,7 @@ class WindowDataset(Dataset):
         end = start + INPUT_LEN
         target_end = end + self.horizon
 
-        if ACTIVE_SPEC.schema_version == "dataset.v1":
+        if ACTIVE_SPEC.schema_version == "dataset.v1" and self.calendar is None:
             x = self.values[start:end]
             y = self.values[end:target_end]
             return torch.from_numpy(x), torch.from_numpy(y)
@@ -690,11 +749,12 @@ class WindowDataset(Dataset):
             "exogenous_past": torch.from_numpy(self.past_covariate_values[start:end]),
             "exogenous_future": torch.from_numpy(self.future_covariate_values[end:target_end]),
             "target": torch.from_numpy(self.target_values[end:target_end]),
+            **({"calendar_features": torch.from_numpy(self.calendar[start:end])} if self.calendar is not None else {}),
         }
 
 
-def make_dataloader(split: str, horizon: int, batch_size: int, shuffle: bool | None = None) -> DataLoader:
-    dataset = WindowDataset(split=split, horizon=horizon)
+def make_dataloader(split: str, horizon: int, batch_size: int, shuffle: bool | None = None, include_calendar: bool = False) -> DataLoader:
+    dataset = WindowDataset(split=split, horizon=horizon, include_calendar=include_calendar)
     if shuffle is None:
         shuffle = split == "train"
     return DataLoader(
@@ -734,12 +794,13 @@ def _model_inputs(x):
             "target_history": x["target_history"],
             "exogenous_past": x["exogenous_past"],
             "exogenous_future": x["exogenous_future"],
+            **({"calendar_features": x["calendar_features"]} if "calendar_features" in x else {}),
         }
     return x
 
 
-def _forward_model(model, x, *, quantiles: bool = False):
-    method = model.forward_quantiles if quantiles else model
+def _forward_model(model, x, *, quantiles: bool = False, distribution: bool = False):
+    method = model.forward_distribution if distribution else (model.forward_quantiles if quantiles else model)
     inputs = _model_inputs(x)
     return method(**inputs) if isinstance(inputs, dict) else method(inputs)
 
@@ -752,6 +813,8 @@ def _empty_probabilistic_state() -> dict[str, object]:
         "width_sum": 0.0,
         "interval_count": 0,
         "interval_label": None,
+        "gaussian_nll_sum": 0.0,
+        "gaussian_count": 0,
     }
 
 
@@ -764,6 +827,11 @@ def _update_probabilistic_state(
     horizon: int,
     prefix: str,
 ) -> None:
+    if getattr(model, "head_cfg", {}).get("output_distribution") == "gaussian":
+        mean, scale = _forward_model(model, x, distribution=True)
+        nll = torch.nn.functional.gaussian_nll_loss(mean, y, scale.square(), full=True, reduction="sum")
+        state["gaussian_nll_sum"] += nll.item()
+        state["gaussian_count"] += y.numel()
     if not hasattr(model, "forward_quantiles"):
         return
     quantile_levels = _quantile_levels(model)
@@ -805,11 +873,13 @@ def _update_probabilistic_state(
 
 
 def _finalize_probabilistic_state(state: dict[str, object]) -> dict[str, float]:
+    gaussian_metrics = {"gaussian_nll": float(state["gaussian_nll_sum"]) / int(state["gaussian_count"])} if state.get("gaussian_count", 0) else {}
     pinball_count = int(state["pinball_count"])
     if pinball_count <= 0:
-        return {}
+        return gaussian_metrics
     pinball = float(state["pinball_sum"]) / pinball_count
     metrics = {
+        **gaussian_metrics,
         "pinball": pinball,
         "crps_approx": 2.0 * pinball,
     }
@@ -854,7 +924,8 @@ def evaluate_val_tsf(model_or_models, device: torch.device, horizons: Iterable[i
         was_training = model.training
         model.eval()
 
-        loader = make_dataloader("val", horizon, batch_size=EVAL_BATCH_SIZE, shuffle=False)
+        calendar = {"include_calendar": True} if getattr(model, "embedding_type", None) == "calendar" else {}
+        loader = make_dataloader("val", horizon, batch_size=EVAL_BATCH_SIZE, shuffle=False, **calendar)
         total_sq_error = 0.0
         total_abs_error = 0.0
         total_values = 0
@@ -999,6 +1070,7 @@ def _iter_scaled_windows(
     *,
     horizon: int,
     batch_size: int,
+    include_calendar: bool = False,
 ) -> Iterable[tuple[torch.Tensor, torch.Tensor]]:
     context_start = BORDER_TEST[0] - INPUT_LEN
     split_end = BORDER_TEST[1]
@@ -1011,6 +1083,8 @@ def _iter_scaled_windows(
 
     starts = range(context_start, context_start + num_windows)
     target_values, past_values, future_values = values
+    calendar = calendar_values(pd.concat([_load_visible_bundle().frame[TIMESTAMP_COL], _load_ref_test_frame()[TIMESTAMP_COL]], ignore_index=True)) if include_calendar else None
+    batch_calendar: list[np.ndarray] = []
     batch_x: list[np.ndarray] = []
     batch_y: list[np.ndarray] = []
     batch_past: list[np.ndarray] = []
@@ -1022,9 +1096,11 @@ def _iter_scaled_windows(
         batch_y.append(target_values[end:target_end])
         batch_past.append(past_values[start:end])
         batch_future.append(future_values[end:target_end])
+        if calendar is not None:
+            batch_calendar.append(calendar[start:end])
 
         if len(batch_x) == batch_size:
-            if ACTIVE_SPEC.schema_version == "dataset.v1":
+            if ACTIVE_SPEC.schema_version == "dataset.v1" and calendar is None:
                 yield (torch.from_numpy(np.stack(batch_x)), torch.from_numpy(np.stack(batch_y)))
             else:
                 yield {
@@ -1032,14 +1108,16 @@ def _iter_scaled_windows(
                     "exogenous_past": torch.from_numpy(np.stack(batch_past)),
                     "exogenous_future": torch.from_numpy(np.stack(batch_future)),
                     "target": torch.from_numpy(np.stack(batch_y)),
+                    **({"calendar_features": torch.from_numpy(np.stack(batch_calendar))} if calendar is not None else {}),
                 }
             batch_x.clear()
             batch_y.clear()
             batch_past.clear()
             batch_future.clear()
+            batch_calendar.clear()
 
     if batch_x:
-        if ACTIVE_SPEC.schema_version == "dataset.v1":
+        if ACTIVE_SPEC.schema_version == "dataset.v1" and calendar is None:
             yield (torch.from_numpy(np.stack(batch_x)), torch.from_numpy(np.stack(batch_y)))
         else:
             yield {
@@ -1047,6 +1125,7 @@ def _iter_scaled_windows(
                 "exogenous_past": torch.from_numpy(np.stack(batch_past)),
                 "exogenous_future": torch.from_numpy(np.stack(batch_future)),
                 "target": torch.from_numpy(np.stack(batch_y)),
+                **({"calendar_features": torch.from_numpy(np.stack(batch_calendar))} if calendar is not None else {}),
             }
 
 
@@ -1072,7 +1151,7 @@ def evaluate_ref_test_tsf(model_or_models, device: torch.device, horizons: Itera
         probabilistic_state = _empty_probabilistic_state()
 
         with torch.no_grad():
-            for batch in _iter_scaled_windows(scaled_values, horizon=horizon, batch_size=EVAL_BATCH_SIZE):
+            for batch in _iter_scaled_windows(scaled_values, horizon=horizon, batch_size=EVAL_BATCH_SIZE, include_calendar=getattr(model, "embedding_type", None) == "calendar"):
                 x, y = _move_batch(batch, device)
 
                 _update_probabilistic_state(

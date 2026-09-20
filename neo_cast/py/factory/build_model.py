@@ -50,14 +50,12 @@ class InstanceNormAction(nn.Module):
 class SeriesDecompositionAction(nn.Module):
     def __init__(self, *, kernel_size: int) -> None:
         super().__init__()
-        if kernel_size % 2 == 0:
-            kernel_size += 1
         self.kernel_size = kernel_size
 
     def _moving_average(self, x: torch.Tensor) -> torch.Tensor:
         pad = (self.kernel_size - 1) // 2
         values = x.permute(0, 2, 1)
-        padded = F.pad(values, (pad, pad), mode="replicate")
+        padded = F.pad(values, (pad, self.kernel_size - 1 - pad), mode="replicate")
         trend = F.avg_pool1d(padded, kernel_size=self.kernel_size, stride=1)
         return trend.permute(0, 2, 1)
 
@@ -196,10 +194,14 @@ class MultiScalePatchEmbedding(nn.Module):
         input_len: int,
         scales: list[dict[str, Any]],
         d_model: int,
+        num_blocks: int = 1,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        if len(scales) < 2:
-            raise ValueError("multiscale_patch requires at least two scales")
+        if not scales:
+            raise ValueError("multiscale_patch requires at least one scale")
+        if num_blocks < 1:
+            raise ValueError("multiscale_patch num_blocks must be >= 1")
 
         self.embeddings = nn.ModuleList(
             [
@@ -212,13 +214,67 @@ class MultiScalePatchEmbedding(nn.Module):
                 for scale in scales
             ]
         )
+        self.scale_embeddings = nn.ParameterList(
+            [nn.Parameter(torch.zeros(1, 1, d_model)) for _ in scales]
+        )
+        self.blocks = nn.ModuleList(
+            [MultiScalePatchBlock(d_model, len(scales), dropout=dropout) for _ in range(num_blocks)]
+        )
         self.token_count = sum(
             1 + (input_len - int(scale["patch_len"])) // int(scale["stride"])
             for scale in scales
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([embedding(x) for embedding in self.embeddings], dim=1)
+        branches = [
+            embedding(x) + scale_embedding
+            for embedding, scale_embedding in zip(self.embeddings, self.scale_embeddings)
+        ]
+        for block in self.blocks:
+            branches = block(branches)
+        return torch.cat(branches, dim=1)
+
+
+class MultiScalePatchBlock(nn.Module):
+    """Process each resolution independently, then exchange pooled scale context."""
+
+    def __init__(self, d_model: int, num_scales: int, *, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.branch_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_scales)])
+        self.branch_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(d_model, d_model * 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model * 2, d_model),
+                    nn.Dropout(dropout),
+                )
+                for _ in range(num_scales)
+            ]
+        )
+        heads = next(candidate for candidate in (4, 2, 1) if d_model % candidate == 0)
+        self.scale_norm = nn.LayerNorm(d_model)
+        self.scale_attention = nn.MultiheadAttention(
+            d_model,
+            heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, branches: list[torch.Tensor]) -> list[torch.Tensor]:
+        local = [
+            branch + mlp(norm(branch))
+            for branch, norm, mlp in zip(branches, self.branch_norms, self.branch_mlps)
+        ]
+        summaries = torch.stack([branch.mean(dim=1) for branch in local], dim=1)
+        normalized = self.scale_norm(summaries)
+        cross_scale = self.scale_attention(normalized, normalized, normalized, need_weights=False)[0]
+        return [
+            branch + self.dropout(cross_scale[:, index : index + 1, :])
+            for index, branch in enumerate(local)
+        ]
 
 
 class SequenceEmbedding(nn.Module):
@@ -238,7 +294,9 @@ class InvertEmbedding(nn.Module):
         self.proj = nn.Linear(input_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x).unsqueeze(1)
+        if x.dim() != 3:
+            raise ValueError("invert requires [batch, variables, history] input")
+        return self.proj(x)
 
 
 class FrequencyEmbedding(nn.Module):
@@ -274,17 +332,26 @@ class CalendarEmbedding(nn.Module):
         self.fields = fields or ["position"]
         self.proj = nn.Linear(1 + 2 * len(self.fields), embed_dim)
 
-    def _calendar_features(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        positions = torch.arange(self.input_len, device=device, dtype=dtype)
+    def _calendar_features(self, values: torch.Tensor) -> torch.Tensor:
+        # Input columns: hour, dayofweek, day (1-based), month (1-based).
+        columns = {"hour": 0, "dayofweek": 1, "day": 2, "month": 3}
         features: list[torch.Tensor] = []
         for field in self.fields:
-            period = float(self.PERIODS.get(field, max(self.input_len, 1)))
-            phase = 2.0 * torch.pi * positions / period
+            if field == "position":
+                phase = 2.0 * torch.pi * torch.arange(values.size(1), device=values.device, dtype=values.dtype) / self.input_len
+                features.extend([phase.sin().expand(values.size(0), -1), phase.cos().expand(values.size(0), -1)])
+                continue
+            if field not in columns:
+                raise ValueError(f"Unsupported real calendar field: {field}")
+            value = values[..., columns[field]] - (1 if field in {"day", "month"} else 0)
+            phase = 2.0 * torch.pi * value / float(self.PERIODS[field])
             features.extend([torch.sin(phase), torch.cos(phase)])
         return torch.stack(features, dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        calendar = self._calendar_features(device=x.device, dtype=x.dtype).unsqueeze(0).expand(x.size(0), -1, -1)
+    def forward(self, x: torch.Tensor, calendar_features: torch.Tensor | None = None) -> torch.Tensor:
+        if calendar_features is None or calendar_features.shape != (*x.shape, 4):
+            raise ValueError("calendar embedding requires real calendar_features [batch, history, 4]")
+        calendar = self._calendar_features(calendar_features.to(device=x.device, dtype=x.dtype))
         return self.proj(torch.cat([x.unsqueeze(-1), calendar], dim=-1))
 
 
@@ -371,8 +438,6 @@ class DLinearCore(nn.Module):
         num_channels: int | None = None,
     ) -> None:
         super().__init__()
-        if kernel_size % 2 == 0:
-            kernel_size += 1
         self.kernel_size = kernel_size
         self.individual = bool(individual)
         self.num_channels = int(num_channels or 0)
@@ -391,7 +456,7 @@ class DLinearCore(nn.Module):
 
     def _moving_average(self, x: torch.Tensor) -> torch.Tensor:
         pad = (self.kernel_size - 1) // 2
-        padded = F.pad(x.unsqueeze(1), (pad, pad), mode="replicate")
+        padded = F.pad(x.unsqueeze(1), (pad, self.kernel_size - 1 - pad), mode="replicate")
         return F.avg_pool1d(padded, kernel_size=self.kernel_size, stride=1).squeeze(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -743,10 +808,47 @@ class GaussianPointHead(nn.Module):
         self.mean = nn.Linear(horizon, horizon)
         self.log_var = nn.Linear(horizon, horizon)
         self.variance_floor = variance_floor
+        self.quantiles = [0.1, 0.5, 0.9]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _ = F.softplus(self.log_var(x)) + self.variance_floor
         return self.mean(x)
+
+    def forward_distribution(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.mean(x), (F.softplus(self.log_var(x)) + self.variance_floor).sqrt()
+
+
+class TokenAttention(nn.Module):
+    """Residual token attention: full softmax or linear-complexity positive features."""
+
+    def __init__(self, width: int, heads: int, mode: str, dropout: float = 0.0) -> None:
+        super().__init__()
+        if width % heads:
+            raise ValueError("attention width must be divisible by heads")
+        self.mode, self.heads = mode, heads
+        self.norm = nn.Identity() if mode == "none" else nn.LayerNorm(width)
+        if mode == "full":
+            self.attention = nn.MultiheadAttention(width, heads, dropout=dropout, batch_first=True)
+        elif mode == "lightweight":
+            self.qkv = nn.Linear(width, width * 3)
+            self.proj = nn.Linear(width, width)
+        elif mode != "none":
+            raise ValueError(f"Unknown attention mode: {mode}")
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == "none":
+            return x
+        z = self.norm(x)
+        if self.mode == "full":
+            y = self.attention(z, z, z, need_weights=False)[0]
+        else:
+            b, n, d = z.shape
+            q, k, v = self.qkv(z).reshape(b, n, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+            q, k = F.elu(q) + 1, F.elu(k) + 1
+            kv = k.transpose(-2, -1) @ v
+            denominator = (q * k.sum(dim=-2, keepdim=True)).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            y = self.proj(((q @ kv) / denominator).transpose(1, 2).reshape(b, n, d))
+        return x + self.dropout(y)
 
 
 class RecipeModel(nn.Module):
@@ -807,6 +909,11 @@ class RecipeModel(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone type: {self.backbone_type}")
         self.prediction_head = self._build_prediction_head()
+        attention = self.backbone_cfg.get("attention", "none")
+        self.input_attention = None
+        if self.backbone_type != "transformer" and attention != "none":
+            width = int(self.backbone_cfg.get("hidden_dim", self.backbone_cfg.get("state_dim", 64)))
+            self.input_attention = nn.Sequential(nn.Linear(1, width), TokenAttention(width, 1, attention), nn.Linear(width, 1))
 
     def _require_num_channels(self, reason: str) -> int:
         if self.model_num_channels is None:
@@ -905,7 +1012,7 @@ class RecipeModel(nn.Module):
                 for scale in self.embedding_cfg["scales"]
             )
         if self.embedding_type == "invert":
-            return 1
+            return self._require_num_channels("invert embedding")
         if self.embedding_type == "frequency":
             return min(int(self.embedding_cfg["n_freq"]), self.input_len // 2 + 1)
         if self.embedding_type == "calendar":
@@ -925,6 +1032,8 @@ class RecipeModel(nn.Module):
                 input_len=self.input_len,
                 scales=self.embedding_cfg["scales"],
                 d_model=d_model or self._embedding_d_model(),
+                num_blocks=int(self.embedding_cfg.get("num_blocks", 1)),
+                dropout=float(self.backbone_cfg.get("dropout", 0.0)),
             )
         if self.embedding_type == "invert":
             return InvertEmbedding(input_len=self.input_len, d_model=d_model or self._embedding_d_model())
@@ -944,6 +1053,8 @@ class RecipeModel(nn.Module):
         raise ValueError(f"Unsupported temporal embedding type: {self.embedding_type}")
 
     def _build_linear_model(self) -> nn.Module:
+        if self.embedding_type == "invert":
+            return nn.Sequential(self._build_temporal_embedding(), nn.Linear(self._embedding_d_model(), self.horizon))
         if self.embedding_type == "none":
             return nn.Linear(self.input_len, self.horizon, bias=bool(self.backbone_cfg.get("bias", True)))
 
@@ -1011,11 +1122,14 @@ class RecipeModel(nn.Module):
                 "embedding": embedding,
                 "position": nn.ParameterDict(
                     {"weight": nn.Parameter(torch.zeros(1, token_count, d_model))}
-                ),
+                ) if self.embedding_type != "invert" else nn.Identity(),
                 "encoder": nn.TransformerEncoder(
                     encoder_layer,
                     num_layers=int(self.backbone_cfg["n_layers"]),
-                ),
+                ) if self.backbone_cfg.get("attention", "full") == "full" else nn.Sequential(*[
+                    nn.Sequential(TokenAttention(d_model, n_heads, self.backbone_cfg["attention"], float(self.backbone_cfg["dropout"])), ResidualMLPBlock(d_model, float(self.backbone_cfg["dropout"]), "gelu"))
+                    for _ in range(int(self.backbone_cfg["n_layers"]))
+                ]),
                 "head": nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.horizon)),
             }
         )
@@ -1147,7 +1261,8 @@ class RecipeModel(nn.Module):
     def _build_prediction_head(self) -> nn.Module:
         head_type = self.head_cfg["type"]
         if head_type in {"linear", "direct_multi_horizon"}:
-            return nn.Identity()
+            from execution_contract import LinearHead, DirectMultiHorizonHead
+            return LinearHead() if head_type == "linear" else DirectMultiHorizonHead()
         if head_type == "residual_correction":
             return ResidualCorrectionHead(
                 horizon=self.horizon,
@@ -1169,17 +1284,26 @@ class RecipeModel(nn.Module):
     def _prepare_flat_series(
         self,
         x: torch.Tensor,
-    ) -> tuple[torch.Tensor, int, int, torch.Tensor, list[tuple[str, Any]]]:
+    ) -> tuple[torch.Tensor, int, int, tuple[torch.Tensor, torch.Tensor], list[tuple[str, Any]]]:
         contexts: list[tuple[str, Any]] = []
         for module in self.preprocessing:
             x = module.forward_transform(x, contexts)
 
         x = self.channel_mixer(x)
-        last_value = x[:, -1:, :]
-        series = x - last_value
+        if self.embedding_type == "invert":
+            location = x.mean(dim=1, keepdim=True).detach()
+            scale = torch.sqrt(x.var(dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
+        else:
+            location = x[:, -1:, :]
+            scale = torch.ones_like(location)
+        series = (x - location) / scale
         batch_size, seq_len, channels = series.shape
         flat = series.permute(0, 2, 1).reshape(batch_size * channels, seq_len)
-        return flat, batch_size, channels, last_value, contexts
+        if self.input_attention is not None:
+            flat = flat + self.input_attention(flat.unsqueeze(-1)).squeeze(-1)
+        if self.embedding_type == "invert":
+            flat = flat.reshape(batch_size, channels, seq_len)
+        return flat, batch_size, channels, (location, scale), contexts
 
     def _merge_history(
         self,
@@ -1221,11 +1345,12 @@ class RecipeModel(nn.Module):
         *,
         batch_size: int,
         channels: int,
-        last_value: torch.Tensor,
+        normalization: tuple[torch.Tensor, torch.Tensor],
         contexts: list[tuple[str, Any]],
     ) -> torch.Tensor:
         pred = flat_pred.reshape(batch_size, channels, self.horizon).permute(0, 2, 1)
-        y = pred + last_value
+        location, scale = normalization
+        y = pred * scale + location
         y = self.output_mixer(y)
         for module, (_, context) in zip(reversed(self.preprocessing), reversed(contexts)):
             y = module.inverse_transform(y, context)
@@ -1251,17 +1376,32 @@ class RecipeModel(nn.Module):
         *,
         batch_size: int,
         channels: int,
-        last_value: torch.Tensor,
+        normalization: tuple[torch.Tensor, torch.Tensor],
         contexts: list[tuple[str, Any]],
     ) -> torch.Tensor:
         quantiles = flat_quantiles.reshape(batch_size, channels, self.horizon, flat_quantiles.size(-1))
-        y = quantiles.permute(0, 2, 1, 3) + last_value.unsqueeze(-1)
+        location, scale = normalization
+        y = quantiles.permute(0, 2, 1, 3) * scale.unsqueeze(-1) + location.unsqueeze(-1)
         y = self._apply_output_mixer_quantiles(y)
         return self._inverse_quantile_forecast(y, contexts)
 
-    def _forward_core(self, series: torch.Tensor) -> torch.Tensor:
+    def _forward_core(self, series: torch.Tensor, calendar_features: torch.Tensor | None = None) -> torch.Tensor:
+        def embed(module: nn.Module) -> torch.Tensor:
+            if self.embedding_type == "calendar":
+                features = calendar_features
+                if features is not None:
+                    features = features.repeat_interleave(series.size(0) // features.size(0), dim=0)
+                return module(series, features)
+            return module(series)
+
+        def output(module: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+            values = module(tokens if self.embedding_type == "invert" else tokens.mean(dim=1))
+            return values.reshape(-1, self.horizon)
+
         if self.backbone_type == "linear":
-            return self.model(series)
+            if self.embedding_type == "calendar":
+                return self.model[1:](embed(self.model[0]))
+            return self.model(series).reshape(-1, self.horizon)
 
         if self.backbone_type in {"dlinear", "tcn", "nbeats", "timesnet"}:
             return self.model(series)
@@ -1271,36 +1411,37 @@ class RecipeModel(nn.Module):
 
         if self.backbone_type == "mlp":
             modules = self.model
-            tokens = modules["embedding"](series)
+            tokens = embed(modules["embedding"])
             tokens = modules["input_proj"](tokens)
             tokens = modules["blocks"](tokens)
-            pooled = tokens.mean(dim=1)
-            return modules["head"](pooled)
+            return output(modules["head"], tokens)
 
         if self.backbone_type == "rnn":
             modules = self.model
-            tokens = modules["embedding"](series)
+            tokens = embed(modules["embedding"])
             encoded, _ = modules["rnn"](tokens)
-            return modules["head"](encoded[:, -1, :])
+            return modules["head"](encoded if self.embedding_type == "invert" else encoded[:, -1, :]).reshape(-1, self.horizon)
 
         if self.backbone_type == "ssm":
             modules = self.model
-            tokens = modules["input_proj"](modules["embedding"](series))
+            tokens = modules["input_proj"](embed(modules["embedding"]))
             tokens = modules["blocks"](tokens)
-            return modules["head"](tokens.mean(dim=1))
+            return output(modules["head"], tokens)
 
         if self.backbone_type == "mixer":
             modules = self.model
-            tokens = modules["input_proj"](modules["embedding"](series))
+            tokens = modules["input_proj"](embed(modules["embedding"]))
             tokens = modules["blocks"](tokens)
-            return modules["head"](tokens.mean(dim=1))
+            return output(modules["head"], tokens)
 
         modules = self.model
-        tokens = modules["embedding"](series)
-        position = modules["position"]["weight"][:, : tokens.size(1), :]
-        encoded = modules["encoder"](tokens + position)
-        pooled = encoded.mean(dim=1)
-        return modules["head"](pooled)
+        tokens = embed(modules["embedding"])
+        if isinstance(modules["position"], nn.Identity):
+            encoded = modules["encoder"](tokens)
+        else:
+            position = modules["position"]["weight"][:, : tokens.size(1), :]
+            encoded = modules["encoder"](tokens + position)
+        return output(modules["head"], encoded)
 
     def forward_quantiles(
         self,
@@ -1309,15 +1450,21 @@ class RecipeModel(nn.Module):
         target_history: torch.Tensor | None = None,
         exogenous_past: torch.Tensor | None = None,
         exogenous_future: torch.Tensor | None = None,
+        calendar_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if isinstance(self.prediction_head, GaussianPointHead):
+            mean, scale = self.forward_distribution(x, target_history=target_history, exogenous_past=exogenous_past, exogenous_future=exogenous_future, calendar_features=calendar_features)
+            levels = mean.new_tensor(self.prediction_head.quantiles)
+            z = torch.distributions.Normal(0.0, 1.0).icdf(levels)
+            return mean.unsqueeze(-1) + scale.unsqueeze(-1) * z
         x = self._merge_history(
             x,
             target_history=target_history,
             exogenous_past=exogenous_past,
             exogenous_future=exogenous_future,
         )
-        flat, batch_size, channels, last_value, contexts = self._prepare_flat_series(x)
-        base_pred = self._forward_core(flat)
+        flat, batch_size, channels, normalization, contexts = self._prepare_flat_series(x)
+        base_pred = self._forward_core(flat, calendar_features)
         if hasattr(self.prediction_head, "forward_quantiles"):
             quantiles = self.prediction_head.forward_quantiles(base_pred)
         else:
@@ -1326,7 +1473,7 @@ class RecipeModel(nn.Module):
             quantiles,
             batch_size=batch_size,
             channels=channels,
-            last_value=last_value,
+            normalization=normalization,
             contexts=contexts,
         ))
 
@@ -1337,6 +1484,7 @@ class RecipeModel(nn.Module):
         target_history: torch.Tensor | None = None,
         exogenous_past: torch.Tensor | None = None,
         exogenous_future: torch.Tensor | None = None,
+        calendar_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self._merge_history(
             x,
@@ -1344,16 +1492,38 @@ class RecipeModel(nn.Module):
             exogenous_past=exogenous_past,
             exogenous_future=exogenous_future,
         )
-        flat, batch_size, channels, last_value, contexts = self._prepare_flat_series(x)
-        pred = self._forward_core(flat)
+        flat, batch_size, channels, normalization, contexts = self._prepare_flat_series(x)
+        pred = self._forward_core(flat, calendar_features)
         pred = self.prediction_head(pred)
         return self._slice_output_channels(self._restore_point_forecast(
             pred,
             batch_size=batch_size,
             channels=channels,
-            last_value=last_value,
+            normalization=normalization,
             contexts=contexts,
         ))
+
+    def forward_distribution(self, x: torch.Tensor | None = None, *, calendar_features: torch.Tensor | None = None, **inputs) -> tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(self.prediction_head, GaussianPointHead):
+            raise ValueError("forward_distribution requires a Gaussian head")
+        if not isinstance(self.output_mixer, nn.Identity):
+            raise ValueError("Gaussian output requires an identity output fusion; use input fusion")
+        x = self._merge_history(x, **inputs)
+        flat, batch, channels, normalization, contexts = self._prepare_flat_series(x)
+        mean, scale = self.prediction_head.forward_distribution(self._forward_core(flat, calendar_features))
+        location, normalization_scale = normalization
+        mean = mean.reshape(batch, channels, self.horizon).permute(0, 2, 1) * normalization_scale + location
+        variance = scale.reshape(batch, channels, self.horizon).permute(0, 2, 1).square() * normalization_scale.square()
+        for module, (_, context) in zip(reversed(self.preprocessing), reversed(contexts)):
+            if isinstance(module, InstanceNormAction):
+                factor = context[1]
+                if module.affine:
+                    factor = factor / module.scale.clamp_min(module.eps)
+                variance = variance * factor.square()
+            elif isinstance(module, SeasonalDifferencingAction):
+                raise ValueError("Gaussian inverse seasonal differencing requires a joint covariance model")
+            mean = module.inverse_transform(mean, context)
+        return self._slice_output_channels(mean), self._slice_output_channels(variance.clamp_min(1e-12).sqrt())
 
 
 def _extract_recipe(model_config: dict[str, Any]) -> dict[str, Any]:

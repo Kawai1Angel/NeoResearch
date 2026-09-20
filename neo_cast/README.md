@@ -2,7 +2,7 @@
 
 > NeoResearch-TSF: Building a Model Factory for Time Series Forecasting via Autonomous Research Agents
 
-`neo-cast` is the current MVP runtime for NeoResearch-TSF. It turns a prepared time-series forecasting task into a repeatable model-design loop: propose a small model candidate, validate it, train it, keep or discard it by validation MSE, export an artifact, and run a final reference-test report.
+`neo-cast` is the current MVP runtime for NeoResearch-TSF. It turns a prepared time-series forecasting task into a repeatable model-design loop: propose a small model candidate, validate it with time-ordered cross-validation, train the final checkpoint, export an artifact, and run a final reference-test report.
 
 The default task is **ETTh1 multivariate forecasting**, but dataset loading now goes through a standard `dataset.v1` contract for numeric multivariate CSVs. The system is still intentionally narrow: fixed validation metric, bounded recipe action space, contiguous split protocol, and a project-local CLI workflow.
 
@@ -38,7 +38,7 @@ The new raw-sequence backbones (`dlinear`, `tcn`, `nbeats`, `timesnet`) currentl
 
 Legacy `recipe_schema_v1` is still accepted as the executable factory format. New design proposals should prefer `model_recipe.v1`.
 
-The main optimization signal is `val_avg_mse`. `ref_test` is reserved for final reporting and is not used as the normal search signal.
+The main optimization signal is `cv_avg_mse`, computed by four expanding-window folds over the original train+val visible range. `cv_std_mse` reports temporal stability, while `val_avg_mse` remains the final checkpoint's original validation-split diagnostic. `ref_test` is reserved for final reporting and never participates in folds or candidate selection.
 
 For details on design modes, model-family constraints, and whether a candidate runs for minutes or epochs, see [NEO_CAST_MODES.md](./NEO_CAST_MODES.md).
 

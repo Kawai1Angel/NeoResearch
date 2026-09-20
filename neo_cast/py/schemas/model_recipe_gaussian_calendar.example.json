@@ -1,0 +1,14 @@
+{
+  "schema_version": "model_recipe.v1",
+  "model_name": "CalendarGaussianForecaster",
+  "hypothesis": "Real UTC calendar features and a Gaussian likelihood model time-dependent mean and uncertainty.",
+  "input": {"history_window": 96, "prediction_horizon": 24, "covariates": false},
+  "architecture": {
+    "backbone": "transformer", "embedding": "calendar", "attention": "lightweight",
+    "d_model": 32, "heads": 4, "layers": 2, "dropout": 0.1,
+    "decomposition": true, "decomposition_kernel": 24,
+    "channel_fusion": "independent", "output_distribution": "gaussian"
+  },
+  "training": {"loss": "gaussian_nll", "optimizer": "adamw", "learning_rate": 0.001, "batch_size": 32, "max_epochs": 10, "time_budget_s": 600},
+  "constraints": {"max_params": "5M", "latency_sensitive": false, "max_latency_ms": 100}
+}

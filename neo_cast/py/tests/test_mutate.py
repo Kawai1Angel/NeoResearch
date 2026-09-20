@@ -55,7 +55,7 @@ class MutateRecipeTest(unittest.TestCase):
         }
 
     def test_patch_recipe_mutates_to_multiscale_and_shared(self) -> None:
-        mutated = mutate_recipe(base_recipe(), {"val_avg_mse": 1.2})
+        mutated = mutate_recipe(base_recipe(), {"cv_avg_mse": 1.2})
 
         self.assertEqual(mutated["embedding"]["type"], "multiscale_patch")
         self.assertEqual(mutated["fusion"]["channel_mode"], "shared")
@@ -71,7 +71,7 @@ class MutateRecipeTest(unittest.TestCase):
             },
             channel_mode="independent",
         )
-        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.0})
+        mutated = mutate_recipe(recipe, {"cv_avg_mse": 1.0})
 
         self.assertEqual(mutated["embedding"]["type"], "multiscale_patch")
         self.assertEqual(mutated["fusion"]["channel_mode"], "shared")
@@ -97,7 +97,7 @@ class MutateRecipeTest(unittest.TestCase):
         )
         before_architecture = self.architecture_signature(recipe)
 
-        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.09177}, index=1)
+        mutated = mutate_recipe(recipe, {"cv_avg_mse": 1.09177}, index=1)
 
         self.assertNotEqual(self.architecture_signature(mutated), before_architecture)
         self.assertNotEqual(mutated["backbone"]["type"], "linear")
@@ -114,7 +114,7 @@ class MutateRecipeTest(unittest.TestCase):
             channel_mode="shared",
         )
 
-        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.09177}, index=1)
+        mutated = mutate_recipe(recipe, {"cv_avg_mse": 1.09177}, index=1)
 
         self.assertEqual(mutated["embedding"], {"type": "none"})
         self.assertNotEqual(mutated["backbone"]["type"], "linear")
@@ -122,7 +122,7 @@ class MutateRecipeTest(unittest.TestCase):
         self.assert_valid_recipe(mutated)
 
     def test_policy_from_state_uses_relative_thresholds(self) -> None:
-        policy = make_policy_from_state({"best_val_avg_mse": 1.09177})
+        policy = make_policy_from_state({"best_cv_avg_mse": 1.09177})
 
         self.assertEqual(policy.baseline_val_mse, 1.09177)
         self.assertAlmostEqual(policy.baseline_val_mse * policy.poor_rel_threshold, 1.1463585)
@@ -135,9 +135,9 @@ class MutateRecipeTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "runner_state.json"
-            state_path.write_text('{"best_val_avg_mse": 1.09177}\n', encoding="utf-8")
+            state_path.write_text('{"best_cv_avg_mse": 1.09177}\n', encoding="utf-8")
 
-            mutated = mutate_recipe(recipe, {"val_avg_mse": 1.09177}, index=1, state_path=state_path)
+            mutated = mutate_recipe(recipe, {"cv_avg_mse": 1.09177}, index=1, state_path=state_path)
 
         self.assertNotEqual(mutated["backbone"]["type"], "linear")
         self.assert_valid_recipe(mutated)
@@ -153,9 +153,9 @@ class MutateRecipeTest(unittest.TestCase):
             channel_mode="shared",
         )
         recipe["preprocessing"] = {"actions": [{"type": "instance_norm", "affine": False, "eps": 1e-5}]}
-        policy = make_policy_from_state({"best_val_avg_mse": 1.0})
+        policy = make_policy_from_state({"best_cv_avg_mse": 1.0})
 
-        mutated = mutate_recipe(recipe, {"val_avg_mse": 1.08}, index=2, policy=policy)
+        mutated = mutate_recipe(recipe, {"cv_avg_mse": 1.08}, index=2, policy=policy)
 
         self.assertLess(mutated["backbone"]["d_model"], 128)
         self.assertLess(mutated["backbone"]["n_layers"], 3)
@@ -168,7 +168,7 @@ class MutateRecipeTest(unittest.TestCase):
             metrics_path = tmp_path / "metrics.json"
             output_path = tmp_path / "mutated.json"
             recipe_path.write_text(f"{json.dumps(base_recipe())}\n", encoding="utf-8")
-            metrics_path.write_text('{"val_avg_mse": 1.2}\n', encoding="utf-8")
+            metrics_path.write_text('{"cv_avg_mse": 1.2}\n', encoding="utf-8")
 
             result = subprocess.run(
                 [

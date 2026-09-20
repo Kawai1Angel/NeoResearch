@@ -1,3 +1,4 @@
+import { digest } from "../../src/research/execution-contract"
 import { describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises"
 import { tmpdir as osTmpdir } from "os"
@@ -145,7 +146,9 @@ describe("research runtime skeleton", () => {
     expect(await artifacts.put({ uri: "/tmp/run_001", kind: "runner_artifact", metadata: {} })).toEqual({
       uri: "file:///tmp/run_001",
     })
-    await expect(metrics.recordRunMetrics({ runID: "rrun_001", metrics: { val_avg_mse: 0.1 } })).resolves.toBeUndefined()
+    await expect(
+      metrics.recordRunMetrics({ runID: "rrun_001", metrics: { val_avg_mse: 0.1 } }),
+    ).resolves.toBeUndefined()
   })
 
   test("file queue persists jobs, leases, retries, and completions", async () => {
@@ -219,7 +222,9 @@ describe("research runtime skeleton", () => {
         seenAt: 124,
       })
 
-      const artifactRecord = JSON.parse((await readFile(path.join(root, "artifacts", "artifacts.jsonl"), "utf8")).trim())
+      const artifactRecord = JSON.parse(
+        (await readFile(path.join(root, "artifacts", "artifacts.jsonl"), "utf8")).trim(),
+      )
       expect(artifactRecord).toMatchObject({
         uri: "file:///tmp/neo-cast/artifacts/run_001",
         kind: "runner_artifact",
@@ -234,7 +239,9 @@ describe("research runtime skeleton", () => {
         recordedAt: 123,
       })
 
-      const heartbeatRecord = JSON.parse((await readFile(path.join(root, "metrics", "worker-heartbeats.jsonl"), "utf8")).trim())
+      const heartbeatRecord = JSON.parse(
+        (await readFile(path.join(root, "metrics", "worker-heartbeats.jsonl"), "utf8")).trim(),
+      )
       expect(heartbeatRecord).toMatchObject({
         workerID: "worker-a",
         jobID: "job-a",
@@ -353,10 +360,33 @@ describe("research runtime skeleton", () => {
     const root = await mkdtemp(path.join(osTmpdir(), "opencode-runtime-subprocess-"))
     try {
       await mkdir(path.join(root, "py"), { recursive: true })
+      const contract = {
+        schema_version: "research_execution_contract.v1",
+        task_id: "rtsk_subprocess",
+        candidate_id: "candidate_a",
+        hypothesis_id: "H1",
+        candidate_spec_sha256: digest({ recipe_id: "candidate_a" }),
+        expected: { backbone: "linear" },
+      }
+      const manifest = {
+        event: "executed_model_manifest",
+        candidate_id: contract.candidate_id,
+        candidate_spec_sha256: contract.candidate_spec_sha256,
+        contract_digest: digest(contract),
+        actual: contract.expected,
+      }
+      const verified = {
+        event: "execution_contract_verified",
+        status: "verified",
+        candidate_id: contract.candidate_id,
+        candidate_spec_sha256: contract.candidate_spec_sha256,
+        contract_digest: digest(contract),
+      }
       await writeFile(
         path.join(root, "py", "validate.py"),
         `#!/usr/bin/env bash
 set -euo pipefail
+printf '%s\\n' '${JSON.stringify(manifest)}' '${JSON.stringify(verified)}'
 test -f .neo-cast/current_candidate.json
 mkdir -p .neo-cast/artifacts/run_subprocess
 printf '{"event":"candidate_resolved"}\\n'
@@ -372,8 +402,16 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
         stage: "smoke",
         approvalRequired: false,
         validation: { ok: true, issues: [] },
-        writes: [{ path: ".neo-cast/current_candidate.json", content: { recipe_id: "candidate_a" } }],
-        command: { executable: "bash", args: ["py/validate.py"], cwd: root },
+        writes: [
+          { path: ".neo-cast/current_candidate.json", content: { recipe_id: "candidate_a" } },
+          { path: "contract.json", content: contract },
+        ],
+        command: {
+          executable: "bash",
+          args: ["py/validate.py"],
+          cwd: root,
+          env: { NEO_CAST_EXECUTION_CONTRACT: path.join(root, "contract.json") },
+        },
         expectedEvents: ["smoke_eval_done"],
         expectedMetrics: ["val_avg_mse"],
         expectedArtifacts: ["runner_artifact"],
@@ -387,6 +425,20 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
 
       const result = await executeSubprocessResearchJob(job)
 
+      const bypass = await executeSubprocessResearchJob(
+        researchJobFromRunPlan({
+          taskID: "rtsk_subprocess",
+          runID: "rrun_bypass",
+          now: 10,
+          runPlan: { ...runPlan, stage: "full", command: { executable: "/no-runner-must-start", args: [] } },
+        }),
+      )
+      expect(bypass.status).toBe("invalid")
+      expect(bypass.metrics).toEqual({})
+      expect(nextRecoveryAction({ status: "invalid", attempts: 1 })).toEqual({
+        action: "discard",
+        reason: "terminal_status",
+      })
       expect(result).toMatchObject({
         status: "succeeded",
         metrics: { val_avg_mse: 0.123, val_avg_mae: 0.456 },
@@ -397,7 +449,9 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
         metadata: { runnerID: "neo-cast-python", stage: "smoke" },
       })
       expect(result.artifacts?.[0]?.uri).toStartWith("file://")
-      const candidatePayload = JSON.parse(await readFile(path.join(root, ".neo-cast", "current_candidate.json"), "utf8"))
+      const candidatePayload = JSON.parse(
+        await readFile(path.join(root, ".neo-cast", "current_candidate.json"), "utf8"),
+      )
       expect(candidatePayload.recipe_id).toBe("candidate_a")
     } finally {
       await rm(root, { recursive: true, force: true })

@@ -91,9 +91,9 @@ describe("Neo-Cast runner client", () => {
     })
     expect(smoke).toEqual({
       executable: "python3",
-      cwd: runnerRoot,
+      cwd: process.cwd(),
       args: [
-        "py/validate.py",
+        path.join(runnerRoot, "py/validate.py"),
         "smoke",
         "--candidate-path",
         ".neo-cast/current_candidate.json",
@@ -102,12 +102,20 @@ describe("Neo-Cast runner client", () => {
         "--artifacts-dir",
         ".neo-cast/artifacts",
       ],
+      env: {
+        NEO_CAST_PROJECT_ROOT: process.cwd(),
+        NEO_CAST_PACKAGE_ROOT: runnerRoot,
+      },
     })
     expect(run).toEqual({
       executable: "python3",
-      cwd: runnerRoot,
-      args: ["py/runner.py", "run", "--description", "full training run"],
+      cwd: process.cwd(),
+      args: [path.join(runnerRoot, "py/runner.py"), "run", "--description", "full training run"],
       timeoutMs: 900000,
+      env: {
+        NEO_CAST_PROJECT_ROOT: process.cwd(),
+        NEO_CAST_PACKAGE_ROOT: runnerRoot,
+      },
     })
   })
 
@@ -139,7 +147,37 @@ describe("Neo-Cast runner client", () => {
       explicitRoot: runnerRoot,
     })
 
-    expect(command.args).toEqual(["py/runner.py", "ref-test", "--run-id", "20260629-063757-hbrp"])
+    expect(command.args).toEqual([
+      path.join(runnerRoot, "py/runner.py"),
+      "ref-test",
+      "--run-id",
+      "20260629-063757-hbrp",
+    ])
+  })
+
+  test("keeps explicit shared runner code separate from an environment-selected project state root", async () => {
+    const runnerRoot = await createRunnerRoot()
+    const projectRoot = await mkdtemp(path.join(tmpdir(), "neo-cast-project-state-"))
+    const previousProjectRoot = process.env.NEO_CAST_PROJECT_ROOT
+    try {
+      process.env.NEO_CAST_PROJECT_ROOT = projectRoot
+      const command = createNeoCastRunnerCommand({
+        stage: "smoke",
+        runtime,
+        description: "isolated smoke run",
+        explicitRoot: runnerRoot,
+      })
+
+      expect(command.cwd).toBe(projectRoot)
+      expect(command.args[0]).toBe(path.join(runnerRoot, "py", "validate.py"))
+      expect(command.env).toEqual({
+        NEO_CAST_PROJECT_ROOT: projectRoot,
+        NEO_CAST_PACKAGE_ROOT: runnerRoot,
+      })
+    } finally {
+      if (previousProjectRoot === undefined) delete process.env.NEO_CAST_PROJECT_ROOT
+      else process.env.NEO_CAST_PROJECT_ROOT = previousProjectRoot
+    }
   })
 
   test("discovers a package-bundled runner and keeps project state in the caller cwd", async () => {

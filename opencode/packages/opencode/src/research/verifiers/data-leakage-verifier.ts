@@ -81,14 +81,13 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
   const protocol = evaluationProtocol(ctx.task)
   const maxHorizon = predictionLengths.length > 0 ? Math.max(...predictionLengths) : undefined
 
-  // Check 1: Evaluation protocol must be fixed_split.
-  // Rolling-window or other protocols shift split boundaries per-run, risking leakage.
-  if (protocol !== undefined && protocol !== "fixed_split") {
+  // Both fixed split and ordered expanding-window CV are leak-safe protocols.
+  if (protocol !== undefined && protocol !== "fixed_split" && protocol !== "expanding_window_ratio") {
     return {
       name,
       accepted: false,
-      reason: `Evaluation protocol '${protocol}' is not 'fixed_split'. Non-fixed protocols may shift split boundaries and leak future data into training.`,
-      evidence: { protocol, expected: "fixed_split" },
+      reason: `Evaluation protocol '${protocol}' is not a supported leak-safe time-ordered protocol.`,
+      evidence: { protocol, expected: ["fixed_split", "expanding_window_ratio"] },
     }
   }
 

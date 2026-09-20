@@ -125,6 +125,9 @@
     "val_metrics": {
       "$ref": "#/$defs/valMetricsBlock"
     },
+    "cv_metrics": {
+      "$ref": "#/$defs/cvMetricsBlock"
+    },
     "ref_test_metrics": {
       "$ref": "#/$defs/refTestMetricsBlock"
     },
@@ -200,6 +203,10 @@
             "type": "array",
             "items": { "type": "integer", "minimum": 0 }
           }
+        },
+        "latency_ms_by_horizon": {
+          "type": "object",
+          "additionalProperties": {"type": "number", "minimum": 0}
         }
       }
     },
@@ -257,6 +264,54 @@
     }
   },
   "$defs": {
+    "cvMetricsBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^cv_h[0-9]+_[a-z0-9_]+$": { "type": "number" },
+        "^cv_avg_[a-z0-9_]+$": { "type": "number" }
+      },
+      "required": ["schema_version", "protocol", "cv_avg_mse", "cv_std_mse", "folds"],
+      "properties": {
+        "schema_version": { "const": "cv_metrics.v1" },
+        "protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy", "protocol_id", "num_folds", "initial_train_ratio", "visible_rows", "input_len", "horizons"],
+          "properties": {
+            "strategy": { "const": "expanding_window_ratio" },
+            "protocol_id": { "type": "string", "minLength": 1 },
+            "num_folds": { "type": "integer", "minimum": 2 },
+            "initial_train_ratio": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+            "fold_val_ratio": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+            "visible_rows": { "type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "minItems": 2, "maxItems": 2 },
+            "input_len": { "type": "integer", "minimum": 1 },
+            "horizons": { "type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1} },
+            "min_train_windows": { "type": "integer", "minimum": 1 },
+            "min_eval_windows": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "cv_avg_mse": { "type": "number" },
+        "cv_std_mse": { "type": "number", "minimum": 0 },
+        "cv_avg_mae": { "type": "number" },
+        "folds": { "type": "array", "minItems": 2, "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^val_h[0-9]+_[a-z0-9_]+$": { "type": "number" },
+            "^val_avg_[a-z0-9_]+$": { "type": "number" }
+          },
+          "required": ["fold_index", "train_rows", "val_rows", "val_avg_mse"],
+          "properties": {
+            "fold_index": { "type": "integer", "minimum": 0 },
+            "train_rows": { "type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "minItems": 2, "maxItems": 2 },
+            "val_rows": { "type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "minItems": 2, "maxItems": 2 },
+            "val_avg_mse": { "type": "number" },
+            "val_avg_mae": { "type": "number" }
+          }
+        } }
+      }
+    },
     "valMetricsBlock": {
       "type": "object",
       "additionalProperties": {

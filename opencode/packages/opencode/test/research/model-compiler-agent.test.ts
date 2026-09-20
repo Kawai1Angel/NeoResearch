@@ -15,7 +15,15 @@ function smokeRun(input: {
     stage: "smoke",
     status: input.status,
     metrics: input.metrics ?? {},
-    resourceUsage: input.resourceUsage ?? {},
+    resourceUsage: {
+      executionContract: {
+        status: "verified",
+        contractDigest: "digest",
+        manifest: { contract_digest: "digest", candidate_id: "rcnd_compile" },
+        verified: { contract_digest: "digest", candidate_id: "rcnd_compile" },
+      },
+      ...input.resourceUsage,
+    },
     artifactRefs: [],
     error: input.error,
     time: { created: 1, updated: 1 },
@@ -40,14 +48,14 @@ test("buildModelCompilerResult passes succeeded smoke runs with bounded finite m
   expect(result.compileReportMarkdown).toContain("PASSED")
 })
 
-test("buildModelCompilerResult allows metricless successful smoke runs for later metric analysis", () => {
+test("buildModelCompilerResult fails metricless successful smoke runs", () => {
   const result = buildModelCompilerResult({
     taskID: "rtsk_compile" as never,
     candidateID: "rcnd_compile" as never,
     smokeRun: smokeRun({ status: "succeeded" }),
   })
 
-  expect(result.status).toBe("passed")
+  expect(result.status).toBe("failed")
   expect(result.smokeMetric).toBeUndefined()
   expect(result.compileReportMarkdown).toContain("Metric: n/a")
 })
@@ -102,4 +110,43 @@ test("buildModelCompilerResult recognizes resource usage timeout flags", () => {
 
   expect(result.status).toBe("timeout")
   expect(result.compileReportMarkdown).toContain("TIMEOUT")
+})
+
+test("compiler fails closed for a missing proof even when smoke metrics succeed", () => {
+  const result = buildModelCompilerResult({
+    taskID: "rtsk_compile" as never,
+    candidateID: "rcnd_compile" as never,
+    smokeRun: smokeRun({
+      status: "succeeded",
+      metrics: { val_avg_mse: 0.1 },
+      resourceUsage: { executionContract: undefined },
+    }),
+  })
+  expect(result.status).toBe("contract_invalid")
+})
+
+test("compiler rejects an invalid run and a stale manifest digest", () => {
+  const invalid = buildModelCompilerResult({
+    taskID: "rtsk_compile" as never,
+    candidateID: "rcnd_compile" as never,
+    smokeRun: smokeRun({ status: "invalid" }),
+  })
+  expect(invalid.status).toBe("contract_invalid")
+  const stale = buildModelCompilerResult({
+    taskID: "rtsk_compile" as never,
+    candidateID: "rcnd_compile" as never,
+    smokeRun: smokeRun({
+      status: "succeeded",
+      metrics: { val_avg_mse: 0.1 },
+      resourceUsage: {
+        executionContract: {
+          status: "verified",
+          contractDigest: "current",
+          manifest: { contract_digest: "old" },
+          verified: { contract_digest: "current" },
+        },
+      },
+    }),
+  })
+  expect(stale.status).toBe("contract_invalid")
 })

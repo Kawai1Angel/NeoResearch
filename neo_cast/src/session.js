@@ -31,7 +31,7 @@ function getLatestSessionRow(projectRoot = process.cwd()) {
 
 // Champion ground truth lives in the TS Research Service (research_champion table).
 // In the legacy `neo-cast design` CLI we no longer rely on Python writing `is_best=1`;
-// instead we derive the session-local best by scanning val_avg_mse over completed rows.
+// instead we derive the session-local best by scanning cv_avg_mse over completed rows.
 // Tie-break is "first occurrence wins" so the originally improving run keeps the BEST tag.
 function getBestSessionRow(projectRoot = process.cwd()) {
   const state = loadRunnerState(projectRoot);
@@ -45,7 +45,7 @@ function getBestSessionRow(projectRoot = process.cwd()) {
   for (const row of rows) {
     const status = row.status;
     if (status === "crash" || status === "smoke_fail" || status === "invalid") continue;
-    const mse = parseFloat(row.val_avg_mse);
+    const mse = parseFloat(row.cv_avg_mse);
     if (!Number.isFinite(mse)) continue;
     if (mse < bestMse) {
       bestMse = mse;

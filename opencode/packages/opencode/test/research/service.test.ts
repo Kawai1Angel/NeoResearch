@@ -156,12 +156,28 @@ function createTSFTask(
   )
 }
 
+// Mock runners explicitly implement the execution protocol before emitting training metrics.
+const fakeContractEvents = `
+${process.execPath} -e '
+const fs = require("fs"), crypto = require("crypto")
+const filename = process.env.NEO_CAST_EXECUTION_CONTRACT
+if (!filename || !fs.existsSync(filename)) process.exit(0)
+const c = JSON.parse(fs.readFileSync(filename))
+const canonical = v => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v)
+const d = crypto.createHash("sha256").update(canonical(c)).digest("hex")
+const manifest = {event:"executed_model_manifest", candidate_id:c.candidate_id, candidate_spec_sha256:c.candidate_spec_sha256, contract_digest:d, actual:c.expected}
+console.log(JSON.stringify(manifest))
+console.log(JSON.stringify({event:"execution_contract_verified", status:"verified", candidate_id:c.candidate_id, candidate_spec_sha256:c.candidate_spec_sha256, contract_digest:d, manifest}))
+'
+`
+
 async function writeFakeNeoCastRunner(root: string) {
   await mkdir(path.join(root, "py"), { recursive: true })
   await writeFile(
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_fake
 cat > .neo-cast/artifacts/run_fake/val_metrics.json <<'JSON'
 {"val_avg_mse":0.123,"val_avg_mae":0.456}
@@ -190,12 +206,17 @@ async function writeTrainingFakeNeoCastRunner(root: string) {
     path.join(root, "py", "runner.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_train
 cat > .neo-cast/artifacts/run_train/val_metrics.json <<'JSON'
 {"val_avg_mse":0.101,"val_avg_mae":0.303}
 JSON
+cat > .neo-cast/artifacts/run_train/cv_metrics.json <<'JSON'
+{"cv_avg_mse":0.202,"cv_std_mse":0.012,"schema_version":"cv_metrics.v1"}
+JSON
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"eval_done","val_avg_mse":0.101,"val_avg_mae":0.303}\\n'
+printf '{"event":"cv_eval_done","cv_avg_mse":0.202,"cv_std_mse":0.012,"val_avg_mse":0.101,"val_avg_mae":0.303}\\n'
 printf '{"event":"artifact_ready","run_id":"train","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_train"
 printf '{"event":"done","status":"success"}\\n'
 `,
@@ -209,6 +230,7 @@ async function writeStreamingFakeNeoCastRunner(root: string) {
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_streaming
 cat > .neo-cast/artifacts/run_streaming/val_metrics.json <<'JSON'
 {"val_avg_mse":0.321,"val_avg_mae":0.654}
@@ -230,6 +252,7 @@ async function writeDiscardFakeNeoCastRunner(root: string) {
     path.join(root, "py", "runner.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 if [[ "\${1:-}" == "init" ]]; then
   mkdir -p .neo-cast
   echo '{"session_id":"test","candidate_counter":0,"crash_streak":0,"no_improve_streak":0,"keep_count":0}' > .neo-cast/runner_state.json
@@ -241,8 +264,31 @@ cat > .neo-cast/artifacts/run_discard/val_metrics.json <<'JSON'
 JSON
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"eval_done","val_avg_mse":0.999,"val_avg_mae":0.888}\\n'
+printf '{"event":"cv_eval_done","cv_avg_mse":0.777,"cv_std_mse":0.055,"val_avg_mse":0.999,"val_avg_mae":0.888}\\n'
 printf '{"event":"artifact_ready","run_id":"discard","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_discard"
 printf '{"event":"done","status":"success"}\\n'
+exit 1
+`,
+    "utf8",
+  )
+}
+
+async function writeCrashAfterSuccessFakeNeoCastRunner(root: string) {
+  await mkdir(path.join(root, "py"), { recursive: true })
+  await writeFile(
+    path.join(root, "py", "runner.py"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+${fakeContractEvents}
+if [[ "\${1:-}" == "init" ]]; then
+  mkdir -p .neo-cast
+  echo '{"session_id":"test","candidate_counter":0,"crash_streak":0,"no_improve_streak":0,"keep_count":0}' > .neo-cast/runner_state.json
+  exit 0
+fi
+printf '{"event":"candidate_resolved"}\\n'
+printf '{"event":"done","status":"success"}\\n'
+printf '{"event":"stage_start","stage":"full"}\\n'
+printf '{"event":"done","status":"crash"}\\n'
 exit 1
 `,
     "utf8",
@@ -255,6 +301,7 @@ async function writeFailingNeoCastRunner(root: string) {
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"runner_error","error_kind":"runner_exit"}\\n'
 printf 'runner failed before artifact creation\\n' >&2
@@ -270,6 +317,7 @@ async function writeMetriclessNeoCastRunner(root: string) {
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_metricless
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"smoke_eval_done"}\\n'
@@ -286,6 +334,7 @@ async function writeNaNNeoCastRunner(root: string) {
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"epoch_end","horizon":24,"epoch":1,"val_loss":NaN}\\n'
 printf '{"event":"epoch_end","horizon":24,"epoch":2,"val_loss":NaN}\\n'
@@ -346,6 +395,7 @@ async function writeSeedAwareFakeNeoCastRunner(root: string) {
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 seed="$(grep -m1 '"seed"' .neo-cast/current_candidate.json | sed 's/[^0-9]//g')"
 mkdir -p .neo-cast/artifacts/run_seed_\${seed}
 printf '%s\\n' "$seed" >> .neo-cast/seed-log.txt
@@ -2872,8 +2922,37 @@ describe("Research service", () => {
 
         expect(executed.run.status).toBe("succeeded")
         expect(executed.run.resourceUsage.exitCode).toBe(1)
+        expect(executed.run.metrics.cv_avg_mse).toBe(0.777)
+        expect(executed.run.metrics.cv_std_mse).toBe(0.055)
         expect(executed.run.metrics.val_avg_mse).toBe(0.999)
         expect(executed.run.error).toBeUndefined()
+      },
+    })
+  })
+
+  test("uses the final runner done status when an earlier stage succeeded", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "crash-after-success-neo-cast")
+        await writeCrashAfterSuccessFakeNeoCastRunner(fakeNeoCastRoot)
+
+        const task = await createTSFTask("execute crash after success runner", {
+          bridgeOnly: true,
+          neoCastProjectRoot: fakeNeoCastRoot,
+          pythonExecutable: "bash",
+        })
+        const candidate = await createCandidate({ taskID: task.id })
+        const executed = await runResearch(
+          Research.Service.use((svc) =>
+            svc.executeRun({ taskID: task.id, candidateID: candidate.id, stage: "full" }),
+          ),
+        )
+
+        expect(executed.run.status).toBe("failed")
+        expect(executed.run.resourceUsage.exitCode).toBe(1)
       },
     })
   })

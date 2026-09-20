@@ -126,6 +126,8 @@ function registerExperimentLineage(projectRoot, row, options = {}) {
       model_family: row.model_family || null,
       status: row.status || null,
       is_best: row.status === "keep" ? "1" : "0",
+      cv_avg_mse: row.cv_avg_mse || null,
+      cv_std_mse: row.cv_std_mse || null,
       val_avg_mse: row.val_avg_mse || null,
     },
   });
@@ -177,10 +179,10 @@ function formatMinutes(timeBudgetMs) {
 function printAttemptResult(attempt, source, candidate, row) {
   const statusPrefix = `R${attempt}`;
   const status = row?.status ? String(row.status).toUpperCase() : "UNKNOWN";
-  const mse = row?.val_avg_mse || "NA";
+  const mse = row?.cv_avg_mse || "NA";
   console.log(`${statusPrefix}:SRC=${source}`);
   console.log(`${statusPrefix}:FAM=${describeCandidateFamily(candidate)}`);
-  console.log(`${statusPrefix}:VAL=${mse}`);
+  console.log(`${statusPrefix}:CV=${mse}`);
   console.log(`${statusPrefix}:DEC=${status}`);
   if (row?.no_improve_streak !== undefined && row?.no_improve_streak !== null) {
     console.log(`${statusPrefix}:NOIMP=${row.no_improve_streak}`);
@@ -231,7 +233,7 @@ async function proposeCandidate(requirementBundle, history, previousRow, resolve
 async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}) {
   const projectRoot = options.projectRoot || process.cwd();
   const timeBudgetMs = options.timeBudgetMs || null;
-  const maxNoImprove = Number(options.maxNoImprove || 5);
+  const maxNoImprove = Number(options.maxNoImprove || 25);
   const maxCandidates = options.maxCandidates ?? Infinity;
   const sessionStartMs = Date.now();
   let attempt = 0;

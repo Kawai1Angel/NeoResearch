@@ -218,13 +218,14 @@ function isHumanCheckpointRequired(err: unknown): boolean {
   const payload = parseBlockedErrorPayload(err)
   if (!payload) return false
   return (
-    payload.reason === "human_checkpoint_required" || payload.reason === "reflection_requested_human_review"
+    payload.reason === "human_checkpoint_required" || payload.reason === "reflection_requested_human_review" || payload.reason === "execution_contract_violation"
   )
 }
 
 function formatCheckpointMessage(err: unknown): string {
   const blocked = parseBlockedErrorPayload(err)
   if (!blocked) return "等待 checkpoint 确认"
+  if (blocked.reason === "execution_contract_violation") return "执行契约不一致，任务已暂停。查看 protocol checkpoint 和 blocker，修复后 /approve 重新验证原 candidate。"
   if (blocked.reason === "reflection_requested_human_review") return "Reflection Agent 建议人工介入 — /approve 确认后继续发布"
   return blocked.checkpointPhase ? `等待 ${blocked.checkpointPhase} checkpoint 确认` : "等待 checkpoint 确认"
 }
@@ -270,6 +271,9 @@ function parseErrorPayload(value: string): string | undefined {
       if (payload.name === "ResearchPipelineBlockedError" && isJsonRecord(data)) {
         const parts: string[] = [payload.name]
         if (typeof data.reason === "string") parts.push(data.reason)
+        if (typeof data.blockerArtifactID === "string") parts.push(`blocker=${data.blockerArtifactID}`)
+        if (typeof data.candidateID === "string") parts.push(`candidate=${data.candidateID}`)
+        if (typeof data.hypothesisID === "string") parts.push(`hypothesis=${data.hypothesisID}`)
         if (typeof data.checkpointPhase === "string") parts.push(`(${data.checkpointPhase})`)
         if (Array.isArray(data.missingFields) && data.missingFields.length > 0)
           parts.push(`[${data.missingFields.join(", ")}]`)
@@ -367,7 +371,7 @@ function socraticSlotLine(slot: ReturnType<typeof buildSocraticClarificationStat
 }
 
 function metricText(metrics: JsonRecord) {
-  for (const key of ["val_avg_mse", "test_avg_mse", "mse", "loss"]) {
+  for (const key of ["cv_avg_mse", "val_avg_mse", "test_avg_mse", "mse", "loss"]) {
     const value = metrics[key]
     if (typeof value === "number") return `${key} ${value.toPrecision(4)}`
   }
@@ -2106,7 +2110,8 @@ export function ResearchCockpit() {
           ? (meta.refTestMetrics as Record<string, unknown>)
           : undefined
       const newLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
-      const metricPart = championPrimaryMetric !== undefined ? ` / val_avg_mse=${championPrimaryMetric.toFixed(4)}` : ""
+      const primaryMetricName = typeof task?.objective.primaryMetric === "string" ? task.objective.primaryMetric : "cv_avg_mse"
+      const metricPart = championPrimaryMetric !== undefined ? ` / ${primaryMetricName}=${championPrimaryMetric.toFixed(4)}` : ""
       const utilityPart = championUtility !== undefined ? ` / utility=${championUtility.toFixed(3)}` : ""
       newLines.push({ id: ++streamEventID, taskID, text: `[Publish] 发布完成 / ${kind ?? "model_export_package"}${metricPart}${utilityPart}`, tone: "success" })
       if (championCandidateID) {
@@ -2183,8 +2188,12 @@ export function ResearchCockpit() {
         if (!runKey || !reportedRunIDs.has(runKey)) {
           if (runKey) reportedRunIDs.add(runKey)
           const metrics = run.metrics ?? {}
+          const cvAvgMse = typeof metrics.cv_avg_mse === "number" ? metrics.cv_avg_mse : undefined
+          const cvStdMse = typeof metrics.cv_std_mse === "number" ? metrics.cv_std_mse : undefined
           const valAvgMse = typeof metrics.val_avg_mse === "number" ? metrics.val_avg_mse : undefined
-          const mseStr = valAvgMse !== undefined ? ` / val_avg_mse=${valAvgMse.toFixed(4)}` : ""
+          const mseStr = cvAvgMse !== undefined
+            ? ` / cv_avg_mse=${cvAvgMse.toFixed(4)}${cvStdMse === undefined ? "" : ` / cv_std_mse=${cvStdMse.toFixed(4)}`}${valAvgMse === undefined ? "" : ` / val_avg_mse=${valAvgMse.toFixed(4)}`}`
+            : valAvgMse !== undefined ? ` / val_avg_mse=${valAvgMse.toFixed(4)}` : ""
           const wallClock = run.resourceUsage?.wallClockSec
           const timePart = typeof wallClock === "number" ? ` / ${wallClock.toFixed(1)}s` : ""
           appendDesignLLMLines([
@@ -2589,7 +2598,7 @@ export function ResearchCockpit() {
     await runAction(`create-${resolvedMode}`, async () => {
       const payload: CreateResearchTaskInput = buildDefaultTsfResearchTask(
         resolvedMode,
-        resolveResearchCockpitProjectRunnerRoot(sdk.directory ?? process.cwd()),
+        resolveResearchCockpitProjectRunnerRoot(process.env.NEO_CAST_ROOT ?? sdk.directory ?? process.cwd()),
         {
           ...defaults,
           ...(interactionMode === undefined ? {} : { interactionMode }),
@@ -3667,7 +3676,7 @@ export function ResearchCockpit() {
       const payload: CreateResearchTaskInput = buildDefaultTsfResearchTaskFromGoal(
         value,
         mode,
-        resolveResearchCockpitProjectRunnerRoot(sdk.directory ?? process.cwd()),
+        resolveResearchCockpitProjectRunnerRoot(process.env.NEO_CAST_ROOT ?? sdk.directory ?? process.cwd()),
         { interactionMode },
       )
       const metadata = payload.taskSpec.metadata

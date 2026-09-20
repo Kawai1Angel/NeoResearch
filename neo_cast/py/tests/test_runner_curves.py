@@ -15,6 +15,17 @@ import runner
 
 
 class RunnerTrainingCurvesTest(unittest.TestCase):
+    def test_cv_decision_ignores_better_standard_validation_metric(self) -> None:
+        state = runner.RunnerState(
+            session_id="session_test", best_run_id="old", best_val_avg_mse=0.9,
+            best_cv_avg_mse=0.4, best_cv_protocol_id="cv_v1", keep_count=1,
+            crash_streak=0, candidate_counter=1, initialized_at="2026-04-29T00:00:00Z",
+            session_started_at="2026-04-29T00:00:00Z",
+        )
+        improved, comparable = runner._cv_improved(state, 0.5, "cv_v1")
+        self.assertTrue(comparable)
+        self.assertFalse(improved)  # A candidate val_avg_mse of 0.1 must not affect this decision.
+
     def test_load_state_backfills_autonomous_fields_for_legacy_state(self) -> None:
         legacy = {
             "session_id": "session_legacy",
@@ -179,6 +190,9 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (artifact_dir / "training_summary.json").write_text('{"num_params_M":0.25}\n', encoding="utf-8")
+            (artifact_dir / "cv_metrics.json").write_text(
+                '{"cv_avg_mse":0.2,"cv_std_mse":0.01,"protocol":{"protocol_id":"cv_v1"}}\n', encoding="utf-8"
+            )
             # Make the resolved file newer than the candidate that smoke already rendered.
             current_mtime = 1_700_000_000
             resolved_mtime = current_mtime + 10
@@ -201,6 +215,8 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
                 session_started_at="2026-04-29T00:00:00Z",
             )
             train_records = [
+                {"event": "cv_eval_done", "cv_avg_mse": 0.2, "cv_std_mse": 0.01,
+                 "val_avg_mse": 0.111, "val_avg_mae": 0.222},
                 {"event": "eval_done", "val_avg_mse": 0.111, "val_avg_mae": 0.222},
                 {
                     "event": "artifact_ready",
@@ -293,6 +309,9 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (new_artifact_dir / "training_summary.json").write_text('{"num_params_M":0.25}\n', encoding="utf-8")
+            (new_artifact_dir / "cv_metrics.json").write_text(
+                '{"cv_avg_mse":0.9,"cv_std_mse":0.1,"protocol":{"protocol_id":"full_horizons_cv"}}\n', encoding="utf-8"
+            )
             state_dir.mkdir(parents=True, exist_ok=True)
             current_path = state_dir / "current_candidate.json"
             resolved_path = state_dir / "resolved_candidate.json"
@@ -314,6 +333,9 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
                 session_started_at="2026-04-29T00:00:00Z",
             )
             train_records = [
+                {"event": "cv_eval_done", "cv_avg_mse": 0.9, "cv_std_mse": 0.1,
+                 "val_avg_mse": 0.9, "val_h96_mse": 0.5, "val_h192_mse": 0.8,
+                 "val_h336_mse": 1.0, "val_h720_mse": 1.3},
                 {
                     "event": "eval_done",
                     "val_avg_mse": 0.9,
@@ -348,7 +370,7 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(rows[-1]["status"], "keep")
         self.assertEqual(saved_state.best_run_id, "new_full")
-        self.assertEqual(saved_state.best_val_avg_mse, 0.9)
+        self.assertEqual(saved_state.best_cv_avg_mse, 0.9)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ import {
   canRunResearchCockpitCandidate,
   findBestResearchCockpitMetric,
   formatResearchCockpitArtifactMetadata,
+  formatResearchCockpitCandidateArchitectureExpandedLines,
+  formatResearchCockpitCandidateRecipeLines,
   formatResearchCockpitExport,
   formatResearchCockpitFingerprint,
   formatResearchCockpitIteration,
@@ -664,7 +666,11 @@ describe("research cockpit data helpers", () => {
         },
         metadata: { interactionMode: "companion" },
       },
-      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      objective: {
+        primaryMetric: "cv_avg_mse",
+        secondaryMetrics: ["cv_std_mse", "val_avg_mse"],
+        direction: "minimize",
+      },
     })
     expect(autonomousTask).toMatchObject({
       title: "TSF Autonomous Research",
@@ -920,6 +926,56 @@ describe("research cockpit data helpers", () => {
     expect(status.reason).toBe("ready")
   })
 
+  test("checks prepared dataset state in an isolated project root while validating a shared runner root", async () => {
+    const runnerRoot = await createPreparedNeoCastRunnerRoot({
+      schema_version: "dataset.v1",
+      source_csv: "/data/shared-stale.csv",
+      task_id: "stale",
+      timestamp_col: "date",
+      feature_columns: ["value"],
+      input_len: 12,
+      horizons: [6],
+      splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
+      normalization: { type: "standard", fit_split: "train" },
+      missing: { strategy: "forward_fill", limit: null },
+      time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+    })
+    const projectRoot = await mkdtemp(path.join(tmpdir(), "neo-cast-project-dataset-"))
+    await mkdir(path.join(projectRoot, ".neo-cast"), { recursive: true })
+    await writeFile(
+      path.join(projectRoot, ".neo-cast", "dataset_spec.json"),
+      `${JSON.stringify({
+        schema_version: "dataset.v1",
+        source_csv: "/data/ETTh1.csv",
+        task_id: "etth1",
+        timestamp_col: "date",
+        feature_columns: ["OT"],
+        input_len: 96,
+        horizons: [24],
+        splits: { train: [0, 100], val: [100, 140], ref_test: [140, 180] },
+        normalization: { type: "standard", fit_split: "train" },
+        missing: { strategy: "forward_fill", limit: null },
+        time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
+      }, null, 2)}\n`,
+      "utf8",
+    )
+
+    const status = getResearchCockpitRunnerStatus(
+      task({
+        id: "isolated_dataset_state",
+        taskSpec: {
+          contextLength: 96,
+          predictionLengths: [24],
+          dataset: { path: "/data/ETTh1.csv", targetCols: ["OT"] },
+          runtime: { neoCastProjectRoot: runnerRoot },
+        },
+      }),
+      { validateRuntime: true, projectRoot },
+    )
+
+    expect(status.reason).toBe("ready")
+  })
+
   test("parses CSV task dialog input with forecasting options", () => {
     expect(parseTsfCsvTaskInput("/data/ETTh1.csv target=OT,HUFL horizon=24,48 context=192 preset=etth1 full")).toEqual({
       datasetPath: "/data/ETTh1.csv",
@@ -1119,6 +1175,30 @@ describe("research cockpit data helpers", () => {
 
     expect(researchCockpitCandidateTitle(item)).toBe("recipe_a")
     expect(researchCockpitCandidatePipeline(item)).toBe("normalize+rev_in / patch / tcn / concat / quantile / adamw")
+  })
+
+  test("displays every backbone type with all of its parameters", () => {
+    const backbones = [
+      ["linear", { type: "linear", shared: false, bias: true }, "linear(shared=false,bias)"],
+      ["mlp", { type: "mlp", depth: 3, hidden_dim: 256, activation: "gelu", dropout: 0.1 }, "mlp(depth=3,h=256,act=gelu,drop=0.1)"],
+      ["transformer", { type: "transformer", dModel: 128, nHeads: 4, nLayers: 3, dropout: 0.2, ffnMult: 4 }, "transformer(d=128,heads=4,layers=3,drop=0.2,ffn=4)"],
+      ["rnn", { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 }, "rnn(cell=gru,h=96,layers=2,drop=0.1)"],
+      ["dlinear", { type: "dlinear", kernelSize: 25, bias: false, individual: true }, "dlinear(k=25,bias=false,individual)"],
+      ["tcn", { type: "tcn", hidden_dim: 128, n_layers: 4, kernel_size: 5, activation: "relu", dropout: 0.15 }, "tcn(h=128,layers=4,k=5,act=relu,drop=0.15)"],
+      ["ssm", { type: "ssm", state_dim: 64, depth: 3, dropout: 0.05 }, "ssm(state=64,depth=3,drop=0.05)"],
+      ["mixer", { type: "mixer", hiddenDim: 192, depth: 4, temporalMixing: "conv", channelMixing: "identity", dropout: 0.2 }, "mixer(h=192,depth=4,tmix=conv,cmix=identity,drop=0.2)"],
+      ["nbeats", { type: "nbeats", hidden_dim: 256, n_blocks: 8, n_layers: 4, activation: "silu", dropout: 0.1 }, "nbeats(h=256,blocks=8,layers=4,act=silu,drop=0.1)"],
+      ["timesnet", { type: "timesnet", hiddenDim: 128, nLayers: 3, topK: 5, kernelSize: 7, dropout: 0.12 }, "timesnet(h=128,layers=3,topK=5,k=7,drop=0.12)"],
+    ] as const
+
+    for (const [type, backbone, expected] of backbones) {
+      const item = candidate({
+        id: `candidate_${type}`,
+        candidateSpec: { backbone },
+      })
+      expect(formatResearchCockpitCandidateRecipeLines(item).architecture).toContain(`backbone=${expected}`)
+      expect(formatResearchCockpitCandidateArchitectureExpandedLines(item)).toContain(`  backbone:       ${expected}`)
+    }
   })
 
   test("checks candidate and runner readiness for per-candidate actions", () => {

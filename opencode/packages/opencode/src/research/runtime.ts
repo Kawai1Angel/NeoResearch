@@ -1,5 +1,6 @@
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "fs/promises"
 import path from "path"
+import { digest, verifyExecutionRecords, type ExecutionContract } from "./execution-contract"
 
 import * as Process from "@/util/process"
 import { DomainRunPlan as DomainRunPlanSchema, type DomainRunPlan } from "./domain"
@@ -100,7 +101,7 @@ export type RecoveryDecision =
   | { readonly action: "discard"; readonly reason: "terminal_status" }
 
 export type ResearchWorkerExecutionResult = {
-  readonly status: "succeeded" | "failed" | "rejected"
+  readonly status: "succeeded" | "failed" | "rejected" | "invalid"
   readonly metrics?: JsonRecord
   readonly resourceUsage?: JsonRecord
   readonly artifacts?: readonly ArtifactStorePutInput[]
@@ -276,7 +277,7 @@ export function nextRecoveryAction(input: {
   readonly errorKind?: string
 }): RecoveryDecision {
   const policy = input.policy ?? DEFAULT_FAILURE_RECOVERY_POLICY
-  if (input.status === "succeeded" || input.status === "rejected") {
+  if (input.status === "succeeded" || input.status === "rejected" || input.status === "invalid") {
     return { action: "discard", reason: "terminal_status" }
   }
 
@@ -411,6 +412,13 @@ export async function executeSubprocessResearchJob(job: ResearchJob): Promise<Re
 
   const plan = parsed.data
   const cwd = plan.command.cwd ?? process.cwd()
+  const contract = plan.writes.find((write) => write.content.schema_version === "research_execution_contract.v1")?.content as unknown as ExecutionContract | undefined
+  if (plan.domainID === "tsf" && plan.stage !== "ref_test" && plan.stage !== "blind_test") {
+    const proof = plan.writes.find((write) => write.content.event === "execution_contract_verified")?.content
+    if (!contract || !contract.hypothesis_id || !plan.command.env?.NEO_CAST_EXECUTION_CONTRACT || (plan.stage !== "smoke" && (!proof || verifyExecutionRecords(contract, [proof.manifest as Record<string, unknown>, proof]).length || !proof.verification_smoke_run_id || typeof proof.smoke_metric !== "number" || !Number.isFinite(proof.smoke_metric)))) {
+      return { status: "invalid", metrics: {}, error: "Missing execution contract or matching verified smoke proof", errorKind: "execution_contract_violation" }
+    }
+  }
   for (const item of plan.writes) {
     await writeJSONFile(runnerPath(cwd, item.path), item.content)
   }
@@ -431,6 +439,7 @@ export async function executeSubprocessResearchJob(job: ResearchJob): Promise<Re
     runnerID: plan.runnerID,
   }
 
+  if (contract && verifyExecutionRecords(contract, records).length) return { status: "invalid", metrics: {}, resourceUsage, artifacts, executionLog: { stdout, stderr, records }, error: "Execution contract violation", errorKind: "execution_contract_violation" }
   if (result.code === 0) {
     return {
       status: "succeeded",

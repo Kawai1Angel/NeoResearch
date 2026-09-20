@@ -133,6 +133,7 @@ def build_metadata(
     model_impl_entry: str,
     state_dict_layout: str,
     val_metrics: dict[str, Any],
+    cv_metrics: dict[str, Any] | None = None,
     horizons: list[int] | None = None,
     session_id: str | None = None,
     candidate_id: str | None = None,
@@ -188,6 +189,8 @@ def build_metadata(
         metadata["candidate_id"] = candidate_id
     if ref_test_metrics:
         metadata["ref_test_metrics"] = ref_test_metrics
+    if cv_metrics:
+        metadata["cv_metrics"] = cv_metrics
     if training_summary:
         metadata["training_summary"] = training_summary
     return metadata
@@ -472,6 +475,9 @@ def _native_model_config(candidate, metadata):
 
 def _normalize_history(history, preprocess):
     if isinstance(history, dict):
+        calendar = {key: history[key] for key in ("timestamps", "calendar_features") if key in history}
+        if "history" in history:
+            return {"history": _normalize_history(history["history"], preprocess), **calendar}
         target = np.asarray(history["target_history"], dtype=np.float32)
         past = np.asarray(history.get("exogenous_past", []), dtype=np.float32)
         future = np.asarray(history.get("exogenous_future", []), dtype=np.float32)
@@ -486,7 +492,7 @@ def _normalize_history(history, preprocess):
             all_names = list(dict.fromkeys(preprocess["observed_past_covariate_names"] + future_names))
             indices = [all_names.index(name) for name in future_names]
             future = (future - mean[indices]) / std[indices]
-        return {"target_history": target, "exogenous_past": past, "exogenous_future": future}
+        return {"target_history": target, "exogenous_past": past, "exogenous_future": future, **calendar}
     array = np.asarray(history, dtype=np.float32)
     mean = np.asarray(preprocess["scaler_mean"], dtype=np.float32)
     std = np.asarray(preprocess["scaler_std"], dtype=np.float32)
@@ -522,79 +528,77 @@ def load_model(device: str | None = None):
     }
 
 
-def predict_normalized(bundle, history, horizon: int):
+def _inference_inputs(bundle, history, horizon):
     metadata = bundle["metadata"]
     if horizon not in metadata["horizons"]:
         raise ValueError(f"Unsupported horizon: {horizon}")
-    if bundle["metadata"].get("dataset_schema_version") == "dataset.v2":
+    calendar = None
+    if isinstance(history, dict):
+        calendar = history.get("calendar_features")
+        if calendar is None and "timestamps" in history:
+            dates = np.asarray(history["timestamps"], dtype="datetime64[s]")
+            if np.isnat(dates).any():
+                raise ValueError("calendar requires valid timestamps")
+            days = dates.astype("datetime64[D]")
+            months = dates.astype("datetime64[M]")
+            calendar = np.stack([
+                (dates - days).astype("timedelta64[h]").astype(int),
+                (days.astype(int) + 3) % 7,
+                (days - months.astype("datetime64[D]")).astype(int) + 1,
+                months.astype(int) % 12 + 1,
+            ], axis=-1).astype(np.float32)
+    def tensor(value, shape, name):
+        array = np.asarray(value, dtype=np.float32)
+        if array.shape != shape:
+            raise ValueError(f"Expected {name} shape {shape}, got {array.shape}")
+        return torch.from_numpy(array).unsqueeze(0).to(bundle["device"])
+    if metadata.get("dataset_schema_version") == "dataset.v2":
         if not isinstance(history, dict):
-            raise ValueError("Covariate model input must provide target_history, exogenous_past, and exogenous_future")
-        required = {"target_history", "exogenous_past", "exogenous_future"}
-        missing = sorted(required.difference(history))
-        if missing:
-            raise ValueError(f"Missing required covariate inputs: {missing}")
-        arrays = {key: np.asarray(value, dtype=np.float32) for key, value in history.items()}
-        expected = {
-            "target_history": (metadata["input_len"], metadata["target_channels"]),
-            "exogenous_past": (metadata["input_len"], metadata["past_exogenous_channels"]),
-            "exogenous_future": (horizon, metadata["future_exogenous_channels"]),
+            raise ValueError("Covariate model requires structured history")
+        inputs = {
+            key: tensor(history[key], shape, key)
+            for key, shape in {
+                "target_history": (metadata["input_len"], metadata["target_channels"]),
+                "exogenous_past": (metadata["input_len"], metadata["past_exogenous_channels"]),
+                "exogenous_future": (horizon, metadata["future_exogenous_channels"]),
+            }.items()
         }
-        for key, shape in expected.items():
-            if arrays[key].shape != shape:
-                raise ValueError(f"Expected {key} shape {shape}, got {arrays[key].shape}")
-        inputs = {key: torch.from_numpy(value).unsqueeze(0).to(bundle["device"]) for key, value in arrays.items()}
-        with torch.no_grad():
-            pred = bundle["models"][horizon](**inputs)
-        return pred.squeeze(0).cpu().numpy()
-    array = np.asarray(history, dtype=np.float32)
-    if array.shape != (metadata["input_len"], metadata["num_channels"]):
-        raise ValueError(
-            f"Expected history shape {(metadata['input_len'], metadata['num_channels'])}, got {array.shape}"
-        )
-    x = torch.from_numpy(array).unsqueeze(0).to(bundle["device"])
+    else:
+        values = history.get("history", history.get("target_history")) if isinstance(history, dict) else history
+        inputs = {"x": tensor(values, (metadata["input_len"], metadata["num_channels"]), "history")}
+    if calendar is not None:
+        inputs["calendar_features"] = tensor(calendar, (metadata["input_len"], 4), "calendar_features")
+    return inputs
+
+
+def predict_normalized(bundle, history, horizon: int):
+    inputs = _inference_inputs(bundle, history, horizon)
     with torch.no_grad():
-        pred = bundle["models"][horizon](x)
+        pred = bundle["models"][horizon](**inputs)
     return pred.squeeze(0).cpu().numpy()
 
 
 def predict_quantiles_normalized(bundle, history, horizon: int):
-    metadata = bundle["metadata"]
-    if horizon not in metadata["horizons"]:
-        raise ValueError(f"Unsupported horizon: {horizon}")
-    if bundle["metadata"].get("dataset_schema_version") == "dataset.v2":
-        if not isinstance(history, dict):
-            raise ValueError("Covariate model input must provide target_history, exogenous_past, and exogenous_future")
-        required = {"target_history", "exogenous_past", "exogenous_future"}
-        missing = sorted(required.difference(history))
-        if missing:
-            raise ValueError(f"Missing required covariate inputs: {missing}")
-        arrays = {key: np.asarray(value, dtype=np.float32) for key, value in history.items()}
-        expected = {
-            "target_history": (metadata["input_len"], metadata["target_channels"]),
-            "exogenous_past": (metadata["input_len"], metadata["past_exogenous_channels"]),
-            "exogenous_future": (horizon, metadata["future_exogenous_channels"]),
-        }
-        for key, shape in expected.items():
-            if arrays[key].shape != shape:
-                raise ValueError(f"Expected {key} shape {shape}, got {arrays[key].shape}")
-        inputs = {key: torch.from_numpy(value).unsqueeze(0).to(bundle["device"]) for key, value in arrays.items()}
-        with torch.no_grad():
-            model = bundle["models"][horizon]
-            pred = model.forward_quantiles(**inputs) if hasattr(model, "forward_quantiles") else model(**inputs).unsqueeze(-1)
-        return pred.squeeze(0).cpu().numpy()
-    array = np.asarray(history, dtype=np.float32)
-    if array.shape != (metadata["input_len"], metadata["num_channels"]):
-        raise ValueError(
-            f"Expected history shape {(metadata['input_len'], metadata['num_channels'])}, got {array.shape}"
-        )
-    x = torch.from_numpy(array).unsqueeze(0).to(bundle["device"])
+    inputs = _inference_inputs(bundle, history, horizon)
+    model = bundle["models"][horizon]
     with torch.no_grad():
-        model = bundle["models"][horizon]
-        if hasattr(model, "forward_quantiles"):
-            pred = model.forward_quantiles(x)
-        else:
-            pred = model(x).unsqueeze(-1)
+        pred = model.forward_quantiles(**inputs) if hasattr(model, "forward_quantiles") else model(**inputs).unsqueeze(-1)
     return pred.squeeze(0).cpu().numpy()
+
+
+def predict_distribution_normalized(bundle, history, horizon: int):
+    inputs = _inference_inputs(bundle, history, horizon)
+    with torch.no_grad():
+        mean, scale = bundle["models"][horizon].forward_distribution(**inputs)
+    return {"mean": mean.squeeze(0).cpu().numpy(), "scale": scale.squeeze(0).cpu().numpy()}
+
+
+def predict_distribution_raw(bundle, history, horizon: int):
+    result = predict_distribution_normalized(bundle, _normalize_history(history, bundle["preprocess"]), horizon)
+    scaler = bundle["preprocess"].get("target_scaler")
+    mean = np.asarray(scaler["mean"] if scaler else bundle["preprocess"]["scaler_mean"], dtype=np.float32)
+    std = np.asarray(scaler["scale"] if scaler else bundle["preprocess"]["scaler_std"], dtype=np.float32)
+    return {"mean": result["mean"] * std + mean, "scale": result["scale"] * np.abs(std)}
 
 
 def predict_raw(bundle, history, horizon: int):
@@ -635,6 +639,11 @@ def render_tool_schema(metadata: dict[str, Any]) -> dict[str, Any]:
         "normalization_space": {"type": "string"},
     }
     required = ["horizon", "prediction", "normalization_space"]
+    summary = metadata.get("training_summary", {})
+    if summary.get("output_distribution") == "gaussian":
+        output_properties["mean"] = {"type": "array", "items": {"type": "array", "items": {"type": "number"}}}
+        output_properties["scale"] = {"type": "array", "description": "Positive standard deviation, same units as mean.", "items": {"type": "array", "items": {"type": "number", "exclusiveMinimum": 0}}}
+        required.extend(["mean", "scale"])
     quantiles = _artifact_quantiles(metadata)
     if quantiles:
         output_properties["quantiles"] = {
@@ -675,8 +684,13 @@ def render_tool_schema(metadata: dict[str, Any]) -> dict[str, Any]:
                     "type": "integer",
                     "enum": list(metadata["horizons"]),
                 },
+                "timestamps": {
+                    "type": "array", "items": {"type": "string"},
+                    "minItems": metadata["input_len"], "maxItems": metadata["input_len"],
+                    "description": "Actual timestamps aligned with history rows; required for calendar embedding.",
+                },
             },
-            "required": ["history", "horizon"],
+            "required": ["history", "horizon"] + (["timestamps"] if summary.get("embedding") == "calendar" else []),
         },
         "outputSchema": {
             "type": "object",
@@ -691,7 +705,7 @@ def render_mcp_server_py() -> str:
 
 from mcp.server.fastmcp import FastMCP
 
-from inference import load_model, predict_quantiles_raw, predict_raw
+from inference import load_model, predict_quantiles_raw, predict_distribution_raw, predict_raw
 
 
 mcp = FastMCP("neo-cast-artifact")
@@ -699,7 +713,9 @@ MODEL_BUNDLE = load_model()
 
 
 @mcp.tool()
-def forecast(history: list[list[float]], horizon: int) -> dict:
+def forecast(history: list[list[float]], horizon: int, timestamps: list[str] | None = None) -> dict:
+    if timestamps is not None:
+        history = {"history": history, "timestamps": timestamps}
     prediction = predict_raw(MODEL_BUNDLE, history, horizon)
     result = {
         "horizon": horizon,
@@ -707,6 +723,9 @@ def forecast(history: list[list[float]], horizon: int) -> dict:
         "normalization_space": MODEL_BUNDLE["metadata"]["normalization_space"],
     }
     training_summary = MODEL_BUNDLE["metadata"].get("training_summary", {})
+    if training_summary.get("output_distribution") == "gaussian":
+        distribution = predict_distribution_raw(MODEL_BUNDLE, history, horizon)
+        result.update({key: value.tolist() for key, value in distribution.items()})
     if training_summary.get("output_distribution") == "quantile":
         quantile_prediction = predict_quantiles_raw(MODEL_BUNDLE, history, horizon)
         result["quantiles"] = training_summary.get("quantiles", [])
@@ -732,6 +751,11 @@ def main() -> None:
     preprocess = json.loads((Path(__file__).resolve().parent / "preprocess.json").read_text(encoding="utf-8"))
     history = [preprocess["scaler_mean"] for _ in range(preprocess["input_len"])]
     bundle = load_model()
+    if bundle["metadata"].get("training_summary", {}).get("embedding") == "calendar":
+        import sys
+        if len(sys.argv) != 2:
+            raise SystemExit("Usage: python example.py history.json (object with history and real timestamps)")
+        history = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     prediction = predict_raw(bundle, history, bundle["metadata"]["horizons"][0])
     print(prediction.shape)
 
@@ -765,7 +789,7 @@ def render_readme_md(metadata: dict[str, Any], candidate: dict[str, Any] | None)
             "- `model.pt`: trained weights and candidate payload",
             "- `preprocess.json`: feature order and scaler statistics",
             "- `model_impl.py`: model builder used by the artifact",
-            "- `inference.py`: `load_model()`, `predict_normalized()`, `predict_raw()`",
+            "- `inference.py`: `load_model()`, `predict_normalized()`, `predict_raw()`, `predict_distribution_normalized()`, `predict_distribution_raw()`",
             "- `mcp_server.py`: MCP server exposing `forecast`",
             "- `tool_schema.json`: tool input schema",
             "- `eval_report.md`: validation and optional ref-test report",
@@ -781,6 +805,8 @@ def render_readme_md(metadata: dict[str, Any], candidate: dict[str, Any] | None)
             "- Public entrypoint is raw-space input.",
             f"- `history` must be shape `[{metadata['input_len']}, {metadata['num_channels']}]` with feature order matching `preprocess.json`.",
             "- `predict_raw()` normalizes with the stored scaler before inference.",
+            "- Calendar models require `{\"history\": [...], \"timestamps\": [...]}` with real aligned timestamps (UTC; naive timestamps are treated as UTC). For dataset.v2, add timestamps to the structured covariate input. `example.py history.json` accepts this input.",
+            "- Gaussian models expose `{mean, scale}` via `predict_distribution_raw()`; scale is positive standard deviation in target units. `predict_raw()` remains the point-mean interface.",
             "",
         ]
     )
@@ -870,6 +896,7 @@ def main() -> None:
         raise SystemExit("error: val_metrics.json is required")
     ref_test_metrics = _load_optional_json(args.ref_test_metrics_json)
     training_summary = _load_optional_json(args.training_summary_json or artifact_dir / "training_summary.json")
+    cv_metrics = _load_optional_json(artifact_dir / "cv_metrics.json")
 
     model_family = args.model_family or (candidate or {}).get("model_family")
     if not model_family:
@@ -892,6 +919,7 @@ def main() -> None:
         model_impl_entry=model_impl_entry,
         state_dict_layout=state_dict_layout,
         val_metrics=val_metrics,
+        cv_metrics=cv_metrics,
         horizons=horizons,
         session_id=args.session_id,
         candidate_id=candidate_id,

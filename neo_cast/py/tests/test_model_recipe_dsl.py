@@ -29,7 +29,7 @@ def make_model_recipe() -> dict:
         "architecture": {
             "backbone": "temporal_conv",
             "decomposition": True,
-            "multiscale_blocks": 3,
+            "layers": 3,
             "attention": "lightweight",
             "hidden_dim": 32,
             "kernel_size": 3,

@@ -303,7 +303,7 @@ test("design delegates autonomous mode to the autonomous loop with budgets", asy
   }
 });
 
-test("design defaults autonomous max no-improve budget to 5", async () => {
+test("design defaults autonomous max no-improve budget to 25", async () => {
   const harness = loadCliWithStubs();
   try {
     const exitCode = await harness.cli.runCli([
@@ -318,7 +318,7 @@ test("design defaults autonomous max no-improve budget to 5", async () => {
 
     assert.equal(exitCode, 0);
     assert.equal(harness.autonomousOptions.length, 1);
-    assert.equal(harness.autonomousOptions[0].maxNoImprove, 5);
+    assert.equal(harness.autonomousOptions[0].maxNoImprove, 25);
   } finally {
     harness.restore();
   }

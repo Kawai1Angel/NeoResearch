@@ -60,13 +60,14 @@ class RecipeFactoryTest(unittest.TestCase):
     def assert_forward_shape(self, recipe: dict[str, Any], *, input_len: int = 32, horizon: int = 8) -> None:
         torch.manual_seed(7)
         model_config = {"recipe": recipe}
-        if recipe["fusion"].get("type") != "temporal" or recipe["fusion"].get("channel_mode") == "shared":
+        if recipe["embedding"]["type"] == "invert" or recipe["fusion"].get("type") != "temporal" or recipe["fusion"].get("channel_mode") == "shared":
             model_config["num_channels"] = 3
         model = build_model(model_config, input_len=input_len, horizon=horizon)
         model.eval()
         x = torch.randn(2, input_len, 3)
+        kwargs = {"calendar_features": torch.tensor([[[12., 2., 15., 6.]]]).expand(2, input_len, 4)} if recipe["embedding"]["type"] == "calendar" else {}
         with torch.no_grad():
-            y = model(x)
+            y = model(x, **kwargs)
         self.assertEqual(tuple(y.shape), (2, horizon, 3))
         self.assertTrue(torch.isfinite(y).all().item())
 
@@ -399,6 +400,7 @@ class RecipeFactoryTest(unittest.TestCase):
             fusion={"type": "graph", "graph_type": "learned"},
             prediction_head={"type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.0001},
         )
+        recipe["training_strategy"]["loss"]["base"] = "gaussian_nll"
 
         self.assertEqual(validate_recipe_against_registry(recipe, input_len=32), [])
         self.assert_forward_shape(recipe)

@@ -94,7 +94,7 @@ Usage:
   neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3]
                   [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep] [--require-approval]
   neo-cast design --requirement "small transformer for ETTh1" --autonomous [--time-budget 2h]
-                  [--max-no-improve 5] [--mock-llm] [--use-reflection] [--use-mutation]
+                  [--max-no-improve 25] [--mock-llm] [--use-reflection] [--use-mutation]
 
 Commands:
   doctor         Check python3, uv, API key, and resolved config
@@ -115,7 +115,7 @@ Design flags:
   --autonomous       Continue iterating until budget, plateau, or crash stopping conditions are met
   --require-approval Pause after model design and require: neo-cast checkpoint approve model_design
   --time-budget      Autonomous wall-clock budget, e.g. 2h, 90m, 3600s
-  --max-no-improve   Autonomous plateau limit; defaults to 5 consecutive non-improving runs
+  --max-no-improve   Autonomous plateau limit; defaults to 25 consecutive non-improving runs
 
 No API key?
   Use \`--mock-llm\` on design commands, or set \`NEO_CAST_USE_MOCK=1\`, to run the
@@ -285,6 +285,8 @@ function registerExperimentLineage(projectRoot, row, options = {}) {
       model_family: row.model_family || null,
       status: row.status || null,
       is_best: row.status === "keep" ? "1" : "0",
+      cv_avg_mse: row.cv_avg_mse || null,
+      cv_std_mse: row.cv_std_mse || null,
       val_avg_mse: row.val_avg_mse || null,
       val_h96_mse: row.val_h96_mse || null,
       val_h720_mse: row.val_h720_mse || null,
@@ -912,7 +914,7 @@ async function handleDesign(positionals, rawFlags) {
 
   if (isAutonomous) {
     const { parseTimeBudget, runAutonomousLoop } = require("./loop");
-    const maxNoImprove = Number(rawFlags["max-no-improve"] || 5);
+    const maxNoImprove = Number(rawFlags["max-no-improve"] || 25);
     if (!Number.isFinite(maxNoImprove) || maxNoImprove < 1) {
       console.error("--max-no-improve must be a positive integer");
       return 1;

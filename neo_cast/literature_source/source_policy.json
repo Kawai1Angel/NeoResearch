@@ -1,0 +1,462 @@
+{
+  "schema_version": "literature_source_policy_v3",
+  "source_id": "patchtst_era_top_venue_tsf_v2",
+  "anchor": {
+    "title": "A Time Series is Worth 64 Words: Long-term Forecasting with Transformers",
+    "venue": "ICLR",
+    "year": 2023,
+    "boundary": "inclusive_calendar_year"
+  },
+  "policy": {
+    "start_year": 2023,
+    "include_tiers": [
+      "A",
+      "B"
+    ],
+    "sections": {
+      "Time Series Forecasting": "accepted_core",
+      "Time Series Foundation Model": "accepted_adjacent",
+      "Time Series Analysis and Systems": "accepted_adjacent"
+    }
+  },
+  "venue_aliases": {
+    "ICLR": "ICLR",
+    "ICML": "ICML",
+    "NeurIPS": "NeurIPS",
+    "NIPS": "NeurIPS",
+    "KDD": "KDD",
+    "AAAI": "AAAI",
+    "IJCAI": "IJCAI",
+    "AISTATS": "AISTATS",
+    "UAI": "UAI",
+    "CIKM": "CIKM",
+    "WWW": "WWW",
+    "WSDM": "WSDM",
+    "ICDM": "ICDM",
+    "ICDE": "ICDE",
+    "SIGMOD": "SIGMOD",
+    "VLDB": "VLDB",
+    "ECML-PKDD": "ECML-PKDD",
+    "MM": "MM",
+    "ACL": "ACL"
+  },
+  "venue_tiers": {
+    "A": [
+      "ICLR",
+      "ICML",
+      "NeurIPS",
+      "KDD",
+      "AAAI",
+      "IJCAI"
+    ],
+    "B": [
+      "AISTATS",
+      "UAI",
+      "CIKM",
+      "WWW",
+      "WSDM",
+      "ICDM",
+      "ICDE",
+      "SIGMOD",
+      "VLDB",
+      "ECML-PKDD"
+    ],
+    "C": [
+      "MM",
+      "ACL"
+    ]
+  },
+  "title_corrections": {
+    "VisionTS: Visual Masked Autoencoders Are Free-Lunch Zero-Shot Time Series Forecastersg": "VisionTS: Visual Masked Autoencoders Are Free-Lunch Zero-Shot Time Series Forecasters",
+    "Non-stationary Transformers: Rethinking the Stationarity in Time Series Forecasting": "Non-stationary Transformers: Exploring the Stationarity in Time Series Forecasting"
+  },
+  "historical_foundations": {
+    "source_id": "curated_historical_foundations",
+    "version": "2026-09-20",
+    "manifest_path": "historical_foundations.json",
+    "boundary": "explicit_allowlist_only",
+    "min_year": 1964,
+    "max_year": 2022
+  },
+  "official_match_threshold": 0.88,
+  "coverage_targets": {
+    "years": [2023, 2024, 2025, 2026],
+    "venues": [
+      "AAAI", "AISTATS", "CIKM", "ECML-PKDD", "ICDE", "ICDM", "ICLR", "ICML",
+      "IJCAI", "KDD", "NeurIPS", "SIGMOD", "UAI", "VLDB", "WSDM", "WWW"
+    ]
+  },
+  "external_title_classification": {
+    "Chronos: Learning the Language of Time Series": "influential_external",
+    "Long-term Forecasting with TiDE": "watchlist",
+    "TSMixer: An All-MLP Architecture for Time Series Forecasting": "watchlist"
+  },
+  "title_pool_overrides": {
+    "Koopa: Learning Non-stationary Time Series Dynamics with Koopman Predictors": "accepted_core"
+  },
+  "citation_expansion": {
+    "enabled": true,
+    "source_id": "openalex_one_hop_citations",
+    "max_results_per_seed": 100,
+    "seeds": {
+      "PatchTST": "A Time Series is Worth 64 Words: Long-term Forecasting with Transformers",
+      "DLinear": "Are Transformers Effective for Time Series Forecasting?",
+      "TimesNet": "TimesNet: Temporal 2D-Variation Modeling for General Time Series Analysis",
+      "iTransformer": "iTransformer: Inverted Transformers Are Effective for Time Series Forecasting",
+      "TimeMixer": "TimeMixer: Decomposable Multiscale Mixing for Time Series Forecasting",
+      "TimesFM": "A decoder-only foundation model for time-series forecasting",
+      "Moirai": "Unified Training of Universal Time Series Forecasting Transformers",
+      "Chronos": "Chronos: Learning the Language of Time Series",
+      "Time-MoE": "Time-MoE: Billion-Scale Time Series Foundation Models with Mixture of Experts"
+    }
+  },
+  "discovery_sources": [
+    {
+      "id": "tscenter_awesome_time_series_papers",
+      "parser": "tscenter_markdown_tables",
+      "repository": "https://github.com/TSCenter/awesome-time-series-papers",
+      "revision": "ba050af19f97fa1f07edc6722363cd4493875a03",
+      "snapshot_url": "https://raw.githubusercontent.com/TSCenter/awesome-time-series-papers/ba050af19f97fa1f07edc6722363cd4493875a03/README.md",
+      "fallback_urls": ["https://cdn.jsdelivr.net/gh/TSCenter/awesome-time-series-papers@ba050af19f97fa1f07edc6722363cd4493875a03/README.md"],
+      "license": "GPL-3.0"
+    },
+    {
+      "id": "qhliu_awesome_time_series_analysis",
+      "parser": "forecast_bullets",
+      "repository": "https://github.com/qhliu26/awesome-time-series-analysis",
+      "revision": "6355cc5c2f0d5ebafc0d164b2938d2721b0bd9ce",
+      "snapshot_url": "https://raw.githubusercontent.com/qhliu26/awesome-time-series-analysis/6355cc5c2f0d5ebafc0d164b2938d2721b0bd9ce/README.md",
+      "fallback_urls": ["https://cdn.jsdelivr.net/gh/qhliu26/awesome-time-series-analysis@6355cc5c2f0d5ebafc0d164b2938d2721b0bd9ce/README.md"],
+      "license": "MIT"
+    },
+    {
+      "id": "tongjifinlab_awesome_time_series_forecasting",
+      "parser": "tongji_paper_bullets",
+      "repository": "https://github.com/TongjiFinLab/awesome-time-series-forecasting",
+      "revision": "4a5ab143cf763ff30f480743e6f6c0b11d105587",
+      "snapshot_url": "https://raw.githubusercontent.com/TongjiFinLab/awesome-time-series-forecasting/4a5ab143cf763ff30f480743e6f6c0b11d105587/README.md",
+      "fallback_urls": ["https://cdn.jsdelivr.net/gh/TongjiFinLab/awesome-time-series-forecasting@4a5ab143cf763ff30f480743e6f6c0b11d105587/README.md"],
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "thuml_time_series_library",
+      "parser": "thuml_model_inventory",
+      "repository": "https://github.com/thuml/Time-Series-Library",
+      "revision": "4e938a1767106324dd753b2a44832bf870a0252e",
+      "snapshot_url": "https://raw.githubusercontent.com/thuml/Time-Series-Library/4e938a1767106324dd753b2a44832bf870a0252e/README.md",
+      "fallback_urls": ["https://cdn.jsdelivr.net/gh/thuml/Time-Series-Library@4e938a1767106324dd753b2a44832bf870a0252e/README.md"],
+      "license": "MIT"
+    }
+  ],
+  "official_proceedings_sources": [
+    {
+      "id": "aaai_ojs_proceedings",
+      "venue": "AAAI",
+      "years": [2021, 2023, 2024, 2025, 2026],
+      "parser": "aaai_ojs",
+      "archive_pages": [1, 2, 3, 4, 5],
+      "archive_url_template": "https://ojs.aaai.org/index.php/AAAI/issue/archive/{page}",
+      "base_url": "https://ojs.aaai.org",
+      "verification": "official_proceedings"
+    },
+    {
+      "id": "iclr_official_proceedings",
+      "venue": "ICLR",
+      "years": [
+        2024,
+        2025,
+        2026
+      ],
+      "parser": "hash_index",
+      "index_url_template": "https://proceedings.iclr.cc/paper_files/paper/{year}",
+      "base_url": "https://proceedings.iclr.cc",
+      "track": "Main Conference Track",
+      "verification": "official_proceedings"
+    },
+    {
+      "id": "icml_pmlr_proceedings",
+      "venue": "ICML",
+      "volumes": {
+        "2022": "162",
+        "2023": "202",
+        "2024": "235",
+        "2025": "267"
+      },
+      "parser": "pmlr_index",
+      "index_url_template": "https://proceedings.mlr.press/v{volume}/",
+      "base_url": "https://proceedings.mlr.press",
+      "track": "Main proceedings",
+      "verification": "official_proceedings"
+    },
+    {
+      "id": "neurips_official_proceedings",
+      "venue": "NeurIPS",
+      "years": [2018, 2019, 2021, 2022, 2023, 2024, 2025],
+      "parser": "hash_index",
+      "index_url_template": "https://proceedings.neurips.cc/paper/{year}",
+      "index_urls": {
+        "2025": "https://proceedings.neurips.cc/paper_files/paper/2025/vol38-main-conference"
+      },
+      "base_url": "https://proceedings.neurips.cc",
+      "track": "Main Conference Track",
+      "verification": "official_proceedings"
+    },
+    {
+      "id": "ijcai_official_proceedings",
+      "venue": "IJCAI",
+      "years": [2018, 2023, 2024, 2025, 2026],
+      "parser": "ijcai_index",
+      "index_url_template": "https://www.ijcai.org/proceedings/{year}/",
+      "base_url": "https://www.ijcai.org",
+      "verification": "official_proceedings"
+    },
+    {
+      "id": "pvldb_official_volumes",
+      "venue": "VLDB",
+      "volumes": {"2023": "16", "2024": "17", "2025": "18", "2026": "19"},
+      "parser": "pvldb_index",
+      "index_url_template": "https://www.vldb.org/pvldb/volumes/{volume}/",
+      "base_url": "https://www.vldb.org",
+      "verification": "official_proceedings"
+    },
+    {
+      "id": "acm_crossref_kdd",
+      "venue": "KDD",
+      "years": [2020, 2023, 2024, 2025, 2026],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1145",
+      "publisher": "ACM",
+      "query_template": "ACM SIGKDD Conference on Knowledge Discovery and Data Mining {year}",
+      "container_regex_template": "ACM SIGKDD .*Conference on Knowledge Discovery.*Data Mining",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    },
+    {
+      "id": "acm_crossref_sigir_historical",
+      "venue": "SIGIR",
+      "years": [2018],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1145",
+      "publisher": "ACM",
+      "query_template": "ACM SIGIR Conference on Research and Development in Information Retrieval 2018",
+      "container_regex_template": "ACM SIGIR Conference on Research.*Information Retrieval",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    },
+    {
+      "id": "crossref_ijf_historical",
+      "venue": "International Journal of Forecasting",
+      "years": [2020, 2021],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1016",
+      "publisher": "Elsevier BV",
+      "work_type": "journal-article",
+      "query_template": "International Journal of Forecasting",
+      "container_regex_template": "International Journal of Forecasting",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    },
+    {
+      "id": "crossref_machine_learning_historical",
+      "venue": "Machine Learning",
+      "years": [2019],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1007",
+      "publisher": "Springer Science and Business Media LLC",
+      "work_type": "journal-article",
+      "query_template": "Machine Learning",
+      "container_regex_template": "^Machine Learning$",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    },
+    {
+      "id": "acm_crossref_www",
+      "venue": "WWW",
+      "years": [2023, 2024, 2025, 2026],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1145",
+      "publisher": "ACM",
+      "query_template": "Proceedings of the ACM Web Conference {year}",
+      "container_regex_template": "ACM Web Conference {year}",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    },
+    {
+      "id": "acm_crossref_wsdm",
+      "venue": "WSDM",
+      "years": [2023, 2024, 2025, 2026],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1145",
+      "publisher": "ACM",
+      "query_template": "ACM International Conference on Web Search and Data Mining {year}",
+      "container_regex_template": "ACM International Conference on Web Search and Data Mining",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    },
+    {
+      "id": "ieee_crossref_icde",
+      "venue": "ICDE",
+      "years": [2023, 2024, 2025, 2026],
+      "parser": "crossref_query",
+      "api_url": "https://api.crossref.org/works",
+      "prefix": "10.1109",
+      "publisher": "IEEE",
+      "query_template": "IEEE International Conference on Data Engineering ICDE {year}",
+      "container_regex_template": "{year} IEEE .*International Conference on Data Engineering",
+      "rows": 1000,
+      "verification": "publisher_metadata"
+    }
+  ],
+  "official_paper_overrides": {
+    "Robust Estimation of a Location Parameter": {
+      "source_id": "publisher_doi_historical",
+      "record_id": "10.1214/aoms/1177703732",
+      "authority": "publisher_metadata",
+      "title": "Robust Estimation of a Location Parameter",
+      "landing_url": "https://doi.org/10.1214/aoms/1177703732",
+      "track": "Journal article",
+      "track_type": "journal",
+      "snapshot_sha256": null
+    },
+    "Regression Quantiles": {
+      "source_id": "publisher_doi_historical",
+      "record_id": "10.2307/1913643",
+      "authority": "publisher_metadata",
+      "title": "Regression Quantiles",
+      "landing_url": "https://doi.org/10.2307/1913643",
+      "track": "Journal article",
+      "track_type": "journal",
+      "snapshot_sha256": null
+    },
+    "Strictly Proper Scoring Rules, Prediction, and Estimation": {
+      "source_id": "publisher_doi_historical",
+      "record_id": "10.1198/016214506000001437",
+      "authority": "publisher_metadata",
+      "title": "Strictly Proper Scoring Rules, Prediction, and Estimation",
+      "landing_url": "https://doi.org/10.1198/016214506000001437",
+      "track": "Journal article",
+      "track_type": "journal",
+      "snapshot_sha256": null
+    },
+    "Making and Evaluating Point Forecasts": {
+      "source_id": "publisher_doi_historical",
+      "record_id": "10.1198/jasa.2011.r10138",
+      "authority": "publisher_metadata",
+      "title": "Making and Evaluating Point Forecasts",
+      "landing_url": "https://doi.org/10.1198/jasa.2011.r10138",
+      "track": "Journal article",
+      "track_type": "journal",
+      "snapshot_sha256": null
+    },
+    "Adaptive Huber Regression": {
+      "source_id": "publisher_doi_historical",
+      "record_id": "10.1080/01621459.2018.1543124",
+      "authority": "publisher_metadata",
+      "title": "Adaptive Huber Regression",
+      "landing_url": "https://doi.org/10.1080/01621459.2018.1543124",
+      "track": "Journal article",
+      "track_type": "journal",
+      "snapshot_sha256": null
+    },
+    "Forecasting the real prices of crude oil using robust regression models with regularization constraints": {
+      "source_id": "publisher_doi_historical",
+      "record_id": "10.1016/j.eneco.2020.104683",
+      "authority": "publisher_metadata",
+      "title": "Forecasting the real prices of crude oil using robust regression models with regularization constraints",
+      "landing_url": "https://doi.org/10.1016/j.eneco.2020.104683",
+      "track": "Journal article",
+      "track_type": "journal",
+      "snapshot_sha256": null
+    },
+    "Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting": {
+      "source_id": "aaai_ojs_proceedings",
+      "record_id": "17325",
+      "authority": "official_proceedings",
+      "title": "Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting",
+      "landing_url": "https://ojs.aaai.org/index.php/AAAI/article/view/17325",
+      "pdf_url": "https://ojs.aaai.org/index.php/AAAI/article/view/17325/17132",
+      "track": "AAAI Technical Track on Machine Learning",
+      "snapshot_sha256": null
+    },
+    "Diffusion Convolutional Recurrent Neural Network: Data-Driven Traffic Forecasting": {
+      "source_id": "openreview_iclr_historical",
+      "record_id": "SJiHXGWAZ",
+      "authority": "official_proceedings",
+      "title": "Diffusion Convolutional Recurrent Neural Network: Data-Driven Traffic Forecasting",
+      "landing_url": "https://openreview.net/forum?id=SJiHXGWAZ",
+      "pdf_url": "https://openreview.net/pdf?id=SJiHXGWAZ",
+      "track": "Main Conference Track",
+      "snapshot_sha256": null
+    },
+    "N-BEATS: Neural basis expansion analysis for interpretable time series forecasting": {
+      "source_id": "openreview_iclr_historical",
+      "record_id": "r1ecqn4YwB",
+      "authority": "official_proceedings",
+      "title": "N-BEATS: Neural basis expansion analysis for interpretable time series forecasting",
+      "landing_url": "https://openreview.net/forum?id=r1ecqn4YwB",
+      "pdf_url": "https://openreview.net/pdf?id=r1ecqn4YwB",
+      "track": "Main Conference Track",
+      "snapshot_sha256": null
+    },
+    "Pyraformer: Low-complexity Pyramidal Attention for Long-range Time Series Modeling and Forecasting": {
+      "source_id": "openreview_iclr_historical",
+      "record_id": "0EXmFzUn5I",
+      "authority": "official_proceedings",
+      "title": "Pyraformer: Low-complexity Pyramidal Attention for Long-range Time Series Modeling and Forecasting",
+      "landing_url": "https://openreview.net/forum?id=0EXmFzUn5I",
+      "pdf_url": "https://openreview.net/pdf?id=0EXmFzUn5I",
+      "track": "Main Conference Track",
+      "snapshot_sha256": null
+    },
+    "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift": {
+      "source_id": "openreview_iclr_historical",
+      "record_id": "cGDAkQo1C0p",
+      "authority": "official_proceedings",
+      "title": "Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift",
+      "landing_url": "https://openreview.net/forum?id=cGDAkQo1C0p",
+      "pdf_url": "https://openreview.net/pdf?id=cGDAkQo1C0p",
+      "track": "Main Conference Track",
+      "snapshot_sha256": null
+    },
+    "Selective Learning for Deep Time Series Forecasting": {
+      "source_id": "neurips_official_proceedings",
+      "title": "Selective Learning for Deep Time Series Forecasting",
+      "landing_url": "https://proceedings.neurips.cc/paper_files/paper/2025/hash/8cf54ff53f44835b9bdab2c546a1ca6d-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.neurips.cc/paper_files/paper/2025/file/8cf54ff53f44835b9bdab2c546a1ca6d-Paper-Conference.pdf"
+    },
+    "TimeEmb: A Lightweight Static-Dynamic Disentanglement Framework for Time Series Forecasting": {
+      "source_id": "neurips_official_proceedings",
+      "title": "TimeEmb: A Lightweight Static-Dynamic Disentanglement Framework for Time Series Forecasting",
+      "landing_url": "https://proceedings.neurips.cc/paper_files/paper/2025/hash/6e79ae23fe8a8bb15a2b2972053f4fc3-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.neurips.cc/paper_files/paper/2025/file/6e79ae23fe8a8bb15a2b2972053f4fc3-Paper-Conference.pdf"
+    }
+  },
+  "audit_sources": [
+    {
+      "name": "THUML Time-Series-Library",
+      "url": "https://github.com/thuml/Time-Series-Library",
+      "role": "version_pinned_discovery_source"
+    },
+    {
+      "name": "TongjiFinLab awesome-time-series-forecasting",
+      "url": "https://github.com/TongjiFinLab/awesome-time-series-forecasting",
+      "role": "version_pinned_discovery_source"
+    },
+    {
+      "name": "OpenAlex",
+      "url": "https://openalex.org",
+      "role": "identifier_and_open_access_enrichment"
+    }
+  ],
+  "download": {
+    "workers": 4,
+    "max_pdf_bytes": 52428800,
+    "public_open_access_only": true
+  }
+}

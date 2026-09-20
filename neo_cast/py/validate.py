@@ -190,7 +190,7 @@ def _spawn_and_forward(cmd: list[str]) -> tuple[int, tuple[dict[str, Any], ...]]
     return exit_code, records
 
 
-def _run_smoke(candidate_path: Path, resolved_path: Path, artifacts_dir: Path) -> int:
+def _run_smoke(candidate_path: Path, resolved_path: Path, artifacts_dir: Path, execution_contract: str | None = None, verification_path: str | None = None) -> int:
     try:
         payload_kind = detect_payload_kind(candidate_path)
         errors = validate_payload(payload_kind, candidate_path)
@@ -246,9 +246,15 @@ def _run_smoke(candidate_path: Path, resolved_path: Path, artifacts_dir: Path) -
         str(artifacts_dir),
         "--smoke",
     ]
+    if execution_contract:
+        train_cmd.extend(["--execution-contract", execution_contract, "--candidate-path", str(candidate_path)])
+        if verification_path:
+            train_cmd.extend(["--contract-verification", verification_path])
     train_exit, train_records = _spawn_and_forward(train_cmd)
+    if execution_contract and (any(r.get("event") == "execution_contract_violation" for r in train_records) or not any(r.get("event") == "execution_contract_verified" for r in train_records)):
+        return 5
     if train_exit != 0:
-        return train_exit if train_exit in {3, 4, 124} else 1
+        return train_exit if train_exit in {3, 4, 5, 124} else 1
 
     smoke_ok = any(record.get("event") in {"smoke_eval_done", "eval_done"} for record in train_records)
     done_success = any(record.get("event") == "done" and record.get("status") == "success" for record in train_records)
@@ -269,6 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
     json_parser.add_argument("--schema", type=str, default=None)
 
     smoke_parser = subparsers.add_parser("smoke", help="Resolve a candidate and run the smoke gate.")
+    smoke_parser.add_argument("--execution-contract", default=os.environ.get("NEO_CAST_EXECUTION_CONTRACT"))
+    smoke_parser.add_argument("--contract-verification", default=os.environ.get("NEO_CAST_CONTRACT_VERIFICATION"))
     smoke_parser.add_argument("--candidate-path", default=str(DEFAULT_CANDIDATE_PATH))
     smoke_parser.add_argument("--resolved-path", default=str(DEFAULT_RESOLVED_PATH))
     smoke_parser.add_argument("--artifacts-dir", default=str(DEFAULT_ARTIFACTS_DIR))
@@ -302,6 +310,8 @@ def main() -> None:
             Path(args.candidate_path).expanduser(),
             Path(args.resolved_path).expanduser(),
             Path(args.artifacts_dir).expanduser(),
+            args.execution_contract,
+            args.contract_verification,
         )
         raise SystemExit(exit_code)
 

@@ -27,12 +27,12 @@ function printCompanionResult(row, attempt = null) {
   }
 
   // BEST tag derives from the session-local `status === "keep"` signal: Python's
-  // runner_state.best_val_avg_mse tracker still flips the row to "keep" when it
+  // runner_state.best_cv_avg_mse tracker still flips the row to "keep" when it
   // improves locally. The TS-driven champion table is the global authority.
   const sessionLocalBest = row.status === "keep" ? "1" : "0";
   console.log(`${statusPrefix}:STATUS=${row.status}`);
   console.log(`${statusPrefix}:RUN=${row.run_id}`);
-  console.log(`${statusPrefix}:VAL=${row.val_avg_mse}`);
+  console.log(`${statusPrefix}:CV=${row.cv_avg_mse}:STD=${row.cv_std_mse}:VAL=${row.val_avg_mse}`);
   console.log(`${statusPrefix}:BEST=${sessionLocalBest}`);
 }
 
@@ -44,7 +44,7 @@ function printFinalSummary(bestRow) {
   console.log(`BEST:RUN=${bestRow.run_id}`);
   console.log(`BEST:ID=${bestRow.candidate_id || "NA"}`);
   console.log(`BEST:FAM=${bestRow.model_family || "NA"}`);
-  console.log(`BEST:VAL=${bestRow.val_avg_mse}`);
+  console.log(`BEST:CV=${bestRow.cv_avg_mse}:STD=${bestRow.cv_std_mse}:VAL=${bestRow.val_avg_mse}`);
 }
 
 module.exports = {

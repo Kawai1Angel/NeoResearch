@@ -30,6 +30,7 @@ import {
   formatResearchTasksTable,
   formatResearchWorkerLoop,
   formatResearchWorkerOnce,
+  pipelineStageForInteractionMode,
   researchModeForInteractionMode,
   type ResearchOutputFormat,
   type ResearchInteractionMode,
@@ -160,7 +161,7 @@ async function syncResearchWorkerRunFinished(input: {
 
   const status =
     input.result.status === "completed"
-      ? execution.status === "rejected"
+      ? execution.status === "invalid" ? "invalid" : execution.status === "rejected"
         ? "rejected"
         : "succeeded"
       : input.result.status === "dead_lettered"
@@ -199,6 +200,7 @@ async function runResearchWorkerOnceCommand(args: ResearchWorkerCommandArgs) {
   let leasedJob: ResearchJob | undefined
   let syncedRun: Research.ResearchRun | undefined
   let execution: ResearchWorkerExecutionResult | undefined
+  let serviceExecuted = false
   const result = await runResearchWorkerOnce({
     queue: runtime.queue,
     artifactStore: runtime.artifactStore,
@@ -208,12 +210,24 @@ async function runResearchWorkerOnceCommand(args: ResearchWorkerCommandArgs) {
     leaseMs: args.leaseMs,
     execute: async (job) => {
       leasedJob = job
-      if (args.syncResearchDb !== false) syncedRun = await syncResearchWorkerRunStarted(job)
+      if (args.syncResearchDb !== false) syncedRun = await findResearchRunForWorkerJob(job)
+      if (syncedRun) {
+        serviceExecuted = true
+        try {
+          const prepared = await runResearch((svc) => svc.executePreparedRun({ run: syncedRun!, runPlan: Research.DomainRunPlan.parse(job.payload) }))
+          execution = { status: prepared.run.status as ResearchWorkerExecutionResult["status"], metrics: prepared.run.metrics, resourceUsage: prepared.run.resourceUsage, error: prepared.run.error }
+        } catch (error) {
+          const persisted = await findResearchRunForWorkerJob(job)
+          if (persisted?.status !== "invalid") throw error
+          execution = { status: "invalid", metrics: {}, resourceUsage: persisted.resourceUsage, error: persisted.error ?? "Execution contract violation", errorKind: "execution_contract_violation" }
+        }
+        return execution
+      }
       execution = await executeSubprocessResearchJob(job)
       return execution
     },
   })
-  if (args.syncResearchDb !== false && leasedJob !== undefined) {
+  if (!serviceExecuted && args.syncResearchDb !== false && leasedJob !== undefined) {
     await syncResearchWorkerRunFinished({
       job: leasedJob,
       run: syncedRun,
@@ -433,9 +447,10 @@ export const ResearchCreateCommand = cmd({
       fullRecipeSpace?: boolean
     },
   ) => {
+    const interactionMode = args.interactionMode ?? (args.mode === "autonomous" ? "socratic" : "companion")
     const input = buildDefaultTsfResearchTaskInput({
-      mode: args.interactionMode ? researchModeForInteractionMode(args.interactionMode) : args.mode,
-      interactionMode: args.interactionMode,
+      mode: args.interactionMode ? researchModeForInteractionMode(interactionMode) : args.mode,
+      interactionMode,
       title: args.title,
       neoCastProjectRoot: args.neoCastRoot,
       datasetPath: args.datasetPath,
@@ -443,7 +458,7 @@ export const ResearchCreateCommand = cmd({
       targetCols: parseStringList(args.targetCols),
       contextLength: parsePositiveInt(args.contextLength, "--context-length"),
       predictionLengths: parsePositiveIntList(args.predictionLengths, "--prediction-lengths"),
-      bridgeOnly: args.fullRecipeSpace ? false : true,
+      bridgeOnly: false,
     })
     const task = await runResearch((svc) => svc.createTask(input))
     print(task, args.format, () => formatResearchTasksTable([task]))
@@ -959,19 +974,20 @@ export const ResearchVibeCommand = cmd({
   ) => {
     const goal = args.goal?.join(" ").trim()
     if (!goal) return
+    const interactionMode = args.interactionMode ?? "socratic"
     const output = await runResearch((svc) =>
       Effect.gen(function* () {
         const task = yield* svc.createTask(
           buildDefaultTsfResearchTaskInputFromGoal({
             goal,
-            mode: researchModeForInteractionMode(args.interactionMode ?? "socratic"),
-            interactionMode: args.interactionMode ?? "socratic",
+            mode: researchModeForInteractionMode(interactionMode),
+            interactionMode,
             neoCastProjectRoot: args.runnerRoot ?? process.cwd(),
           }),
         )
         const pipeline = yield* svc.runFullPipeline({
           taskID: task.id,
-          stage: "smoke",
+          stage: pipelineStageForInteractionMode(interactionMode),
           description: goal,
           maxIterations: args.maxIterations,
           explorationRate: args.exploration,

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/historical_foundations.json",
+  "title": "NeoResearch Historical Foundations Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "version", "scope", "records"],
+  "properties": {
+    "schema_version": {"const": "historical_foundations_v1"},
+    "version": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "scope": {"type": "string", "minLength": 20},
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "year",
+          "venue",
+          "venue_tier",
+          "category",
+          "paper_url",
+          "publication_status",
+          "publication_track"
+        ],
+        "properties": {
+          "title": {"type": "string", "minLength": 5},
+          "aliases": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 5},
+            "uniqueItems": true
+          },
+          "year": {"type": "integer", "minimum": 1900, "maximum": 2022},
+          "venue": {"type": "string", "minLength": 2},
+          "venue_tier": {"enum": ["A", "B", "C", "unranked"]},
+          "category": {
+            "enum": [
+              "convolutional_forecasting",
+              "decomposition_forecasting",
+              "distribution_shift",
+              "frequency_decomposition_forecasting",
+              "frequency_forecasting",
+              "graph_forecasting",
+              "interpretable_forecasting",
+              "interpretable_probabilistic_forecasting",
+              "multivariate_forecasting",
+              "non_stationarity",
+              "point_forecast_evaluation",
+              "probabilistic_forecasting",
+              "probabilistic_forecast_evaluation",
+              "quantile_forecasting",
+              "robust_estimation",
+              "robust_forecasting",
+              "spatio_temporal_forecasting",
+              "statistical_neural_hybrid",
+              "transformer_forecasting"
+            ]
+          },
+          "paper_url": {"type": "string", "format": "uri"},
+          "pdf_url": {"type": "string", "format": "uri"},
+          "code_url": {"type": "string", "format": "uri"},
+          "source_label": {"type": "string"},
+          "doi": {"type": "string"},
+          "arxiv": {"type": "string", "pattern": "^[0-9]{4}\\.[0-9]{4,5}$"},
+          "publication_status": {"enum": ["peer_reviewed", "preprint"]},
+          "publication_track": {"enum": ["main", "journal", "preprint"]}
+        }
+      }
+    }
+  }
+}

@@ -49,6 +49,7 @@ ACTION_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     },
     "loss": {
         "mse": {"phase_min": "phase0b", "bridge_supported": True},
+        "gaussian_nll": {"phase_min": "phase2", "bridge_supported": False},
         "mae": {"phase_min": "phase1", "bridge_supported": False},
         "huber": {"phase_min": "phase1", "bridge_supported": False},
         "quantile": {"phase_min": "phase2", "bridge_supported": False},
@@ -171,6 +172,12 @@ def validate_recipe_against_registry(
         errors.append("fusion.channel_mode must be 'independent' or 'shared' when provided")
 
     output_distribution = recipe.get("prediction_head", {}).get("output_distribution", "point")
+    if output_distribution == "gaussian" and loss_type != "gaussian_nll":
+        errors.append("Gaussian output requires loss.base='gaussian_nll'")
+    if loss_type == "gaussian_nll" and (head_type != "gaussian" or output_distribution != "gaussian"):
+        errors.append("gaussian_nll requires a Gaussian distribution head")
+    if output_distribution == "gaussian" and (fusion_type == "temporal_then_feature" or "seasonal_differencing" in preprocessing_types):
+        errors.append("Gaussian output does not support output channel mixing or inverse seasonal differencing without joint covariance")
     allowed_distribution = {
         "linear": {"point"},
         "direct_multi_horizon": {"point"},
