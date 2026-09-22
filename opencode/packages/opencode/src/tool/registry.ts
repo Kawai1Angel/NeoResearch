@@ -1,3 +1,4 @@
+import { LiteratureRunTool, LiteratureListIntentsTool, LiteratureSearchTool, LiteratureReadPaperTool, LiteratureGetResultsTool } from "./research-literature"
 import { PlanExitTool } from "./plan"
 import { Session } from "../session"
 import { QuestionTool } from "./question"
@@ -130,6 +131,11 @@ export const layer: Layer.Layer<
     const experimentResults = yield* ExperimentResultsTool
     const readTrainingCurve = yield* ReadTrainingCurveTool
     const readMemoryLessons = yield* ReadMemoryLessonsTool
+    const literatureRun = yield* LiteratureRunTool
+    const literatureListIntents = yield* LiteratureListIntentsTool
+    const literatureSearch = yield* LiteratureSearchTool
+    const literatureReadPaper = yield* LiteratureReadPaperTool
+    const literatureGetResults = yield* LiteratureGetResultsTool
     const analyzeDataset = yield* AnalyzeDatasetTool
     const readTaskspec = yield* ReadTaskspecTool
     const updateTaskspec = yield* UpdateTaskspecTool
@@ -234,6 +240,11 @@ export const layer: Layer.Layer<
           experimentResults: Tool.init(experimentResults),
           readTrainingCurve: Tool.init(readTrainingCurve),
           readMemoryLessons: Tool.init(readMemoryLessons),
+          literatureRun: Tool.init(literatureRun),
+          literatureListIntents: Tool.init(literatureListIntents),
+          literatureSearch: Tool.init(literatureSearch),
+          literatureReadPaper: Tool.init(literatureReadPaper),
+          literatureGetResults: Tool.init(literatureGetResults),
           analyzeDataset: Tool.init(analyzeDataset),
           readTaskspec: Tool.init(readTaskspec),
           updateTaskspec: Tool.init(updateTaskspec),
@@ -271,6 +282,11 @@ export const layer: Layer.Layer<
             tool.experimentResults,
             tool.readTrainingCurve,
             tool.readMemoryLessons,
+            tool.literatureRun,
+            tool.literatureListIntents,
+            tool.literatureSearch,
+            tool.literatureReadPaper,
+            tool.literatureGetResults,
             tool.analyzeDataset,
             tool.readTaskspec,
             tool.updateTaskspec,

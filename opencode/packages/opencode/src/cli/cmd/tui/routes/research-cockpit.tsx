@@ -1,3 +1,4 @@
+import { updateLiteratureView, type LiteratureView } from "./research-literature-state"
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
 import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -101,6 +102,7 @@ type ResearchCockpitDatasetPreparationResult = {
 
 const chatRequestTimeoutMs = 90_000
 const researchAgentWorkflowOrder = [
+  "LiteratureAgent",
   "HypoPlanner Agent",
   "ModelDesigner Agent",
   "ModelCompiler Agent",
@@ -1195,6 +1197,7 @@ export function ResearchCockpit() {
   const [chatUsageByContext, setChatUsageByContext] = createSignal<Record<string, Record<string, ChatUsageEntry>>>({})
   const [interactionModeByTask, setInteractionModeByTask] = createSignal<Record<string, ResearchInteractionMode>>({})
   const [liveAgentEventStage, setLiveAgentEventStage] = createSignal<string | undefined>(undefined)
+  const [literatureView, setLiteratureView] = createSignal<LiteratureView>()
   const [dataAnalysisStream, setDataAnalysisStream] = createSignal<{
     id: number
     taskID?: string
@@ -1573,6 +1576,19 @@ export function ResearchCockpit() {
       return
     }
     if (researchPayload.type === "research.agent.llm.call_path") {
+      return
+    }
+    if (researchPayload.type.startsWith("research.agent.literature.")) {
+      const previous = literatureView()
+      const next = updateLiteratureView(previous, selectedTask()?.id, researchPayload as { type: string; properties?: Record<string, unknown> })
+      if (!next || next === previous) return
+      setLiteratureView(next)
+      setLiveAgentEventStage(next.status === "running" ? "LiteratureAgent" : undefined)
+      if (next.status !== "running" && (previous?.taskID !== next.taskID || previous?.status !== next.status)) {
+        appendDesignLLMLines(next.rows.map((row) => ({ id: ++streamEventID, taskID: next.taskID, text: row.text,
+          tone: next.status === "failed" ? "error" as const : "muted" as const })))
+      }
+      setRefresh((value) => value + 1)
       return
     }
     if (researchPayload.type === "research.agent.dataAnalysis.started") {
@@ -2401,6 +2417,10 @@ export function ResearchCockpit() {
     const taskID = selectedTask()?.id
     if (selectedCandidateTaskID !== taskID) {
       selectedCandidateTaskID = taskID
+      if (literatureView()?.taskID !== taskID) {
+        setLiteratureView(undefined)
+        if (liveAgentEventStage() === "LiteratureAgent") setLiveAgentEventStage(undefined)
+      }
       setSelectedCandidateID(undefined)
       setSelectedCandidateIndex(0)
       return
@@ -4085,6 +4105,18 @@ export function ResearchCockpit() {
       onSelect: () => appendCockpitNotice("help", "Use /help, /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export."),
     },
     {
+      title: "Open Literature child session",
+      value: "research.literature.session",
+      category: "Research",
+      slash: { name: "literature-session" },
+      onSelect: () => {
+        const artifact = taskArtifacts().find((item) => item.kind === "task_evidence_bundle_json")
+        const sessionID = literatureView()?.taskID === selectedTask()?.id ? literatureView()?.sessionID ?? artifact?.metadata.sessionID : artifact?.metadata.sessionID
+        if (typeof sessionID === "string") route.navigate({ type: "session", sessionID })
+        else appendCockpitNotice("literature", "当前任务尚无 Literature child session。")
+      },
+    },
+    {
       title: "Back to NeoResearch home",
       value: "research.home",
       category: "Research",
@@ -4422,6 +4454,7 @@ export function ResearchCockpit() {
       const hasLiveDaStream = !!daStreamForDedupe && (!task || !daStreamForDedupe.taskID || daStreamForDedupe.taskID === task.id)
       for (const item of formatResearchCockpitTaskAgentLLMLines(taskArtifacts())) {
         if (hasLiveDaStream && item.id.startsWith("llm-data-")) continue
+        if (item.id.startsWith("literature-") && designLLMLines().some((line) => line.taskID === task.id && line.text.startsWith("[LiteratureAgent] 完成"))) continue
         ambientLines.push({ id: item.id, text: item.text, tone: item.tone })
       }
       const champ = validChampion()
@@ -4544,6 +4577,11 @@ export function ResearchCockpit() {
           lines.push({ id: `da-stream-${daStream.id}-loading`, text: "  ...", tone: "muted", spinner: true })
         }
       }
+    }
+    const literature = literatureView()
+    if (literature && literature.taskID === selectedTask()?.id && literature.status === "running") {
+      lines.push({ id: "literature-live-header", text: "[LiteratureAgent]", tone: "muted" })
+      for (const row of literature.rows) lines.push({ id: `literature-live-${row.key}`, text: row.text, tone: "muted" })
     }
     // Initial-phase HypoPlanner (before any training): render alongside DA stream, before design lines.
     const hypoStream = hypoPlannerStream()

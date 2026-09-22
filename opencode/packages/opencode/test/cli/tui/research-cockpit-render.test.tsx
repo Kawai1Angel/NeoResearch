@@ -3067,7 +3067,7 @@ describe("ResearchCockpit render", () => {
       ["empty", undefined, "Intent Agent"],
       ["created", "苏格拉底", "Intent Agent"],
       ["profile", "苏格拉底", "Data Analysis Agent"],
-      ["profile_confirmed", "苏格拉底", "HypoPlanner Agent"],
+      ["profile_confirmed", "苏格拉底", "Data Analysis Agent"],
       ["explore", "苏格拉底", "ModelDesigner Agent"],
       // After the B-3 fix, a task with a champion but no successful train run
       // lands on Publish Agent (champion alone no longer activates Reflection
@@ -3164,10 +3164,10 @@ describe("ResearchCockpit render", () => {
       for (let attempt = 0; attempt < 20; attempt++) {
         await app.renderOnce()
         frame = app.captureCharFrame()
-        if (frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("HypoPlanner Agent"))) break
+        if (frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("LiteratureAgent"))) break
         await Bun.sleep(25)
       }
-      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("HypoPlanner Agent"))).toBe(true)
+      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("LiteratureAgent"))).toBe(true)
 
       app.mockInput.pressKey("TAB", { shift: true })
       for (let attempt = 0; attempt < 20; attempt++) {
@@ -5448,4 +5448,56 @@ describe("ResearchCockpit render", () => {
       app.renderer.destroy()
     }
   })
+})
+
+test("Literature streams tools, caches and data-only completion while rejecting old-task events", async () => {
+  await mkdir(Global.Path.state, { recursive: true })
+  await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+  const events = createCockpitEventSource()
+  const app = await testRender(() => <ResearchCockpitHarness fetch={researchFetch} events={events.source} />, { width: 160, height: 48 })
+  try {
+    await waitForFrame(app, "smoke succeeded")
+    events.emit({ type: "research.agent.literature.started", properties: { taskID } })
+    await waitForFrame(app, "[LiteratureAgent]")
+    events.emit({ type: "research.agent.literature.part.updated", properties: { taskID, partID: "lit-tool", kind: "tool", toolName: "literature_run", toolState: "running" } })
+    await waitForFrame(app, "literature_run")
+    for (let i = 0; i < 10; i++) events.emit({ type: "research.agent.literature.progress", properties: { taskID, runID: "retrieve_test", step: "assemble_evidence", status: "completed", cached: true } })
+    const progress = await waitForFrame(app, "缓存命中")
+    expect(progress.split("缓存命中")).toHaveLength(2)
+    events.emit({ type: "research.agent.literature.failed", properties: { taskID: "another_task" } })
+    await app.renderOnce()
+    expect(app.captureCharFrame()).not.toContain("证据未交付")
+    events.emit({ type: "research.agent.literature.completed", properties: { taskID, metadata: { retrieveRunID: "retrieve_test", readiness: "ready_data_only", callPath: "direct", gapCount: 2 } } })
+    const completed = await waitForFrame(app, "ready_data_only")
+    expect(completed).toContain("0 papers / 0 cards")
+    events.emit({ type: "research.agent.literature.started", properties: { taskID } })
+    events.emit({ type: "research.agent.literature.failed", properties: { taskID } })
+    await waitForFrame(app, "证据未交付")
+  } finally { app.renderer.destroy() }
+})
+
+test("Literature completion and child navigation recover from artifact metadata without SSE", async () => {
+  await mkdir(Global.Path.state, { recursive: true })
+  await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+  const fetchWithLiterature = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (requestURL(input).pathname === `/research/tasks/${taskID}/artifacts`) return response([{
+      id: "artifact_literature_replay", taskID, kind: "task_evidence_bundle_json", uri: "file:///tmp/task_evidence_bundle.json",
+      metadata: { schemaVersion: "task_evidence_bundle_v1", retrieveRunID: "retrieve_replay", readiness: "ready_data_only",
+        callPath: "session_tool", sessionID: "session_literature_replay", selectedEntryCount: 0, gapCount: 3,
+        summary: { literaturePaperCount: 0, paperBackedCardCount: 0 } }, time: { created: now, updated: now },
+    }])
+    return researchFetch(input, init)
+  }) as typeof fetch
+  for (let reopen = 0; reopen < 2; reopen++) {
+    let command: CommandDialog | undefined
+    let route: ReturnType<typeof useRoute> | undefined
+    const app = await testRender(() => <ResearchCockpitHarness fetch={fetchWithLiterature} onCommand={(value) => { command = value }} onRoute={(value) => { route = value }} />, { width: 160, height: 48 })
+    try {
+      const frame = await waitForFrame(app, "ready_data_only")
+      expect(frame).toContain("session_tool")
+      expect(frame).toContain("✓ LiteratureAgent")
+      command?.trigger("research.literature.session")
+      expect(route?.data).toEqual({ type: "session", sessionID: "session_literature_replay" })
+    } finally { app.renderer.destroy() }
+  }
 })

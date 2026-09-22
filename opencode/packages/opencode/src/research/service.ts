@@ -1,6 +1,9 @@
+import { EffectBridge } from "@/effect"
+import { recoverLiteratureReceipt } from "./literature-session-receipt"
+import { createLiteraturePhase, bindLiteratureSession, type LiteraturePhase } from "./literature-phase-executor"
 import { buildExecutionContract, digest, validateCandidateAgainstHypothesis, verifyExecutionRecords, type ExecutionContract, type ContractMismatch } from "./execution-contract"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { Cause, Context, Effect, Layer, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Schema, Stream, Semaphore } from "effect"
 import { cp, mkdir, readdir, readFile, writeFile } from "fs/promises"
 import { existsSync, openSync, readSync, closeSync } from "fs"
 import { createHash } from "crypto"
@@ -106,7 +109,6 @@ import {
   summarizeDataAnalysisAgent,
 } from "./agents/data-analysis-agent"
 import {
-  RetrieveAgent,
   RetrieveResultSchema,
   TASK_EVIDENCE_ROLES,
   taskContextDigest,
@@ -116,7 +118,6 @@ import {
   type TaskEvidenceRole,
   type RetrieveTaskContext,
 } from "./retrieve"
-import { ConfiguredLLMExtractionModel } from "./literature/extraction-model"
 import {
   buildModelCompilerResult,
   type ModelCompilerResult,
@@ -7602,8 +7603,64 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      )
 	    })
 
-    const runRetrieveAgent = Effect.fn("Research.runRetrieveAgent")(function* (input: RunRetrieveAgentInput) {
+    // Completed tool parts are authoritative receipts even without final prose.
+    const runLiteratureSession = (task: ResearchTask, phase: LiteraturePhase, modelRef: OpencodeModelRef) =>
+      Effect.gen(function* () {
+        const child = yield* session.create({ parentID: task.sessionID as Session.Info["id"], title: `Literature · ${task.id}` }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        if (!child) return undefined
+        yield* bus.publish(Event.LiteratureAgentProgress, { taskID: task.id, agent: "LiteratureAgent",
+          runID: phase.snapshot.retrieveRunID, step: "prepare_intents", status: "completed", sessionID: child.id,
+          counts: { intents: phase.snapshot.intents.length } })
+        const release = bindLiteratureSession(child.id, phase)
+        const assistantMessages = new Set<string>()
+        const isAssistant = (messageID: MessageV2.Part["messageID"]) => {
+          if (assistantMessages.has(messageID)) return true
+          const info = MessageV2.get({ sessionID: child.id, messageID }).info
+          if (info.role !== "assistant" || info.agent !== "research-literature") return false
+          assistantMessages.add(messageID)
+          return true
+        }
+        const forward = (part: MessageV2.Part) => {
+          if (!isAssistant(part.messageID)) return Effect.void
+          if (part.type === "text") return bus.publish(Event.LiteratureAgentPartUpdated, {
+            taskID: task.id, agent: "LiteratureAgent", partID: part.id, kind: "text", text: part.text.slice(-8000),
+          })
+          if (part.type !== "tool") return Effect.void
+          const state = part.state
+          return bus.publish(Event.LiteratureAgentPartUpdated, {
+            taskID: task.id, agent: "LiteratureAgent", partID: part.id, kind: "tool",
+            toolName: part.tool, toolState: state.status,
+            toolDurationMs: state.status === "completed" ? state.time.end - state.time.start : undefined,
+            toolError: state.status === "error" ? "Literature tool failed; see child session" : undefined,
+          })
+        }
+        return yield* Effect.gen(function* () {
+          yield* Effect.scoped(Effect.gen(function* () {
+            yield* Effect.forkScoped(bus.subscribe(MessageV2.Event.PartUpdated).pipe(
+              Stream.filter((event) => event.properties.sessionID === child.id),
+              Stream.runForEach((event) => forward(event.properties.part as MessageV2.Part)),
+            ))
+            yield* Effect.forkScoped(bus.subscribe(MessageV2.Event.PartDelta).pipe(
+              Stream.filter((event) => event.properties.sessionID === child.id && event.properties.field === "text" && isAssistant(event.properties.messageID)),
+              Stream.runForEach((event) => bus.publish(Event.LiteratureAgentStreamDelta, {
+                taskID: task.id, agent: "LiteratureAgent", delta: event.properties.delta,
+              })),
+            ))
+            yield* sessionPrompt.prompt({ sessionID: child.id, agent: "research-literature",
+              model: { providerID: ProviderID.make(modelRef.providerID), modelID: ModelID.make(modelRef.modelID) },
+              parts: [{ type: "text", text: "Inspect the bound retrieval intents, then call literature_run to complete the Literature phase. Summarize the validated results briefly." }],
+            }).pipe(Effect.catchCause(() => Effect.void))
+          }))
+          const messages = yield* session.messages({ sessionID: child.id })
+          const receipt = yield* Effect.promise(() => recoverLiteratureReceipt(phase, messages.filter((message) => message.info.role === "assistant").flatMap((message) => message.parts)))
+          return receipt ? { receipt, sessionID: child.id } : undefined
+        }).pipe(Effect.ensuring(Effect.sync(release)))
+      })
+
+    const literatureLocks = new Map<ResearchTaskID, Semaphore.Semaphore>()
+    const runRetrieveAgentUnlocked = Effect.fn("Research.runRetrieveAgent")(function* (input: RunRetrieveAgentInput) {
       yield* updateTaskStatus({ taskID: input.taskID, status: "literature" })
+      yield* bus.publish(Event.LiteratureAgentStarted, { taskID: input.taskID, agent: "LiteratureAgent", stage: "literature", status: "started" })
       yield* bus.publish(Event.RetrieveAgentStarted, {
         taskID: input.taskID,
         agent: "RetrieveAgent",
@@ -7628,29 +7685,28 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         ].find((candidate) => existsSync(path.join(candidate, "literature_knowledge"))) ?? path.resolve(Instance.directory, "neo_cast")
         if (configuredNeoCastRoot && !existsSync(neoCastRoot)) throw new Error(`Neo-Cast project root is unavailable: ${neoCastRoot}`)
         if (!existsSync(neoCastRoot)) yield* Effect.promise(() => mkdir(neoCastRoot, { recursive: true }))
-        const literatureModel = yield* Effect.promise(() =>
-          ConfiguredLLMExtractionModel.create({ workspaceRoot: Instance.directory, neoCastRoot }),
-        )
-        const agent = new RetrieveAgent({
-          neoCastRoot,
-          workspaceRoot: Instance.directory,
-          ...(literatureModel === undefined ? {} : { literatureModel }),
-        })
-        const result = yield* Effect.promise(async () => {
-          try {
-            return await agent.run({
-              quantitativeReport: quantitativeArtifact.uri.slice(7),
-              quantitativeReportArtifactID: quantitativeArtifact.id,
-              taskContext: buildRetrieveTaskContext(task),
-              ...(input.force === undefined ? {} : { force: input.force }),
-              ...(input.budgets === undefined ? {} : { budgets: input.budgets }),
-              ...(input.maxCardsPerPaper === undefined ? {} : { maxCardsPerPaper: input.maxCardsPerPaper }),
-              ...(input.catalogPath === undefined ? {} : { catalogPath: input.catalogPath }),
-            })
-          } finally {
-            agent.close()
-          }
-        })
+        const progressBridge = yield* EffectBridge.make()
+        const phase: LiteraturePhase = yield* Effect.promise(() => createLiteraturePhase({
+          neoCastRoot, workspaceRoot: Instance.directory, taskID: task.id,
+          run: { quantitativeReport: quantitativeArtifact.uri.slice(7), quantitativeReportArtifactID: quantitativeArtifact.id,
+            taskContext: buildRetrieveTaskContext(task), force: input.force, budgets: input.budgets,
+            maxCardsPerPaper: input.maxCardsPerPaper, catalogPath: input.catalogPath },
+          onProgress: (progress) => progressBridge.promise(bus.publish(Event.LiteratureAgentProgress, {
+            taskID: task.id, agent: "LiteratureAgent", runID: phase.snapshot.retrieveRunID, ...progress,
+          })),
+        }))
+        const config = runtime.literatureSessionTools === true
+          ? yield* Effect.promise(async () => (await resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: neoCastRoot }))?.config)
+          : undefined
+        const modelRef = config ? mapToModelRef(config) : undefined
+        const attempt = task.sessionID && modelRef
+          ? yield* runLiteratureSession(task, phase, modelRef)
+          : undefined
+        const callPath = attempt ? "session_tool" : "direct"
+        const directReason = attempt ? null : runtime.literatureSessionTools !== true ? "session_tools_disabled"
+          : !config ? "llm_not_configured" : !modelRef ? "model_not_mapped" : "tool_not_started"
+        const receipt = attempt?.receipt ?? (yield* Effect.promise(() => phase.execute()))
+        const result = yield* Effect.promise(() => phase.validate(receipt))
         if (result.taskID !== task.id) throw new Error(`Quantitative report task mismatch: expected ${task.id}, received ${result.taskID}`)
         const existingResultArtifact = artifacts.find((item) =>
           item.kind === "literature_retrieve_result_json" && recordValue(item.metadata).retrieveRunID === result.retrieveRunID,
@@ -7688,6 +7744,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .where(eq(ResearchArtifactTable.id, resultArtifact.id)).run())
         yield* db((d) => d.update(ResearchArtifactTable).set({
           metadata: { ...taskEvidenceArtifact.metadata, phase: "literature", agent: "LiteratureAgent",
+            callPath, sessionID: attempt?.sessionID ?? null, summary: result.summary, gapCount: result.taskEvidence.gaps.length,
+            reason: directReason,
             readiness: result.taskEvidence.readiness, selectedEntryCount: result.taskEvidence.summary.selectedEntryCount,
             uncoveredMustCoverIntentCount: result.taskEvidence.summary.uncoveredMustCoverIntentCount },
           time_updated: Date.now(),
@@ -7705,10 +7763,21 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             ...result.summary,
           },
         })
+        yield* bus.publish(Event.LiteratureAgentCompleted, {
+          taskID: task.id, agent: "LiteratureAgent", stage: "literature", status: "completed",
+          metadata: { retrieveRunID: result.retrieveRunID, resultArtifactID: resultArtifact.id,
+            taskEvidenceArtifactID: taskEvidenceArtifact.id, readiness: result.taskEvidence.readiness,
+            callPath, reason: directReason, sessionID: attempt?.sessionID ?? null, ...result.summary,
+            selectedEntryCount: result.taskEvidence.summary.selectedEntryCount, gapCount: result.taskEvidence.gaps.length },
+        })
         return result
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
+            yield* bus.publish(Event.LiteratureAgentFailed, {
+              taskID: input.taskID, agent: "LiteratureAgent", stage: "literature", status: "failed",
+              metadata: { code: "literature_phase_failed", message: "Literature execution or provenance validation failed", recoverable: false },
+            })
             yield* bus.publish(Event.RetrieveAgentFailed, {
               taskID: input.taskID,
               agent: "RetrieveAgent",
@@ -7720,6 +7789,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }),
         ),
       )
+    })
+
+    const runRetrieveAgent = (input: RunRetrieveAgentInput) => Effect.suspend(() => {
+      const lock = literatureLocks.get(input.taskID) ?? Semaphore.makeUnsafe(1)
+      literatureLocks.set(input.taskID, lock)
+      return lock.withPermits(1)(runRetrieveAgentUnlocked(input))
     })
 
     const loadDataAnalysisSummary = (taskID: ResearchTaskID) =>

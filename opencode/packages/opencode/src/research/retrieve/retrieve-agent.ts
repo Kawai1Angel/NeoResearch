@@ -1,3 +1,4 @@
+import type { LiteratureProgress } from "../literature-phase-executor"
 import { createHash } from "crypto"
 import path from "path"
 import { LiteratureAgent } from "../literature/literature-agent"
@@ -83,6 +84,7 @@ export class RetrieveAgent {
   private readonly ownedKnowledgeSource?: KnowledgeStore
 
   constructor(private readonly config: {
+    readonly onProgress?: (progress: LiteratureProgress) => Promise<void>
     readonly neoCastRoot: string
     readonly workspaceRoot: string
     readonly retrievalRoot?: string
@@ -99,6 +101,7 @@ export class RetrieveAgent {
       this.ownedLiteratureAgent = new LiteratureAgent({
         neoCastRoot: config.neoCastRoot,
         workspaceRoot: config.workspaceRoot,
+        onProgress: config.onProgress,
         ...(config.literatureModel === undefined ? {} : { model: config.literatureModel }),
         ...(config.knowledgeRoot === undefined ? {} : { knowledgeRoot: config.knowledgeRoot }),
       })
@@ -118,7 +121,7 @@ export class RetrieveAgent {
     this.ownedLiteratureAgent?.close()
   }
 
-  async run(input: RetrieveAgentInput): Promise<RetrieveResult> {
+  async prepare(input: RetrieveAgentInput) {
     const report = typeof input.quantitativeReport === "string"
       ? await readQuantitativeReport(input.quantitativeReport)
       : readQuantitativeReportValue(input.quantitativeReport)
@@ -159,10 +162,6 @@ export class RetrieveAgent {
       },
     })
     const retrieveRunID = `retrieve_${runDigest.slice(0, 16)}`
-    if (!input.force) {
-      const existing = await this.store.loadResult(retrieveRunID)
-      if (existing) return existing
-    }
     const datasetEvidence = extractDatasetEvidence(report)
     const mappings = mapScientificConcepts(report, datasetEvidence)
     const transformations = buildConceptTransformations(report, mappings)
@@ -173,6 +172,25 @@ export class RetrieveAgent {
       budgets.maxLiteraturePapersPerIntent,
     ))
     const selectedCandidates = selectBridgeCandidates(candidates, budgets)
+    return { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
+      reportDigest, quantitativeReportArtifactID, runDigest, retrieveRunID, datasetEvidence,
+      mappings, transformations, intents, candidates, selectedCandidates }
+  }
+
+  async run(input: RetrieveAgentInput, prepared?: Awaited<ReturnType<RetrieveAgent["prepare"]>>): Promise<RetrieveResult> {
+    const { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
+      reportDigest, quantitativeReportArtifactID, runDigest, retrieveRunID, datasetEvidence,
+      transformations, intents, candidates, selectedCandidates } = prepared ?? await this.prepare(input)
+    if (!input.force) {
+      const existing = await this.store.loadResult(retrieveRunID)
+      if (existing) {
+        await this.config.onProgress?.({ step: "assemble_evidence", status: "completed", cached: true })
+        return existing
+      }
+    }
+    await this.config.onProgress?.({ step: "prepare_intents", status: "completed", counts: { intents: intents.length } })
+    await this.config.onProgress?.({ step: "search", status: "completed", counts: { candidates: candidates.length } })
+    await this.config.onProgress?.({ step: "select", status: "completed", counts: { papers: selectedCandidates.length } })
     const bridge = await runLiteratureBridge(this.literatureAgent, {
       retrieveRunID,
       candidates: selectedCandidates,
@@ -184,6 +202,7 @@ export class RetrieveAgent {
     })
     const literatureResults = [...bridge.papers, ...skippedPapers(candidates)]
       .toSorted((left, right) => left.paperID.localeCompare(right.paperID))
+    await this.config.onProgress?.({ step: "assemble_evidence", status: "running" })
     const taskEvidence = buildTaskEvidence({
       retrieveRunID,
       quantitativeReportArtifactID,

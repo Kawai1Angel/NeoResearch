@@ -98,6 +98,12 @@ neo-research serve
 `cockpit` starts the terminal interface. `dashboard` starts the local server and opens the web
 interface. `serve` starts the headless Research OS API server for local integrations.
 
+The Literature phase appears between DataAnalysis and HypoPlanner, with bounded progress,
+readiness summaries and replay after reopening Cockpit. Set taskSpec `runtime.literatureSessionTools`
+to `true` to enable the restricted Literature child session; the initial default remains direct
+execution. Use `/literature-session` to open its tool trace. See the
+[Literature tools and event contract](src/research/literature/README.md#session-tools-and-cockpit).
+
 ## Research Task Lifecycle
 
 ```bash

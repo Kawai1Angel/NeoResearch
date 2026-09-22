@@ -722,3 +722,15 @@ test("defaultAgent throws when all primary agents are disabled", async () => {
     },
   })
 })
+
+test("research-literature grants only its bounded tools and denies general execution", async () => {
+  await using tmp = await tmpdir({ config: { permission: { "*": "allow" } } })
+  const agent = await load(tmp.path, (svc) => svc.get("research-literature"))
+  expect(agent?.hidden).toBe(true)
+  for (const name of ["literature_run", "literature_list_intents", "literature_search", "literature_read_paper", "literature_get_results"]) {
+    expect(evalPerm(agent, name)).toBe("allow")
+  }
+  for (const name of ["bash", "read", "write", "webfetch", "websearch", "update_taskspec"]) {
+    expect(evalPerm(agent, name)).toBe("deny")
+  }
+})

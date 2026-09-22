@@ -1,6 +1,6 @@
 # LiteratureAgent 工具化与 TUI 接入实施方案
 
-状态：待实施
+状态：阶段 A/B/C 已实现；真实 provider/PDF 联调验收前保留 direct 默认路径（可选第三阶段未实施）
 
 范围：`opencode/packages/opencode` 的 Research 流水线、session 工具与 Research Cockpit TUI
 
@@ -157,3 +157,35 @@ Research Cockpit 改造：
 | E2E | Companion checkpoint 后完成 DataAnalysis → Literature → HypoPlanner；有效文献与 data-only 两条路径均成功 |
 
 在 `opencode/packages/opencode` 运行新增的 package-scoped Bun 测试与 `bun typecheck`，不要在 `opencode/` 根目录运行 `npm test`。第一阶段上线前保留直接路径开关/降级能力；只有工具路径在真实任务中通过缓存、故障恢复和 TUI 回放验证后，才考虑让它成为默认。无需为本文档修改数据库或现有 artifact schema；若第三阶段引入新的运行状态持久化，再单独评估 migration 与版本升级。
+
+## 8. 实施与验证记录
+
+已落地共享 executor、五个受限工具、隐藏 `research-literature` agent、专用 session 回执恢复、
+Service 落盘校验与 artifact 刷新，以及 Cockpit 节点、进度、摘要回放和 `/literature-session` 导航。
+同一任务的 phase/artifact 登记串行；同一 KnowledgeStore 的写入在服务进程内串行，重复工具调用
+共享同一个执行 Promise。取消/超时在下一进度边界停止，正在进行的内部模型请求可能先返回。
+
+启用方式：在 taskSpec 的 runtime 中设置 `literatureSessionTools: true`。默认保留 direct，
+未配置可用模型或工具尚未开始时允许直接执行；已开始的操作对账原 Promise 与落盘结果。
+文献工具不开放 task/path/force 参数。可选第三阶段的 process/finalize 未实施。
+完整用户说明与事件 envelope 见 [Literature README](../../opencode/packages/opencode/src/research/literature/README.md)。
+
+验证命令（Bun 命令均在 `opencode/packages/opencode` 执行）：
+
+```bash
+bun run typecheck
+bun test test/research/literature-session.test.ts test/research/literature-tools.test.ts \
+  test/research/literature-phase.test.ts test/research/literature-pipeline.test.ts \
+  test/research/retrieve test/research/literature \
+  test/cli/tui/research-cockpit-data.test.ts test/cli/tui/research-literature-state.test.ts --timeout 30000
+bun test test/cli/tui/research-cockpit-render.test.tsx \
+  --test-name-pattern 'Literature|renders the prompt agent label|tab cycles' --timeout 30000
+bun test test/agent/agent.test.ts test/tool/registry.test.ts test/research/domain-registry.test.ts --timeout 30000
+# 在 neo_cast 执行：
+npm test
+```
+
+已通过核心回归、Literature 相关渲染、agent/tool 注册与权限、类型检查及 Neo-Cast Node/Python 测试。
+扩展检查发现 6 项已有 Cockpit 渲染失败（onboarding/旧文本/切换断言）和 8 项已有 TSF 域失败
+（baseline fixture 与当前 baseline 集合不符）；这些失败均已在独立的未修改 HEAD 副本复现。
+真实 provider 与实际 PDF 的 session_tool 联调尚未进行，因此本次不将工具路径改为默认。

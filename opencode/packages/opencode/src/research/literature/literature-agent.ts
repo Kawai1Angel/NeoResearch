@@ -1,3 +1,4 @@
+import type { LiteratureProgress } from "../literature-phase-executor"
 import { createHash } from "crypto"
 import { access, mkdir, readFile, rename, writeFile } from "fs/promises"
 import path from "path"
@@ -61,6 +62,7 @@ export class LiteratureAgent {
   private readonly store: KnowledgeStore
 
   constructor(private readonly config: {
+    readonly onProgress?: (progress: LiteratureProgress) => Promise<void>
     readonly neoCastRoot: string
     readonly workspaceRoot: string
     readonly model?: LiteratureExtractionModel
@@ -104,6 +106,10 @@ export class LiteratureAgent {
         result.summary.agentInferenceCount += processed.cards.filter((card) => card.evidence.every((item) => item.evidenceType === "agent_inference")).length
         result.summary.duplicateCount += processed.duplicateCount
       } catch (error) {
+        // Corrupt contracts, cached JSON and SQLite state must never become paper gaps.
+        if (error instanceof SyntaxError || (error instanceof Error &&
+          (["ZodError", "SQLiteError", "AbortError", "TimeoutError"].includes(error.name)))) throw error
+        await this.config.onProgress?.({ step: "parse", paperID: source.kind === "catalog_paper" ? source.paperID : undefined, status: "failed" })
         result.summary.failedCount += 1
         result.processed.push({
           paperID: source.kind === "catalog_paper" ? source.paperID : "unresolved-local-pdf",
@@ -123,6 +129,7 @@ export class LiteratureAgent {
     },
     model: LiteratureExtractionModel,
   ) {
+    await this.config.onProgress?.({ step: "parse", paperID: source.kind === "catalog_paper" ? source.paperID : undefined, status: "running" })
     const parsed = await (this.config.documentParser?.(source) ?? this.parseSource(source))
     const document = NormalizedDocumentSchema.parse(JSON.parse(await readFile(parsed.documentPath, "utf8")))
     const chunks = parseJsonl(await readFile(parsed.chunksPath, "utf8"), DocumentChunkSchema)
@@ -190,6 +197,7 @@ export class LiteratureAgent {
       }
     }
 
+    await this.config.onProgress?.({ step: "extract", paperID: document.paperID, status: "running" })
     const extracted = await extractCandidates({
       model, chunks, paper, cardTypes: options.cardTypes, includeAgentInference: options.includeAgentInference,
     })
@@ -199,6 +207,7 @@ export class LiteratureAgent {
     const verifications: unknown[] = []
     const taxonomySuggestions: string[] = []
     for (const candidate of candidates) {
+      await this.config.onProgress?.({ step: "verify", paperID: document.paperID, status: "running" })
       const verified = await verifyCandidate({ model, candidate, chunks, requireExactEvidenceSpan: options.requireExactEvidenceSpan })
         .catch((error) => ({ ok: false as const, rejection: { candidate, reason: "evidence_does_not_support_claim" as const, detail: `verifier error: ${String(error)}` } }))
       if (!verified.ok) { rejected.push(verified.rejection); continue }

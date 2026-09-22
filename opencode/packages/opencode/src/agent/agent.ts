@@ -1,3 +1,4 @@
+import PROMPT_RESEARCH_LITERATURE from "./prompt/research-literature.txt"
 import { Config } from "../config"
 import z from "zod"
 import { Provider } from "../provider"
@@ -234,6 +235,15 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_SUMMARY,
+          },
+          "research-literature": {
+            name: "research-literature", description: "Bound Literature phase tools", mode: "primary", steps: 12,
+            options: {}, native: true, hidden: true,
+            permission: Permission.merge(defaults, user, Permission.fromConfig({
+              "*": "deny", literature_run: "allow", literature_list_intents: "allow",
+              literature_search: "allow", literature_read_paper: "allow", literature_get_results: "allow",
+            })),
+            prompt: PROMPT_RESEARCH_LITERATURE,
           },
           "research-data-analysis": {
             name: "research-data-analysis",

@@ -1,3 +1,4 @@
+import { literatureSummary } from "./research-literature-state"
 import { spawnSync } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
@@ -17,6 +18,7 @@ export type ResearchCockpitTask = {
     | "intent_gathering"
     | "profiling"
     | "analyzing"
+    | "literature"
     | "data_analysis"
     | "hypo_planning"
     | "baselining"
@@ -320,12 +322,20 @@ export function buildResearchCockpitAgentWorkflow(input: ResearchCockpitWorkflow
   const reflectionDone = hasReflectionEvidence(input)
   const reflectionActive = trainEvalDone && !reflectionDone
   const designerIteration = modelDesignerIteration(input)
-  const planningActive = hasProfile && input.runnerReady && requirementsConfirmed
+  const literatureArtifact = input.artifacts.find((artifact) => artifact.kind === "task_evidence_bundle_json")
+  const literatureDone = Boolean(literatureArtifact) || (Array.isArray(asRecord(asRecord(asRecord(input.task?.taskSpec).metadata).workflow).completedPhases)
+    && (asRecord(asRecord(asRecord(input.task?.taskSpec).metadata).workflow).completedPhases as unknown[]).includes("literature"))
+  const planningActive = literatureDone && hasProfile && input.runnerReady && requirementsConfirmed
   const designActive = hasHypothesisPlan && input.runnerReady
   const designerDisplayLabel =
     designerIteration && (hasCompilerEvidence || designActive) ? `ModelDesigner Agent (${designerIteration})` : "ModelDesigner Agent"
 
   return [
+    {
+      label: "LiteratureAgent",
+      status: literatureDone ? "done" : input.task?.status === "literature" ? "active" : "todo",
+      detail: literatureArtifact ? literatureSummary(literatureArtifact.metadata) : "Retrieve local papers and assemble validated task evidence.",
+    },
     {
       label: "HypoPlanner Agent",
       displayLabel:
@@ -476,6 +486,10 @@ export function selectNextBestAction(input: ResearchCockpitWorkflowInput): Resea
         title: "Run Data Analysis",
         detail: "Inspect dataset patterns, targets, missingness, and seasonality before hypothesis planning.",
       }
+    }
+    if (!completedPhaseList.includes("literature")) {
+      return { command: "/pipeline hypo-planning", action: "run_hypo_planning", title: "Run Literature Retrieval",
+        detail: "Retrieve local literature and validate evidence before hypothesis planning." }
     }
     if (!completedPhaseList.includes("hypo_planning")) {
       return {
@@ -1798,6 +1812,8 @@ export function formatResearchCockpitTaskAgentLLMLines(
 ): ResearchCockpitTaskAgentLLMLine[] {
   const lines: ResearchCockpitTaskAgentLLMLine[] = []
 
+  const literatureArtifact = artifacts.find((a) => a.kind === "task_evidence_bundle_json")
+  if (literatureArtifact) lines.push({ id: `literature-${literatureArtifact.id}`, text: literatureSummary(literatureArtifact.metadata), tone: "success" })
   const dataAnalysisArtifact = artifacts.find((a) => a.kind === "dataset_analysis_report")
   if (dataAnalysisArtifact) {
     const status = typeof dataAnalysisArtifact.metadata.llmStatus === "string" ? dataAnalysisArtifact.metadata.llmStatus : undefined

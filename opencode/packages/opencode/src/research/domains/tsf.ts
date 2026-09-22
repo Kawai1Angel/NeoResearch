@@ -181,6 +181,7 @@ export const TSFTaskSpec = z
       .object({
         bridgeOnly: z.boolean().default(true),
         neoCastProjectRoot: z.string().optional(),
+        literatureSessionTools: z.boolean().optional(),
         pythonExecutable: z.string().min(1).default("python3"),
         currentCandidatePath: z.string().min(1).default(".neo-cast/current_candidate.json"),
         resolvedCandidatePath: z.string().min(1).default(".neo-cast/resolved_candidate.json"),

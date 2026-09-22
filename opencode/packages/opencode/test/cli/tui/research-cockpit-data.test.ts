@@ -218,6 +218,7 @@ describe("research cockpit data helpers", () => {
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
       "active:Create research task",
       "todo:Data Analysis Agent",
+      "todo:LiteratureAgent",
       "todo:HypoPlanner Agent",
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
@@ -298,6 +299,7 @@ describe("research cockpit data helpers", () => {
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
       "done:Create research task",
       "done:Data Analysis Agent",
+      "todo:LiteratureAgent",
       "done:HypoPlanner Agent",
       "done:ModelDesigner Agent",
       "done:ModelCompiler Agent",
@@ -344,6 +346,7 @@ describe("research cockpit data helpers", () => {
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toEqual([
       "done:Create research task",
       "active:Data Analysis Agent",
+      "todo:LiteratureAgent",
       "todo:HypoPlanner Agent",
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
@@ -383,6 +386,7 @@ describe("research cockpit data helpers", () => {
     expect(buildResearchCockpitWorkflow(input).map((item) => `${item.status}:${item.label}`)).toEqual([
       "done:Create research task",
       "todo:Data Analysis Agent",
+      "todo:LiteratureAgent",
       "todo:HypoPlanner Agent",
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
@@ -548,6 +552,7 @@ describe("research cockpit data helpers", () => {
     })
 
     expect(workflow.map((item) => `${item.status}:${item.displayLabel ?? item.label}`)).toEqual([
+      "todo:LiteratureAgent",
       "todo:HypoPlanner Agent",
       "todo:ModelDesigner Agent",
       "todo:ModelCompiler Agent",
@@ -584,7 +589,7 @@ describe("research cockpit data helpers", () => {
     expect(workflow.map((item) => `${item.status}:${item.label}`)).toContain("todo:HypoPlanner Agent")
   })
 
-  test("activates HypoPlanner after requirements confirmation is approved", () => {
+  test("keeps HypoPlanner pending until literature completes after requirements approval", () => {
     const workflow = buildResearchCockpitAgentWorkflow({
       task: task({
         id: "task_requirements_approved",
@@ -609,7 +614,7 @@ describe("research cockpit data helpers", () => {
       runnerReady: true,
     })
 
-    expect(workflow.map((item) => `${item.status}:${item.label}`)).toContain("active:HypoPlanner Agent")
+    expect(workflow.map((item) => `${item.status}:${item.label}`)).toContain("todo:HypoPlanner Agent")
   })
 
   test("marks Reflection Agent done when reflection notes are available", () => {
