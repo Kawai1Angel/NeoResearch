@@ -34,7 +34,8 @@ On the first iteration only, the input includes `baselineOptions` — the candid
 5. **existingHypotheses** — hypotheses currently in the pool (statement + status). These are what you are updating this cycle.
 6. **abandonedHypotheses** — directions abandoned in earlier rounds (statement only). Do NOT generate hypotheses that restate or closely resemble these.
 7. **baselineOptions** — first iteration only: candidate baseline recipes (`recipeID` + `description`) to choose from via `pick_baseline`. See "Baseline selection" above.
-8. **instruction** — explicit per-call instructions included in the user message; follow them.
+8. **taskEvidence** — the only literature evidence that may be cited. It contains readiness, selected KnowledgeCard revisions, allowed roles, linked dataset evidence paths, applicability, conflicts, and gaps. It is task-scoped; never infer another card from the wider knowledge store.
+9. **instruction** — explicit per-call instructions included in the user message; follow them.
 
 ## Narration
 The user watches this session live in a TUI panel that only shows what you write or call — going
@@ -68,5 +69,10 @@ supports or rules out). Keep each sentence brief, but never skip it.
 - Do not infer "no exogenous variables" from `targetCount=1` or weak target cross-correlation. Check
   `taskSpec.dataset.observedPastCovariates` and `taskSpec.dataset.knownFutureCovariates` first.
 - `expectedOutcome` must reference `val_avg_mse` (or the task's `primaryMetric`) and state the anticipated direction or magnitude.
+- Every hypothesis must include `datasetEvidencePaths`, `literatureEvidence`, `applicabilityAssumptions`, `falsificationCriteria`, and `evidenceLevel` in hypothesis tool calls/direct JSON output.
+- `literatureEvidence` entries must use an exact `cardID`, `cardRevision`, and `role` from `taskEvidence.entries`. Never cite cards outside this bundle and never treat relevance/BM25 scores as truth confidence.
+- `paper_supported` requires at least one valid literature reference. When taskEvidence has no eligible entry, use `data_only` and an empty `literatureEvidence` array. Use `conflicted` when cited evidence has a contradiction or hard applicability conflict, and explain it in risk/assumptions.
+- For a literature-supported hypothesis, every `datasetEvidencePaths` value must occur in the cited taskEvidence entries. `expectedOutcome` remains a falsifiable prediction, never a guarantee copied from a paper.
+- Every non-baseline-control hypothesis must include at least one concrete falsification criterion.
 - `suggestedBackbones` and `suggestedPreprocessing` must be subsets of what `methodLibrary` lists as allowed.
 - Priority: `high` for directions Reflection explicitly recommended, `medium` for plausible alternatives, `low` for speculative ones.

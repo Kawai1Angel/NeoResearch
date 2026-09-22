@@ -1,0 +1,59 @@
+{
+  "schemaVersion": "tsf_task_evidence_v1",
+  "bindingThreshold": 0.3,
+  "weights": {
+    "scientific": 0.35,
+    "method": 0.3,
+    "taskType": 0.15,
+    "domain": 0.1,
+    "role": 0.1
+  },
+  "genericTerms": [
+    "time",
+    "series",
+    "forecast",
+    "forecasting",
+    "model",
+    "modeling",
+    "temporal",
+    "method",
+    "data"
+  ],
+  "aliases": {
+    "forecasting": ["forecast", "prediction", "predictive"],
+    "seasonality": ["seasonal", "periodic", "periodicity"],
+    "multiple_seasonalities": ["multi periodic", "multiple periods", "multi scale frequency"],
+    "trend_dynamics": ["trend", "detrending", "long term evolution"],
+    "non_stationarity": ["nonstationary", "non stationary", "distribution shift"],
+    "potential_structural_break": ["change point", "changepoint", "regime transition"],
+    "covariate_conditioning": ["exogenous", "known future covariate", "covariate fusion"],
+    "cross_series_dependency": ["cross variable", "channel mixing", "inter series"],
+    "lead_lag_relationship": ["lead lag", "lag aware", "lagged covariate"],
+    "contaminated_observations": ["outlier", "robust", "heavy tailed"],
+    "incomplete_observations": ["missing", "masked", "incomplete"],
+    "irregular_sampling": ["irregular", "continuous time", "time gap"],
+    "long_horizon_dependency": ["long horizon", "long range", "multi horizon"],
+    "frequency_multiscale": ["frequency domain", "multi scale", "spectral"],
+    "seasonal_decomposition": ["decomposition", "trend seasonal"],
+    "adaptive_normalization": ["adaptive normalization", "shift aware"],
+    "cross_variable_modeling": ["cross attention", "channel mixing"],
+    "continuous_time_modeling": ["continuous time", "time gap encoding"]
+  },
+  "dataScale": {
+    "smallMaxRows": 4999,
+    "mediumMaxRows": 99999
+  },
+  "controlledPredicates": [
+    "regular_sampling",
+    "irregular_sampling",
+    "long_horizon",
+    "short_horizon",
+    "small_data",
+    "medium_data",
+    "large_data",
+    "low_compute",
+    "medium_compute",
+    "high_compute"
+  ],
+  "highConfidenceContradiction": 0.7
+}

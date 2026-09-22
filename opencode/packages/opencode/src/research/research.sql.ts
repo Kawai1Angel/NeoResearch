@@ -14,6 +14,7 @@ import type {
 } from "./schema"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID } from "@/session/schema"
+import type { TaskEvidenceRole } from "./retrieve/contract"
 
 export const ResearchTaskTable = sqliteTable(
   "research_task",
@@ -179,6 +180,15 @@ export const ResearchHypothesisTable = sqliteTable(
     priority: text().notNull(),
     risk: text().notNull(),
     testable: integer({ mode: "boolean" }).notNull(),
+    dataset_evidence_paths: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
+    literature_evidence: text({ mode: "json" }).notNull().default([]).$type<Array<{
+      cardID: string
+      cardRevision: number
+      role: TaskEvidenceRole
+    }>>(),
+    applicability_assumptions: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
+    falsification_criteria: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
+    evidence_level: text().notNull().default("data_only"),
     // pending | active | testing | confirmed | rejected | abandoned
     status: text().notNull().default("pending"),
     abandon_reason: text(),

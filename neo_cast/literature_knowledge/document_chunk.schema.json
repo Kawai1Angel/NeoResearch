@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "document_chunk.schema.json",
+  "title": "Literature document chunk",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "chunkID", "documentID", "paperID", "sectionID", "sectionKind", "pageStart", "pageEnd", "ordinal", "text", "textSha256"],
+  "properties": {
+    "schemaVersion": {"const": "document_chunk_v1"},
+    "chunkID": {"type": "string", "pattern": "^chunk_[a-f0-9]{20}$"},
+    "documentID": {"type": "string"},
+    "paperID": {"type": "string"},
+    "sectionID": {"type": "string"},
+    "sectionKind": {"enum": ["abstract", "introduction", "related_work", "method", "experiment_setup", "results", "ablation", "complexity", "limitations", "conclusion", "references", "unknown"]},
+    "pageStart": {"type": "integer", "minimum": 1},
+    "pageEnd": {"type": "integer", "minimum": 1},
+    "ordinal": {"type": "integer", "minimum": 0},
+    "text": {"type": "string", "minLength": 1},
+    "textSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "previousChunkID": {"type": "string"},
+    "nextChunkID": {"type": "string"}
+  }
+}

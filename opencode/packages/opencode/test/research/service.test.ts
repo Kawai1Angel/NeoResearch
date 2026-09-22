@@ -13,6 +13,8 @@ import { createFileResearchRuntime } from "../../src/research/runtime"
 import { Database, eq } from "../../src/storage"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
+import { addHypothesisToPool } from "../../src/research/hypothesis-store"
+import { validateCandidateAgainstHypothesis } from "../../src/research/execution-contract"
 
 function runResearch<A, E>(fx: Effect.Effect<A, E, Research.Service>) {
   return Effect.runPromise(fx.pipe(Effect.provide(Research.defaultLayer)))
@@ -208,6 +210,8 @@ async function writeTrainingFakeNeoCastRunner(root: string) {
 set -euo pipefail
 ${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_train
+cp .neo-cast/artifacts/run_fake/model_impl.py .neo-cast/artifacts/run_train/model_impl.py
+cp .neo-cast/artifacts/run_fake/inference.py .neo-cast/artifacts/run_train/inference.py
 cat > .neo-cast/artifacts/run_train/val_metrics.json <<'JSON'
 {"val_avg_mse":0.101,"val_avg_mae":0.303}
 JSON
@@ -412,19 +416,46 @@ printf '{"event":"done","status":"success"}\\n'
   )
 }
 
-function createCandidate(input: {
+async function createSearchHypothesis(taskID: Research.ResearchTaskID) {
+  // Ranking/loop tests deliberately explore multiple architectures. Contract-gate
+  // tests use narrow hypotheses instead of this search-policy fixture.
+  return addHypothesisToPool(taskID, {
+    statement: "Compare the declared architecture families under a shared evaluation protocol.",
+    motivation: ["Exercise search ranking and stopping policy."],
+    expectedOutcome: "Select the best verified full-run result.",
+    suggestedBackbones: ["linear", "mlp", "transformer", "rnn", "dlinear", "tcn", "ssm", "mixer", "nbeats", "timesnet"],
+    suggestedPreprocessing: [],
+    priority: "high",
+    risk: "Architecture ranking is dataset-dependent.",
+    testable: true,
+  })
+}
+
+async function createCandidate(input: {
   taskID: Research.ResearchTaskID
   parentCandidateID?: Research.ResearchCandidateID
   candidateSpec?: Research.JsonRecord
   rationale?: string
 }) {
+  const spec = input.candidateSpec ?? validTsfCandidateSpec()
+  const hypothesis = await addHypothesisToPool(input.taskID, {
+    statement: input.rationale ?? "Test the declared candidate architecture.",
+    motivation: ["Service regression fixture"],
+    expectedOutcome: "Complete evaluation under the declared protocol.",
+    suggestedBackbones: [String((spec.backbone as Record<string, unknown>).type)],
+    suggestedPreprocessing: [],
+    priority: "medium",
+    risk: "Fixture",
+    testable: true,
+  })
   return runResearch(
     Research.Service.use((svc) =>
       svc.createCandidate({
         taskID: input.taskID,
+        hypothesisID: hypothesis.id,
         parentCandidateID: input.parentCandidateID,
         domainID: "tsf",
-        candidateSpec: input.candidateSpec ?? validTsfCandidateSpec(),
+        candidateSpec: spec,
         rationale: input.rationale ?? "baseline modular candidate",
         riskLevel: "low",
         approvalStatus: "auto_approved",
@@ -447,13 +478,35 @@ function createRun(input: {
       svc.createRun({
         taskID: input.taskID,
         candidateID: input.candidateID,
-        stage: input.stage ?? "smoke",
+        stage: input.stage ?? (input.status === "succeeded" ? "full" : "smoke"),
         status: input.status,
         metrics: input.metrics,
-        resourceUsage: input.resourceUsage,
+        resourceUsage: {
+          ...(input.status === "succeeded" ? { executionContract: { status: "verified" } } : {}),
+          ...input.resourceUsage,
+        },
       }),
     ),
   )
+}
+
+async function executeFixtureSmoke(taskID: Research.ResearchTaskID, candidateID: Research.ResearchCandidateID) {
+  const task = await runResearch(Research.Service.use((svc) => svc.getTask(taskID)))
+  const runtime = task.taskSpec.runtime as Record<string, unknown>
+  if (typeof runtime.neoCastProjectRoot !== "string") {
+    const root = path.join(Instance.directory, "fixture-neo-cast")
+    await writeTrainingFakeNeoCastRunner(root)
+    await runResearch(Research.Service.use((svc) => svc.updateTaskSpec({
+      taskID,
+      taskSpec: { ...task.taskSpec, runtime: { ...runtime, neoCastProjectRoot: root, pythonExecutable: "bash" } },
+    })))
+  } else {
+    await writeFakeNeoCastRunner(runtime.neoCastProjectRoot)
+  }
+  const result = await runResearch(Research.Service.use((svc) => svc.executeRun({ taskID, candidateID, stage: "smoke" })))
+  expect(result.run.status).toBe("succeeded")
+  expect(result.run.resourceUsage.executionContract).toMatchObject({ status: "verified" })
+  return result
 }
 
 async function approveIntentCheckpoint(taskID: Research.ResearchTaskID, replyMessage = "Intent requirements confirmed.") {
@@ -482,6 +535,7 @@ async function runFullPipelineAfterIntentConfirmation(input: {
   stage?: Research.ExecutableRunStage
   description?: string
   maxIterations?: number
+  targetMetricValue?: number
   outputDir?: string
 }) {
   try {
@@ -630,12 +684,19 @@ describe("Research service", () => {
         )
         expect(artifact.id).toStartWith("rart_")
 
+        await expect(runResearch(Research.Service.use((svc) => svc.setChampion({
+          taskID: task.id, candidateID: candidate.id, runID: run.id, primaryMetric: 0.42, utility: 0.7,
+        })))).rejects.toThrow("full")
+        const fullRun = await createRun({
+          taskID: task.id, candidateID: candidate.id, status: "succeeded",
+          metrics: { val_avg_mse: 0.42 },
+        })
         const champion = await runResearch(
           Research.Service.use((svc) =>
             svc.setChampion({
               taskID: task.id,
               candidateID: candidate.id,
-              runID: run.id,
+              runID: fullRun.id,
               primaryMetric: 0.42,
               utility: 0.7,
             }),
@@ -716,6 +777,7 @@ describe("Research service", () => {
           "dataset_analysis_report",
           "dataset_main_analysis_markdown",
           "dataset_qualitative_analysis_markdown",
+          "dataset_quantitative_analysis_json",
           "dataset_quantitative_analysis_markdown",
           "task_profile_json",
         ])
@@ -730,10 +792,17 @@ describe("Research service", () => {
         expect(summary).toContain("Qualitative sub-agent")
         expect(summary).toContain("cross-variate")
         const quantitative = analysisArtifacts.find((artifact) => artifact.kind === "dataset_quantitative_analysis_markdown")
+        const quantitativeJSON = analysisArtifacts.find((artifact) => artifact.kind === "dataset_quantitative_analysis_json")
         const qualitative = analysisArtifacts.find((artifact) => artifact.kind === "dataset_qualitative_analysis_markdown")
         expect(quantitative?.uri.replace(/^file:\/\//, "")).toEndWith(
           path.join(".neo-research", "sessions", task.id, "analysis", "quantitative_analysis.md"),
         )
+        expect(quantitativeJSON?.uri.replace(/^file:\/\//, "")).toEndWith(
+          path.join(".neo-research", "sessions", task.id, "analysis", "quantitative_analysis.json"),
+        )
+        const quantitativeValue = JSON.parse(await readFile(quantitativeJSON!.uri.replace(/^file:\/\//, ""), "utf8"))
+        expect(quantitativeValue.schemaVersion).toBe("dataset_quantitative_analysis_v1")
+        expect(quantitativeValue.statistics.frequency.spectralPeaks).toBeArray()
         expect(qualitative?.uri.replace(/^file:\/\//, "")).toEndWith(
           path.join(".neo-research", "sessions", task.id, "analysis", "qualitative_analysis.md"),
         )
@@ -797,9 +866,10 @@ describe("Research service", () => {
 
         const result = await runFullPipelineAfterIntentConfirmation({
           taskID: task.id,
-          stage: "smoke",
+          stage: "full",
           description: "pipeline smoke",
           maxIterations: 1,
+          targetMetricValue: 0.2,
           outputDir: ".neo-research/pipeline",
         })
 
@@ -808,7 +878,7 @@ describe("Research service", () => {
         expect(result.dataAnalysis.artifact.kind).toBe("dataset_analysis_report")
         expect(result.hypoPlanning.agent).toBe("HypoPlannerAgent")
         expect(result.hypoPlanning.plan.hypotheses.length).toBeGreaterThan(0)
-        expect(result.nas.loop.stoppedReason).toBe("max_iterations")
+        expect(result.nas.loop.stoppedReason).toBe("target_reached")
         expect(result.nas.loop.iterations).toHaveLength(1)
         expect(result.publish.artifact.kind).toBe("model_export_package")
         const manifest = JSON.parse(await readFile(path.join(result.publish.path, "manifest.json"), "utf8"))
@@ -820,7 +890,7 @@ describe("Research service", () => {
         expect(manifest.files.leaderboard).toBe("experiments/leaderboard.md")
         expect(manifest.integrity.status).toBe("complete")
         expect(await readFile(path.join(result.publish.path, "reports", "final_report.md"), "utf8")).toContain(
-          "# pipeline autonomous task",
+          "# Final Research Report: pipeline autonomous task",
         )
         expect(await readFile(path.join(result.publish.path, "artifacts", "release_package.md"), "utf8")).toContain(
           "## Release Integrity",
@@ -865,9 +935,10 @@ describe("Research service", () => {
 
         const firstRun = await runFullPipelineAfterIntentConfirmation({
           taskID: task.id,
-          stage: "smoke",
+          stage: "full",
           description: "pipeline smoke",
           maxIterations: 1,
+          targetMetricValue: 0.2,
           outputDir: ".neo-research/pipeline",
         })
 
@@ -914,6 +985,7 @@ describe("Research service", () => {
               stage: "full",
               description: "pipeline smoke",
               maxIterations: 1,
+          targetMetricValue: 0.2,
               outputDir: ".neo-research/pipeline",
             })
 
@@ -962,9 +1034,10 @@ describe("Research service", () => {
 
         await runFullPipelineAfterIntentConfirmation({
           taskID: task.id,
-          stage: "smoke",
+          stage: "full",
           description: "pipeline smoke",
           maxIterations: 1,
+          targetMetricValue: 0.2,
           outputDir: ".neo-research/pipeline",
         })
 
@@ -1015,9 +1088,10 @@ describe("Research service", () => {
             const error = yield* svc
               .runFullPipeline({
                 taskID: task.id,
-                stage: "smoke",
+                stage: "full",
                 description: "pipeline smoke",
                 maxIterations: 1,
+          targetMetricValue: 0.2,
                 outputDir: ".neo-research/pipeline",
               })
               .pipe(
@@ -1035,12 +1109,17 @@ describe("Research service", () => {
           }),
         )
 
-        // Socratic mode auto-confirms intent and re-runs the full pipeline without blocking.
-        expect(blockedReplay.error).toBeUndefined()
-        expect(blockedReplay.events.dataAnalysisStarted).toBeGreaterThan(0)
-        expect(blockedReplay.events.nasStarted).toBeGreaterThan(0)
-        expect(blockedReplay.events.reflectionStarted).toBeGreaterThan(0)
-        expect(blockedReplay.events.publishStarted).toBeGreaterThan(0)
+        // A changed task contract requires renewed intent confirmation.
+        expect(blockedReplay.error).toMatchObject({
+          name: "ResearchPipelineBlockedError",
+          data: { reason: "human_checkpoint_required", checkpointPhase: "intent_confirmed" },
+        })
+        expect(Object.values(blockedReplay.events)).toEqual([0, 0, 0, 0])
+        await approveIntentCheckpoint(task.id)
+        await runResearch(Research.Service.use((svc) => svc.runFullPipeline({
+          taskID: task.id, stage: "full", maxIterations: 1, targetMetricValue: 0.2,
+          outputDir: ".neo-research/pipeline",
+        })))
         const runsAfterUpdate = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
         expect(runsAfterUpdate.length).toBeGreaterThan(runsBeforeUpdate.length)
       },
@@ -1178,7 +1257,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await createTSFTask(
           "socratic autonomous pipeline task",
           {
@@ -1205,8 +1284,9 @@ describe("Research service", () => {
             const error = yield* svc
               .runFullPipeline({
                 taskID: task.id,
-                stage: "smoke",
+                stage: "full",
                 maxIterations: 1,
+                targetMetricValue: 0.2,
                 outputDir: ".neo-research/pipeline",
               })
               .pipe(
@@ -1228,33 +1308,17 @@ describe("Research service", () => {
         const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
         expect(approvals.find((a) => a.reason.includes("[checkpoint:intent_confirmed]") && a.status === "pending")).toBeDefined()
 
-        // After intent approval, pipeline runs DataAnalysis + HypoPlanning then pauses at search_space_confirmed.
+        // Socratic mode auto-confirms the search-space and final-model checkpoints.
         await approveIntentCheckpoint(task.id)
-        await expect(
-          runResearch(
-            Research.Service.use((svc) =>
-              svc.runFullPipeline({
-                taskID: task.id,
-                stage: "smoke",
-                maxIterations: 1,
-                outputDir: ".neo-research/pipeline",
-              }),
-            ),
-          ),
-        ).rejects.toMatchObject({
-          name: "ResearchPipelineBlockedError",
-          data: { taskID: task.id, reason: "human_checkpoint_required", checkpointPhase: "search_space_confirmed" },
-        })
-
-        // HypoPlanning has completed (produces hypo_plan_md) before the search_space block.
+        const result = await runResearch(Research.Service.use((svc) => svc.runFullPipeline({
+          taskID: task.id, stage: "full", maxIterations: 1, targetMetricValue: 0.2,
+          outputDir: ".neo-research/pipeline",
+        })))
+        expect(result.publish.artifact.kind).toBe("model_export_package")
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         expect(artifacts.find((artifact) => artifact.kind === "hypo_plan_md")).toBeDefined()
-
-        // The search_space_confirmed checkpoint approval exists with a reason visible in the TUI.
         const approvalsAfter = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
-        const ssApproval = approvalsAfter.find((a) => a.reason.includes("[checkpoint:search_space_confirmed]") && a.status === "pending")
-        expect(ssApproval).toBeDefined()
-        expect(ssApproval?.reason).toContain("搜索空间已确认")
+        expect(approvalsAfter.filter((a) => a.status === "pending")).toHaveLength(0)
       },
     })
   })
@@ -1637,7 +1701,7 @@ describe("Research service", () => {
             svc.prepareRun({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "full",
+              stage: "smoke",
             }),
           ),
         )
@@ -1697,7 +1761,7 @@ describe("Research service", () => {
             svc.executeRun({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "full",
+              stage: "smoke",
             }),
           ),
         )
@@ -1754,7 +1818,7 @@ describe("Research service", () => {
             svc.prepareRun({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "full",
+              stage: "smoke",
               description: "durable handoff",
             }),
           ),
@@ -1890,7 +1954,7 @@ describe("Research service", () => {
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
-        const task = await createTSFTask("recipe memory task", { bridgeOnly: false })
+        const task = await createTSFTask("recipe memory task", { bridgeOnly: false }, "autonomous")
         const candidate = await runResearch(
           Research.Service.use((svc) =>
             svc.createCandidate({
@@ -1904,21 +1968,10 @@ describe("Research service", () => {
             }),
           ),
         )
-        const run = await createRun({
-          taskID: task.id,
-          candidateID: candidate.id,
-          status: "running",
+        await createRun({
+          taskID: task.id, candidateID: candidate.id, status: "succeeded",
+          metrics: { val_avg_mse: 0.12 },
         })
-
-        await runResearch(
-          Research.Service.use((svc) =>
-            svc.updateRunStatus({
-              runID: run.id,
-              status: "succeeded",
-              metrics: { val_avg_mse: 0.12 },
-            }),
-          ),
-        )
 
         const memory = await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))
         expect(memory[0]?.candidateSummary).toMatchObject({
@@ -2296,19 +2349,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const task = await createTSFTask("governed phase-two task", { bridgeOnly: false })
-        const candidate = await runResearch(
-          Research.Service.use((svc) =>
-            svc.createCandidate({
-              taskID: task.id,
-              domainID: "tsf",
-              candidateSpec: phaseTwoTsfCandidateSpec(),
-              rationale: "Profile-ranked phase-two recipe with native TimeRecipe actions.",
-              riskLevel: "medium",
-              approvalStatus: "auto_approved",
-              generatedBy: "mutation",
-            }),
-          ),
-        )
+        const candidate = await createCandidate({ taskID: task.id, candidateSpec: phaseTwoTsfCandidateSpec() })
 
         await expect(
           runResearch(
@@ -2366,6 +2407,7 @@ describe("Research service", () => {
         const governanceRecord = JSON.parse(await readFile(governancePath, "utf8"))
         expect(governanceRecord.replyMessage).toBe("Approved bounded low-fidelity exploration.")
 
+        await executeFixtureSmoke(task.id, candidate.id)
         const prepared = await runResearch(
           Research.Service.use((svc) =>
             svc.prepareRun({
@@ -2425,17 +2467,7 @@ describe("Research service", () => {
           reason: "Stage promotion blocked: low_fidelity requires a succeeded smoke run or protocol override.",
         })
 
-        await runResearch(
-          Research.Service.use((svc) =>
-            svc.createRun({
-              taskID: task.id,
-              candidateID: candidate.id,
-              stage: "smoke",
-              status: "succeeded",
-              metrics: { val_avg_mse: 0.2 },
-            }),
-          ),
-        )
+        await executeFixtureSmoke(task.id, candidate.id)
 
         const prepared = await runResearch(
           Research.Service.use((svc) =>
@@ -2540,6 +2572,10 @@ describe("Research service", () => {
           ),
         )
 
+        await executeFixtureSmoke(task.id, candidate.id)
+        await runResearch(Research.Service.use((svc) => svc.executeRun({
+          taskID: task.id, candidateID: candidate.id, stage: "full",
+        })))
         const prepared = await runResearch(
           Research.Service.use((svc) =>
             svc.prepareRun({
@@ -2718,8 +2754,8 @@ describe("Research service", () => {
         const task = await createTSFTask("review baseline workflow")
 
         const seeded = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
-        expect(seeded.candidates).toHaveLength(3)
-        expect(seeded.approvals).toHaveLength(3)
+        expect(seeded.candidates).toHaveLength(1)
+        expect(seeded.approvals).toHaveLength(1)
         expect(seeded.candidates.every((item) => item.approvalStatus === "pending")).toBe(true)
 
         const approval = seeded.approvals[0]!
@@ -2751,6 +2787,70 @@ describe("Research service", () => {
         expect(prepared.runPlan.writes[0]!.content.recipe_version).toBe("recipe_schema_v1")
       },
     })
+  })
+
+  test("binds baseline controls independently and validates existing candidates against their own hypothesis", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const root = path.join(tmp.path, "runner")
+      await writeFakeNeoCastRunner(root)
+      const task = await createTSFTask("control binding", { neoCastProjectRoot: root, pythonExecutable: "bash" }, "autonomous")
+      const intervention = await addHypothesisToPool(task.id, {
+        id: "H1", statement: "Test temporal attention, independently of the linear control.",
+        motivation: ["Test attention"], expectedOutcome: "Improve validation error",
+        suggestedBackbones: ["transformer"], suggestedPreprocessing: [], priority: "high", risk: "Overfit", testable: true,
+      })
+      const seeded = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
+      const baseline = seeded.candidates[0]!
+      expect(baseline.hypothesisID).not.toBe(intervention.id)
+      const hypotheses = await runResearch(Research.Service.use((svc) => svc.listHypotheses(task.id)))
+      const control = hypotheses.find((h) => h.id === baseline.hypothesisID)!
+      expect(validateCandidateAgainstHypothesis(control, baseline)).toEqual([])
+      expect(validateCandidateAgainstHypothesis(intervention, baseline).length).toBeGreaterThan(0)
+      const duplicate = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
+      expect(duplicate.candidates).toHaveLength(0)
+      expect(await runResearch(Research.Service.use((svc) => svc.listHypotheses(task.id)))).toHaveLength(2)
+      const iteration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })))
+      expect(iteration.candidate.id).toBe(baseline.id)
+      expect(iteration.run.status).toBe("succeeded")
+
+      const exploration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke", forceExplore: true })))
+      expect(exploration.candidate.hypothesisID).toBe(intervention.id)
+      expect(exploration.candidate.candidateSpec.backbone).toMatchObject({ type: "transformer" })
+      expect(validateCandidateAgainstHypothesis(intervention, exploration.candidate)).toEqual([])
+      expect(exploration.run.status).toBe("succeeded")
+    } })
+  })
+
+  test("preserves bound hypothesis snapshots and versions reused planner labels consistently", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const root = path.join(tmp.path, "runner")
+      await writeFakeNeoCastRunner(root)
+      const task = await createTSFTask("refresh bindings", { neoCastProjectRoot: root, pythonExecutable: "bash" }, "autonomous")
+      const original = await addHypothesisToPool(task.id, {
+        id: "H1", statement: "An immutable historical linear-control hypothesis.",
+        motivation: ["Historical control"], expectedOutcome: "Establish a floor",
+        suggestedBackbones: ["linear"], suggestedPreprocessing: [], priority: "low", risk: "Underfit", testable: true,
+      })
+      const candidate = await runResearch(Research.Service.use((svc) => svc.createCandidate({
+        taskID: task.id, domainID: "tsf", hypothesisID: original.id,
+        candidateSpec: validTsfCandidateSpec(), rationale: "Historical control",
+        generatedBy: "heuristic", riskLevel: "low", approvalStatus: "auto_approved",
+      })))
+      const result = await runResearch(Research.Service.use((svc) => svc.runHypoPlannerAgent({ taskID: task.id })))
+      const pool = await runResearch(Research.Service.use((svc) => svc.listHypotheses(task.id)))
+      expect(pool.find((h) => h.id === original.id)).toEqual(original)
+      const version = result.plan.hypotheses.find((h) => h.id.startsWith("H1_"))!
+      expect(version).toBeDefined()
+      expect(pool.find((h) => h.id === version.id)?.statement).toBe(version.statement)
+      expect(result.hypothesesYaml).toContain(version.id)
+      expect(result.planMarkdown).toContain(version.id)
+      const iteration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })))
+      expect(iteration.candidate.id).toBe(candidate.id)
+      expect(iteration.candidate.hypothesisID).toBe(original.id)
+      expect(iteration.run.status).toBe("succeeded")
+    } })
   })
 
   test("seeds data-profiled TSF baselines for full recipe autonomous search", async () => {
@@ -2831,6 +2931,7 @@ describe("Research service", () => {
           ),
         )
 
+        await executeFixtureSmoke(task.id, seeded.candidates[0]!.id)
         const executed = await runResearch(
           Research.Service.use((svc) =>
             svc.executeRun({
@@ -2843,17 +2944,17 @@ describe("Research service", () => {
         )
 
         expect(executed.run.status).toBe("succeeded")
-        expect(executed.run.metrics.val_avg_mse).toBe(0.123)
+        expect(executed.run.metrics.val_avg_mse).toBe(0.101)
         expect(executed.run.resourceUsage.exitCode).toBe(0)
         expect(executed.run.resourceUsage.reproducibility).toMatchObject({
           datasetSHA: expect.any(String),
           lockHash: expect.any(String),
           preprocessSHA: expect.any(String),
         })
-        expect(executed.run.artifactRefs).toHaveLength(4)
+        expect(executed.run.artifactRefs).toHaveLength(5)
 
         const writtenCandidate = JSON.parse(
-          await readFile(path.join(fakeNeoCastRoot, ".neo-cast", "current_candidate.json"), "utf8"),
+          await readFile(path.join(tmp.path, ".neo-cast", "current_candidate.json"), "utf8"),
         )
         expect(writtenCandidate.recipe_version).toBe("recipe_schema_v1")
 
@@ -2861,13 +2962,13 @@ describe("Research service", () => {
         expect(artifacts.some((artifact) => artifact.kind === "runner_plan_json")).toBe(true)
         expect(artifacts.some((artifact) => artifact.kind === "runner_artifact")).toBe(true)
         expect(artifacts.some((artifact) => artifact.kind === "runner_progress_jsonl")).toBe(true)
-        const executionLog = artifacts.find((artifact) => artifact.kind === "runner_execution_log_json")
+        const executionLog = artifacts.find((artifact) => artifact.kind === "runner_execution_log_json" && artifact.runID === executed.run.id)
         expect(executionLog?.runID).toBe(executed.run.id)
         expect(executionLog?.metadata).toMatchObject({
           runnerID: executed.runPlan.runnerID,
-          stage: "smoke",
+          stage: "full",
           exitCode: 0,
-          recordCount: 4,
+          recordCount: 7,
         })
         expect(executed.run.artifactRefs).toContain(executionLog!.id)
         const executionLogRecord = JSON.parse(await readFile(executionLog!.uri.replace("file://", ""), "utf8"))
@@ -2877,7 +2978,7 @@ describe("Research service", () => {
 
         const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))
         expect(champion?.candidateID).toBe(seeded.candidates[0]!.id)
-        expect(champion?.primaryMetric).toBe(0.123)
+        expect(champion?.primaryMetric).toBe(0.101)
 
         const memory = await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))
         expect(memory[0]!.outcome).toBe("accepted")
@@ -2888,7 +2989,7 @@ describe("Research service", () => {
           horizonContextRatio: 0.25,
           bridgeOnly: true,
         })
-        expect(memory[0]!.candidateSummary.primaryMetric).toBe(0.123)
+        expect(memory[0]!.candidateSummary.primaryMetric).toBe(0.101)
       },
     })
   })
@@ -2909,6 +3010,7 @@ describe("Research service", () => {
         })
         const candidate = await createCandidate({ taskID: task.id })
 
+        await executeFixtureSmoke(task.id, candidate.id)
         const executed = await runResearch(
           Research.Service.use((svc) =>
             svc.executeRun({
@@ -2945,6 +3047,7 @@ describe("Research service", () => {
           pythonExecutable: "bash",
         })
         const candidate = await createCandidate({ taskID: task.id })
+        await executeFixtureSmoke(task.id, candidate.id)
         const executed = await runResearch(
           Research.Service.use((svc) =>
             svc.executeRun({ taskID: task.id, candidateID: candidate.id, stage: "full" }),
@@ -3004,6 +3107,8 @@ describe("Research service", () => {
         )
 
         expect(progress.map((item) => item.event)).toEqual([
+          "executed_model_manifest",
+          "execution_contract_verified",
           "stage_start",
           "epoch_end",
           "timeout",
@@ -3069,7 +3174,7 @@ describe("Research service", () => {
           runnerID: executed.runPlan.runnerID,
           stage: "smoke",
           exitCode: 7,
-          recordCount: 2,
+          recordCount: 4,
         })
         expect(executed.run.artifactRefs).toContain(executionLog!.id)
         expect(executed.run.artifactRefs).toContain(progressLog!.id)
@@ -3268,7 +3373,7 @@ describe("Research service", () => {
           ),
         ).toEqual([3, 5, 7])
 
-        const seedLog = await readFile(path.join(fakeNeoCastRoot, ".neo-cast", "seed-log.txt"), "utf8")
+        const seedLog = await readFile(path.join(tmp.path, ".neo-cast", "seed-log.txt"), "utf8")
         expect(seedLog.trim().split("\n")).toEqual(["3", "5", "7"])
 
         const exported = await runResearch(Research.Service.use((svc) => svc.exportTaskArtifact({ taskID: task.id })))
@@ -3371,6 +3476,7 @@ describe("Research service", () => {
 
         expect(report).toContain("## Data Analysis Agents")
         expect(report).toContain("dataset_quantitative_analysis_markdown")
+        expect(report).toContain("dataset_quantitative_analysis_json")
         expect(report).toContain("dataset_qualitative_analysis_markdown")
         expect(report).toContain("dataset_main_analysis_markdown")
         expect(report).toContain("dataset_analysis_plot_png")
@@ -3732,7 +3838,7 @@ describe("Research service", () => {
           ),
         )
 
-        expect(iteration.seededCandidates).toHaveLength(3)
+        expect(iteration.seededCandidates).toHaveLength(1)
         expect(iteration.approvals).toHaveLength(0)
         expect(iteration.candidate.approvalStatus).toBe("auto_approved")
         expect(iteration.run.status).toBe("succeeded")
@@ -3788,7 +3894,7 @@ describe("Research service", () => {
         ])
 
         const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))
-        expect(champion?.candidateID).toBe(iteration.candidate.id)
+        expect(champion).toBeUndefined()
       },
     })
   })
@@ -3974,7 +4080,7 @@ describe("Research service", () => {
         })
 
         const candidates = await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))
-        expect(candidates).toHaveLength(4)
+        expect(candidates).toHaveLength(2)
       },
     })
   })
@@ -4020,7 +4126,7 @@ describe("Research service", () => {
     })
   })
 
-  test("autonomous loop retries metricless succeeded runs as inconclusive candidates", async () => {
+  test("autonomous loop retries metricless smoke runs as compiler failures", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4054,13 +4160,15 @@ describe("Research service", () => {
 
         const designStep = loop.iterations[1]!.managerTrace.find((step) => step.role === "design")
         expect(designStep?.metadata).toMatchObject({
-          inconclusiveCandidateCount: 1,
+          inconclusiveCandidateCount: 0,
         })
 
         const selectionRecord = JSON.parse(
           await readFile(loop.iterations[1]!.selectionArtifact.uri.replace("file://", ""), "utf8"),
         )
-        expect(selectionRecord.inconclusiveCandidateIDs).toContain(loop.iterations[0]!.candidate.id)
+        expect(selectionRecord.inconclusiveCandidateIDs).toEqual([])
+        expect(loop.iterations.map((item) => item.run.status)).toEqual(["failed", "failed"])
+        expect(loop.iterations[0]!.run.error).toContain("val_avg_mse is missing")
       },
     })
   })
@@ -4137,7 +4245,7 @@ describe("Research service", () => {
     })
   })
 
-  test("autonomous loop defaults plateau to 5 rounds against the current task best", async () => {
+  test("autonomous loop defaults plateau to 25 rounds against the current task best", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4154,6 +4262,9 @@ describe("Research service", () => {
           },
           "autonomous",
         )
+        await runResearch(Research.Service.use((svc) => svc.updateTaskBudget({
+          taskID: task.id, budget: { maxRuns: 60 },
+        })))
         const sessionBestCandidate = await createCandidate({
           taskID: task.id,
           rationale: "current task/session best",
@@ -4166,23 +4277,24 @@ describe("Research service", () => {
           metrics: { val_avg_mse: 0.05, val_avg_mae: 0.2 },
         })
 
+        await createSearchHypothesis(task.id)
         const loop = await runResearch(
           Research.Service.use((svc) =>
             svc.runAutonomousLoop({
               taskID: task.id,
               stage: "full",
-              maxIterations: 10,
+              maxIterations: 30,
               description: "default plateau against current best",
             }),
           ),
         )
 
         expect(loop.stoppedReason).toBe("plateau")
-        expect(loop.iterations).toHaveLength(5)
+        expect(loop.iterations).toHaveLength(25)
         expect(loop.iterations.every((iteration) => iteration.run.metrics.val_avg_mse === 0.101)).toBe(true)
       },
     })
-  })
+  }, 60_000)
 
   test("autonomous loop does not use smoke metrics for no-improvement stopping", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
@@ -4213,6 +4325,7 @@ describe("Research service", () => {
           metrics: { val_avg_mse: 0.01, val_avg_mae: 0.02 },
         })
 
+        await createSearchHypothesis(task.id)
         const loop = await runResearch(
           Research.Service.use((svc) =>
             svc.runAutonomousLoop({
@@ -4326,7 +4439,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
 
         const task = await runResearch(
           Research.Service.use((svc) =>
@@ -4354,12 +4467,13 @@ describe("Research service", () => {
           ),
         )
 
-        for (let index = 0; index < 6; index++) {
+        await createSearchHypothesis(task.id)
+        for (let index = 0; index < 3; index++) {
           await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({
                 taskID: task.id,
-                stage: "smoke",
+                stage: "full",
                 description: `baseline ${index + 1}`,
               }),
             ),
@@ -4370,7 +4484,7 @@ describe("Research service", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousIteration({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               description: "ranked native proposal",
             }),
           ),
@@ -4395,7 +4509,7 @@ describe("Research service", () => {
           version: "tsf_profile_learned_memory_ranker_v1",
           featureSource: "taskFingerprint.datasetProfile",
           rankingCount: selectionRecord.rankings.length,
-          memoryEvidenceCount: 6,
+          memoryEvidenceCount: 3,
           benchmarkEvidenceCount: 0,
         })
         expect(selectionRecord.rankings[0].predictorVersion).toBe("tsf_profile_learned_memory_ranker_v1")
@@ -4406,12 +4520,12 @@ describe("Research service", () => {
           bridgeOnly: false,
 	          historyRunCount: 6,
 	          historyMetricRunCount: 6,
-	          historyMemoryCount: 6,
-	          learnedRankerTrainingExamples: 7,
-	          learnedRankerPositiveExamples: 2,
+	          historyMemoryCount: 3,
+	          learnedRankerTrainingExamples: 10,
+	          learnedRankerPositiveExamples: 5,
 	          learnedRankerNegativeExamples: 5,
 	          hasChampion: true,
-	          memoryEvidenceCount: 6,
+	          memoryEvidenceCount: 3,
           benchmarkEvidenceCount: 0,
           datasetProfileSignals: {
             source: "dataset.path",
@@ -4555,7 +4669,8 @@ describe("Research service", () => {
             "autonomous",
           )
 
-          for (let index = 0; index < 3; index++) {
+          await createSearchHypothesis(task.id)
+          for (let index = 0; index < 1; index++) {
             await runResearch(
               Research.Service.use((svc) =>
                 svc.runAutonomousIteration({
@@ -4611,7 +4726,7 @@ describe("Research service", () => {
       directory: tmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
 
         const sourceTask = await createTSFTask("source benchmark memory", { bridgeOnly: false })
         await runResearch(
@@ -4672,12 +4787,13 @@ describe("Research service", () => {
           ),
         )
 
-        for (let index = 0; index < 6; index++) {
+        await createSearchHypothesis(task.id)
+        for (let index = 0; index < 3; index++) {
           await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({
                 taskID: task.id,
-                stage: "smoke",
+                stage: "full",
                 description: `baseline ${index + 1}`,
               }),
             ),
@@ -4688,7 +4804,7 @@ describe("Research service", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousIteration({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               description: "benchmark-memory proposal",
             }),
           ),
@@ -4700,12 +4816,12 @@ describe("Research service", () => {
         expect(iteration.selectionArtifact!.metadata).toMatchObject({
           rankPredictorVersion: "tsf_profile_learned_memory_ranker_v1",
           historyDomainMemoryCount: 1,
-          historyTaskMemoryCount: 6,
+          historyTaskMemoryCount: 3,
         })
         expect(selectionRecord.rankings[0].features).toMatchObject({
           historyDomainMemoryCount: 1,
-	          learnedRankerTrainingExamples: 8,
-	          learnedRankerPositiveExamples: 3,
+	          learnedRankerTrainingExamples: 11,
+	          learnedRankerPositiveExamples: 6,
 	          learnedRankerNegativeExamples: 5,
 	        })
         expect(selectionRecord.rankings[0].reasons.some((reason: string) => reason.includes("benchmark memory"))).toBe(
@@ -4765,7 +4881,7 @@ describe("Research service", () => {
       directory: targetTmp.path,
       fn: async () => {
         const fakeNeoCastRoot = path.join(targetTmp.path, "fake-neo-cast")
-        await writeFakeNeoCastRunner(fakeNeoCastRoot)
+        await writeTrainingFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await runResearch(
           Research.Service.use((svc) =>
             svc.createTask({
@@ -4792,12 +4908,13 @@ describe("Research service", () => {
           ),
         )
 
-        for (let index = 0; index < 6; index++) {
+        await createSearchHypothesis(task.id)
+        for (let index = 0; index < 3; index++) {
           await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({
                 taskID: task.id,
-                stage: "smoke",
+                stage: "full",
                 description: `baseline ${index + 1}`,
               }),
             ),
@@ -4808,7 +4925,7 @@ describe("Research service", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousIteration({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               description: "isolated benchmark-memory proposal",
             }),
           ),

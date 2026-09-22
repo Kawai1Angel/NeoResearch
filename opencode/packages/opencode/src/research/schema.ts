@@ -101,6 +101,7 @@ export const ResearchTaskStatus = Schema.Literals([
   "profiling",
   "analyzing",
   "data_analysis",
+  "literature",
   "hypo_planning",
   "baselining",
   "searching",

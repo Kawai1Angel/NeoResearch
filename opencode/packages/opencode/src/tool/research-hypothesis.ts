@@ -4,10 +4,12 @@ import {
   abandonHypothesisInPool,
   addHypothesisToPool,
   listHypothesesInPool,
+  loadTaskEvidenceForSession,
   resolveTaskIDBySessionID,
   updateHypothesisInPool,
   HypothesisNotFoundError,
 } from "@/research/hypothesis-store"
+import { validateHypothesisEvidence, type HypothesisObject } from "@/research/agents/hypo-planner-agent"
 
 type SafeResult<T> = { ok: true; value: T } | { ok: false; error: string }
 
@@ -21,6 +23,20 @@ async function safe<T>(fn: () => Promise<T>): Promise<SafeResult<T>> {
 
 const Priority = Schema.Literals(["high", "medium", "low"])
 const StringArray = Schema.optional(Schema.Array(Schema.String))
+const EvidenceLevel = Schema.Literals(["data_only", "paper_supported", "conflicted"])
+const EvidenceRole = Schema.Literals([
+  "supports_mechanism",
+  "supports_applicability",
+  "suggests_implementation",
+  "defines_evaluation",
+  "warns_limitation",
+  "contradicts",
+])
+const LiteratureEvidence = Schema.optional(Schema.Array(Schema.Struct({
+  cardID: Schema.String,
+  cardRevision: Schema.Number,
+  role: EvidenceRole,
+})))
 
 const NOT_IN_RESEARCH_SESSION =
   "This tool can only be used inside a research task session — could not resolve the current research task."
@@ -38,6 +54,11 @@ const AddParameters = Schema.Struct({
   testable: Schema.optional(Schema.Boolean).annotate({
     description: "Whether this hypothesis can be tested with an experiment run. Defaults to true.",
   }),
+  datasetEvidencePaths: StringArray.annotate({ description: "Dataset JSON paths grounding this hypothesis." }),
+  literatureEvidence: LiteratureEvidence.annotate({ description: "Exact cardID/revision/role references from the task evidence bundle." }),
+  applicabilityAssumptions: StringArray.annotate({ description: "Conditions that must hold for literature transfer." }),
+  falsificationCriteria: StringArray.annotate({ description: "Concrete observations that would reject the hypothesis." }),
+  evidenceLevel: Schema.optional(EvidenceLevel).annotate({ description: "data_only, paper_supported, or conflicted." }),
 })
 
 type AddArgs = Schema.Schema.Type<typeof AddParameters>
@@ -54,8 +75,7 @@ export const HypothesisAddTool = Tool.define(
         if (!taskID) {
           return { title: "hypothesis_add", metadata: { hypoID: undefined as string | undefined }, output: NOT_IN_RESEARCH_SESSION }
         }
-        const created = yield* Effect.promise(() =>
-          addHypothesisToPool(taskID, {
+        const hypothesis = {
             statement: args.statement,
             motivation: args.motivation ?? [],
             expectedOutcome: args.expectedOutcome ?? "",
@@ -64,8 +84,21 @@ export const HypothesisAddTool = Tool.define(
             priority: args.priority,
             risk: args.risk ?? "",
             testable: args.testable ?? true,
-          }),
-        )
+            datasetEvidencePaths: args.datasetEvidencePaths ?? [],
+            literatureEvidence: args.literatureEvidence ?? [],
+            applicabilityAssumptions: args.applicabilityAssumptions ?? [],
+            falsificationCriteria: args.falsificationCriteria ?? [],
+            evidenceLevel: args.evidenceLevel ?? "data_only" as const,
+          }
+        const result = yield* Effect.promise(() => safe(async () => {
+          const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
+          validateHypothesisEvidence([{ id: "pending", status: "pending", ...hypothesis }], taskEvidence)
+          return addHypothesisToPool(taskID, hypothesis)
+        }))
+        if (!result.ok) {
+          return { title: "hypothesis_add", metadata: { hypoID: undefined as string | undefined }, output: result.error }
+        }
+        const created = result.value
         return {
           title: "hypothesis_add",
           metadata: { hypoID: created.id as string | undefined },
@@ -85,6 +118,11 @@ const UpdateParameters = Schema.Struct({
   priority: Schema.optional(Priority),
   risk: Schema.optional(Schema.String),
   testable: Schema.optional(Schema.Boolean),
+  datasetEvidencePaths: StringArray,
+  literatureEvidence: LiteratureEvidence,
+  applicabilityAssumptions: StringArray,
+  falsificationCriteria: StringArray,
+  evidenceLevel: Schema.optional(EvidenceLevel),
 })
 
 type UpdateArgs = Schema.Schema.Type<typeof UpdateParameters>
@@ -102,7 +140,14 @@ export const HypothesisUpdateTool = Tool.define(
           return { title: "hypothesis_update", metadata: { hypoID: undefined as string | undefined }, output: NOT_IN_RESEARCH_SESSION }
         }
         const { hypoID, ...rest } = args
-        const result = yield* Effect.promise(() => safe(() => updateHypothesisInPool(taskID, hypoID, rest)))
+        const result = yield* Effect.promise(() => safe(async () => {
+          const existing = (await listHypothesesInPool(taskID, { includeAbandoned: true })).find((item) => item.id === hypoID)
+          if (!existing) throw new HypothesisNotFoundError(hypoID)
+          const candidate: HypothesisObject = { ...existing, ...rest }
+          const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
+          validateHypothesisEvidence([candidate], taskEvidence)
+          return updateHypothesisInPool(taskID, hypoID, rest)
+        }))
         if (!result.ok) {
           return { title: "hypothesis_update", metadata: { hypoID: hypoID as string | undefined }, output: result.error }
         }

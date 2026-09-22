@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dataset_quantitative_analysis.schema.json",
+  "title": "Dataset quantitative analysis",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "taskID", "domain", "dataset", "forecast", "profile", "statistics", "warnings", "sourceArtifactIDs"],
+  "properties": {
+    "schemaVersion": {"const": "dataset_quantitative_analysis_v1"},
+    "taskID": {"type": "string", "minLength": 1},
+    "domain": {"type": "string", "minLength": 1},
+    "dataset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["samplingFrequency", "targetColumns", "observedPastCovariates", "knownFutureCovariates", "staticCovariates"],
+      "properties": {
+        "samplingFrequency": {"type": "string", "minLength": 1},
+        "targetColumns": {"type": "array", "items": {"type": "string"}},
+        "observedPastCovariates": {"type": "array", "items": {"type": "string"}},
+        "knownFutureCovariates": {"type": "array", "items": {"type": "string"}},
+        "staticCovariates": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "forecast": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contextLength", "predictionLengths", "horizonContextRatio"],
+      "properties": {
+        "contextLength": {"type": "integer", "minimum": 1},
+        "predictionLengths": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}},
+        "horizonContextRatio": {"type": "number", "minimum": 0}
+      }
+    },
+    "profile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rowCount", "missingRate", "trendStrength", "seasonalityStrength", "crossVarCorrelation", "distributionShift", "outlierRate", "irregularIntervalRatio"],
+      "properties": {
+        "rowCount": {"type": "integer", "minimum": 0},
+        "missingRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "trendStrength": {"type": "number", "minimum": 0},
+        "seasonalityStrength": {"type": "number", "minimum": 0},
+        "crossVarCorrelation": {"type": "number", "minimum": 0},
+        "distributionShift": {"type": "number", "minimum": 0},
+        "outlierRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "irregularIntervalRatio": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "statistics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stationarity", "acf", "decomposition", "frequency", "changepoint", "crossLag"],
+      "properties": {
+        "stationarity": {"type": "object", "additionalProperties": false, "properties": {"adfStatistic": {"type": "number"}, "adfStationary": {"type": "boolean"}, "kpssStatistic": {"type": "number"}, "kpssStationary": {"type": "boolean"}}},
+        "acf": {"type": "object", "additionalProperties": false, "properties": {"topLag": {"type": "integer", "minimum": 1}, "topCorrelation": {"type": "number"}, "pacfTopLag": {"type": "integer", "minimum": 1}, "pacfTopCorrelation": {"type": "number"}}},
+        "decomposition": {"type": "object", "additionalProperties": false, "properties": {"period": {"type": "integer", "minimum": 1}, "trendVarianceShare": {"type": "number", "minimum": 0}, "seasonalVarianceShare": {"type": "number", "minimum": 0}, "residualVarianceShare": {"type": "number", "minimum": 0}}},
+        "frequency": {
+          "type": "object", "additionalProperties": false, "required": ["spectralPeaks"],
+          "properties": {
+            "dominantPeriod": {"type": "number", "exclusiveMinimum": 0}, "dominantPowerShare": {"type": "number", "minimum": 0, "maximum": 1},
+            "spectralPeaks": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["period", "powerShare", "significant"], "properties": {"period": {"type": "number", "exclusiveMinimum": 0}, "powerShare": {"type": "number", "minimum": 0, "maximum": 1}, "significant": {"type": "boolean"}, "stabilityAcrossWindows": {"type": "number", "minimum": 0, "maximum": 1}}}}
+          }
+        },
+        "changepoint": {"type": "object", "additionalProperties": false, "properties": {"index": {"type": "integer", "minimum": 0}, "score": {"type": "number", "minimum": 0}, "severity": {"enum": ["low", "medium", "high"]}}},
+        "crossLag": {"type": "object", "additionalProperties": false, "properties": {"source": {"type": "string", "minLength": 1}, "target": {"type": "string", "minLength": 1}, "lag": {"type": "integer"}, "correlation": {"type": "number"}}}
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "sourceArtifactIDs": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -337,7 +337,7 @@ The runtime will compile model_recipe.v1 into the executable recipe_schema_v1 fa
 - output_distribution: point, quantile, gaussian
 - loss: mse, mae, huber, quantile, distillation, gaussian_nll
 - optimizer: adam, adamw, or sgd
-- scheduler: none, cosine, one_cycle, plateau
+- scheduler: none, cosine, one_cycle, plateau, lradj_type1, lradj_type2, lradj_type3, lradj_3, lradj_4, lradj_5, lradj_6
 
 Action parameters:
 - preprocessing.actions: one or more of [{ "type": "none" }], [{ "type": "instance_norm", "affine": false, "eps": 0.00001 }], [{ "type": "series_decomposition", "method": "moving_average", "kernel_size": 25 }], [{ "type": "seasonal_differencing", "period": 24, "order": 1 }], [{ "type": "missing_mask", "mask_channel": true, "fill_policy": "zero"|"mean"|"ffill" }], [{ "type": "sample_reweighting", "scheme": "uniform"|"horizon_tail"|"outlier_robust" }]
@@ -371,7 +371,7 @@ Action parameters:
 - quantile loss should include quantiles: [0.1, 0.5, 0.9]
 - distillation loss should include supervised_weight, teacher_weight, and teacher: { "type": "last_value"|"moving_average", "window": 24 }
 - training_strategy.optimizer.type: "adam" | "adamw" | "sgd"
-- training_strategy.scheduler.type: "none" | "cosine" | "one_cycle" | "plateau"
+- training_strategy.scheduler.type: "none" | "cosine" | "one_cycle" | "plateau" | "lradj_type1" | "lradj_type2" | "lradj_type3" | "lradj_3" | "lradj_4" | "lradj_5" | "lradj_6"
 
 ## Output format
 Return a single JSON object and nothing else. No markdown, no explanation outside the JSON.

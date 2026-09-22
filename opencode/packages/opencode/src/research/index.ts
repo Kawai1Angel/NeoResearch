@@ -10,11 +10,13 @@ export type {
   ResearchManagerRole,
   ResearchManagerStep,
   ResearchManagerTraceStep,
+  RunRetrieveAgentInput,
   RunFullPipelineResult,
   SeedSweepResult,
 } from "./service"
 export type { IntentAgentResult } from "./agents/intent-agent"
 export type { DataAnalysisAgentResult } from "./agents/data-analysis-agent"
+export * from "./retrieve"
 export {
   buildExperimentPlan,
   buildHypoPlanMarkdown,
@@ -22,6 +24,7 @@ export {
   buildHypothesesYaml,
   extractEvidenceSummary,
   generateHypotheses,
+  validateHypothesisEvidence,
   serializeHypothesisPlanMetadata,
 } from "./agents/hypo-planner-agent"
 export type { ExperimentPlan, HypoPlannerInput, HypoPlannerResult, HypothesisObject } from "./agents/hypo-planner-agent"

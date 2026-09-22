@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "tsf_scientific_concepts_v1",
+  "concepts": {
+    "seasonality": { "label": "seasonality", "paperTerms": ["seasonal patterns", "periodic dependencies"] },
+    "multiple_seasonalities": { "label": "multiple seasonalities", "paperTerms": ["multiple seasonalities", "multi-periodic patterns"] },
+    "trend_dynamics": { "label": "trend dynamics", "paperTerms": ["trend dynamics", "long-term evolution"] },
+    "non_stationarity": { "label": "non-stationarity", "paperTerms": ["non-stationary time series", "temporal distribution shift"] },
+    "potential_structural_break": { "label": "potential structural break", "paperTerms": ["structural breaks", "regime transitions"] },
+    "covariate_conditioning": { "label": "covariate-conditioned forecasting", "paperTerms": ["known future covariates", "exogenous variables"] },
+    "cross_series_dependency": { "label": "cross-series dependency", "paperTerms": ["cross-variable dependencies", "inter-series correlation"] },
+    "lead_lag_relationship": { "label": "lead-lag relationship", "paperTerms": ["lead-lag relationship", "lagged covariates"] },
+    "contaminated_observations": { "label": "contaminated observations", "paperTerms": ["outlier-contaminated observations", "heavy-tailed noise"] },
+    "incomplete_observations": { "label": "incomplete observations", "paperTerms": ["missing observations", "incomplete time series"] },
+    "irregular_sampling": { "label": "irregularly sampled time series", "paperTerms": ["irregular time series", "irregular sampling"] },
+    "long_horizon_dependency": { "label": "long-horizon dependency", "paperTerms": ["long-term time series forecasting", "long-horizon forecasting"] }
+  }
+}

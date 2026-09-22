@@ -1,10 +1,12 @@
-import { and, eq, Database } from "@/storage"
+import { and, desc, eq, Database } from "@/storage"
 import { Bus } from "@/bus"
 import { SessionTable } from "@/session/session.sql"
-import { ResearchHypothesisTable, ResearchTaskTable } from "./research.sql"
-import { ResearchHypothesisID, type JsonRecord, type ResearchTaskID } from "./schema"
+import { readFile } from "fs/promises"
+import { ResearchArtifactTable, ResearchHypothesisTable, ResearchTaskTable } from "./research.sql"
+import { ResearchHypothesisID, type JsonRecord, type ResearchTaskID, type ResearchArtifactID } from "./schema"
 import { Event } from "./event"
 import type { HypothesisObject, HypothesisStatus } from "./agents/hypo-planner-agent"
+import { TaskEvidenceBundleSchema, type TaskEvidenceBundle } from "./retrieve/contract"
 
 const VALID_STATUSES: readonly HypothesisStatus[] = [
   "pending",
@@ -35,8 +37,33 @@ function mapRow(row: ResearchHypothesisRow): HypothesisObject {
     priority: row.priority === "high" || row.priority === "medium" || row.priority === "low" ? row.priority : "medium",
     risk: row.risk,
     testable: row.testable,
+    datasetEvidencePaths: Array.isArray(row.dataset_evidence_paths) ? row.dataset_evidence_paths : [],
+    literatureEvidence: Array.isArray(row.literature_evidence) ? row.literature_evidence : [],
+    applicabilityAssumptions: Array.isArray(row.applicability_assumptions) ? row.applicability_assumptions : [],
+    falsificationCriteria: Array.isArray(row.falsification_criteria) ? row.falsification_criteria : [],
+    evidenceLevel: row.evidence_level === "paper_supported" || row.evidence_level === "conflicted" ? row.evidence_level : "data_only",
     status,
     ...(row.abandon_reason ? { abandonReason: row.abandon_reason } : {}),
+  }
+}
+
+type HypothesisEvidenceFields = Pick<
+  HypothesisObject,
+  "datasetEvidencePaths" | "literatureEvidence" | "applicabilityAssumptions" | "falsificationCriteria" | "evidenceLevel"
+>
+
+type HypothesisDraft = Omit<
+  HypothesisObject,
+  "id" | "status" | "abandonReason" | keyof HypothesisEvidenceFields
+> & Partial<HypothesisEvidenceFields> & { id?: string }
+
+function normalizedEvidence(hypothesis: Partial<HypothesisEvidenceFields>): HypothesisEvidenceFields {
+  return {
+    datasetEvidencePaths: hypothesis.datasetEvidencePaths ?? [],
+    literatureEvidence: hypothesis.literatureEvidence ?? [],
+    applicabilityAssumptions: hypothesis.applicabilityAssumptions ?? [],
+    falsificationCriteria: hypothesis.falsificationCriteria ?? [],
+    evidenceLevel: hypothesis.evidenceLevel ?? "data_only",
   }
 }
 
@@ -93,11 +120,12 @@ export async function listHypothesesInPool(
 
 export async function addHypothesisToPool(
   taskID: ResearchTaskID,
-  hypothesis: Omit<HypothesisObject, "id" | "status" | "abandonReason"> & { id?: string },
+  hypothesis: HypothesisDraft,
 ): Promise<HypothesisObject> {
   const now = Date.now()
   const id = ResearchHypothesisID.ascending()
   const hypoID = hypothesis.id?.trim() || id
+  const evidence = normalizedEvidence(hypothesis)
   Database.use((d) =>
     d
       .insert(ResearchHypothesisTable)
@@ -113,13 +141,18 @@ export async function addHypothesisToPool(
         priority: hypothesis.priority,
         risk: hypothesis.risk,
         testable: hypothesis.testable,
+        dataset_evidence_paths: [...evidence.datasetEvidencePaths],
+        literature_evidence: [...evidence.literatureEvidence],
+        applicability_assumptions: [...evidence.applicabilityAssumptions],
+        falsification_criteria: [...evidence.falsificationCriteria],
+        evidence_level: evidence.evidenceLevel,
         status: "pending",
         time_created: now,
         time_updated: now,
       })
       .run(),
   )
-  const created: HypothesisObject = { ...hypothesis, id: hypoID, status: "pending" }
+  const created: HypothesisObject = { ...hypothesis, ...evidence, id: hypoID, status: "pending" }
   publishChanged(taskID, "add", created)
   return created
 }
@@ -153,6 +186,11 @@ export async function updateHypothesisInPool(
         ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
         ...(patch.risk !== undefined ? { risk: patch.risk } : {}),
         ...(patch.testable !== undefined ? { testable: patch.testable } : {}),
+        ...(patch.datasetEvidencePaths !== undefined ? { dataset_evidence_paths: [...patch.datasetEvidencePaths] } : {}),
+        ...(patch.literatureEvidence !== undefined ? { literature_evidence: [...patch.literatureEvidence] } : {}),
+        ...(patch.applicabilityAssumptions !== undefined ? { applicability_assumptions: [...patch.applicabilityAssumptions] } : {}),
+        ...(patch.falsificationCriteria !== undefined ? { falsification_criteria: [...patch.falsificationCriteria] } : {}),
+        ...(patch.evidenceLevel !== undefined ? { evidence_level: patch.evidenceLevel } : {}),
         ...(status !== undefined ? { status } : {}),
         time_updated: Date.now(),
       })
@@ -169,6 +207,52 @@ export async function updateHypothesisInPool(
   const updated = mapRow(updatedRow!)
   publishChanged(taskID, "update", updated)
   return updated
+}
+
+const sessionEvidence = new Map<string, { taskID: ResearchTaskID; artifactID?: ResearchArtifactID }>()
+
+export function bindTaskEvidenceToSession(sessionID: string, taskID: ResearchTaskID, artifactID?: ResearchArtifactID) {
+  sessionEvidence.set(sessionID, { taskID, artifactID })
+  return () => { sessionEvidence.delete(sessionID) }
+}
+
+export async function loadTaskEvidenceForSession(taskID: ResearchTaskID, sessionID: string) {
+  const binding = sessionEvidence.get(sessionID)
+  if (!binding) return loadTaskEvidenceForTask(taskID)
+  if (binding.taskID !== taskID) throw new Error("Task evidence session ownership mismatch")
+  if (!binding.artifactID) return undefined
+  return loadTaskEvidenceForTask(taskID, binding.artifactID)
+}
+
+export async function loadTaskEvidenceForTask(taskID: ResearchTaskID, artifactID?: ResearchArtifactID): Promise<TaskEvidenceBundle | undefined> {
+  const artifact = Database.use((d) =>
+    d
+      .select({ id: ResearchArtifactTable.id, uri: ResearchArtifactTable.uri, metadata: ResearchArtifactTable.metadata })
+      .from(ResearchArtifactTable)
+      .where(and(
+        eq(ResearchArtifactTable.task_id, taskID),
+        eq(ResearchArtifactTable.kind, "task_evidence_bundle_json"),
+        ...(artifactID ? [eq(ResearchArtifactTable.id, artifactID)] : []),
+      ))
+      .orderBy(desc(ResearchArtifactTable.time_updated))
+      .get(),
+  )
+  if (!artifact) {
+    if (artifactID) throw new Error(`Task evidence artifact was not found: ${artifactID}`)
+    return undefined
+  }
+  if (!artifact.uri.startsWith("file://")) throw new Error(`Task evidence artifact must use a file URI: ${artifact.uri}`)
+  const bundle = TaskEvidenceBundleSchema.parse(JSON.parse(await readFile(artifact.uri.slice("file://".length), "utf8")))
+  if (bundle.taskID !== taskID || artifact.metadata.retrieveRunID !== bundle.retrieveRunID) {
+    throw new Error(`Task evidence provenance mismatch for artifact ${artifact.id}`)
+  }
+  const quantitative = Database.use((d) => d.select({ id: ResearchArtifactTable.id }).from(ResearchArtifactTable).where(and(
+    eq(ResearchArtifactTable.id, bundle.quantitativeReportArtifactID as ResearchArtifactID),
+    eq(ResearchArtifactTable.task_id, taskID),
+    eq(ResearchArtifactTable.kind, "dataset_quantitative_analysis_json"),
+  )).get())
+  if (!quantitative) throw new Error(`Task evidence quantitative artifact mismatch for ${artifact.id}`)
+  return bundle
 }
 
 export async function abandonHypothesisInPool(

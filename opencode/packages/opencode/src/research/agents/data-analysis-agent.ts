@@ -4,6 +4,11 @@ import path from "path"
 import { deflateSync } from "zlib"
 import { Instance } from "@/project/instance"
 import type { JsonRecord, ResearchArtifact, ResearchArtifactID, ResearchTask } from "../schema"
+import {
+  DatasetQuantitativeAnalysisSchema,
+  type DatasetQuantitativeAnalysis,
+  type SpectralPeak,
+} from "../retrieve/contract"
 
 export type DatasetAnalysisPlot = {
   readonly kind: "dataset_analysis_plot_png"
@@ -36,6 +41,7 @@ export type DatasetStatisticalAnalysis = {
   readonly frequency: {
     readonly dominantPeriod?: number
     readonly dominantPowerShare?: number
+    readonly spectralPeaks: readonly SpectralPeak[]
   }
   readonly changepoint: {
     readonly index?: number
@@ -59,6 +65,7 @@ export interface DataAnalysisQuantitativeResult {
   readonly agent: "DataAnalysisAgent"
   readonly taskID: ResearchTask["id"]
   readonly reportMarkdown: string
+  readonly reportJSON: DatasetQuantitativeAnalysis
   readonly llm: {
     readonly status: "disabled"
   }
@@ -370,7 +377,7 @@ function frequencyAnalysis(series: readonly number[]) {
   const values = finiteSeries(series)
   const avg = finiteMean(values) ?? 0
   const centered = values.map((value) => value - avg)
-  if (centered.length < 4) return {}
+  if (centered.length < 4) return { spectralPeaks: [] }
   const powers: Array<{ period: number; power: number }> = []
   for (let k = 1; k <= Math.floor(centered.length / 2); k++) {
     let real = 0
@@ -384,9 +391,25 @@ function frequencyAnalysis(series: readonly number[]) {
   }
   const totalPower = powers.reduce((sum, item) => sum + item.power, 0)
   const best = powers.toSorted((left, right) => right.power - left.power)[0]
+  const localPeaks = powers.filter((item, index) => {
+    const previous = powers[index - 1]?.power ?? Number.NEGATIVE_INFINITY
+    const next = powers[index + 1]?.power ?? Number.NEGATIVE_INFINITY
+    return item.power >= previous && item.power >= next && item.period >= 2
+  })
+  const strongestShare = best && totalPower > 0 ? best.power / totalPower : 0
+  const significanceThreshold = Math.max(0.02, strongestShare * 0.1)
+  const spectralPeaks = localPeaks
+    .map((item) => ({
+      period: roundAnalysisValue(item.period)!,
+      powerShare: roundAnalysisValue(totalPower > 0 ? item.power / totalPower : 0)!,
+      significant: totalPower > 0 && item.power / totalPower >= significanceThreshold,
+    }))
+    .toSorted((left, right) => right.powerShare - left.powerShare)
+    .slice(0, 8)
   return {
     dominantPeriod: roundAnalysisValue(best?.period),
     dominantPowerShare: roundAnalysisValue(best && totalPower > 0 ? best.power / totalPower : undefined),
+    spectralPeaks,
   }
 }
 
@@ -477,7 +500,7 @@ function buildStatisticalAnalysis(matrix: DatasetSeriesMatrix | undefined, finge
         topCorrelation: roundAnalysisValue(numericProfileValue(profile, "acfMainPeriodStrength")),
       },
       decomposition: {},
-      frequency: {},
+      frequency: { spectralPeaks: [] },
       changepoint: {},
       crossLag: {},
     }
@@ -616,34 +639,101 @@ export async function buildDatasetAnalysisContext(task: ResearchTask, fingerprin
   }
 }
 
+function finiteOrZero(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function nonnegativeIntegerOrZero(value: unknown) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0
+}
+
+function positiveInteger(value: unknown, fallback = 1) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback
+}
+
+export function buildDatasetQuantitativeAnalysis(input: {
+  readonly task: ResearchTask
+  readonly fingerprint: JsonRecord
+  readonly context: DatasetAnalysisContext
+  readonly sourceArtifactIDs?: readonly ResearchArtifactID[]
+}): DatasetQuantitativeAnalysis {
+  const taskSpec = recordValue(input.task.taskSpec)
+  const dataset = taskDatasetSpec(input.task)
+  const metadata = recordValue(taskSpec.metadata)
+  const profile = recordValue(recordValue(input.fingerprint).datasetProfile)
+  const warning = recordValue(recordValue(input.fingerprint).datasetProfileWarning)
+  const contextLength = positiveInteger(taskSpec.contextLength, positiveInteger(input.fingerprint.contextLength))
+  const predictionLengths = Array.isArray(taskSpec.predictionLengths)
+    ? taskSpec.predictionLengths.filter((item): item is number => typeof item === "number" && Number.isInteger(item) && item > 0)
+    : []
+  const safePredictionLengths = predictionLengths.length > 0 ? predictionLengths : [positiveInteger(input.fingerprint.maxPredictionLength)]
+  const samplingFrequency = [dataset.samplingFrequency, dataset.frequency, metadata.samplingFrequency, metadata.frequency]
+    .find((item): item is string => typeof item === "string" && item.trim().length > 0)?.trim() ?? "unknown"
+  return DatasetQuantitativeAnalysisSchema.parse({
+    schemaVersion: "dataset_quantitative_analysis_v1",
+    taskID: input.task.id,
+    domain: input.task.domainID,
+    dataset: {
+      samplingFrequency,
+      targetColumns: datasetRoleList(dataset, "targetCols"),
+      observedPastCovariates: datasetRoleList(dataset, "observedPastCovariates"),
+      knownFutureCovariates: datasetRoleList(dataset, "knownFutureCovariates"),
+      staticCovariates: datasetRoleList(dataset, "staticCovariates"),
+    },
+    forecast: {
+      contextLength,
+      predictionLengths: safePredictionLengths,
+      horizonContextRatio: finiteOrZero(input.fingerprint.horizonContextRatio) || Math.max(...safePredictionLengths) / contextLength,
+    },
+    profile: {
+      rowCount: nonnegativeIntegerOrZero(profile.rowCount),
+      missingRate: finiteOrZero(profile.missingRate),
+      trendStrength: finiteOrZero(profile.trendStrength),
+      seasonalityStrength: finiteOrZero(profile.seasonalityStrength),
+      crossVarCorrelation: finiteOrZero(profile.crossVarCorrelation),
+      distributionShift: finiteOrZero(profile.distributionShift),
+      outlierRate: finiteOrZero(profile.outlierRate),
+      irregularIntervalRatio: finiteOrZero(profile.irregularIntervalRatio),
+    },
+    statistics: input.context.statistics,
+    warnings: Object.keys(warning).length === 0
+      ? []
+      : [`${typeof warning.code === "string" ? warning.code : "dataset_profile_warning"}: ${typeof warning.message === "string" ? warning.message : "dataset profile warning"}`],
+    sourceArtifactIDs: input.sourceArtifactIDs ?? [],
+  })
+}
+
 export function analyzeDataset(input: {
   readonly task: ResearchTask
   readonly fingerprint: JsonRecord
   readonly context: DatasetAnalysisContext
+  readonly sourceArtifactIDs?: readonly ResearchArtifactID[]
 }): DataAnalysisQuantitativeResult {
   const { task, fingerprint, context } = input
-  const profile = recordValue(recordValue(fingerprint).datasetProfile)
-  const dataset = taskDatasetSpec(task)
+  const quantitative = buildDatasetQuantitativeAnalysis(input)
+  const profile = quantitative.profile
+  const rawProfile = recordValue(recordValue(fingerprint).datasetProfile)
+  const dataset = quantitative.dataset
   const stats = context.statistics
-  const targetCols = datasetRoleList(dataset, "targetCols")
-  const observedPastCovariates = datasetRoleList(dataset, "observedPastCovariates")
-  const knownFutureCovariates = datasetRoleList(dataset, "knownFutureCovariates")
-  const staticCovariates = datasetRoleList(dataset, "staticCovariates")
+  const targetCols = dataset.targetColumns
+  const observedPastCovariates = dataset.observedPastCovariates
+  const knownFutureCovariates = dataset.knownFutureCovariates
+  const staticCovariates = dataset.staticCovariates
   const rows: [string, unknown, string][] = [
     ["Rows", profile.rowCount, "usable observations detected in the CSV profile"],
-    ["Targets", profile.targetCount, "forecast target columns used by the task"],
+    ["Targets", targetCols.length, "forecast target columns used by the task"],
     ["Missing rate", profile.missingRate, "fraction of missing numeric target cells"],
     ["Trend strength", profile.trendStrength, "mean absolute correlation with time index"],
     ["Seasonality strength", profile.seasonalityStrength, "best lag-correlation over common TSF lags"],
     ["Cross-variate correlation", profile.crossVarCorrelation, "mean absolute pairwise target correlation"],
     ["Distribution shift", profile.distributionShift, "normalized first-half vs second-half drift"],
     ["Outlier rate", profile.outlierRate, "IQR-based extreme-value share"],
-    ["ACF main period", profile.acfMainPeriod, "dominant lag from average target autocorrelation"],
-    ["ACF main period strength", profile.acfMainPeriodStrength, "mean autocorrelation strength at the dominant lag"],
-    ["ADF statistic", profile.adfStatistic, "Augmented Dickey-Fuller style stationarity statistic"],
-    ["ADF stationarity", profile.adfStationary, "whether the profile suggests stationarity at the default threshold"],
+    ["ACF main period", rawProfile.acfMainPeriod, "dominant lag from average target autocorrelation"],
+    ["ACF main period strength", rawProfile.acfMainPeriodStrength, "mean autocorrelation strength at the dominant lag"],
+    ["ADF statistic", rawProfile.adfStatistic, "Augmented Dickey-Fuller style stationarity statistic"],
+    ["ADF stationarity", rawProfile.adfStationary, "whether the profile suggests stationarity at the default threshold"],
     ["Irregular interval ratio", profile.irregularIntervalRatio, "timestamp cadence instability"],
-    ["Duplicate timestamp rate", profile.duplicateTimestampRate, "duplicate timestamp share"],
+    ["Duplicate timestamp rate", rawProfile.duplicateTimestampRate, "duplicate timestamp share"],
     ["KPSS statistic", stats.stationarity.kpssStatistic, "level-stationarity diagnostic; lower values support stationary residual behavior"],
     ["KPSS stationarity", stats.stationarity.kpssStationary, "whether the KPSS-style statistic remains below the default level threshold"],
     ["ACF top lag", stats.acf.topLag, "lag with strongest average autocorrelation across target columns"],
@@ -707,6 +797,7 @@ export function analyzeDataset(input: {
     "## Frequency and Change Diagnostics",
     "",
     `- Dominant frequency period: ${renderAnalysisValue(stats.frequency.dominantPeriod)} with power share ${renderAnalysisValue(stats.frequency.dominantPowerShare)}`,
+    `- Spectral peaks: ${stats.frequency.spectralPeaks.length > 0 ? stats.frequency.spectralPeaks.map((peak) => `${renderAnalysisValue(peak.period)} (${renderAnalysisValue(peak.powerShare)}, significant=${peak.significant})`).join("; ") : "n/a"}`,
     `- Change point: ${renderAnalysisValue(stats.changepoint.index)} score=${renderAnalysisValue(stats.changepoint.score)} severity=${renderAnalysisValue(stats.changepoint.severity)}`,
     `- Cross-lag: ${renderAnalysisValue(stats.crossLag.source)} -> ${renderAnalysisValue(stats.crossLag.target)} lag=${renderAnalysisValue(stats.crossLag.lag)} corr=${renderAnalysisValue(stats.crossLag.correlation)}`,
     "",
@@ -718,6 +809,7 @@ export function analyzeDataset(input: {
     agent: "DataAnalysisAgent",
     taskID: task.id,
     reportMarkdown: `${lines.join("\n")}\n`,
+    reportJSON: quantitative,
     llm: { status: "disabled" },
   }
 }

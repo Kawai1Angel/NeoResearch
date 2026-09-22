@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "concept_transformation.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["transformationID", "datasetEvidence", "scientificConcepts", "modelingChallenges", "methodConcepts", "paperLanguage"],
+  "properties": {
+    "transformationID": {"type": "string", "minLength": 1},
+    "datasetEvidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evidence"}},
+    "scientificConcepts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/scientific"}},
+    "modelingChallenges": {"type": "array", "items": {"type": "string"}},
+    "methodConcepts": {"type": "array", "items": {"$ref": "#/$defs/method"}},
+    "paperLanguage": {"$ref": "#/$defs/paperLanguage"}
+  },
+  "$defs": {
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["path", "metric", "value", "interpretation"], "properties": {"path": {"type": "string", "pattern": "^\\$\\."}, "metric": {"type": "string"}, "value": {}, "interpretation": {"type": "string"}}},
+    "scientific": {"type": "object", "additionalProperties": false, "required": ["conceptID", "label", "paperTerms", "confidence", "basis"], "properties": {"conceptID": {"type": "string"}, "label": {"type": "string"}, "paperTerms": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "basis": {"enum": ["deterministic_rule", "llm_supported"]}}},
+    "method": {"type": "object", "additionalProperties": false, "required": ["conceptID", "label", "paperTerms", "rationale", "status"], "properties": {"conceptID": {"type": "string"}, "label": {"type": "string"}, "paperTerms": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "rationale": {"type": "string"}, "status": {"const": "retrieval_hypothesis"}}},
+    "paperLanguage": {"type": "object", "additionalProperties": false, "required": ["taskTerms", "phenomenonTerms", "methodTerms", "domainTerms", "queryText"], "properties": {"taskTerms": {"type": "array", "items": {"type": "string"}}, "phenomenonTerms": {"type": "array", "items": {"type": "string"}}, "methodTerms": {"type": "array", "items": {"type": "string"}}, "domainTerms": {"type": "array", "items": {"type": "string"}}, "queryText": {"type": "string", "minLength": 1}}}
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "retrieval_intent.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["intentID", "question", "transformationID", "priority", "mustCover", "paperLanguageQuery"],
+  "properties": {
+    "intentID": {"type": "string", "minLength": 1}, "question": {"type": "string", "minLength": 1}, "transformationID": {"type": "string", "minLength": 1},
+    "priority": {"type": "number", "minimum": 0, "maximum": 1}, "mustCover": {"type": "boolean"},
+    "paperLanguageQuery": {"type": "object", "additionalProperties": false, "required": ["taskTerms", "phenomenonTerms", "methodTerms", "domainTerms", "queryText"], "properties": {"taskTerms": {"type": "array", "items": {"type": "string"}}, "phenomenonTerms": {"type": "array", "items": {"type": "string"}}, "methodTerms": {"type": "array", "items": {"type": "string"}}, "domainTerms": {"type": "array", "items": {"type": "string"}}, "queryText": {"type": "string", "minLength": 1}}}
+  }
+}

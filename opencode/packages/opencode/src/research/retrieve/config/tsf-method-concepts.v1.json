@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "tsf_method_concepts_v1",
+  "concepts": {
+    "seasonality": [{ "conceptID": "seasonal_decomposition", "label": "seasonal decomposition", "paperTerms": ["seasonal decomposition", "periodic encoding"] }],
+    "multiple_seasonalities": [{ "conceptID": "frequency_multiscale", "label": "frequency and multi-scale modeling", "paperTerms": ["frequency-domain modeling", "multi-scale temporal modeling"] }],
+    "trend_dynamics": [{ "conceptID": "trend_decomposition", "label": "trend decomposition", "paperTerms": ["trend decomposition", "detrending"] }],
+    "non_stationarity": [{ "conceptID": "adaptive_normalization", "label": "shift-aware adaptation", "paperTerms": ["adaptive normalization", "distribution-shift-aware forecasting"] }],
+    "potential_structural_break": [{ "conceptID": "regime_adaptation", "label": "regime-adaptive modeling", "paperTerms": ["change-point-aware forecasting", "regime-adaptive modeling"] }],
+    "covariate_conditioning": [{ "conceptID": "covariate_fusion", "label": "covariate fusion", "paperTerms": ["covariate fusion", "exogenous attention"] }],
+    "cross_series_dependency": [{ "conceptID": "cross_variable_modeling", "label": "cross-variable modeling", "paperTerms": ["channel mixing", "cross-variable attention"] }],
+    "lead_lag_relationship": [{ "conceptID": "lag_aware_fusion", "label": "lag-aware fusion", "paperTerms": ["lag-aware feature fusion", "temporal cross-attention"] }],
+    "contaminated_observations": [{ "conceptID": "robust_forecasting", "label": "robust forecasting", "paperTerms": ["robust loss", "robust normalization"] }],
+    "incomplete_observations": [{ "conceptID": "missingness_aware", "label": "missingness-aware encoding", "paperTerms": ["masked modeling", "missingness-aware encoder"] }],
+    "irregular_sampling": [{ "conceptID": "continuous_time_modeling", "label": "continuous-time modeling", "paperTerms": ["continuous-time modeling", "time-gap encoding"] }],
+    "long_horizon_dependency": [{ "conceptID": "efficient_long_range", "label": "efficient long-range modeling", "paperTerms": ["multi-scale context modeling", "efficient long-range modeling"] }]
+  }
+}

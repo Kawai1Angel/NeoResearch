@@ -13,7 +13,7 @@ const BIN = path.join(REPO_ROOT, "bin", "neo-cast.js");
 function runNode(args, options = {}) {
   return spawnSync("node", [BIN, ...args], {
     cwd: options.cwd || REPO_ROOT,
-    env: { ...process.env, ...(options.env || {}) },
+    env: { ...require("./python-env"), ...(options.env || {}) },
     encoding: "utf8",
   });
 }

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "extraction_manifest.schema.json",
+  "title": "Literature extraction run manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runID", "paperID", "documentID", "inputDigest", "status", "versions", "counters", "startedAt"],
+  "properties": {
+    "schemaVersion": {"const": "extraction_manifest_v1"},
+    "runID": {"type": "string", "pattern": "^lerun_[a-zA-Z0-9_-]+$"},
+    "paperID": {"type": "string"},
+    "documentID": {"type": "string"},
+    "inputDigest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "status": {"enum": ["running", "completed", "partial", "failed"]},
+    "versions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["parser", "chunker", "taxonomy", "candidatePrompt", "verifierPrompt", "knowledgeCardSchema", "model"],
+      "properties": {
+        "parser": {"type": "string"}, "chunker": {"type": "string"}, "taxonomy": {"type": "string"},
+        "candidatePrompt": {"type": "string"}, "verifierPrompt": {"type": "string"},
+        "knowledgeCardSchema": {"type": "string"}, "model": {"type": "string"}
+      }
+    },
+    "counters": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidateCount", "acceptedCount", "rejectedCount", "duplicateCount", "warningCount"],
+      "properties": {
+        "candidateCount": {"type": "integer", "minimum": 0}, "acceptedCount": {"type": "integer", "minimum": 0},
+        "rejectedCount": {"type": "integer", "minimum": 0}, "duplicateCount": {"type": "integer", "minimum": 0},
+        "warningCount": {"type": "integer", "minimum": 0}
+      }
+    },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "failedChunks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["chunkID", "error"],
+            "properties": {"chunkID": {"type": "string"}, "error": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "startedAt": {"type": "string", "format": "date-time"},
+    "finishedAt": {"type": "string", "format": "date-time"}
+  }
+}

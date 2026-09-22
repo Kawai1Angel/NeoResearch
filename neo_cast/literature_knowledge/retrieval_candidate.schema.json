@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "retrieval_candidate.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "candidateID", "paperID", "intentID", "queryText", "bm25", "evidenceLevel", "localPDF", "publicationStatus", "decision", "decisionReasons"],
+  "properties": {
+    "schemaVersion": {"const": "retrieval_candidate_v1"}, "candidateID": {"type": "string", "pattern": "^rc_[a-f0-9]{16}$"}, "paperID": {"type": "string"}, "intentID": {"type": "string"}, "queryText": {"type": "string"},
+    "bm25": {"type": "object", "additionalProperties": false, "required": ["rank", "score", "matchedFields", "matchedTerms"], "properties": {"rank": {"type": "integer", "minimum": 1}, "score": {"type": "number", "minimum": 0}, "matchedFields": {"type": "array", "items": {"type": "string"}}, "matchedTerms": {"type": "array", "items": {"type": "string"}}}},
+    "evidenceLevel": {"enum": ["metadata_only", "document_available", "paper_backed"]}, "localPDF": {"type": "boolean"}, "publicationStatus": {"type": "string"},
+    "decision": {"enum": ["send_to_literature_agent", "retain_candidate", "domain_only", "skipped_pdf_unavailable"]}, "decisionReasons": {"type": "array", "items": {"type": "string"}}
+  }
+}

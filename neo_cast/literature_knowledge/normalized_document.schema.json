@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "normalized_document.schema.json",
+  "title": "Normalized literature document",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "documentID", "paperID", "sourcePath", "sourceSha256", "parser", "language", "pages", "sections", "parseWarnings"],
+  "properties": {
+    "schemaVersion": {"const": "normalized_document_v1"},
+    "documentID": {"type": "string", "pattern": "^doc_[a-f0-9]{16}$"},
+    "paperID": {"type": "string", "minLength": 1},
+    "sourcePath": {"type": "string", "minLength": 1},
+    "sourceSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "parser": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {"name": {"type": "string"}, "version": {"type": "string"}}
+    },
+    "language": {"type": "string", "minLength": 2},
+    "title": {"type": "string"},
+    "pages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pageNumber", "text", "blocks"],
+        "properties": {
+          "pageNumber": {"type": "integer", "minimum": 1},
+          "text": {"type": "string"},
+          "blocks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["blockID", "text"],
+              "properties": {
+                "blockID": {"type": "string", "minLength": 1},
+                "text": {"type": "string"},
+                "bbox": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}, {"type": "number"}], "items": false}
+              }
+            }
+          }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sectionID", "heading", "normalizedKind", "startPage", "endPage", "blockIDs"],
+        "properties": {
+          "sectionID": {"type": "string", "minLength": 1},
+          "heading": {"type": "string"},
+          "normalizedKind": {"enum": ["abstract", "introduction", "related_work", "method", "experiment_setup", "results", "ablation", "complexity", "limitations", "conclusion", "references", "unknown"]},
+          "startPage": {"type": "integer", "minimum": 1},
+          "endPage": {"type": "integer", "minimum": 1},
+          "blockIDs": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "parseWarnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

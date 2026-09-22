@@ -9,12 +9,11 @@ const { spawnSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const BIN = path.join(REPO_ROOT, "bin", "neo-cast.js");
-const DATASET = path.join(REPO_ROOT, "datasets (1)", "ETTh1.csv");
 
 function runNode(args, options = {}) {
   const result = spawnSync("node", [BIN, ...args], {
     cwd: options.cwd || REPO_ROOT,
-    env: { ...process.env, ...(options.env || {}) },
+    env: { ...require("./python-env"), ...(options.env || {}) },
     encoding: "utf8",
   });
   return result;
@@ -22,14 +21,21 @@ function runNode(args, options = {}) {
 
 test("prepare-data materializes visible and ref-test splits", () => {
   const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-data-"));
+  const source = path.join(dataRoot, "ETTh1.csv");
+  const rows = ["date,HUFL,HULL,MUFL,MULL,LUFL,LULL,OT"];
+  for (let i = 0; i < 14400; i++) {
+    const timestamp = new Date(Date.UTC(2020, 0, 1) + i * 3600000).toISOString();
+    rows.push(`${timestamp},${[1, 2, 3, 4, 5, 6, 7].map((scale) => scale + Math.sin(i / 24)).join(",")}`);
+  }
+  fs.writeFileSync(source, rows.join("\n") + "\n");
   const result = runNode(
-    ["prepare-data", "--source", DATASET, "--force"],
-    { env: { NEO_TSF_DATA_ROOT: dataRoot } }
+    ["prepare-data", "--source", source, "--force"],
+    { cwd: dataRoot, env: { NEO_TSF_DATA_ROOT: dataRoot } }
   );
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.ok(fs.existsSync(path.join(dataRoot, "ETTh1_visible.csv")));
-  assert.ok(fs.existsSync(path.join(dataRoot, "ETTh1_ref_test.csv")));
+  assert.ok(fs.existsSync(path.join(dataRoot, "etth1_visible.csv")));
+  assert.ok(fs.existsSync(path.join(dataRoot, "etth1_ref_test.csv")));
 });
 
 test("init-runtime supports skip-install for fast project bootstrap", () => {

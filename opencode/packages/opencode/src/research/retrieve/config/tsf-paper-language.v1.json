@@ -1,0 +1,5 @@
+{
+  "schemaVersion": "tsf_paper_language_v1",
+  "taskTerms": ["time series forecasting"],
+  "queryStopTerms": ["strength", "score", "ratio", "statistic", "correlation"]
+}

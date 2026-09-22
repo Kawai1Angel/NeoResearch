@@ -8,6 +8,7 @@ import {
   generateHypotheses,
 } from "../../src/research/agents/hypo-planner-agent"
 import type { ResearchMemory, ResearchRun, ResearchTask } from "../../src/research/schema"
+import { fixture, frequencyCard } from "./retrieve/fixtures"
 
 function task(extraSpec: Record<string, unknown> = {}, extraBudget: Record<string, unknown> = {}): ResearchTask {
   return {
@@ -79,6 +80,41 @@ test("extractEvidenceSummary truncates and returns the data analysis markdown", 
   expect(summary).toContain("missing_values")
   expect(summary).toContain("1 warning")
   expect(summary).toContain("2 source artifacts")
+})
+
+test("invalid LLM literature citations fall back to deterministic data-only hypotheses", () => {
+  const input = { task: task(), dataAnalysisSummary: dataAnalysisSummary(), runs: [], memory: [] }
+  const generated = generateHypotheses(input)
+  const result = buildHypoPlannerResult({
+    ...input,
+    llmHypotheses: generated.map((hypothesis) => ({
+      ...hypothesis,
+      evidenceLevel: "paper_supported" as const,
+      literatureEvidence: [{ cardID: "invented_card", cardRevision: 1, role: "supports_mechanism" as const }],
+    })),
+  })
+  expect(result.llm.status).toBe("disabled")
+  expect(result.plan.hypotheses).toEqual(generated)
+})
+
+test("paper-supported and conflicted hypotheses preserve citations, assumptions and rendered evidence", () => {
+  for (const conflicted of [false, true]) {
+    const taskEvidence = fixture({ cards: [frequencyCard(conflicted ? { status: "contradicted" } : {})] }).build()
+    const result = buildHypoPlannerResult({ task: task(), dataAnalysisSummary: dataAnalysisSummary(), runs: [], memory: [], taskEvidence })
+    const hypothesis = result.plan.hypotheses.find((item) => item.literatureEvidence.length > 0)!
+    expect(hypothesis).toBeDefined()
+    expect(hypothesis.evidenceLevel).toBe(conflicted ? "conflicted" : "paper_supported")
+    expect(hypothesis.applicabilityAssumptions.length).toBeGreaterThan(0)
+    expect(hypothesis.falsificationCriteria.length).toBeGreaterThan(0)
+    expect(result.planMarkdown).toContain("kc_123456789abc@1")
+    expect(result.planMarkdown).toContain(`Literature readiness: ${taskEvidence.readiness}`)
+    expect(result.hypothesesYaml).toContain("cardRevision: 1")
+    expect(result.hypothesesYaml).toContain(`evidenceLevel: ${hypothesis.evidenceLevel}`)
+    if (conflicted) {
+      expect(hypothesis.literatureEvidence[0]!.role).toBe("contradicts")
+      expect(hypothesis.risk).toContain("conflicts")
+    }
+  }
 })
 
 test("generateHypotheses creates prioritized seasonal, trend, and channel hypotheses from task evidence", () => {

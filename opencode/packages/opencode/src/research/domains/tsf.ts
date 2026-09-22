@@ -2835,6 +2835,7 @@ function isDataAnalysisArtifact(kind: string) {
   return (
     kind === "dataset_analysis_report" ||
     kind === "dataset_quantitative_analysis_markdown" ||
+    kind === "dataset_quantitative_analysis_json" ||
     kind === "dataset_qualitative_analysis_markdown" ||
     kind === "dataset_main_analysis_markdown" ||
     kind === "dataset_analysis_plot_png"

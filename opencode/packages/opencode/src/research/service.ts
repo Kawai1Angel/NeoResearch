@@ -78,6 +78,7 @@ import {
   UpdateTaskStatusInput,
 } from "./schema"
 import { Event } from "./event"
+import { addHypothesisToPool, bindTaskEvidenceToSession, loadTaskEvidenceForTask } from "./hypothesis-store"
 import {
   type DomainCandidateProposal,
   DomainRunPlan as DomainRunPlanSchema,
@@ -105,6 +106,18 @@ import {
   summarizeDataAnalysisAgent,
 } from "./agents/data-analysis-agent"
 import {
+  RetrieveAgent,
+  RetrieveResultSchema,
+  TASK_EVIDENCE_ROLES,
+  taskContextDigest,
+  type RetrievalBudgets,
+  type RetrieveResult,
+  type TaskEvidenceBundle,
+  type TaskEvidenceRole,
+  type RetrieveTaskContext,
+} from "./retrieve"
+import { ConfiguredLLMExtractionModel } from "./literature/extraction-model"
+import {
   buildModelCompilerResult,
   type ModelCompilerResult,
 } from "./agents/model-compiler-agent"
@@ -122,6 +135,7 @@ import {
   buildHypothesesYaml,
   extractEvidenceSummary,
   generateHypotheses,
+  validateHypothesisEvidence,
   referenceBaselineOptions,
   type ExperimentPlan,
   type HypoPlannerInput,
@@ -217,6 +231,7 @@ export interface RunFullPipelineResult {
   readonly task: ResearchTask
   readonly intent: IntentAgentResult
   readonly dataAnalysis: DataAnalysisAgentResult
+  readonly literature: RetrieveResult
   readonly hypoPlanning: HypoPlannerResult
   readonly nas: NASAgentResult
   readonly reflection: ReflectionAgentResult
@@ -233,6 +248,7 @@ export interface ResearchLLMStatus {
 const PipelineWorkflowPhases = [
   "intent_gathering",
   "data_analysis",
+  "literature",
   "hypo_planning",
   "searching",
   "nas_budget_extended",
@@ -785,6 +801,11 @@ function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
     priority: priority === "high" || priority === "medium" || priority === "low" ? priority : "medium",
     risk: row.risk,
     testable: row.testable,
+    datasetEvidencePaths: Array.isArray(row.dataset_evidence_paths) ? row.dataset_evidence_paths : [],
+    literatureEvidence: Array.isArray(row.literature_evidence) ? row.literature_evidence : [],
+    applicabilityAssumptions: Array.isArray(row.applicability_assumptions) ? row.applicability_assumptions : [],
+    falsificationCriteria: Array.isArray(row.falsification_criteria) ? row.falsification_criteria : [],
+    evidenceLevel: row.evidence_level === "paper_supported" || row.evidence_level === "conflicted" ? row.evidence_level : "data_only",
     status: validStatus,
     ...(row.abandon_reason ? { abandonReason: row.abandon_reason } : {}),
   }
@@ -819,17 +840,28 @@ function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly Hypothesi
   }
 }
 
+function hypothesisDefinitionDigest(hypothesis: HypothesisObject) {
+  const { id, status, abandonReason, ...definition } = hypothesis
+  return digest(definition)
+}
+
 function recoverHypoPlannerResultFromPlan(input: {
   readonly task: ResearchTask
   readonly dataAnalysisSummary: string
   readonly plan: ExperimentPlan
+  readonly taskEvidence?: TaskEvidenceBundle
 }): HypoPlannerResult {
-  const evidenceSummary = extractEvidenceSummary(input.dataAnalysisSummary)
+  const evidenceSummary = [
+    extractEvidenceSummary(input.dataAnalysisSummary),
+    input.taskEvidence
+      ? `Literature readiness: ${input.taskEvidence.readiness}; selected=${input.taskEvidence.summary.selectedEntryCount}; gaps=${input.taskEvidence.gaps.length}; conflicts=${input.taskEvidence.conflicts.length}.`
+      : "Literature readiness: ready_data_only; no task evidence bundle was supplied.",
+  ].filter(Boolean).join("\n")
   const partial = {
     agent: "HypoPlannerAgent" as const,
     taskID: input.task.id,
     plan: input.plan,
-    hypothesesYaml: buildHypothesesYaml(input.plan),
+    hypothesesYaml: buildHypothesesYaml(input.plan, input.taskEvidence?.readiness),
     evidenceSummary,
     llm: { status: "skipped" as const },
   }
@@ -2124,6 +2156,33 @@ function buildTaskDefinition(task: ResearchTask): Record<string, unknown> {
   }
 }
 
+function buildRetrieveTaskContext(task: ResearchTask): RetrieveTaskContext {
+  const spec = recordValue(task.taskSpec)
+  const metadata = recordValue(spec.metadata)
+  const objective = recordValue(task.objective)
+  const budget = recordValue(task.budget)
+  const runtime = { ...recordValue(metadata.runtime), ...recordValue(spec.runtime) }
+  const positiveNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
+  const rawCompute = budget.computeProfile ?? runtime.computeProfile
+  const computeProfile = rawCompute === "low" || rawCompute === "medium" || rawCompute === "high" ? rawCompute : "unknown"
+  const primaryMetric = typeof objective.primaryMetric === "string" && objective.primaryMetric.trim()
+    ? objective.primaryMetric.trim()
+    : undefined
+  return {
+    taskType: typeof spec.taskType === "string" && spec.taskType.trim() ? spec.taskType.trim() : "forecasting",
+    domain: typeof metadata.domain === "string" && metadata.domain.trim() ? metadata.domain.trim() : task.domainID,
+    objective: {
+      ...(primaryMetric === undefined ? {} : { primaryMetric }),
+      probabilistic: spec.probabilistic === true || objective.probabilistic === true,
+    },
+    constraints: {
+      computeProfile,
+      ...(positiveNumber(budget.latencyBudget) === undefined ? {} : { latencyBudget: positiveNumber(budget.latencyBudget) }),
+      ...(positiveNumber(budget.parameterBudget) === undefined ? {} : { parameterBudget: positiveNumber(budget.parameterBudget) }),
+    },
+  }
+}
+
 function buildHypoPlannerUserPrompt(
   task: ResearchTask,
   dataAnalysisSummary: string,
@@ -2133,6 +2192,7 @@ function buildHypoPlannerUserPrompt(
   latestReflection: LatestReflectionSummary,
   llmSearchPreferences?: string[],
   abandonedHypotheses?: readonly { statement: string }[],
+  taskEvidence?: TaskEvidenceBundle,
   opts?: {
     sessionMode?: boolean
     baselineOptions?: readonly { recipeID: string; description: string }[]
@@ -2198,6 +2258,25 @@ function buildHypoPlannerUserPrompt(
       abandonedHypotheses: abandonedHypotheses && abandonedHypotheses.length > 0
         ? abandonedHypotheses.map((h) => ({ statement: h.statement }))
         : null,
+      taskEvidence: taskEvidence
+        ? {
+            readiness: taskEvidence.readiness,
+            entries: taskEvidence.entries.map((entry) => ({
+              cardID: entry.cardID,
+              revision: entry.cardRevision,
+              claim: entry.claim,
+              roles: entry.roles,
+              conceptIDs: entry.linkage.conceptIDs,
+              methodConceptIDs: entry.linkage.methodConceptIDs,
+              datasetEvidencePaths: entry.linkage.datasetEvidencePaths,
+              applicability: entry.applicability,
+              limitations: entry.limitations,
+              registryMappings: entry.implementation?.registryMappings ?? [],
+            })),
+            conflicts: taskEvidence.conflicts,
+            gaps: taskEvidence.gaps,
+          }
+        : { readiness: "ready_data_only", entries: [], conflicts: [], gaps: [] },
       ...(opts?.baselineOptions && opts.baselineOptions.length > 0
         ? { baselineOptions: opts.baselineOptions }
         : {}),
@@ -2209,7 +2288,10 @@ function buildHypoPlannerUserPrompt(
         "Leave every other existingHypothesis unchanged — they have not been tested yet and there is no new evidence about them. " +
         "abandonedHypotheses lists ideas already abandoned in earlier rounds — do not regenerate hypotheses that restate or closely resemble these. " +
         "Ground each hypothesis's motivation in specific values from dataAnalysis or outcomes from previousReflection. " +
-        "Set expectedOutcome to a concrete, metric-referenced prediction." +
+        "Set expectedOutcome to a concrete, metric-referenced prediction. " +
+        "Only cite cardID/revision/role combinations supplied in taskEvidence; relevance is not truth confidence. " +
+        "Use evidenceLevel=data_only with empty literatureEvidence when no eligible entry exists. " +
+        "Treat expectedOutcome as a prediction, surface contradictions in risk/applicabilityAssumptions, and provide at least one falsificationCriteria item per non-baseline hypothesis." +
         (opts?.baselineOptions && opts.baselineOptions.length > 0
           ? " After the hypothesis pool is updated, call pick_baseline exactly once to choose the single reference baseline from baselineOptions, citing specific dataAnalysis evidence."
           : ""),
@@ -2236,7 +2318,42 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
   const suggestedPreprocessing = filterStrings(rec.suggestedPreprocessing)
   const risk = typeof rec.risk === "string" ? rec.risk : ""
   const testable = typeof rec.testable === "boolean" ? rec.testable : true
-  return { id, statement, motivation, expectedOutcome, suggestedBackbones, suggestedPreprocessing, priority, risk, testable }
+  const datasetEvidencePaths = filterStrings(rec.datasetEvidencePaths)
+  const applicabilityAssumptions = filterStrings(rec.applicabilityAssumptions)
+  const falsificationCriteria = filterStrings(rec.falsificationCriteria)
+  const evidenceLevel = rec.evidenceLevel === "data_only" || rec.evidenceLevel === "paper_supported" || rec.evidenceLevel === "conflicted"
+    ? rec.evidenceLevel
+    : undefined
+  if (!Array.isArray(rec.datasetEvidencePaths) || !Array.isArray(rec.literatureEvidence) ||
+      !Array.isArray(rec.applicabilityAssumptions) || !Array.isArray(rec.falsificationCriteria) || !evidenceLevel) return undefined
+  const roles = new Set<string>(TASK_EVIDENCE_ROLES)
+  const literatureEvidence = (rec.literatureEvidence as unknown[]).map((item) => {
+    const reference = recordValue(item)
+    if (typeof reference.cardID !== "string" || !Number.isInteger(reference.cardRevision) ||
+        typeof reference.role !== "string" || !roles.has(reference.role)) return undefined
+    return {
+      cardID: reference.cardID,
+      cardRevision: reference.cardRevision as number,
+      role: reference.role as TaskEvidenceRole,
+    }
+  })
+  if (literatureEvidence.some((item) => item === undefined)) return undefined
+  return {
+    id,
+    statement,
+    motivation,
+    expectedOutcome,
+    suggestedBackbones,
+    suggestedPreprocessing,
+    priority,
+    risk,
+    testable,
+    datasetEvidencePaths,
+    literatureEvidence: literatureEvidence as Array<{ cardID: string; cardRevision: number; role: TaskEvidenceRole }>,
+    applicabilityAssumptions,
+    falsificationCriteria,
+    evidenceLevel,
+  }
 }
 
 type LatestReflectionSummary = {
@@ -2266,11 +2383,10 @@ function parseLLMHypothesesResult(
     const parsed = extractJsonObject(text)
     const parsedRec = recordValue(parsed)
     if (!Array.isArray(parsedRec.hypotheses)) return undefined
-    const validated = (parsedRec.hypotheses as unknown[])
-      .map(validateLLMHypothesisItem)
-      .filter((h): h is HypothesisObject => h !== undefined)
-      .slice(0, 8)
-    return validated.length > 0 ? { hypotheses: validated, usage } : undefined
+    const rawHypotheses = (parsedRec.hypotheses as unknown[]).slice(0, 8)
+    const validated = rawHypotheses.map(validateLLMHypothesisItem)
+    if (validated.some((item) => item === undefined)) return undefined
+    return validated.length > 0 ? { hypotheses: validated as HypothesisObject[], usage } : undefined
   } catch {
     return undefined
   }
@@ -2287,6 +2403,7 @@ async function generateLLMHypotheses(
   existingHypotheses?: readonly { statement: string; status: string }[],
   latestReflection?: LatestReflectionSummary,
   abandonedHypotheses?: readonly { statement: string }[],
+  taskEvidence?: TaskEvidenceBundle,
 ): Promise<{ hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
@@ -2308,7 +2425,7 @@ async function generateLLMHypotheses(
     }
     const llmSearchPreferences = await loadLLMSearchPreferences(workspaceRoot, task.id)
     const system = buildHypoPlannerSystemPrompt()
-    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences, abandonedHypotheses ?? [])
+    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences, abandonedHypotheses ?? [], taskEvidence)
     const llmPromise = onDelta
       ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
@@ -2553,15 +2670,29 @@ function buildDatasetAnalysisReports(
   fingerprint: JsonRecord,
   context: DatasetAnalysisContext,
   llmQualitative?: string,
+  sourceArtifactIDs: readonly ResearchArtifactID[] = [],
 ): DatasetAnalysisReport[] {
+  const quantitative = analyzeDataset({ task, fingerprint, context, sourceArtifactIDs })
   return [
     {
       kind: "dataset_quantitative_analysis_markdown",
       filename: "quantitative_analysis.md",
       role: "quantitative-data-analyst",
-      content: analyzeDataset({ task, fingerprint, context }).reportMarkdown,
+      content: quantitative.reportMarkdown,
       metadata: {
         format: "markdown",
+        role: "quantitative-data-analyst",
+        phase: "data_analysis",
+      } as JsonRecord,
+    },
+    {
+      kind: "dataset_quantitative_analysis_json",
+      filename: "quantitative_analysis.json",
+      role: "quantitative-data-analyst",
+      content: `${JSON.stringify(quantitative.reportJSON, null, 2)}\n`,
+      metadata: {
+        format: "json",
+        schemaVersion: "dataset_quantitative_analysis_v1",
         role: "quantitative-data-analyst",
         phase: "data_analysis",
       } as JsonRecord,
@@ -2587,7 +2718,7 @@ function buildDatasetAnalysisReports(
         format: "markdown",
         role: "main-data-analyst",
         phase: "data_analysis",
-        inputs: ["dataset_quantitative_analysis_markdown", "dataset_qualitative_analysis_markdown"],
+        inputs: ["dataset_quantitative_analysis_json", "dataset_quantitative_analysis_markdown", "dataset_qualitative_analysis_markdown"],
       } as JsonRecord,
     },
   ]
@@ -3220,6 +3351,7 @@ export interface Interface {
   readonly listRuns: (taskID: ResearchTaskID) => Effect.Effect<ResearchRun[]>
   readonly createArtifact: (input: CreateArtifactInput) => Effect.Effect<ResearchArtifact>
   readonly listArtifacts: (taskID: ResearchTaskID) => Effect.Effect<ResearchArtifact[]>
+  readonly listHypotheses: (taskID: ResearchTaskID) => Effect.Effect<HypothesisObject[]>
   readonly prepareTaskDataset: (input: PrepareTaskDatasetInput) => Effect.Effect<PrepareTaskDatasetResult>
   readonly profileTask: (input: ProfileTaskInput) => Effect.Effect<ProfileTaskResult>
   readonly exportTaskArtifact: (input: ExportTaskArtifactInput) => Effect.Effect<ExportTaskArtifactResult>
@@ -3242,9 +3374,11 @@ export interface Interface {
   readonly answerIntentQuestion: (input: AnswerIntentInput) => Effect.Effect<IntentAgentResult>
   readonly interpretAndApplySlotModification: (input: { taskID: ResearchTaskID; message: string }) => Effect.Effect<IntentAgentResult>
   readonly runDataAnalysisAgent: (input: ProfileTaskInput) => Effect.Effect<DataAnalysisAgentResult>
+  readonly runRetrieveAgent: (input: RunRetrieveAgentInput) => Effect.Effect<RetrieveResult>
   readonly runHypoPlannerAgent: (input: {
     readonly taskID: ResearchTaskID
     readonly outputDir?: string
+    readonly taskEvidenceArtifactID?: ResearchArtifactID
   }) => Effect.Effect<HypoPlannerResult>
   readonly runNASAgent: (input: AutonomousLoopInput) => Effect.Effect<NASAgentResult>
   readonly runVerifierAgent: (input: VerifierAgentRunInput) => Effect.Effect<VerifierAgentResult>
@@ -3252,6 +3386,14 @@ export interface Interface {
   readonly runPublishAgent: (input: ExportTaskArtifactInput) => Effect.Effect<PublishAgentResult>
   readonly runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult>
   readonly getResearchLLMStatus: () => Effect.Effect<ResearchLLMStatus>
+}
+
+export type RunRetrieveAgentInput = {
+  readonly taskID: ResearchTaskID
+  readonly force?: boolean
+  readonly budgets?: Partial<RetrievalBudgets>
+  readonly maxCardsPerPaper?: number
+  readonly catalogPath?: string
 }
 
 const llmCallLog = Log.create({ service: "research.llm" })
@@ -3282,6 +3424,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       readonly stageLabel: string
       readonly taskID: string
       readonly user: string
+      readonly evidenceBinding?: { taskID: ResearchTaskID; artifactID?: ResearchArtifactID }
       readonly modelRef: OpencodeModelRef | undefined
       readonly onDelta?: (delta: string) => Effect.Effect<void>
       readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>
@@ -3294,12 +3437,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         })
         const onDelta = input.onDelta
         const onPartUpdated = input.onPartUpdated
+        const releaseEvidence = input.evidenceBinding
+          ? bindTaskEvidenceToSession(child.id, input.evidenceBinding.taskID, input.evidenceBinding.artifactID)
+          : () => {}
         const promptEffect = sessionPrompt.prompt({
           sessionID: child.id,
           agent: input.agent,
           model: { providerID: ProviderID.make(input.modelRef.providerID), modelID: ModelID.make(input.modelRef.modelID) },
           parts: [{ type: "text", text: input.user }],
-        })
+        }).pipe(Effect.ensuring(Effect.sync(releaseEvidence)))
         const result = (onDelta || onPartUpdated)
           ? yield* Effect.scoped(
               Effect.gen(function* () {
@@ -3591,16 +3737,24 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .get(),
       )
       if (!row) throw missing("Research task", input.taskID)
+      // A candidate's hypothesis is part of its execution contract. Refreshing the
+      // search plan must not delete or reinterpret that historical binding.
+      const candidates = yield* listCandidates(input.taskID)
+      const boundIDs = candidates.flatMap((candidate) => candidate.hypothesisID ? [candidate.hypothesisID] : [])
+      const hypotheses = input.hypothesisPlan.hypotheses.filter((h) => !boundIDs.includes(h.id))
       yield* db((d) =>
-        d.delete(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.task_id, input.taskID)).run(),
+        d.delete(ResearchHypothesisTable).where(and(
+          eq(ResearchHypothesisTable.task_id, input.taskID),
+          ...(boundIDs.length ? [notInArray(ResearchHypothesisTable.hypo_id, boundIDs)] : []),
+        )).run(),
       )
-      if (input.hypothesisPlan.hypotheses.length > 0) {
+      if (hypotheses.length > 0) {
         const time = nowTime()
         yield* db((d) =>
           d
             .insert(ResearchHypothesisTable)
             .values(
-              input.hypothesisPlan.hypotheses.map((h) => ({
+              hypotheses.map((h) => ({
                 id: ResearchHypothesisID.ascending(),
                 task_id: input.taskID,
                 hypo_id: h.id,
@@ -3612,6 +3766,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 priority: h.priority,
                 risk: h.risk,
                 testable: h.testable,
+                dataset_evidence_paths: [...h.datasetEvidencePaths],
+                literature_evidence: [...h.literatureEvidence],
+                applicability_assumptions: [...h.applicabilityAssumptions],
+                falsification_criteria: [...h.falsificationCriteria],
+                evidence_level: h.evidenceLevel,
                 status: h.status ?? "pending",
                 time_created: time.created,
                 time_updated: time.updated,
@@ -3866,10 +4025,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       for (const proposal of proposals) {
         const recipeID = candidateRecipeID(proposal.candidateSpec)
         if (recipeID && existingRecipeIDs.has(recipeID)) continue
+        // A control establishes the comparison floor; it does not test the current
+        // intervention hypothesis, which may require a different architecture.
+        const baselineHypothesis = task.domainID === "tsf"
+          ? yield* Effect.promise(() => addHypothesisToPool(task.id, {
+              statement: proposal.rationale,
+              motivation: ["Establish a reference baseline under the task evaluation protocol."],
+              expectedOutcome: "Produce a reproducible metric floor for subsequent hypothesis tests.",
+              suggestedBackbones: [String(recordValue(proposal.candidateSpec.backbone).type)],
+              suggestedPreprocessing: [],
+              priority: "low",
+              risk: "The reference baseline may underfit the dataset.",
+              testable: true,
+              falsificationCriteria: ["Reject this control if it cannot complete the configured evaluation protocol."],
+            }))
+          : undefined
         const approvalStatus =
           task.mode === "autonomous" ? "auto_approved" : proposal.approvalStatus
         const candidate = yield* createCandidate({
           taskID: task.id,
+          hypothesisID: baselineHypothesis?.id,
           domainID: task.domainID,
           candidateSpec: proposal.candidateSpec,
           rationale: proposal.rationale,
@@ -4507,6 +4682,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       assertCandidateApproved(task.id, candidate)
 
       const stage = input.stage ?? "smoke"
+      yield* ensureRunApprovalGates(task, candidate, stage)
       const candidateSpec = input.seed === undefined ? candidate.candidateSpec : candidateSpecWithSeed(candidate.candidateSpec, input.seed)
       let runnerRunID = input.runnerRunID
       if ((stage === "ref_test" || stage === "blind_test") && runnerRunID === undefined) {
@@ -4581,8 +4757,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         runPlan.command.env = { ...runPlan.command.env, NEO_CAST_EXECUTION_CONTRACT: contractPath, NEO_CAST_CONTRACT_CANDIDATE: runnerPath(Instance.directory, runPlan.writes[0].path), NEO_CAST_CONTRACT_VERIFICATION: proofPath }
         if (stage === "smoke") runPlan.command.args.push("--execution-contract", contractPath, "--contract-verification", proofPath)
       }
-      yield* ensureRunApprovalGates(task, candidate, stage)
-
       const run = yield* createRun({
         taskID: task.id,
         candidateID: candidate.id,
@@ -5612,15 +5786,39 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }
         }
         rankings = DomainRegistry.rankCandidateProposals(task.domainID, proposalContext)
-        if (!proposal) proposal = DomainRegistry.proposeCandidate(task.domainID, proposalContext)
+        if (!proposal) {
+          // The heuristic ranker is not hypothesis-aware. Prefer a compatible
+          // recipe before falling back; the execution gate remains authoritative.
+          proposal = selectedHypothesis && task.domainID === "tsf"
+            ? rankings.find((ranking) => validateCandidateAgainstHypothesis(
+                selectedHypothesis,
+                { hypothesisID: selectedHypothesis.id, candidateSpec: ranking.candidateSpec } as ResearchCandidate,
+                ranking.candidateSpec,
+                task.taskSpec,
+              ).length === 0)
+            : undefined
+          proposal ??= DomainRegistry.proposeCandidate(task.domainID, proposalContext)
+        }
 
         if (proposal) {
           proposalCreated = true
           selectionSource = "domain_proposal"
           const approvalStatus =
             task.mode === "autonomous" ? "auto_approved" : proposal.approvalStatus
+          const proposalHypothesis = selectedHypothesis ?? (task.domainID === "tsf"
+            ? yield* Effect.promise(() => addHypothesisToPool(task.id, {
+                statement: proposal!.rationale,
+                motivation: ["Domain proposal generated before an experiment plan was available."],
+                expectedOutcome: "Evaluate the proposed architecture under the task protocol.",
+                suggestedBackbones: [String(recordValue(proposal!.candidateSpec.backbone).type)],
+                suggestedPreprocessing: [],
+                priority: "medium",
+                risk: "Heuristic proposal requires empirical verification.",
+                testable: true,
+              }))
+            : undefined)
           candidate = yield* createCandidate({
-            hypothesisID: selectedHypothesis?.id,
+            hypothesisID: proposalHypothesis?.id,
             taskID: task.id,
             domainID: task.domainID,
             candidateSpec: proposal.candidateSpec,
@@ -5657,9 +5855,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
       if (!candidate) throw new Error(`No approved autonomous candidate is ready for task: ${task.id}`)
 
-      if (selectedHypothesis && !resumeCandidate) {
+      const candidateHypothesis = (yield* listHypotheses(task.id)).find((item) => item.id === candidate.hypothesisID)
+      if (candidateHypothesis && !resumeCandidate) {
         const contract = buildExecutionContract(task, candidate, DomainRegistry.createRunPlan(task.domainID, { taskSpec: task.taskSpec, candidateSpec: candidate.candidateSpec, stage: "smoke" }).writes[0].content)
-        const mismatches = validateCandidateAgainstHypothesis(selectedHypothesis, candidate)
+        const mismatches = validateCandidateAgainstHypothesis(candidateHypothesis, candidate)
         if (mismatches.length) yield* blockExecutionContract(task, candidate, contract, mismatches)
       }
       const rankPredictor = rankPredictorArtifactRecord(rankings)
@@ -5672,7 +5871,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const modelDesignerResult = buildModelDesignerResult({
         taskID: task.id,
         candidate,
-        selectedHypothesis,
+        selectedHypothesis: candidateHypothesis,
         rationale: designSummary,
         llmStatus: modelDesignerLLMStatusFromMetadata(llmMetadata, candidate.generatedBy, selectionSource),
         selectionSource,
@@ -6862,7 +7061,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         : yield* Effect.promise(() =>
             generateLLMQualitativeAnalysis(task, fingerprint as JsonRecord, analysisContext, Instance.directory, input._onDeltaQualitative),
           )
-      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative?.text)
+      const analysisFiles = buildDatasetAnalysisReports(task, fingerprint as JsonRecord, analysisContext, llmQualitative?.text, [artifact.id])
       if (llmQualitative?.searchPreferences && llmQualitative.searchPreferences.length > 0) {
         yield* Effect.promise(async () => {
           await mkdir(analysisDirectory, { recursive: true })
@@ -6920,14 +7119,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         )
       }
       analysisArtifacts.push(...plotArtifacts)
-      const sourceReports: DatasetAnalysisSourceReport[] = analysisFiles.map((source, index) => {
+      const sourceReports: DatasetAnalysisSourceReport[] = analysisFiles.flatMap((source, index) => {
+        if (source.metadata.format !== "markdown") return []
         const sourceArtifact = analysisArtifacts[index]!
-        return {
+        return [{
           id: sourceArtifact.id,
           kind: sourceArtifact.kind,
           role: source.role,
           content: source.content,
-        }
+        }]
       })
       const unifiedReportPath = path.join(analysisDirectory, "data_analysis_summary.md")
       yield* Effect.promise(async () => {
@@ -7351,6 +7551,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          (item) =>
 	            item.runID === profile.run.id &&
 	            (item.kind === "dataset_quantitative_analysis_markdown" ||
+	              item.kind === "dataset_quantitative_analysis_json" ||
 	              item.kind === "dataset_qualitative_analysis_markdown" ||
 	              item.kind === "dataset_main_analysis_markdown"),
 	        )
@@ -7401,6 +7602,126 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      )
 	    })
 
+    const runRetrieveAgent = Effect.fn("Research.runRetrieveAgent")(function* (input: RunRetrieveAgentInput) {
+      yield* updateTaskStatus({ taskID: input.taskID, status: "literature" })
+      yield* bus.publish(Event.RetrieveAgentStarted, {
+        taskID: input.taskID,
+        agent: "RetrieveAgent",
+        stage: "literature_retrieval",
+        status: "started",
+      })
+      return yield* Effect.gen(function* () {
+        const task = yield* getTask(input.taskID)
+        const artifacts = yield* listArtifacts(input.taskID)
+        const quantitativeArtifact = artifacts
+          .find((item) => item.kind === "dataset_quantitative_analysis_json" && item.uri.startsWith("file://"))
+        if (!quantitativeArtifact) {
+          throw new Error(`Structured quantitative analysis was not created for task: ${input.taskID}`)
+        }
+        const runtime = recordValue(recordValue(task.taskSpec).runtime)
+        const configuredNeoCastRoot = typeof runtime.neoCastProjectRoot === "string" && runtime.neoCastProjectRoot.trim()
+          ? path.resolve(runtime.neoCastProjectRoot)
+          : undefined
+        const neoCastRoot = configuredNeoCastRoot ?? [
+          path.resolve(Instance.directory),
+          path.resolve(Instance.directory, "neo_cast"),
+        ].find((candidate) => existsSync(path.join(candidate, "literature_knowledge"))) ?? path.resolve(Instance.directory, "neo_cast")
+        if (configuredNeoCastRoot && !existsSync(neoCastRoot)) throw new Error(`Neo-Cast project root is unavailable: ${neoCastRoot}`)
+        if (!existsSync(neoCastRoot)) yield* Effect.promise(() => mkdir(neoCastRoot, { recursive: true }))
+        const literatureModel = yield* Effect.promise(() =>
+          ConfiguredLLMExtractionModel.create({ workspaceRoot: Instance.directory, neoCastRoot }),
+        )
+        const agent = new RetrieveAgent({
+          neoCastRoot,
+          workspaceRoot: Instance.directory,
+          ...(literatureModel === undefined ? {} : { literatureModel }),
+        })
+        const result = yield* Effect.promise(async () => {
+          try {
+            return await agent.run({
+              quantitativeReport: quantitativeArtifact.uri.slice(7),
+              quantitativeReportArtifactID: quantitativeArtifact.id,
+              taskContext: buildRetrieveTaskContext(task),
+              ...(input.force === undefined ? {} : { force: input.force }),
+              ...(input.budgets === undefined ? {} : { budgets: input.budgets }),
+              ...(input.maxCardsPerPaper === undefined ? {} : { maxCardsPerPaper: input.maxCardsPerPaper }),
+              ...(input.catalogPath === undefined ? {} : { catalogPath: input.catalogPath }),
+            })
+          } finally {
+            agent.close()
+          }
+        })
+        if (result.taskID !== task.id) throw new Error(`Quantitative report task mismatch: expected ${task.id}, received ${result.taskID}`)
+        const existingResultArtifact = artifacts.find((item) =>
+          item.kind === "literature_retrieve_result_json" && recordValue(item.metadata).retrieveRunID === result.retrieveRunID,
+        )
+        const resultArtifact = existingResultArtifact ?? (yield* createArtifact({
+          taskID: task.id,
+          kind: "literature_retrieve_result_json",
+          uri: `file://${path.join(neoCastRoot, ".neo-cast", "literature-retrieval", "runs", result.retrieveRunID, "retrieve_result.json")}`,
+          metadata: {
+            format: "json",
+            schemaVersion: "retrieve_result_v2",
+            retrieveRunID: result.retrieveRunID,
+            quantitativeReportArtifactID: quantitativeArtifact.id,
+          },
+        }))
+        const existingTaskEvidenceArtifact = artifacts.find((item) =>
+          item.kind === "task_evidence_bundle_json" && recordValue(item.metadata).retrieveRunID === result.retrieveRunID,
+        )
+        const taskEvidenceArtifact = existingTaskEvidenceArtifact ?? (yield* createArtifact({
+          taskID: task.id,
+          kind: "task_evidence_bundle_json",
+          uri: `file://${path.join(neoCastRoot, ".neo-cast", "literature-retrieval", "runs", result.retrieveRunID, "task_evidence_bundle.json")}`,
+          metadata: {
+            format: "json",
+            schemaVersion: "task_evidence_bundle_v1",
+            retrieveRunID: result.retrieveRunID,
+            readiness: result.taskEvidence.readiness,
+            selectedEntryCount: result.taskEvidence.summary.selectedEntryCount,
+            uncoveredMustCoverIntentCount: result.taskEvidence.summary.uncoveredMustCoverIntentCount,
+          },
+        }))
+        // Force/recovery may revise card selection without changing retrieveRunID.
+        // Refresh the existing registration rather than leaving stale readiness/counts.
+        yield* db((d) => d.update(ResearchArtifactTable).set({ time_updated: Date.now() })
+          .where(eq(ResearchArtifactTable.id, resultArtifact.id)).run())
+        yield* db((d) => d.update(ResearchArtifactTable).set({
+          metadata: { ...taskEvidenceArtifact.metadata, phase: "literature", agent: "LiteratureAgent",
+            readiness: result.taskEvidence.readiness, selectedEntryCount: result.taskEvidence.summary.selectedEntryCount,
+            uncoveredMustCoverIntentCount: result.taskEvidence.summary.uncoveredMustCoverIntentCount },
+          time_updated: Date.now(),
+        }).where(eq(ResearchArtifactTable.id, taskEvidenceArtifact.id)).run())
+        yield* bus.publish(Event.RetrieveAgentCompleted, {
+          taskID: task.id,
+          agent: "RetrieveAgent",
+          stage: "literature_retrieval",
+          status: "completed",
+          metadata: {
+            retrieveRunID: result.retrieveRunID,
+            artifactID: resultArtifact.id,
+            taskEvidenceArtifactID: taskEvidenceArtifact.id,
+            readiness: result.taskEvidence.readiness,
+            ...result.summary,
+          },
+        })
+        return result
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* bus.publish(Event.RetrieveAgentFailed, {
+              taskID: input.taskID,
+              agent: "RetrieveAgent",
+              stage: "literature_retrieval",
+              status: "failed",
+              metadata: errorMetadata(Cause.squash(cause)),
+            })
+            return yield* Effect.failCause(cause)
+          }),
+        ),
+      )
+    })
+
     const loadDataAnalysisSummary = (taskID: ResearchTaskID) =>
       Effect.gen(function* () {
         const artifacts = yield* listArtifacts(taskID)
@@ -7411,9 +7732,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         return yield* Effect.promise(() => readFile(filePath, "utf8").catch(() => ""))
       })
 
+    const loadTaskEvidenceBundle = (taskID: ResearchTaskID, artifactID?: ResearchArtifactID) =>
+      Effect.promise(() => loadTaskEvidenceForTask(taskID, artifactID))
+
 	    const runHypoPlannerAgent = Effect.fn("Research.runHypoPlannerAgent")(function* (input: {
 	      readonly taskID: ResearchTaskID
 	      readonly outputDir?: string
+	      readonly taskEvidenceArtifactID?: ResearchArtifactID
 	    }) {
       yield* assertExecutionCheckpoint(input.taskID, undefined, "hypoplanner")
 	      yield* updateTaskStatus({ taskID: input.taskID, status: "hypo_planning" })
@@ -7455,7 +7780,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          return null
 	        })
 	        const dataAnalysisSummary = yield* loadDataAnalysisSummary(input.taskID)
-	        const draftHypotheses = generateHypotheses({ task, dataAnalysisSummary, runs, memory })
+	        const taskEvidence = yield* loadTaskEvidenceBundle(input.taskID, input.taskEvidenceArtifactID)
+	        const draftHypotheses = generateHypotheses({ task, dataAnalysisSummary, runs, memory, taskEvidence })
 	        const onDeltaHypo = (delta: string): void => {
 	          void Effect.runPromise(
 	            bus.publish(Event.HypoPlannerAgentStreamDelta, {
@@ -7485,12 +7811,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              })
 	              .filter((option): option is { recipeID: string; description: string } => option !== undefined)
 	          : []
+	        const evidenceArtifactID = input.taskEvidenceArtifactID ?? (yield* listArtifacts(task.id))
+            .find((item) => item.kind === "task_evidence_bundle_json" && recordValue(item.metadata).retrieveRunID === taskEvidence?.retrieveRunID)?.id
 	        const hypoSessionAttempt = yield* requestViaSession({
+	          evidenceBinding: { taskID: task.id, artifactID: evidenceArtifactID },
 	          rootSessionID: task.sessionID,
 	          agent: "research-hypo-planner",
 	          stageLabel: "HypoPlanner",
 	          taskID: task.id,
-	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses, latestReflection, hypoSearchPreferences, abandonedHypotheses, { sessionMode: true, baselineOptions }),
+	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses, latestReflection, hypoSearchPreferences, abandonedHypotheses, taskEvidence, { sessionMode: true, baselineOptions }),
 	          modelRef: mapToModelRef(hypoConfig),
 	          onDelta: (delta) => bus.publish(Event.HypoPlannerAgentStreamDelta, { taskID: task.id, agent: "HypoPlannerAgent", delta }),
           onPartUpdated: (part) => {
@@ -7527,7 +7856,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const llmHypothesesResult = hypoSessionAttempt
 	          ? undefined
 	          : yield* Effect.promise(() =>
-	              generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses),
+	              generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses, taskEvidence),
 	            )
 	        const llmHypoUsage = hypoSessionAttempt ? hypoSessionAttempt.usage : llmHypothesesResult?.usage
 	        // Session mode: agent used hypothesis_* tools to write to DB; read current pool state.
@@ -7546,14 +7875,32 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          typeof refreshedMetadata.referenceBaselineRationale === "string"
 	            ? refreshedMetadata.referenceBaselineRationale
 	            : undefined
-	        const result = buildHypoPlannerResult({
+	        let result = buildHypoPlannerResult({
 	          task,
 	          dataAnalysisSummary,
 	          runs,
 	          memory,
+	          taskEvidence,
 	          llmHypotheses: sessionPoolHypotheses ?? llmHypothesesResult?.hypotheses,
 	          toolReferenceBaseline,
 	        })
+
+        if (!(hypoSessionAttempt && result.llm.status === "used")) {
+          // Direct planners reuse labels such as H1 across rounds. Version changed
+          // definitions before writing artifacts so YAML, events and DB agree.
+          const boundIDs = new Set((yield* listCandidates(task.id)).map((candidate) => candidate.hypothesisID))
+          const pool = yield* listHypotheses(task.id)
+          const bound = new Map(pool.filter((h) => boundIDs.has(h.id)).map((h) => [h.id, h]))
+          const hypotheses = result.plan.hypotheses.map((h) => {
+            const previous = bound.get(h.id)
+            return previous && hypothesisDefinitionDigest(previous) !== hypothesisDefinitionDigest(h)
+              ? { ...h, id: `${h.id}_${ResearchHypothesisID.ascending()}` }
+              : h
+          })
+          const plan = { ...result.plan, hypotheses }
+          result = { ...result, plan, hypothesesYaml: buildHypothesesYaml(plan, taskEvidence?.readiness) }
+          result = { ...result, planMarkdown: buildHypoPlanMarkdown(result) }
+        }
 	        const outputDir = path.join(
 	          Instance.directory,
 	          input.outputDir ?? path.join(".neo-research", "sessions", input.taskID, "hypotheses"),
@@ -7573,6 +7920,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            format: "markdown",
 	            phase: "hypo_planning",
 	            agent: "HypoPlannerAgent",
+	            ...(evidenceArtifactID === undefined ? {} : { taskEvidenceArtifactID: evidenceArtifactID }),
+	            literatureReadiness: taskEvidence?.readiness ?? "ready_data_only",
 	            hypothesisCount: result.plan.hypotheses.length,
 	            baselineStrategy: result.plan.baselineStrategy,
 	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
@@ -7597,6 +7946,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            format: "yaml",
 	            phase: "hypo_planning",
 	            agent: "HypoPlannerAgent",
+	            ...(evidenceArtifactID === undefined ? {} : { taskEvidenceArtifactID: evidenceArtifactID }),
+	            literatureReadiness: taskEvidence?.readiness ?? "ready_data_only",
 	            hypothesisCount: result.plan.hypotheses.length,
 	            baselineStrategy: result.plan.baselineStrategy,
 	            ...(result.plan.referenceBaseline === undefined ? {} : { referenceBaseline: result.plan.referenceBaseline }),
@@ -7604,7 +7955,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            ...(toolReferenceBaselineRationale ? { referenceBaselineRationale: toolReferenceBaselineRationale } : {}),
 	          },
 	        })
-	        if (hypoSessionAttempt) {
+	        if (hypoSessionAttempt && result.llm.status === "used") {
 	          // Session mode: hypothesis rows managed by tools — update task metadata only.
 	          const t = yield* getTask(input.taskID)
 	          const meta = recordValue(t.taskSpec.metadata)
@@ -7633,7 +7984,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          )
 	          if (taskRow) yield* bus.publish(Event.TaskUpdated, { task: mapTask(taskRow) })
 	        } else {
-	          // Direct mode: full bulk-replace of hypothesis rows.
+	          // Direct mode: replace unbound proposals, retaining candidate-bound snapshots.
 	          const nextHypothesisStatements = new Set(result.plan.hypotheses.map((h) => h.statement))
 	          const newlyAbandoned = existingHypotheses
 	            .filter((h) => !nextHypothesisStatements.has(h.statement))
@@ -8457,17 +8808,50 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           } satisfies DataAnalysisAgentResult
         })
 
-      const recoverHypoPlanning = (task: ResearchTask) =>
+      const recoverRetrieveResult = (task: ResearchTask) =>
+        Effect.gen(function* () {
+          const artifacts = yield* listArtifacts(task.id)
+          const resultArtifact = artifacts.find((item) =>
+            item.kind === "literature_retrieve_result_json" && recordValue(item.metadata).schemaVersion === "retrieve_result_v2",
+          )
+          if (!resultArtifact) throw new Error(`Missing retrieve_result_v2 artifact for task: ${task.id}`)
+          const resultPath = filePathFromURI(resultArtifact.uri)
+          if (!resultPath) throw new Error(`Invalid retrieve result artifact URI for task: ${task.id}`)
+          const result = yield* Effect.promise(() =>
+            readFile(resultPath, "utf8").then((text) => RetrieveResultSchema.parse(JSON.parse(text))),
+          )
+          if (result.taskID !== task.id) throw new Error(`Retrieve result task mismatch: expected ${task.id}, received ${result.taskID}`)
+          const quantitativeArtifact = artifacts.find((item) => item.kind === "dataset_quantitative_analysis_json")
+          if (!quantitativeArtifact || quantitativeArtifact.id !== result.quantitativeReportArtifactID) {
+            throw new Error(`Retrieve result quantitative artifact mismatch for task: ${task.id}`)
+          }
+          const taskEvidenceArtifact = artifacts.find((item) =>
+            item.kind === "task_evidence_bundle_json" && recordValue(item.metadata).retrieveRunID === result.retrieveRunID,
+          )
+          if (!taskEvidenceArtifact) throw new Error(`Missing task evidence artifact for retrieve run: ${result.retrieveRunID}`)
+          const taskEvidence = yield* loadTaskEvidenceBundle(task.id, taskEvidenceArtifact.id)
+          if (!taskEvidence || taskEvidence.retrieveRunID !== result.retrieveRunID ||
+              taskEvidence.quantitativeReportArtifactID !== result.quantitativeReportArtifactID ||
+              taskEvidence.taskContextDigest !== taskContextDigest(buildRetrieveTaskContext(task)) ||
+              JSON.stringify(taskEvidence) !== JSON.stringify(result.taskEvidence)) {
+            throw new Error(`Task evidence provenance mismatch for retrieve run: ${result.retrieveRunID}`)
+          }
+          return result
+        })
+
+      const recoverHypoPlanning = (task: ResearchTask, taskEvidenceArtifactID: ResearchArtifactID) =>
         Effect.gen(function* () {
           const dataAnalysisSummary = yield* loadDataAnalysisSummary(task.id)
+          const taskEvidence = yield* loadTaskEvidenceBundle(task.id, taskEvidenceArtifactID)
           const hypotheses = yield* listHypotheses(task.id)
           const plan = experimentPlanFromDB(task, hypotheses)
           if (plan !== undefined) {
-            return recoverHypoPlannerResultFromPlan({ task, dataAnalysisSummary, plan })
+            validateHypothesisEvidence(hypotheses, taskEvidence)
+            return recoverHypoPlannerResultFromPlan({ task, dataAnalysisSummary, plan, taskEvidence })
           }
           const runs = yield* listRuns(input.taskID)
           const memory = yield* listMemory(input.taskID)
-          return buildHypoPlannerResult({ task, dataAnalysisSummary, runs, memory })
+          return buildHypoPlannerResult({ task, dataAnalysisSummary, runs, memory, taskEvidence })
         })
 
       const recoverNAS = (task: ResearchTask) =>
@@ -8702,11 +9086,39 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
       const taskAfterDataAnalysis = yield* getTask(input.taskID)
       const workflowAfterDataAnalysis = workflowMetadataFromTask(taskAfterDataAnalysis)
-      const hypoPlanning = workflowAfterDataAnalysis.completedPhases.includes("hypo_planning")
-        ? yield* recoverHypoPlanning(taskAfterDataAnalysis)
+      const literature = workflowAfterDataAnalysis.completedPhases.includes("literature")
+        ? yield* recoverRetrieveResult(taskAfterDataAnalysis).pipe(
+            Effect.catchCause(() => Effect.gen(function* () {
+              const rebuilt = yield* runRetrieveAgent({ taskID: input.taskID, force: true })
+              yield* updateTaskWorkflow({ taskID: input.taskID,
+                completedPhases: workflowAfterDataAnalysis.completedPhases.filter((phase) =>
+                  PipelineWorkflowPhases.indexOf(phase) <= PipelineWorkflowPhases.indexOf("literature")),
+                lastCheckpoint: "intent_confirmed",
+              })
+              return rebuilt
+            })),
+          )
+        : yield* runRetrieveAgent({ taskID: input.taskID }).pipe(
+            Effect.tap(() => updateTaskWorkflow({ taskID: input.taskID,
+              completedPhases: [...workflowAfterDataAnalysis.completedPhases.filter((phase) =>
+                PipelineWorkflowPhases.indexOf(phase) < PipelineWorkflowPhases.indexOf("literature")), "literature"],
+              lastCheckpoint: "intent_confirmed",
+            })),
+          )
+
+      const taskAfterLiterature = yield* getTask(input.taskID)
+      const workflowAfterLiterature = workflowMetadataFromTask(taskAfterLiterature)
+      const literatureArtifacts = yield* listArtifacts(input.taskID)
+      const taskEvidenceArtifact = literatureArtifacts.find((item) =>
+        item.kind === "task_evidence_bundle_json" && recordValue(item.metadata).retrieveRunID === literature.retrieveRunID,
+      )
+      if (!taskEvidenceArtifact) throw new Error(`Missing task evidence artifact for retrieve run: ${literature.retrieveRunID}`)
+      const hypoPlanning = workflowAfterLiterature.completedPhases.includes("hypo_planning")
+        ? yield* recoverHypoPlanning(taskAfterLiterature, taskEvidenceArtifact.id)
         : yield* runHypoPlannerAgent({
             taskID: input.taskID,
             outputDir: input.outputDir === undefined ? undefined : path.join(input.outputDir, "hypotheses"),
+            taskEvidenceArtifactID: taskEvidenceArtifact.id,
           }).pipe(
             Effect.tap(() => markWorkflowPhase("hypo_planning")),
           )
@@ -8993,7 +9405,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
 
       const completed = yield* getTask(input.taskID)
-      return { task: completed, intent, dataAnalysis, hypoPlanning, nas, reflection, publish }
+      return { task: completed, intent, dataAnalysis, literature, hypoPlanning, nas, reflection, publish }
     })
 
     const createMemory = Effect.fn("Research.createMemory")(function* (input: CreateMemoryInput) {
@@ -9134,6 +9546,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       answerIntentQuestion,
       interpretAndApplySlotModification,
       runDataAnalysisAgent,
+      runRetrieveAgent,
       runHypoPlannerAgent,
       runNASAgent,
       runVerifierAgent,
@@ -9173,6 +9586,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       listRuns,
       createArtifact,
       listArtifacts,
+      listHypotheses,
       prepareTaskDataset,
       profileTask,
       exportTaskArtifact,

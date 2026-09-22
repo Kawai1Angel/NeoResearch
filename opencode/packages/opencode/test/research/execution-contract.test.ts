@@ -31,6 +31,11 @@ const hypothesis = {
   priority: "high",
   risk: "low",
   testable: true,
+  datasetEvidencePaths: [],
+  literatureEvidence: [],
+  applicabilityAssumptions: [],
+  falsificationCriteria: ["Reject if the candidate does not improve the target metric."],
+  evidenceLevel: "data_only",
 } satisfies HypothesisObject
 
 test("Gate A rejects a different hypothesis and backbone", () => {

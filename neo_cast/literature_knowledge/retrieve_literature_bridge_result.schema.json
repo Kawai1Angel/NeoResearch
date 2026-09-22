@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "retrieve_literature_bridge_result.schema.json",
+  "type": "object", "additionalProperties": false, "required": ["retrieveRunID", "papers"],
+  "properties": {"retrieveRunID": {"type": "string"}, "papers": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["paperID", "intentIDs", "candidateIDs", "status", "acceptedCardIDs", "rejectedCandidateCount", "warningCount"], "properties": {"paperID": {"type": "string"}, "intentIDs": {"type": "array", "items": {"type": "string"}}, "candidateIDs": {"type": "array", "items": {"type": "string"}}, "status": {"enum": ["completed", "partial", "failed", "skipped_pdf_unavailable"]}, "literatureRunID": {"type": "string"}, "acceptedCardIDs": {"type": "array", "items": {"type": "string"}}, "rejectedCandidateCount": {"type": "integer", "minimum": 0}, "warningCount": {"type": "integer", "minimum": 0}, "reviewPath": {"type": "string"}, "error": {"type": "string"}}}}}
+}

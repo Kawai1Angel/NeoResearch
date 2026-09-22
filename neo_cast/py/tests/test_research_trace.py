@@ -50,7 +50,8 @@ class ResearchTraceTest(unittest.TestCase):
         self.assertEqual(design_entry["made_by"], "ModelDesigner Agent")
         self.assertIn("multiscale_patch", design_entry["decision"])
         self.assertIn("Multi-scale patches", " ".join(design_entry["evidence"]))
-        self.assertIn("val_avg_mse", design_entry["verification_plan"])
+        self.assertIn("cv_avg_mse", design_entry["verification_plan"])
+        self.assertIn("cv_std_mse", design_entry["verification_plan"])
         for field in ("decision", "made_by", "evidence", "expected_effect", "verification_plan"):
             self.assertIn(field, design_entry)
 

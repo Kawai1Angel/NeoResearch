@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "literature_taxonomy_v1",
+  "mechanisms": {
+    "channel_independence": ["channel-independent", "channel independent", "variable-independent", "independent channel encoding"],
+    "seasonal_decomposition": ["series decomposition", "trend-seasonal decomposition", "seasonal decomposition"],
+    "patch_encoding": ["patching", "patch-based encoding", "patch embedding"],
+    "frequency_modeling": ["frequency-domain modeling", "spectral modeling", "fourier modeling"]
+  },
+  "data_features": {
+    "long_horizon": ["long-term forecasting", "long horizon", "long prediction length"],
+    "distribution_shift": ["non-stationarity", "nonstationarity", "temporal distribution shift"],
+    "multivariate": ["multivariate time series", "multiple variables"],
+    "seasonality": ["seasonal pattern", "periodicity"]
+  },
+  "task_types": {
+    "forecasting": ["time series forecasting", "prediction"],
+    "classification": ["time series classification"]
+  }
+}
