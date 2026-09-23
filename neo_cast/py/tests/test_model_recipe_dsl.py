@@ -53,6 +53,27 @@ def make_model_recipe() -> dict:
 
 
 class ModelRecipeDslTest(unittest.TestCase):
+    def test_candidate_schemas_accept_extended_design_notes(self) -> None:
+        long_notes = "设计依据" * 600
+        recipe = json.loads((PY_ROOT / "schemas" / "recipe_dlinear.example.json").read_text(encoding="utf-8"))
+        recipe["notes"] = long_notes
+        model_recipe = make_model_recipe()
+        model_recipe["notes"] = long_notes
+        candidate = {
+            "schema_version": "candidate.v1",
+            "hypothesis": "Validate that detailed model-design feedback survives the runner boundary.",
+            "model_family": "nlinear",
+            "model_config": {},
+            "train_config": {"lr": 0.001, "batch_size": 32, "max_epochs": 1},
+            "notes": long_notes,
+        }
+
+        for kind, payload in (("recipe", recipe), ("model-recipe", model_recipe), ("candidate", candidate)):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp_dir:
+                payload_path = Path(tmp_dir) / f"{kind}.json"
+                payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                self.assertEqual(validate_payload(kind, payload_path), [])
+
     def test_model_recipe_compiles_to_executable_candidate_recipe(self) -> None:
         compiled = compile_model_recipe(make_model_recipe())
 

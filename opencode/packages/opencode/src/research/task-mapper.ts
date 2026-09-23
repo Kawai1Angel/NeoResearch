@@ -26,6 +26,8 @@ export function mapTask(row: ResearchTaskRow) {
     id: row.id,
     projectID: row.project_id,
     sessionID: row.session_id ?? undefined,
+    cockpitChatSessionID: row.cockpit_chat_session_id ?? undefined,
+    stateRevision: row.state_revision,
     title: row.title,
     domainID: row.domain_id,
     mode: row.mode,

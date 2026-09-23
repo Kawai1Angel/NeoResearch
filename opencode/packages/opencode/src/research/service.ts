@@ -1,11 +1,27 @@
+import { supersedeIntentCheckpoints } from "./taskspec-store"
+import { taskExecutionRoot, taskSessionModel, validateTaskRuntimePaths } from "./task-isolation"
+import { readSelectedSessionModel, resolveSessionModel } from "./session-model"
+import { Provider } from "@/provider"
+import { appendLog, recordResearchEvent, snapshotPhaseArtifact } from "./log-archive"
+import { logPhaseMethod } from "./phase-log"
+import { executionOwner, runnerGroupExited } from "./owner"
+import { recordCompletedPhases } from "./phase-store"
+import { searchCycle, chargeIteration, saveCrashStreak, cycleClock, extendSearchCycle } from "./cycle"
+import {
+  NAS_DEFAULT_MAX_ITERATIONS,
+  NAS_DEFAULT_MAX_NO_IMPROVE,
+  RESEARCH_MAX_RUNS_SAFETY_LIMIT,
+} from "./defaults"
+import { abortable } from "./abortable"
 import { EffectBridge } from "@/effect"
 import { recoverLiteratureReceipt } from "./literature-session-receipt"
 import { createLiteraturePhase, bindLiteratureSession, type LiteraturePhase } from "./literature-phase-executor"
+import { KnowledgeStore } from "./literature/knowledge-store"
 import { buildExecutionContract, digest, validateCandidateAgainstHypothesis, verifyExecutionRecords, type ExecutionContract, type ContractMismatch } from "./execution-contract"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema, Stream, Semaphore } from "effect"
-import { cp, mkdir, readdir, readFile, writeFile } from "fs/promises"
-import { existsSync, openSync, readSync, closeSync } from "fs"
+import { cp, mkdir, readdir, readFile, writeFile, rename } from "fs/promises"
+import { existsSync, openSync, readSync, closeSync, realpathSync } from "fs"
 import { createHash } from "crypto"
 import os from "os"
 import path from "path"
@@ -32,6 +48,8 @@ import {
   ResearchHypothesisTable,
   ResearchMemoryTable,
   ResearchRunTable,
+  ResearchCycleTable,
+  ResearchRunnerLockTable,
   ResearchTaskTable,
 } from "./research.sql"
 import {
@@ -93,8 +111,7 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { apiKeyFor, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
-import { ProviderID, ModelID } from "@/provider/schema"
+import { apiKeyFor, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata as buildLLMMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
 import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
 import {
@@ -314,6 +331,7 @@ export const PipelineBlockedError = NamedError.create(
       "pipeline_requires_autonomous",
       "intent_clarification_required",
       "human_checkpoint_required",
+      "human_checkpoint_rejected",
       "reflection_requested_human_review",
       "runner_not_configured",
       "execution_contract_violation",
@@ -410,8 +428,9 @@ function intentCheckpointSignature(task: ResearchTask) {
   const dataset = recordValue(spec.dataset)
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
+  const loop = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   return [
-    `mode=${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
+    `mode=${compactIntentValue(taskInteractionMode(task) ?? (task.mode === "review" ? "companion" : "socratic"))}`,
     `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
     `targets=${compactIntentValue(dataset.targetCols)}`,
     `pastCovariates=${compactIntentValue(dataset.observedPastCovariates)}`,
@@ -421,7 +440,8 @@ function intentCheckpointSignature(task: ResearchTask) {
     `horizons=${compactIntentValue(spec.predictionLengths)}`,
     `metric=${compactIntentValue(objective.primaryMetric)}`,
     `direction=${compactIntentValue(objective.direction)}`,
-    `maxRuns=${compactIntentValue(budget.maxRuns)}`,
+    `maxIterations=${compactIntentValue(loop.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS)}`,
+    `maxNoImprove=${compactIntentValue(loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
   ].join("|")
 }
 
@@ -430,6 +450,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
   const dataset = recordValue(spec.dataset)
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
+  const loop = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   const metadata = recordValue(spec.metadata)
   // intentSlots holds values typed by the user (or LLM-parsed). Use them as fallback when
   // canonical fields are not yet set (e.g. natural-language input without a configured API key).
@@ -460,9 +481,10 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Error preferences: ${compactIntentValue(intentSlots.error_preferences ?? objective.errorPreferences)}`,
     `Latency budget: ${compactIntentValue(intentSlots.latency_budget ?? budget.latencyBudget)}`,
     `Parameter budget: ${compactIntentValue(intentSlots.parameter_budget ?? budget.parameterBudget)}`,
+    `NAS planned iterations: ${compactIntentValue(intentSlots.max_iterations ?? loop.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS)}`,
+    `Stop after no improvement: ${compactIntentValue(intentSlots.max_no_improve ?? loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
     `Interpretability: ${compactIntentValue(intentSlots.interpretability ?? spec.interpretability)}`,
     `Deployment target: ${compactIntentValue(intentSlots.deployment_target ?? spec.deploymentTarget)}`,
-    `Budget max runs: ${compactIntentValue(budget.maxRuns)}`,
     `Business context: ${compactIntentValue(intentSlots.business_context ?? metadata.businessContext ?? metadata.business_context)}`,
     "",
     "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并逐一修改 slots 后重新确认。",
@@ -489,6 +511,7 @@ interface RunnerProgressFields {
   readonly horizon?: number
   readonly valLoss?: number
   readonly elapsedS?: number
+  readonly foldIndex?: number
 }
 
 interface TrainingCurvePoint {
@@ -544,12 +567,14 @@ function parseProgressLine(line: string): RunnerProgressFields {
     const horizon = finiteNumber(record.horizon)
     const valLoss = finiteNumber(record.val_loss) ?? finiteNumber(record.valLoss)
     const elapsedS = finiteNumber(record.elapsed_s) ?? finiteNumber(record.elapsedS)
+    const foldIndex = finiteNumber(record.cv_fold_index) ?? finiteNumber(record.foldIndex)
     return {
       ...(event === undefined ? {} : { event }),
       ...(epoch === undefined ? {} : { epoch }),
       ...(horizon === undefined ? {} : { horizon }),
       ...(valLoss === undefined ? {} : { valLoss }),
       ...(elapsedS === undefined ? {} : { elapsedS }),
+      ...(foldIndex === undefined ? {} : { foldIndex }),
     }
   } catch {
     return {}
@@ -638,7 +663,8 @@ function fallbackRunEvaluation(task: ResearchTask, run: ResearchRun): DomainRunE
 
 function maxRunsLimit(budget: ResearchTask["budget"]) {
   const value = (budget as Record<string, unknown>).maxRuns
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return RESEARCH_MAX_RUNS_SAFETY_LIMIT
+  return Math.min(Math.floor(value), RESEARCH_MAX_RUNS_SAFETY_LIMIT)
 }
 
 function maxParallelLimit(budget: ResearchTask["budget"]) {
@@ -922,6 +948,15 @@ function hasCompletedWorkflowPhase(task: ResearchTask, phase: PipelineWorkflowPh
 }
 
 function errorMetadata(error: unknown): JsonRecord {
+  if (Provider.ModelNotFoundError.isInstance(error)) {
+    return {
+      error: `Model not found: ${error.data.providerID}/${error.data.modelID}`,
+      errorName: error.name,
+      providerID: error.data.providerID,
+      modelID: error.data.modelID,
+      suggestions: error.data.suggestions ?? [],
+    }
+  }
   return {
     error: error instanceof Error ? error.message : String(error),
     errorName: error instanceof Error ? error.name : "Error",
@@ -1149,13 +1184,13 @@ function sessionLocalMetricState(input: {
 }
 
 function autonomousLoopMaxIterations(inputValue: unknown, task: ResearchTask) {
-  const requested = integerPolicyValue(inputValue)
-  if (requested !== undefined) return Math.max(1, Math.min(requested, 200))
-  return 20
+  const requested = loopPolicyInteger(inputValue, task, "maxIterations") ?? NAS_DEFAULT_MAX_ITERATIONS
+  return Math.max(1, Math.min(requested, 200))
 }
 
 function artifactDirsFromRecords(records: Record<string, unknown>[]) {
   return records
+    .filter((record) => record.ephemeral !== true)
     .map((record) => record.artifact_dir)
     .filter((value): value is string => typeof value === "string" && value.length > 0)
 }
@@ -2071,9 +2106,13 @@ async function generateLLMQualitativeAnalysis(
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
     const result = await Promise.race([llmPromise, timeoutPromise])
-    if (!result) return undefined
+    if (!result) {
+      recordResearchEvent(workspaceRoot, "research.llm.fallback", { taskID: task.id, stage: "generateLLMQualitativeAnalysis", reason: "timeout" })
+      return undefined
+    }
     return { ...result, searchPreferences: parseSearchPreferencesFromQualitative(result.text) }
-  } catch {
+  } catch (error) {
+    recordResearchEvent(workspaceRoot, "research.llm.fallback", { taskID: task.id, stage: "generateLLMQualitativeAnalysis", error: String(error) })
     return undefined
   }
 }
@@ -2432,9 +2471,13 @@ async function generateLLMHypotheses(
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
     const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
     const result = await Promise.race([llmPromise, timeoutPromise])
-    if (!result) return undefined
+    if (!result) {
+      recordResearchEvent(workspaceRoot, "research.llm.fallback", { taskID: task.id, stage: "generateLLMHypotheses", reason: "timeout" })
+      return undefined
+    }
     return parseLLMHypothesesResult(result.text, result.usage)
-  } catch {
+  } catch (error) {
+    recordResearchEvent(workspaceRoot, "research.llm.fallback", { taskID: task.id, stage: "generateLLMHypotheses", error: String(error) })
     return undefined
   }
 }
@@ -2444,6 +2487,8 @@ interface ReflectionLLMContext {
   readonly taskSpec: JsonRecord
   /** Objective statement derived from the task (metric name + direction + target). */
   readonly taskObjective: string
+  /** User-confirmed NAS iteration plan used to judge remaining search capacity. */
+  readonly maxIterations: number
   /** Rationale of the most recent candidate — encodes the hypothesis being tested. */
   readonly currentHypothesis?: string
   /** candidateSpec JSON of the most recent candidate (architecture + training recipe). */
@@ -2464,6 +2509,7 @@ function buildReflectionSessionUserPrompt(
   task: ResearchTask,
   analysis: ReflectionAnalysis,
   currentHypothesis?: string,
+  maxIterations = autonomousLoopMaxIterations(undefined, task),
 ): string {
   const objectiveRecord = recordValue(task.objective)
   const direction = analysis.direction
@@ -2478,6 +2524,7 @@ function buildReflectionSessionUserPrompt(
     {
       taskSpec: task.taskSpec,
       taskObjective,
+      maxIterations,
       currentHypothesis: currentHypothesis ?? null,
       structuralAnalysis: {
         decision: analysis.decision,
@@ -2506,6 +2553,7 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
     {
       taskSpec: context.taskSpec,
       taskObjective: context.taskObjective,
+      maxIterations: context.maxIterations,
       originalHypothesis: context.currentHypothesis ?? null,
       experimentDesign: context.experimentDesign ?? null,
       experimentResults: {
@@ -2787,7 +2835,7 @@ function renderReleasePackageMarkdown(input: {
   ].join("\n")
 }
 
-async function ensureRunnerStateInitialized(plan: DomainRunPlan): Promise<void> {
+async function ensureRunnerStateInitialized(plan: DomainRunPlan, signal?: AbortSignal): Promise<void> {
   const cwd = plan.command.cwd ?? process.cwd()
   const stateFile = path.join(cwd, ".neo-cast", "runner_state.json")
   if (existsSync(stateFile)) return
@@ -2805,6 +2853,8 @@ async function ensureRunnerStateInitialized(plan: DomainRunPlan): Promise<void> 
   }
 
   const result = await Process.run([plan.command.executable, runnerScript, "init"], {
+    abort: signal,
+    tree: true,
     cwd,
     env: plan.command.env,
     nothrow: true,
@@ -2823,9 +2873,13 @@ async function ensureRunnerStateInitialized(plan: DomainRunPlan): Promise<void> 
 async function executeRunnerPlan(
   plan: DomainRunPlan,
   onProgressLine?: (line: string) => void,
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void,
+  onStderrLine?: (line: string) => void,
 ): Promise<RunnerExecution> {
   const cwd = plan.command.cwd ?? process.cwd()
-  await ensureRunnerStateInitialized(plan)
+  signal?.throwIfAborted()
+  await ensureRunnerStateInitialized(plan, signal)
   for (const item of plan.writes) {
     const file = runnerPath(cwd, item.path)
     await mkdir(path.dirname(file), { recursive: true })
@@ -2877,14 +2931,15 @@ async function executeRunnerPlan(
   const result = await Process.runStreaming([plan.command.executable, ...plan.command.args], {
     cwd,
     env: plan.command.env,
-    abort: abortController.signal,
+    abort: signal ? AbortSignal.any([signal, abortController.signal]) : abortController.signal,
+    tree: true,
     kill: "SIGKILL",
     timeout: RUNNER_ABORT_KILL_GRACE_MS,
     nothrow: true,
+    onSpawn,
     onStdoutLine: handleStdoutLine,
-    onStderrLine: () => resetIdleTimer(),
-  })
-  clearRunnerTimers()
+    onStderrLine: (line) => { resetIdleTimer(); onStderrLine?.(line) },
+  }).finally(clearRunnerTimers)
   const stdout = result.stdout.toString()
   const stderr = [result.stderr.toString(), abortReason].filter((item) => item && item.length > 0).join("\n")
   return {
@@ -2943,6 +2998,8 @@ async function buildReproducibilitySeal(
     path.join(workspaceRoot, "package-lock.json"),
   ])
   const preprocessPath = firstExistingFile([
+    path.join(plan.command.cwd ?? workspaceRoot, ".neo-cast", "dataset_spec.json"),
+    path.join(plan.command.cwd ?? workspaceRoot, ".neo-cast", "dataset", "dataset_spec.json"),
     path.join(neoCastRoot, ".neo-cast", "dataset_spec.json"),
     path.join(neoCastRoot, ".neo-cast", "dataset", "dataset_spec.json"),
     path.join(neoCastRoot, "py", "prepare_tsf.py"),
@@ -3150,6 +3207,8 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectR
   if (!config) {
     throw new Error("TSF dataset preparation requires taskSpec.dataset.path and taskSpec.runtime.neoCastProjectRoot")
   }
+  config.source = path.resolve(projectRoot, String(recordValue(task.taskSpec.dataset).path))
+  const executionRoot = taskExecutionRoot(task, projectRoot)
   const args = [path.join(config.root, "bin", "neo-cast.js"), "prepare-data", "--source", config.source]
   const preset = datasetPresetFromLoader(config.loaderID)
   if (preset) args.push("--dataset-preset", preset)
@@ -3199,9 +3258,9 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectR
   return {
     executable: process.env.NEO_CAST_NODE ?? "node",
     args,
-    cwd: path.resolve(projectRoot),
+    cwd: path.resolve(executionRoot),
     env: {
-      NEO_CAST_PROJECT_ROOT: path.resolve(projectRoot),
+      NEO_CAST_PROJECT_ROOT: path.resolve(executionRoot),
       NEO_CAST_PACKAGE_ROOT: config.root,
       ...(existsSync(sharedPython)
         ? {
@@ -3339,6 +3398,8 @@ function mapChampion(row: ResearchChampionRow) {
 }
 
 export interface Interface {
+  readonly reconcileInterruptedRuns: (taskID: ResearchTaskID) => Effect.Effect<void>
+  readonly ensureCockpitChat: (taskID: ResearchTaskID) => Effect.Effect<{ id: string }>
   readonly createTask: (input: CreateTaskInput) => Effect.Effect<ResearchTask>
   readonly listTasks: (input?: ListTaskInput) => Effect.Effect<ResearchTask[]>
   readonly getTask: (taskID: ResearchTaskID) => Effect.Effect<ResearchTask>
@@ -3412,12 +3473,32 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const bus = yield* Bus.Service
     const session = yield* Session.Service
     const sessionPrompt = yield* SessionPrompt.Service
+    const selectSessionModel = (taskID: string, requested: OpencodeModelRef | undefined) =>
+      Effect.gen(function* () {
+        const task = yield* getTask(taskID as ResearchTaskID)
+        const pinned = taskSessionModel(task.taskSpec)
+        const selected = yield* resolveSessionModel(requested, pinned ?? (yield* Effect.promise(readSelectedSessionModel))).pipe(
+          Effect.provide(Provider.defaultLayer),
+        )
+        if (!pinned) yield* Effect.sync(() => Database.transaction((d) => {
+          const current = d.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.id, task.id)).get()!
+          const spec = current.task_spec as JsonRecord
+          if (!taskSessionModel(spec)) d.update(ResearchTaskTable).set({
+            task_spec: { ...spec, metadata: { ...recordValue(spec.metadata), sessionModel: selected } },
+          }).where(eq(ResearchTaskTable.id, task.id)).run()
+        }))
+        recordResearchEvent(Instance.directory, "research.model.selected", {
+          taskID, requested: requested ?? null, selected,
+          fallback: requested?.providerID !== selected.providerID || requested?.modelID !== selected.modelID,
+        })
+        return selected
+      })
 
     /**
      * Routes a research-loop stage's user prompt through opencode's SessionPrompt machinery,
      * in a fresh child session scoped to the task's root session. Returns undefined when the
-     * task has no root session, the LLM config doesn't map to an opencode provider, or the
-     * session-based call throws — callers should fall back to the direct LLM transport.
+     * task has no root session, neither a TUI selection nor a mapped research model exists,
+     * or the session-based call throws — callers can fall back to the direct LLM transport.
      */
     const requestViaSession = (input: {
       readonly rootSessionID: string | undefined
@@ -3431,7 +3512,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>
     }) =>
       Effect.gen(function* () {
-        if (!input.rootSessionID || !input.modelRef) return undefined
+        if (!input.rootSessionID || (!input.modelRef && !taskSessionModel((yield* getTask(input.taskID as ResearchTaskID)).taskSpec) && !(yield* Effect.promise(readSelectedSessionModel)))) return undefined
         const child = yield* session.create({
           parentID: input.rootSessionID as Session.Info["id"],
           title: `${input.stageLabel} · ${input.taskID}`,
@@ -3444,9 +3525,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const promptEffect = sessionPrompt.prompt({
           sessionID: child.id,
           agent: input.agent,
-          model: { providerID: ProviderID.make(input.modelRef.providerID), modelID: ModelID.make(input.modelRef.modelID) },
+          model: yield* selectSessionModel(input.taskID, input.modelRef),
           parts: [{ type: "text", text: input.user }],
-        }).pipe(Effect.ensuring(Effect.sync(releaseEvidence)))
+        }).pipe(Effect.onInterrupt(() => sessionPrompt.cancel(child.id)), Effect.ensuring(Effect.sync(releaseEvidence)))
         const result = (onDelta || onPartUpdated)
           ? yield* Effect.scoped(
               Effect.gen(function* () {
@@ -3485,43 +3566,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           : ZERO_USAGE
         if (!text.trim()) return undefined
         return { text, usage }
-      }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      }).pipe(Effect.catchCause((cause) => Effect.sync(() => {
+        recordResearchEvent(Instance.directory, "research.llm.fallback", {
+          taskID: input.taskID, stage: input.stageLabel, transport: "session", error: Cause.pretty(cause),
+        })
+        return undefined
+      })))
 
-    const reconcileStaleRuns = Effect.fn("Research.reconcileStaleRuns")(function* () {
-      const cutoff = Date.now() - STALE_RUN_RECONCILE_MS
-      const staleRows = yield* db((d) =>
-        d
-          .select({ run: ResearchRunTable })
-          .from(ResearchRunTable)
-          .innerJoin(ResearchTaskTable, eq(ResearchRunTable.task_id, ResearchTaskTable.id))
-          .where(
-            and(
-              eq(ResearchTaskTable.project_id, Instance.project.id),
-              inArray(ResearchRunTable.status, ["queued", "running"]),
-              lt(ResearchRunTable.time_updated, cutoff),
-            ),
-          )
-          .all(),
-      )
-      for (const item of staleRows) {
-        const finishedAt = Date.now()
-        const row = yield* db((d) =>
-          d
-            .update(ResearchRunTable)
-            .set({
-              status: "failed",
-              error: `TUI restart while run was ${item.run.status}`,
-              time_updated: finishedAt,
-              time_finished: finishedAt,
-            })
-            .where(eq(ResearchRunTable.id, item.run.id))
-            .returning()
-            .get(),
-        )
-        if (row) yield* bus.publish(Event.RunUpdated, { run: mapRun(row) })
-      }
-    })
-    yield* reconcileStaleRuns()
+    // Never infer runner termination from age. Recovery exposes unowned queued/
+    // running runs as needing reconciliation, without mutating them on read.
 
     const getTask = Effect.fn("Research.getTask")(function* (taskID: ResearchTaskID) {
       const projectID = Instance.project.id
@@ -3565,10 +3618,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const createTask = Effect.fn("Research.createTask")(function* (input: CreateTaskInput) {
       const time = nowTime()
-      const taskSpec = normalizeTaskSpec(input)
+      const normalized = normalizeTaskSpec(input)
+      const selected = taskSessionModel(normalized) ?? (yield* Effect.promise(readSelectedSessionModel))
+      const taskSpec = { ...normalized, metadata: { ...recordValue(normalized.metadata), executionIsolation: "task",
+        ...(selected ? { sessionModel: selected } : {}) } }
       const sessionID = input.sessionID ?? (yield* session.create({ title: `Research: ${input.title}` })).id
-      const row = yield* db((d) =>
-        d
+      const row = yield* Effect.sync(() => Database.transaction((d) => {
+        const owner = d.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.session_id, sessionID)).get()
+        if (owner) throw new Error("This session already belongs to a research task; create a new session for an independent task")
+        return d
           .insert(ResearchTaskTable)
           .values({
             id: ResearchTaskID.ascending(),
@@ -3585,12 +3643,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             time_updated: time.updated,
           })
           .returning()
-          .get(),
-      )
+          .get()
+      }, { behavior: "immediate" }))
       if (!row) throw new Error("Research task insert returned no row")
       const task = mapTask(row)
       yield* bus.publish(Event.TaskCreated, { task })
       return task
+    })
+
+    const ensureCockpitChat = Effect.fn("Research.ensureCockpitChat")(function* (taskID: ResearchTaskID) {
+      const task = yield* getTask(taskID)
+      if (task.cockpitChatSessionID) return { id: task.cockpitChatSessionID }
+      const chat = yield* session.create({ title: `Research chat: ${task.title}`, parentID: task.sessionID })
+      const row = yield* db((d) => d.update(ResearchTaskTable)
+        .set({ cockpit_chat_session_id: chat.id })
+        .where(and(eq(ResearchTaskTable.id, taskID), isNull(ResearchTaskTable.cockpit_chat_session_id)))
+        .returning().get())
+      if (row) return { id: chat.id }
+      // Another client won the binding CAS. Discard our unused session.
+      yield* session.remove(chat.id)
+      return { id: (yield* getTask(taskID)).cockpitChatSessionID! }
     })
 
     const listTasks = Effect.fn("Research.listTasks")(function* (input?: ListTaskInput) {
@@ -3638,7 +3710,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         taskSpec: input.taskSpec,
       })
       const taskSpecMetadata = recordValue(taskSpec.metadata)
-      const nextMetadata = { ...taskSpecMetadata }
+      const managed = recordValue(existing.taskSpec.metadata)
+      const nextMetadata: Record<string, unknown> = { ...taskSpecMetadata,
+        executionIsolation: managed.executionIsolation ?? "legacy",
+        ...(managed.sessionModel ? { sessionModel: managed.sessionModel } : {}),
+      }
       if (nextMetadata.workflow !== undefined) delete nextMetadata.workflow
       const projectID = Instance.project.id
       const row = yield* db((d) =>
@@ -3687,8 +3763,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         ...task.taskSpec,
         metadata: { ...metadata, workflow: next } as unknown as JsonRecord,
       }
-      const row = yield* db((d) =>
-        d
+      const row = yield* Effect.sync(() => Database.transaction((d) => {
+        recordCompletedPhases(task, next.completedPhases)
+        return d
           .update(ResearchTaskTable)
           .set({
             task_spec: nextTaskSpec,
@@ -3696,8 +3773,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           })
           .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
           .returning()
-          .get(),
-      )
+          .get()
+      }))
       if (!row) throw missing("Research task", input.taskID)
       const updated = mapTask(row)
       yield* bus.publish(Event.TaskUpdated, { task: updated })
@@ -3938,7 +4015,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         d.select().from(ResearchApprovalTable).where(eq(ResearchApprovalTable.id, input.approvalID)).get(),
       )
       if (!existingRow) throw missing("Research approval", input.approvalID)
-      yield* getTask(existingRow.task_id)
+      const approvalTask = yield* getTask(existingRow.task_id)
+      if (input.status === "approved" && existingRow.reason.includes("[checkpoint:intent_confirmed]")) {
+        const signature = existingRow.reason.split(/\r?\n/).find((line) => line.startsWith("Intent signature: "))
+        if (signature && signature !== `Intent signature: ${intentCheckpointSignature(approvalTask)}`) {
+          throw new Error("This intent checkpoint is outdated. Refresh and confirm the latest research intent.")
+        }
+        if (existingRow.reply_message === "Superseded by updated research intent.") {
+          throw new Error("This intent checkpoint is outdated. Refresh and confirm the latest research intent.")
+        }
+      }
 
       const now = Date.now()
       const row = yield* db((d) =>
@@ -4136,6 +4222,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       readonly reason: string
     }) {
       const checkpointTag = `[checkpoint:${input.phase}]`
+      const task = yield* getTask(input.taskID)
+      const signature = `Checkpoint signature: ${intentCheckpointSignature(task)}`
       const rows = yield* db((d) =>
         d
           .select()
@@ -4149,14 +4237,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           )
           .all(),
       )
-      const approved = rows.find((row) => row.status === "approved" && row.reason.includes(checkpointTag))
-      if (approved) return mapApproval(approved)
-      const pending = rows.find((row) => row.status === "pending" && row.reason.includes(checkpointTag))
-      if (pending) return mapApproval(pending)
+      // Rejections are decisions too. Reuse the latest decision instead of silently
+      // replacing a rejection with a fresh pending approval on every resume.
+      const latest = rows.filter((row) => row.reason.includes(checkpointTag) &&
+        (!row.reason.includes("Checkpoint signature:") || row.reason.includes(signature)))
+        .sort((a, b) => b.time_created - a.time_created)[0]
+      if (latest) return mapApproval(latest)
       return yield* createApproval({
         taskID: input.taskID,
         kind: "protocol",
-        reason: `${checkpointTag}\n${input.reason}`,
+        reason: `${checkpointTag}\n${signature}\n${input.reason}`,
       })
     })
 
@@ -4167,6 +4257,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const phase = "intent_confirmed"
       const checkpointTag = `[checkpoint:${phase}]`
       const signature = `Intent signature: ${intentCheckpointSignature(input.task)}`
+      supersedeIntentCheckpoints(input.task.id, signature)
       const checkpointReason = `${checkpointTag}\n${input.reason}`
       const rows = yield* db((d) =>
         d
@@ -4451,6 +4542,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
       yield* ensureRunApprovalGates(task, candidate, input.stage)
       const time = nowTime()
+      const activeCycle = yield* db((d) => d.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.active_task, input.taskID)).get())
       const row = yield* db((d) =>
         d
           .insert(ResearchRunTable)
@@ -4461,7 +4553,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             stage: input.stage,
             status,
             metrics: status === "invalid" ? {} : input.metrics ?? {},
-            resource_usage: input.resourceUsage ?? {},
+            resource_usage: { ...input.resourceUsage, ...(activeCycle ? { cycleID: activeCycle.id } : {}) },
             artifact_refs: input.artifactRefs ? [...input.artifactRefs] : [],
             time_created: time.created,
             time_updated: time.updated,
@@ -4501,7 +4593,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .limit(1)
           .all(),
       )
-      if (!rows[0] || rows[0].metadata.status === "resolved") return undefined
+      if (!rows[0] || rows[0].metadata.status !== "open") return undefined
       return mapArtifact(rows[0])
     })
 
@@ -4600,7 +4692,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         taskID: task.id,
         candidateID: candidate.id,
         kind: "protocol",
-        reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n实验执行契约不一致，任务已暂停。\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\n修复后 approve 以启动原 candidate 的 smoke verification。`,
+        reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n实验执行契约不一致，任务已暂停。\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\n实现已修复时 approve，以重新验证原 candidate；candidate 设计本身错误时 reject，以废弃该 candidate 并重新运行 ModelDesigner。`,
       })
       yield* db((d) =>
         d
@@ -4629,6 +4721,76 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         invalidRunID: invalidRun?.id,
         mismatches,
       })
+    })
+
+    const supersedeExecutionContractCheckpoint = Effect.fn("Research.supersedeExecutionContractCheckpoint")(function* (
+      blocker: ResearchArtifact,
+    ) {
+      const task = yield* getTask(blocker.taskID)
+      const candidateID = String(blocker.metadata.candidateID) as ResearchCandidateID
+      const now = Date.now()
+      const candidateRow = yield* db((d) =>
+        d
+          .update(ResearchCandidateTable)
+          .set({ approval_status: "rejected", time_updated: now })
+          .where(and(eq(ResearchCandidateTable.id, candidateID), eq(ResearchCandidateTable.task_id, task.id)))
+          .returning()
+          .get(),
+      )
+      if (candidateRow) yield* bus.publish(Event.CandidateUpdated, { candidate: mapCandidate(candidateRow) })
+
+      const incidents = yield* db((d) =>
+        d
+          .select()
+          .from(ResearchArtifactTable)
+          .where(
+            and(
+              eq(ResearchArtifactTable.task_id, task.id),
+              eq(ResearchArtifactTable.kind, "execution_contract_violation_json"),
+            ),
+          )
+          .all(),
+      )
+      for (const incident of incidents.filter(
+        (item) => item.metadata.candidateID === candidateID && item.metadata.status === "open",
+      )) {
+        if (incident.uri.startsWith("file://")) {
+          yield* Effect.promise(async () => {
+            try {
+              const file = incident.uri.slice(7)
+              const payload = JSON.parse(await readFile(file, "utf8"))
+              await writeFile(
+                file,
+                `${JSON.stringify({
+                  ...payload,
+                  status: "superseded",
+                  evidence_disposition: "inconclusive",
+                  superseded_reason: "candidate_rejected_for_redesign",
+                  superseded_timestamp: new Date(now).toISOString(),
+                }, null, 2)}\n`,
+                "utf8",
+              )
+            } catch {
+              // The database remains authoritative when an old local artifact is unavailable.
+            }
+          })
+        }
+        yield* db((d) =>
+          d
+            .update(ResearchArtifactTable)
+            .set({
+              metadata: {
+                ...incident.metadata,
+                status: "superseded",
+                supersededReason: "candidate_rejected_for_redesign",
+              },
+              time_updated: now,
+            })
+            .where(eq(ResearchArtifactTable.id, incident.id))
+            .run(),
+        )
+      }
+      yield* updateTaskStatus({ taskID: task.id, status: "searching" })
     })
 
     const requireVerifiedSmoke = Effect.fn("Research.requireVerifiedSmoke")(function* (
@@ -4737,9 +4899,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (!runPlan.validation.ok) {
         throw new Error(`Research candidate failed domain validation: ${runPlan.validation.issues[0]?.message}`)
       }
+      const executionRoot = taskExecutionRoot(task, Instance.directory)
+      if (executionRoot !== Instance.directory) {
+        validateTaskRuntimePaths(task, executionRoot)
+        yield* Effect.promise(() => mkdir(executionRoot, { recursive: true }))
+        runPlan.command.cwd = executionRoot
+        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_PROJECT_ROOT: executionRoot }
+      }
       if (task.domainID === "tsf" && stage !== "ref_test" && stage !== "blind_test") {
-        runPlan.command.cwd = Instance.directory
-        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_PROJECT_ROOT: Instance.directory }
+        runPlan.command.cwd = executionRoot
+        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_PROJECT_ROOT: executionRoot }
         const blocker = yield* assertExecutionCheckpoint(task.id, candidate.id, stage)
         if (blocker && (candidate.hypothesisID ?? null) !== blocker.metadata.hypothesisID) throw new Error("Recovery must retain the original hypothesis identity.")
         const contract = buildExecutionContract(task, candidate, runPlan.writes[0].content)
@@ -4755,15 +4924,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           runPlan.writes.push({ path: proofPath, content: proof as JsonRecord })
         }
         runPlan.writes.push({ path: contractPath, content: contract as unknown as JsonRecord })
-        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_EXECUTION_CONTRACT: contractPath, NEO_CAST_CONTRACT_CANDIDATE: runnerPath(Instance.directory, runPlan.writes[0].path), NEO_CAST_CONTRACT_VERIFICATION: proofPath }
+        runPlan.command.env = { ...runPlan.command.env, NEO_CAST_EXECUTION_CONTRACT: contractPath, NEO_CAST_CONTRACT_CANDIDATE: runnerPath(executionRoot, runPlan.writes[0].path), NEO_CAST_CONTRACT_VERIFICATION: proofPath }
         if (stage === "smoke") runPlan.command.args.push("--execution-contract", contractPath, "--contract-verification", proofPath)
       }
+      const interrupted = (yield* listRuns(task.id)).find((run) => run.candidateID === candidate.id && run.stage === stage && run.status === "failed" && run.error?.startsWith("Research attempt interrupted"))
       const run = yield* createRun({
         taskID: task.id,
         candidateID: candidate.id,
         stage,
         status: "queued",
-        resourceUsage: input.seed === undefined ? undefined : ({ seed: input.seed } as ResearchRun["resourceUsage"]),
+        resourceUsage: { ...(input.seed === undefined ? {} : { seed: input.seed }), ...(interrupted ? { retry_of: interrupted.id } : {}) },
       })
 
       const root = runnerPath(Instance.directory, ".neo-research/run-plans")
@@ -5016,9 +5186,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
     })
 
-    const executePreparedRun = Effect.fn("Research.executePreparedRun")(function* (
+    const executePreparedRun = logPhaseMethod("executePreparedRun", Effect.fn("Research.executePreparedRun")(function* (
       prepared: PreparedRun,
-      options: { readonly completeQueuedRuntimeJob?: boolean } = {},
+      options: { readonly completeQueuedRuntimeJob?: boolean; readonly recoveredExecution?: RunnerExecution } = {},
     ) {
       if (options.completeQueuedRuntimeJob) {
         yield* Effect.promise(async () => {
@@ -5057,15 +5227,37 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         }
       }
       const running = yield* updateRunStatus({ runID: prepared.run.id, status: "running" })
+      const liveProgressPath = path.join(Instance.directory, ".neo-research", "runner-progress", running.taskID, `${running.id}.jsonl`)
+      appendLog(liveProgressPath, { event: "runner_started", runID: running.id, taskID: running.taskID, stage: running.stage })
+      const liveProgressArtifact = yield* createArtifact({ taskID: running.taskID, runID: running.id,
+        kind: "runner_progress_jsonl", uri: `file://${liveProgressPath}`, metadata: { stage: running.stage, live: true } })
       let progressPublishQueue = Promise.resolve()
       const persistedProgressLines: JsonRecord[] = []
+      const displayProgressLines: JsonRecord[] = []
       const publishProgressLine = Instance.bind((line: string) => {
         const parsed = parseProgressLine(line)
-        persistedProgressLines.push({
+        appendLog(liveProgressPath, { stream: "stdout", line, ...parsed })
+        const progressRecord = {
           time: new Date().toISOString(),
           line,
           ...parsed,
-        } as JsonRecord)
+        } as JsonRecord
+        persistedProgressLines.push(progressRecord)
+        if (parsed.event !== "batch_progress") {
+          displayProgressLines.push(progressRecord)
+          if (displayProgressLines.length > 500) displayProgressLines.splice(0, displayProgressLines.length - 500)
+          Database.use((d) => d.update(ResearchArtifactTable).set({
+            metadata: {
+              runnerID: prepared.runPlan.runnerID,
+              runnerKind: prepared.runPlan.runnerKind,
+              stage: prepared.runPlan.stage,
+              live: true,
+              lineCount: persistedProgressLines.length,
+              previewLines: [...displayProgressLines],
+            },
+            time_updated: Date.now(),
+          }).where(eq(ResearchArtifactTable.id, liveProgressArtifact.id)).run())
+        }
         progressPublishQueue = progressPublishQueue
           .then(() =>
             Effect.runPromise(
@@ -5079,13 +5271,27 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           )
           .catch(() => undefined)
       })
-      const execution = yield* Effect.promise(async () => {
-        const result = await executeRunnerPlan(prepared.runPlan, publishProgressLine)
+      const execution = options.recoveredExecution ?? (yield* abortable(async (signal) => {
+        const cwd = prepared.runPlan.command.cwd ?? Instance.directory
+        const workspace = existsSync(cwd) ? realpathSync(cwd) : path.resolve(cwd)
+        const acquired = Database.use((db) => db.insert(ResearchRunnerLockTable).values({ workspace, run_id: running.id }).onConflictDoNothing().returning().get())
+        if (!acquired) throw new Error(`Runner workspace is still owned by another attempt: ${workspace}`)
+        const result = await executeRunnerPlan(prepared.runPlan, publishProgressLine, signal, (pid) => {
+          Database.use((db) => db.update(ResearchRunTable).set({ resource_usage: {
+            ...running.resourceUsage,
+            execution: { worker: executionOwner(running.id, pid), attemptID: running.id, planDigest: digest(prepared.runPlan), workspace: prepared.runPlan.command.cwd ?? Instance.directory },
+          } }).where(eq(ResearchRunTable.id, running.id)).run())
+        }, (line) => appendLog(liveProgressPath, { stream: "stderr", line })).catch((error) => {
+          appendLog(liveProgressPath, { event: signal.aborted ? "runner_canceled" : "runner_failed", error: String(error), runID: running.id })
+          throw error
+        }).finally(() => Database.use((db) => db.delete(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.run_id, running.id)).run()))
+        appendLog(liveProgressPath, { event: signal.aborted ? "runner_canceled" : "runner_exited", exitCode: result.exitCode, runID: running.id })
         await progressPublishQueue
         return result
-      })
+      }))
+      appendLog(liveProgressPath, { event: "runner_finished", exitCode: execution.exitCode, runID: running.id })
       const metrics = metricsFromRecords(execution.records, prepared.runPlan.stage)
-      const artifactRefs: ResearchArtifactID[] = [...running.artifactRefs]
+      const artifactRefs: ResearchArtifactID[] = [...running.artifactRefs, liveProgressArtifact.id]
 
       const executionLogRoot = runnerPath(Instance.directory, ".neo-research/runner-executions")
       const executionLogDirectory = path.join(executionLogRoot, running.taskID)
@@ -5093,9 +5299,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       yield* Effect.promise(async () => {
         await mkdir(executionLogDirectory, { recursive: true })
         await writeFile(
-          executionLogPath,
+          `${executionLogPath}.tmp`,
           `${JSON.stringify(
             {
+              planDigest: digest(prepared.runPlan),
               taskID: running.taskID,
               candidateID: running.candidateID,
               runID: running.id,
@@ -5118,6 +5325,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           "utf8",
         )
       })
+      yield* Effect.promise(() => rename(`${executionLogPath}.tmp`, executionLogPath))
       const executionLogArtifact = yield* createArtifact({
         taskID: running.taskID,
         runID: running.id,
@@ -5133,33 +5341,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
       artifactRefs.push(executionLogArtifact.id)
 
-      if (persistedProgressLines.length > 0) {
-        const progressRoot = runnerPath(Instance.directory, ".neo-research/runner-progress")
-        const progressDirectory = path.join(progressRoot, running.taskID)
-        const progressPath = path.join(progressDirectory, `${running.id}.jsonl`)
-        yield* Effect.promise(async () => {
-          await mkdir(progressDirectory, { recursive: true })
-          await writeFile(
-            progressPath,
-            `${persistedProgressLines.map((item) => JSON.stringify(item)).join("\n")}\n`,
-            "utf8",
-          )
-        })
-        const progressArtifact = yield* createArtifact({
-          taskID: running.taskID,
-          runID: running.id,
-          kind: "runner_progress_jsonl",
-          uri: `file://${progressPath}`,
-          metadata: {
-            runnerID: prepared.runPlan.runnerID,
-            runnerKind: prepared.runPlan.runnerKind,
-            stage: prepared.runPlan.stage,
-            lineCount: persistedProgressLines.length,
-            previewLines: persistedProgressLines.slice(-500),
-          },
-        })
-        artifactRefs.push(progressArtifact.id)
-      }
+      yield* db((d) => d.update(ResearchArtifactTable).set({
+        metadata: {
+          runnerID: prepared.runPlan.runnerID,
+          runnerKind: prepared.runPlan.runnerKind,
+          stage: prepared.runPlan.stage,
+          live: false,
+          lineCount: persistedProgressLines.length,
+          previewLines: displayProgressLines.slice(-500),
+        },
+        time_updated: Date.now(),
+      }).where(eq(ResearchArtifactTable.id, liveProgressArtifact.id)).run())
 
       for (const artifactDir of artifactDirsFromRecords(execution.records)) {
         const artifact = yield* createArtifact({
@@ -5226,17 +5418,50 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         return { run: yield* attachArtifactRefToRun(run, proof.id), runPlan: prepared.runPlan }
       }
       return { run, runPlan: prepared.runPlan }
+    }))
+
+    const reconcileInterruptedRuns = Effect.fn("Research.reconcileInterruptedRuns")(function* (taskID: ResearchTaskID) {
+      yield* getTask(taskID)
+      const runs = yield* listRuns(taskID)
+      for (const run of runs.filter((run) => run.status === "running" || run.status === "queued")) {
+        const recovered = yield* Effect.promise(async () => {
+          try {
+            const plan = JSON.parse(await readFile(path.join(Instance.directory, ".neo-research/run-plans", taskID, `${run.id}.json`), "utf8"))
+            const result = JSON.parse(await readFile(path.join(Instance.directory, ".neo-research/runner-executions", taskID, `${run.id}.json`), "utf8"))
+            if (plan.taskID !== taskID || plan.runID !== run.id || result.taskID !== taskID || result.runID !== run.id || result.candidateID !== run.candidateID || result.planDigest !== digest(plan.runPlan) || !Array.isArray(result.records) || typeof result.exitCode !== "number") return undefined
+            return { runPlan: plan.runPlan as DomainRunPlan, execution: result as RunnerExecution }
+          } catch { return undefined }
+        })
+        if (!recovered) {
+          const execution = recordValue(run.resourceUsage.execution)
+          if (run.stage !== "ref_test" && run.stage !== "blind_test" && execution.attemptID === run.id && typeof execution.worker === "string" && runnerGroupExited(execution.worker)) {
+            yield* updateRunStatus({ runID: run.id, status: "failed", error: "Research attempt interrupted; original runner process group confirmed exited" })
+            yield* db((d) => d.delete(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.run_id, run.id)).run())
+          }
+          continue
+        }
+        yield* executePreparedRun({ run, runPlan: recovered.runPlan }, { recoveredExecution: recovered.execution })
+        yield* db((d) => d.delete(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.run_id, run.id)).run())
+      }
     })
 
-    const executeRun = Effect.fn("Research.executeRun")(function* (input: PrepareRunInput) {
+    const executeRun = logPhaseMethod("executeRun", Effect.fn("Research.executeRun")(function* (input: PrepareRunInput) {
       const queued = yield* loadQueuedPreparedRun(input)
       if (queued !== undefined) return yield* executePreparedRun(queued, { completeQueuedRuntimeJob: true })
 
       const prepared = yield* prepareRunInternal(input, { enqueueRuntimeJob: false })
       return yield* executePreparedRun(prepared)
-    })
+    }))
 
     const resumeExecutionContractCheckpoint = Effect.fn("Research.resumeExecutionContractCheckpoint")(function* (taskID: ResearchTaskID) {
+      const current = yield* latestExecutionBlocker(taskID)
+      if (!current) return undefined
+      const approvals = yield* listApprovals({ taskID, limit: 10000 })
+      const approval = approvals.find((item) => item.id === current.metadata.approvalID)
+      if (approval?.status === "rejected") {
+        yield* supersedeExecutionContractCheckpoint(current)
+        return undefined
+      }
       const blocker = yield* assertExecutionCheckpoint(taskID)
       if (!blocker) return undefined
       const candidateID = String(blocker.metadata.candidateID) as ResearchCandidateID
@@ -5541,6 +5766,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       readonly task: ResearchTask
       readonly iterations: AutonomousIterationResult[]
       readonly stoppedReason: AutonomousLoopStoppedReason
+      readonly maxIterations: number
     }) {
       const artifact = yield* writeAutonomousLoopArtifact(input)
 
@@ -5551,6 +5777,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         yield* runReflectionAgent({
           taskID: input.task.id,
           stoppedReason: input.stoppedReason,
+          maxIterations: input.maxIterations,
         }).pipe(Effect.catchCause(() => Effect.void))
       }
 
@@ -5561,7 +5788,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
     })
 
-    const runAutonomousIteration = Effect.fn("Research.runAutonomousIteration")(function* (
+    const runAutonomousIteration = logPhaseMethod("runAutonomousIteration", Effect.fn("Research.runAutonomousIteration")(function* (
       input: AutonomousIterationInput,
     ) {
       const task = yield* getTask(input.taskID)
@@ -5733,63 +5960,107 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const modelDesignerConfig = modelDesignerLLMContext?.config ?? (yield* Effect.promise(() =>
           resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: modelDesignerNeoCastRoot }),
         ))
-        const modelDesignerSessionAttempt = yield* requestViaSession({
-          rootSessionID: task.sessionID,
-          agent: "research-model-designer",
-          stageLabel: "ModelDesigner",
-          taskID: task.id,
-          user: buildUserPrompt({
+        let proposal: DomainCandidateProposal | undefined
+        let validationFeedback: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
+        const maxModelDesignerAttempts = 3
+        for (let attempt = 1; attempt <= maxModelDesignerAttempts; attempt++) {
+          const promptInput = {
             task,
             proposalContext,
             dataAnalysisMarkdown,
             ...(hypoPlanMarkdown ? { hypoPlanMarkdown } : {}),
             ...(previousReflectionMarkdown ? { previousReflectionMarkdown } : {}),
-          }),
-          modelRef: mapToModelRef(modelDesignerConfig),
-        })
-        modelDesignerCallPath = modelDesignerSessionAttempt ? "session" : "direct"
-        logLLMCallPath("ModelDesigner", task.id, modelDesignerCallPath)
-        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "ModelDesigner", path: modelDesignerCallPath })
-        // Raw LLM text is only available via the session path — proposeLLMCandidate's direct-API
-        // fallback parses straight to a candidateSpec and never returns the underlying text.
-        modelDesignerRawText = modelDesignerSessionAttempt?.text
-        const modelDesignerSessionResult = modelDesignerSessionAttempt
-          ? buildLLMProposalFromText(modelDesignerSessionAttempt.text, modelDesignerSessionAttempt.usage, modelDesignerConfig)
-          : undefined
-        const llmResult = modelDesignerSessionResult
-          ? modelDesignerSessionResult
-          : yield* Effect.promise(() =>
-              proposeLLMCandidate({
-                task,
-                proposalContext,
-                workspaceRoot: Instance.directory,
-                dataAnalysisMarkdown,
-                ...(hypoPlanMarkdown ? { hypoPlanMarkdown } : {}),
-                ...(previousReflectionMarkdown ? { previousReflectionMarkdown } : {}),
-                ...(authJsonKey ? { authJsonKey } : {}),
-              }),
-            )
-        llmMetadata = llmResult.metadata
-        let proposal: DomainCandidateProposal | undefined
-        if (llmResult.proposal) {
+            ...(validationFeedback ? { validationFeedback } : {}),
+          }
+          const modelDesignerSessionAttempt = yield* requestViaSession({
+            rootSessionID: task.sessionID,
+            agent: "research-model-designer",
+            stageLabel: attempt === 1 ? "ModelDesigner" : `ModelDesigner retry ${attempt}`,
+            taskID: task.id,
+            user: buildUserPrompt(promptInput),
+            modelRef: mapToModelRef(modelDesignerConfig),
+          })
+          modelDesignerCallPath = modelDesignerSessionAttempt ? "session" : "direct"
+          logLLMCallPath("ModelDesigner", task.id, modelDesignerCallPath)
+          yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "ModelDesigner", path: modelDesignerCallPath })
+
+          // Raw LLM text is only available via the session path — direct transport
+          // returns a parsed candidate plus metadata.
+          if (modelDesignerSessionAttempt) modelDesignerRawText = modelDesignerSessionAttempt.text
+          const modelDesignerSessionResult = modelDesignerSessionAttempt
+            ? buildLLMProposalFromText(modelDesignerSessionAttempt.text, modelDesignerSessionAttempt.usage, modelDesignerConfig)
+            : undefined
+          const llmResult = modelDesignerSessionAttempt
+            ? modelDesignerSessionResult ?? {
+                proposal: undefined,
+                metadata: buildLLMMetadata(modelDesignerConfig, "invalid", {
+                  llmError: "ModelDesigner response did not contain a valid candidate JSON object",
+                }),
+              }
+            : yield* Effect.promise(() =>
+                proposeLLMCandidate({
+                  ...promptInput,
+                  workspaceRoot: Instance.directory,
+                  ...(authJsonKey ? { authJsonKey } : {}),
+                }),
+              )
+          llmMetadata = { ...llmResult.metadata, llmAttempt: attempt }
+          if (!llmResult.proposal) {
+            if (modelDesignerSessionAttempt && attempt < maxModelDesignerAttempts) {
+              validationFeedback = {
+                attempt,
+                issues: [{ path: "response", message: "Response did not contain a valid candidate JSON object" }],
+              }
+              continue
+            }
+            break
+          }
+
           const validation = DomainRegistry.validateCandidate(task.domainID, {
             taskSpec: task.taskSpec,
             candidateSpec: llmResult.proposal.candidateSpec,
           })
-          if (validation.ok) {
+          const hypothesisMismatches = selectedHypothesis && task.domainID === "tsf"
+            ? validateCandidateAgainstHypothesis(
+                selectedHypothesis,
+                {
+                  hypothesisID: selectedHypothesis.id,
+                  candidateSpec: llmResult.proposal.candidateSpec,
+                } as ResearchCandidate,
+                undefined,
+                task.taskSpec,
+              )
+            : []
+          if (validation.ok && hypothesisMismatches.length === 0) {
             proposal = llmResult.proposal
-          } else {
-            llmMetadata = {
-              ...llmMetadata,
-              llmStatus: "invalid",
-              llmError: validation.issues[0]?.message ?? "LLM candidate failed domain validation",
-            }
+            break
+          }
+
+          const issues = [
+            ...validation.issues.map((item) => ({ path: item.path, message: item.message })),
+            ...hypothesisMismatches.map((item) => ({
+              path: item.path,
+              message: "Candidate does not satisfy the selected hypothesis",
+              expected: item.expected,
+              actual: item.actual,
+            })),
+          ]
+          validationFeedback = {
+            attempt,
+            issues,
+            rejectedCandidate: llmResult.proposal.candidateSpec,
+          }
+          llmMetadata = {
+            ...llmMetadata,
+            llmStatus: "invalid",
+            llmError: issues.map((item) => `${item.path}: ${item.message}`).join("; ").slice(0, 1000),
+            llmValidationIssues: issues,
           }
         }
         rankings = DomainRegistry.rankCandidateProposals(task.domainID, proposalContext)
         if (!proposal) {
-          // The heuristic ranker is not hypothesis-aware. Prefer a compatible
-          // recipe before falling back; the execution gate remains authoritative.
+          // Heuristic proposals may be used only when they satisfy the selected
+          // hypothesis. Never attach a generic fallback to an incompatible plan.
           proposal = selectedHypothesis && task.domainID === "tsf"
             ? rankings.find((ranking) => validateCandidateAgainstHypothesis(
                 selectedHypothesis,
@@ -5798,7 +6069,36 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 task.taskSpec,
               ).length === 0)
             : undefined
-          proposal ??= DomainRegistry.proposeCandidate(task.domainID, proposalContext)
+          if (!proposal) {
+            const fallback = DomainRegistry.proposeCandidate(task.domainID, proposalContext)
+            const fallbackMismatches = fallback && selectedHypothesis && task.domainID === "tsf"
+              ? validateCandidateAgainstHypothesis(
+                  selectedHypothesis,
+                  { hypothesisID: selectedHypothesis.id, candidateSpec: fallback.candidateSpec } as ResearchCandidate,
+                  undefined,
+                  task.taskSpec,
+                )
+              : []
+            if (fallback && fallbackMismatches.length === 0) proposal = fallback
+          }
+        }
+        if (!proposal) {
+          const issueText = validationFeedback?.issues.length
+            ? validationFeedback.issues
+                .map((item) => `${item.path}: ${item.message}`)
+                .join("\n")
+            : "No candidate compatible with the selected hypothesis was available."
+          yield* ensurePendingApproval({
+            taskID: task.id,
+            kind: "protocol",
+            reason: `[checkpoint:model_design_validation]\nModelDesigner could not produce a valid candidate after ${maxModelDesignerAttempts} attempts.\n${issueText}\n修正模型设计或配置后 approve 以重新运行 ModelDesigner。`,
+          })
+          yield* updateTaskStatus({ taskID: task.id, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: task.id,
+            reason: "human_checkpoint_required",
+            checkpointPhase: "model_design_validation",
+          })
         }
 
         if (proposal) {
@@ -5946,7 +6246,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         ),
       )
 
-      const requestedStage = input.stage ?? "smoke"
+      const requestedStage = input.stage ?? "full"
       if (
         requestedStage !== "smoke" &&
         stageRequiresDomainActionApproval(requestedStage) &&
@@ -6225,7 +6525,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         managerTrace,
         selectionArtifact,
       }
-    })
+    }))
 
     const getAutonomousLoopStopReason = Effect.fn("Research.getAutonomousLoopStopReason")(function* (
       task: ResearchTask,
@@ -6254,29 +6554,40 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return hasBlockingApproval ? ("approval_required" as const) : undefined
     })
 
-    const runAutonomousLoop = Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
+    const runAutonomousLoop = logPhaseMethod("runAutonomousLoop", Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
       const iterations: AutonomousIterationResult[] = []
       yield* assertExecutionCheckpoint(input.taskID)
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
-      const maxIterations = autonomousLoopMaxIterations(input.maxIterations, task)
+      const requestedIterations = autonomousLoopMaxIterations(input.maxIterations, task)
       const direction = objectiveDirection(task.objective)
       const primaryMetricName = objectiveMetricName(task.objective)
-      const targetMetricValue = loopPolicyValue(input.targetMetricValue, task, "targetMetricValue", "target")
-      const minRelativeImprovement =
+      const requestedTargetMetricValue = loopPolicyValue(input.targetMetricValue, task, "targetMetricValue", "target")
+      const requestedMinRelativeImprovement =
         loopPolicyValue(input.minRelativeImprovement, task, "minRelativeImprovement", "minImprovement") ?? 0
-      const maxNoImprove = loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds") ?? 25
-      const timeBudgetSeconds = loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS")
-      const maxCrashStreak = loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak")
-      const explorationRate = loopPolicyRate(input.explorationRate, task, "explorationRate", "exploration")
+      const requestedMaxNoImprove =
+        loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds") ?? NAS_DEFAULT_MAX_NO_IMPROVE
+      const requestedTimeBudget = loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS")
+      const requestedMaxCrashStreak = loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak")
+      const requestedExplorationRate = loopPolicyRate(input.explorationRate, task, "explorationRate", "exploration")
       const startedAt = Date.now()
       const stage = input.stage ?? "full"
       const existingRuns = yield* listRuns(task.id)
+      const cycle = searchCycle(task, existingRuns, { maxIterations: requestedIterations, timeBudgetSeconds: requestedTimeBudget,
+        targetMetricValue: requestedTargetMetricValue, minRelativeImprovement: requestedMinRelativeImprovement,
+        maxNoImprove: requestedMaxNoImprove, maxCrashStreak: requestedMaxCrashStreak, explorationRate: requestedExplorationRate })
+      const targetMetricValue = cycle.policy.targetMetricValue
+      const minRelativeImprovement = cycle.policy.minRelativeImprovement ?? 0
+      const maxNoImprove = cycle.policy.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE
+      const maxCrashStreak = cycle.policy.maxCrashStreak
+      const explorationRate = cycle.policy.explorationRate
+      const maxIterations = cycle.policy.maxIterations ?? requestedIterations
+      const timeBudgetSeconds = cycle.policy.timeBudgetSeconds
       const initialMetricState =
         stage === "smoke"
           ? { bestMetric: undefined, noImproveStreak: 0 }
           : sessionLocalMetricState({
-              runs: existingRuns,
+              runs: existingRuns.filter((run) => !cycle.request_key || run.resourceUsage.cycleID === cycle.id),
               stage,
               primaryMetricName,
               direction,
@@ -6284,21 +6595,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             })
       let bestMetric = initialMetricState.bestMetric
       let noImproveStreak = initialMetricState.noImproveStreak
-      let crashStreak = 0
-      for (let index = 0; index < maxIterations; index++) {
-        if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
-          return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "time_budget_exhausted" })
+      let crashStreak = cycle.crash_streak
+      const stopClock = cycleClock(cycle.id)
+      return yield* Effect.gen(function* () {
+      if (maxCrashStreak !== undefined && crashStreak >= maxCrashStreak) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "crash_streak_exceeded" })
+      if (cycle.iterations > 0 && maxNoImprove !== undefined && noImproveStreak >= maxNoImprove) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
+      for (let index = cycle.iterations; index < maxIterations; index++) {
+        if (timeBudgetSeconds !== undefined && cycle.elapsed_ms + Date.now() - startedAt >= timeBudgetSeconds * 1000) {
+          return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "time_budget_exhausted" })
         }
         const budgetExceeded = yield* getRunBudgetExceeded(task, "queued")
         if (budgetExceeded) {
           yield* ensureBudgetApproval(task, undefined, budgetExceeded)
-          return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "budget_exhausted" })
+          return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "budget_exhausted" })
         }
         const blockedReason = yield* getAutonomousLoopStopReason(task)
-        if (blockedReason) return yield* finishAutonomousLoop({ task, iterations, stoppedReason: blockedReason })
+        if (blockedReason) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: blockedReason })
 
         const description =
           input.description === undefined ? undefined : `${input.description} (iteration ${index + 1})`
+        chargeIteration(cycle.id)
         const iterationResult = yield* runAutonomousIteration({
           taskID: input.taskID,
           stage,
@@ -6309,12 +6625,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           Effect.catchCause((cause) => {
             const error = Cause.squash(cause)
             if (ApprovalRequiredError.isInstance(error)) {
-              return finishAutonomousLoop({ task, iterations, stoppedReason: "approval_required" }).pipe(
+              return finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "approval_required" }).pipe(
                 Effect.map((result) => ({ status: "stopped" as const, result })),
               )
             }
             if (SeedBaselinesError.isInstance(error)) {
-              return finishAutonomousLoop({ task, iterations, stoppedReason: "seed_failed" }).pipe(
+              return finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "seed_failed" }).pipe(
                 Effect.map((result) => ({ status: "stopped" as const, result })),
               )
             }
@@ -6325,11 +6641,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         iterations.push(iterationResult.iteration)
         if (iterationResult.iteration.run.status === "failed") {
           crashStreak += 1
+          saveCrashStreak(cycle.id, crashStreak)
           if (maxCrashStreak !== undefined && crashStreak >= maxCrashStreak) {
-            return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "crash_streak_exceeded" })
+            return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "crash_streak_exceeded" })
           }
         } else {
           crashStreak = 0
+          saveCrashStreak(cycle.id, crashStreak)
         }
         const metric =
           stage === "smoke" ? undefined : metricValue(iterationResult.iteration.run.metrics, primaryMetricName)
@@ -6346,31 +6664,32 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           const targetReached =
             targetMetricValue !== undefined &&
             (direction === "minimize" ? metric <= targetMetricValue : metric >= targetMetricValue)
-          if (targetReached) return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "target_reached" })
+          if (targetReached) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "target_reached" })
           if (maxNoImprove !== undefined && noImproveStreak >= maxNoImprove) {
-            return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "plateau" })
+            return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
           }
         }
         // Per-iteration reflection: run after every TrainEval, LLM-augmented, non-blocking.
-        yield* runReflectionAgent({ taskID: input.taskID }).pipe(Effect.catchCause(() => Effect.void))
+        yield* runReflectionAgent({ taskID: input.taskID, maxIterations }).pipe(Effect.catchCause(() => Effect.void))
         // Check loop-end conditions after reflection. If any stop condition is already met,
         // there is no next iteration — skip HypoPlanner and finish immediately.
-        if (timeBudgetSeconds !== undefined && Date.now() - startedAt >= timeBudgetSeconds * 1000) {
-          return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "time_budget_exhausted" })
+        if (timeBudgetSeconds !== undefined && cycle.elapsed_ms + Date.now() - startedAt >= timeBudgetSeconds * 1000) {
+          return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "time_budget_exhausted" })
         }
         const isLastIteration = index === maxIterations - 1
         if (!isLastIteration) {
           const nextIterBlockedReason = yield* getAutonomousLoopStopReason(task)
           if (nextIterBlockedReason) {
-            return yield* finishAutonomousLoop({ task, iterations, stoppedReason: nextIterBlockedReason })
+            return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: nextIterBlockedReason })
           }
           // Next iteration will run: refresh hypotheses, then restore searching status.
           yield* runHypoPlannerAgent({ taskID: input.taskID }).pipe(Effect.catchCause(() => Effect.void))
           yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
         }
       }
-      return yield* finishAutonomousLoop({ task, iterations, stoppedReason: "max_iterations" })
-    })
+      return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "max_iterations" })
+      }).pipe(Effect.ensuring(Effect.sync(stopClock)))
+    }))
 
     const updateRunStatus = Effect.fn("Research.updateRunStatus")(function* (input: UpdateRunStatusInput) {
       const existingRow = yield* db((d) =>
@@ -6428,6 +6747,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const createArtifact = Effect.fn("Research.createArtifact")(function* (input: CreateArtifactInput) {
       yield* getTask(input.taskID)
       if (input.runID) yield* getRunForTask(input.taskID, input.runID)
+      if (input.runID) {
+        const existing = yield* db((d) => d.select().from(ResearchArtifactTable).where(and(eq(ResearchArtifactTable.task_id, input.taskID), eq(ResearchArtifactTable.run_id, input.runID!), eq(ResearchArtifactTable.kind, input.kind), eq(ResearchArtifactTable.uri, input.uri))).get())
+        if (existing) return mapArtifact(existing)
+      }
+      const snapshot = yield* Effect.promise(() => snapshotPhaseArtifact(Instance.directory, input))
       const time = nowTime()
       const row = yield* db((d) =>
         d
@@ -6437,8 +6761,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             task_id: input.taskID,
             run_id: input.runID,
             kind: input.kind,
-            uri: input.uri,
-            metadata: input.metadata ?? {},
+            uri: snapshot?.uri ?? input.uri,
+            metadata: { ...input.metadata, ...(snapshot ? { sourceURI: snapshot.sourceURI, sha256: snapshot.sha256 } : {}) },
             time_created: time.created,
             time_updated: time.updated,
           })
@@ -6463,15 +6787,28 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return rows.map(mapArtifact)
     })
 
-    const prepareTaskDataset = Effect.fn("Research.prepareTaskDataset")(function* (input: PrepareTaskDatasetInput) {
+    const prepareTaskDataset = logPhaseMethod("prepareTaskDataset", Effect.fn("Research.prepareTaskDataset")(function* (input: PrepareTaskDatasetInput) {
       const task = yield* getTask(input.taskID)
       const command = buildPrepareDatasetCommand(task, input.force ?? true, Instance.directory)
-      const execution = yield* Effect.promise(() =>
-        Process.run([command.executable, ...command.args], {
+      yield* Effect.promise(() => mkdir(command.cwd, { recursive: true }))
+      const preparationLog = path.join(Instance.directory, ".neo-research", "logs", task.id, `prepare-${crypto.randomUUID()}.jsonl`)
+      appendLog(preparationLog, { event: "process_started", command: command.executable, args: command.args })
+      const execution = yield* abortable((signal) =>
+        Process.runStreaming([command.executable, ...command.args], {
+          abort: signal,
+          tree: true,
           cwd: command.cwd,
           env: command.env,
+          onStdoutLine: (line) => appendLog(preparationLog, { stream: "stdout", line }),
+          onStderrLine: (line) => appendLog(preparationLog, { stream: "stderr", line }),
           nothrow: true,
           timeout: 300_000,
+        }).then((result) => {
+          appendLog(preparationLog, { event: signal.aborted ? "process_canceled" : "process_exited", exitCode: result.code })
+          return result
+        }).catch((error) => {
+          appendLog(preparationLog, { event: signal.aborted ? "process_canceled" : "process_failed", error: String(error) })
+          throw error
         }),
       )
       if (execution.code !== 0) {
@@ -6532,7 +6869,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         datasetSpec,
         command: payload.command as JsonRecord,
       }
-    })
+    }))
 
     const readTaskExportSnapshot = Effect.fn("Research.readTaskExportSnapshot")(function* (taskID: ResearchTaskID) {
       const projectID = Instance.project.id
@@ -6799,6 +7136,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             if (source === undefined || !existsSync(source)) continue
             await cp(source, path.join(traceDirectory, `${artifact.id}.json`), { force: true })
           }
+          for (const name of ["logs", "runner-progress", "runner-executions", "artifact-versions"]) {
+            const source = path.join(Instance.directory, ".neo-research", name, task.id)
+            if (!existsSync(source)) continue
+            await cp(source, path.join(traceDirectory, name), { recursive: true, force: true })
+            copiedFiles[`trace/${name}`] = `trace/${name}`
+          }
           const integrity = buildReleaseIntegrity(kind, copiedFiles)
           await writeFile(
             releasePackagePath,
@@ -6905,7 +7248,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return { artifact, path: outputPath }
     })
 
-    const profileTask = Effect.fn("Research.profileTask")(function* (
+    const profileTask = logPhaseMethod("profileTask", Effect.fn("Research.profileTask")(function* (
       input: ProfileTaskInput & { readonly _onDeltaQualitative?: (delta: string) => void },
     ) {
       const task = yield* getTask(input.taskID)
@@ -7183,7 +7526,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       )
       yield* bus.publish(Event.RunUpdated, { run })
       return { fingerprint, run, artifact, path: outputPath }
-    })
+    }))
 
 	    const writeIntentSpecArtifact = Effect.fn("Research.writeIntentSpecArtifact")(function* (
 	      result: IntentAgentResult,
@@ -7291,6 +7634,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    const runIntentAgentTurn = Effect.fn("Research.runIntentAgentTurn")(function* (input: {
 	      readonly task: ResearchTask
 	      readonly userMessage: string
+          readonly syntheticPrompt?: boolean
 	      readonly modelRef: OpencodeModelRef | undefined
 	      readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>
 	      readonly onDelta?: (delta: string) => Effect.Effect<void>
@@ -7300,7 +7644,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      // never ran, which from the TUI looked like the [IntentAgent] stream got skipped
 	      // straight to a canned "Next question". Publish IntentAgentFailed so the cause is
 	      // visible instead of an empty spinner forever.
-	      if (!input.task.sessionID || !input.modelRef) {
+	      if (!input.task.sessionID || (!input.modelRef && !taskSessionModel(input.task.taskSpec) && !(yield* Effect.promise(readSelectedSessionModel)))) {
 	        yield* bus.publish(Event.IntentAgentFailed, {
 	          taskID: input.task.id,
 	          agent: "IntentAgent",
@@ -7321,12 +7665,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        })).id
 	      const onPartUpdated = input.onPartUpdated
 	      const onDelta = input.onDelta
-	      const promptEffect = sessionPrompt.prompt({
-	        sessionID,
-	        agent: "research-intent-agent",
-	        model: { providerID: ProviderID.make(input.modelRef.providerID), modelID: ModelID.make(input.modelRef.modelID) },
-	        parts: [{ type: "text", text: input.userMessage }],
-	      })
+	      const promptEffect = selectSessionModel(input.task.id, input.modelRef).pipe(
+            Effect.flatMap((model) => sessionPrompt.prompt({
+              sessionID,
+              agent: "research-intent-agent",
+              model,
+              parts: [{ type: "text", text: input.userMessage, synthetic: input.syntheticPrompt ?? false }],
+            })),
+            Effect.onInterrupt(() => sessionPrompt.cancel(sessionID)),
+          )
 	      const result = yield* (onPartUpdated || onDelta
 	        ? Effect.scoped(
 	            Effect.gen(function* () {
@@ -7363,7 +7710,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            .pipe(Effect.andThen(Effect.succeed(undefined))),
 	        ),
 	      )
-	      if (!result) return { sessionID, checkOk: false }
+	      if (!result) return undefined
 	      const checkOk = result.parts.some((part) => {
 	        if (part.type !== "tool" || part.tool !== "check_taskspec") return false
 	        const s = part.state
@@ -7418,7 +7765,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      return { ...base, clarifyingQuestions: questions }
 	    })
 
-	    const runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult> = Effect.fn(
+	    const runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult> = logPhaseMethod("runIntentAgent", Effect.fn(
 	      "Research.runIntentAgent",
 	    )(function* (taskID: ResearchTaskID) {
 	      yield* updateTaskStatus({ taskID, status: "intent_gathering" })
@@ -7445,6 +7792,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          yield* runIntentAgentTurn({
 	            task,
 	            userMessage: buildIntentAgentKickoffPrompt(task),
+            syntheticPrompt: true,
 	            modelRef: mapToModelRef(intentConfig),
 	            onPartUpdated: onIntentAgentPartUpdated(taskID),
 	            onDelta: (delta) => bus.publish(Event.IntentAgentStreamDelta, { taskID, agent: "IntentAgent", delta }),
@@ -7484,14 +7832,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          }),
 	        ),
 	      )
-	    })
+	    }))
 
 	    // Continues the IntentAgent session with a new user message — replaces the old
 	    // "rerun a stateless analyzeIntentTask() pass" behavior. Both answerIntentQuestion
 	    // (structured slot answers) and interpretAndApplySlotModification (free-text) now
 	    // funnel into this: the LLM in the session does the interpretation itself, so there's
 	    // no separate parseSlotInputsWithLLM/interpretSlotModificationWithLLM call anymore.
-	    const continueIntentAgentSession = Effect.fn("Research.continueIntentAgentSession")(function* (input: {
+	    const continueIntentAgentSession = logPhaseMethod("continueIntentAgentSession", Effect.fn("Research.continueIntentAgentSession")(function* (input: {
 	      readonly taskID: ResearchTaskID
 	      readonly message: string
 	    }) {
@@ -7499,16 +7847,23 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      const intentLLMContext = yield* Effect.promise(() => resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory }))
 	      const intentConfig =
 	        intentLLMContext?.config ?? (yield* Effect.promise(() => resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory })))
-	      const turn = yield* runIntentAgentTurn({
+	      yield* bus.publish(Event.IntentAgentStarted, {
+        taskID: input.taskID, agent: "IntentAgent", stage: "intent_gathering", status: "started",
+      })
+      const turn = yield* runIntentAgentTurn({
         task,
         userMessage: input.message,
         modelRef: mapToModelRef(intentConfig),
         onPartUpdated: onIntentAgentPartUpdated(input.taskID),
         onDelta: (delta) => bus.publish(Event.IntentAgentStreamDelta, { taskID: input.taskID, agent: "IntentAgent", delta }),
       })
-	      yield* advanceFromIntentTurn({ taskID: input.taskID, checkOk: turn?.checkOk ?? false })
+	      if (turn) yield* bus.publish(Event.IntentAgentCompleted, {
+        taskID: input.taskID, agent: "IntentAgent", stage: "intent_gathering", status: "completed",
+        metadata: { sessionID: turn.sessionID, checkOk: turn.checkOk },
+      })
+      yield* advanceFromIntentTurn({ taskID: input.taskID, checkOk: turn?.checkOk ?? false })
 	      return yield* intentResultFromTask(input.taskID)
-	    })
+	    }))
 
 	    const answerIntentQuestion = Effect.fn("Research.answerIntentQuestion")(function* (input: AnswerIntentInput) {
 	      const message = `用户回答（结构化字段）：\n${JSON.stringify(input.slots, null, 2)}`
@@ -7523,7 +7878,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    })
 
 
-	    const runDataAnalysisAgent = Effect.fn("Research.runDataAnalysisAgent")(function* (input: ProfileTaskInput) {
+	    const runDataAnalysisAgent = logPhaseMethod("runDataAnalysisAgent", Effect.fn("Research.runDataAnalysisAgent")(function* (input: ProfileTaskInput) {
 	      yield* updateTaskStatus({ taskID: input.taskID, status: "data_analysis" })
 	      yield* bus.publish(Event.DataAnalysisAgentStarted, {
 	        taskID: input.taskID,
@@ -7601,7 +7956,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          }),
 	        ),
 	      )
-	    })
+	    }))
 
     // Completed tool parts are authoritative receipts even without final prose.
     const runLiteratureSession = (task: ResearchTask, phase: LiteraturePhase, modelRef: OpencodeModelRef) =>
@@ -7630,8 +7985,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           return bus.publish(Event.LiteratureAgentPartUpdated, {
             taskID: task.id, agent: "LiteratureAgent", partID: part.id, kind: "tool",
             toolName: part.tool, toolState: state.status,
+            toolInput: state.status !== "pending" ? state.input : undefined,
+            toolOutput: state.status === "completed" ? state.output : undefined,
             toolDurationMs: state.status === "completed" ? state.time.end - state.time.start : undefined,
-            toolError: state.status === "error" ? "Literature tool failed; see child session" : undefined,
+            toolError: state.status === "error" ? state.error : undefined,
           })
         }
         return yield* Effect.gen(function* () {
@@ -7647,9 +8004,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               })),
             ))
             yield* sessionPrompt.prompt({ sessionID: child.id, agent: "research-literature",
-              model: { providerID: ProviderID.make(modelRef.providerID), modelID: ModelID.make(modelRef.modelID) },
+              model: yield* selectSessionModel(task.id, modelRef),
               parts: [{ type: "text", text: "Inspect the bound retrieval intents, then call literature_run to complete the Literature phase. Summarize the validated results briefly." }],
-            }).pipe(Effect.catchCause(() => Effect.void))
+            }).pipe(Effect.onInterrupt(() => sessionPrompt.cancel(child.id)), Effect.catchCause(() => Effect.void))
           }))
           const messages = yield* session.messages({ sessionID: child.id })
           const receipt = yield* Effect.promise(() => recoverLiteratureReceipt(phase, messages.filter((message) => message.info.role === "assistant").flatMap((message) => message.parts)))
@@ -7658,7 +8015,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
 
     const literatureLocks = new Map<ResearchTaskID, Semaphore.Semaphore>()
-    const runRetrieveAgentUnlocked = Effect.fn("Research.runRetrieveAgent")(function* (input: RunRetrieveAgentInput) {
+    const runRetrieveAgentUnlocked = logPhaseMethod("runRetrieveAgentUnlocked", Effect.fn("Research.runRetrieveAgent")(function* (input: RunRetrieveAgentInput) {
       yield* updateTaskStatus({ taskID: input.taskID, status: "literature" })
       yield* bus.publish(Event.LiteratureAgentStarted, { taskID: input.taskID, agent: "LiteratureAgent", stage: "literature", status: "started" })
       yield* bus.publish(Event.RetrieveAgentStarted, {
@@ -7705,9 +8062,40 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const callPath = attempt ? "session_tool" : "direct"
         const directReason = attempt ? null : runtime.literatureSessionTools !== true ? "session_tools_disabled"
           : !config ? "llm_not_configured" : !modelRef ? "model_not_mapped" : "tool_not_started"
-        const receipt = attempt?.receipt ?? (yield* Effect.promise(() => phase.execute()))
+        const receipt = attempt?.receipt ?? (yield* abortable((signal) => phase.execute(signal)))
         const result = yield* Effect.promise(() => phase.validate(receipt))
         if (result.taskID !== task.id) throw new Error(`Quantitative report task mismatch: expected ${task.id}, received ${result.taskID}`)
+        const paperTitles = new Map(phase.snapshot.index.documents.map((paper) => [paper.paperID, paper.title]))
+        const selectedCards = new Map(result.taskEvidence.entries.map((entry) => [entry.cardID, entry]))
+        const acceptedCardIDs = [...new Set(result.literatureResults.flatMap((paper) => paper.acceptedCardIDs))]
+        const cardSummaries = (() => {
+          if (acceptedCardIDs.length === 0) return result.taskEvidence.entries.map((entry) => ({ cardID: entry.cardID,
+            paperID: entry.paperID, cardType: entry.cardType, claim: entry.claim, selected: true }))
+          try {
+            const knowledge = new KnowledgeStore(path.join(neoCastRoot, ".neo-cast", "literature-knowledge", "knowledge.db"))
+            try {
+              return acceptedCardIDs.map((cardID) => {
+                const card = knowledge.getCard(cardID)
+                const selected = selectedCards.get(cardID)
+                return selected ? { cardID, paperID: selected.paperID, cardType: selected.cardType,
+                  claim: selected.claim, selected: true } : card ? { cardID, paperID: card.paperID,
+                  cardType: card.cardType, claim: card.claim, selected: false } : undefined
+              }).filter((card) => card !== undefined)
+            } finally {
+              knowledge.close()
+            }
+          } catch {
+            return result.taskEvidence.entries.map((entry) => ({ cardID: entry.cardID,
+              paperID: entry.paperID, cardType: entry.cardType, claim: entry.claim, selected: true }))
+          }
+        })()
+        const displayMetadata = {
+          paperSummaries: result.literatureResults
+            .filter((paper) => paper.status !== "skipped_pdf_unavailable")
+            .map((paper) => ({ paperID: paper.paperID, title: paperTitles.get(paper.paperID) ?? paper.paperID,
+              status: paper.status, acceptedCardCount: paper.acceptedCardIDs.length })),
+          cardSummaries,
+        }
         const existingResultArtifact = artifacts.find((item) =>
           item.kind === "literature_retrieve_result_json" && recordValue(item.metadata).retrieveRunID === result.retrieveRunID,
         )
@@ -7746,6 +8134,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           metadata: { ...taskEvidenceArtifact.metadata, phase: "literature", agent: "LiteratureAgent",
             callPath, sessionID: attempt?.sessionID ?? null, summary: result.summary, gapCount: result.taskEvidence.gaps.length,
             reason: directReason,
+            ...displayMetadata,
             readiness: result.taskEvidence.readiness, selectedEntryCount: result.taskEvidence.summary.selectedEntryCount,
             uncoveredMustCoverIntentCount: result.taskEvidence.summary.uncoveredMustCoverIntentCount },
           time_updated: Date.now(),
@@ -7768,6 +8157,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           metadata: { retrieveRunID: result.retrieveRunID, resultArtifactID: resultArtifact.id,
             taskEvidenceArtifactID: taskEvidenceArtifact.id, readiness: result.taskEvidence.readiness,
             callPath, reason: directReason, sessionID: attempt?.sessionID ?? null, ...result.summary,
+            ...displayMetadata,
             selectedEntryCount: result.taskEvidence.summary.selectedEntryCount, gapCount: result.taskEvidence.gaps.length },
         })
         return result
@@ -7789,7 +8179,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }),
         ),
       )
-    })
+    }))
 
     const runRetrieveAgent = (input: RunRetrieveAgentInput) => Effect.suspend(() => {
       const lock = literatureLocks.get(input.taskID) ?? Semaphore.makeUnsafe(1)
@@ -7810,7 +8200,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const loadTaskEvidenceBundle = (taskID: ResearchTaskID, artifactID?: ResearchArtifactID) =>
       Effect.promise(() => loadTaskEvidenceForTask(taskID, artifactID))
 
-	    const runHypoPlannerAgent = Effect.fn("Research.runHypoPlannerAgent")(function* (input: {
+	    const runHypoPlannerAgent = logPhaseMethod("runHypoPlannerAgent", Effect.fn("Research.runHypoPlannerAgent")(function* (input: {
 	      readonly taskID: ResearchTaskID
 	      readonly outputDir?: string
 	      readonly taskEvidenceArtifactID?: ResearchArtifactID
@@ -8112,9 +8502,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          }),
 	        ),
 	      )
-	    })
+	    }))
 
-	    const runNASAgent = Effect.fn("Research.runNASAgent")(function* (input: AutonomousLoopInput) {
+	    const runNASAgent = logPhaseMethod("runNASAgent", Effect.fn("Research.runNASAgent")(function* (input: AutonomousLoopInput) {
       yield* assertExecutionCheckpoint(input.taskID)
       yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
       yield* bus.publish(Event.NASAgentStarted, {
@@ -8265,8 +8655,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }),
         ),
       )
-    })
-	    const runVerifierAgent = Effect.fn("Research.runVerifierAgent")(function* (input: VerifierAgentRunInput) {
+    }))
+	    const runVerifierAgent = logPhaseMethod("runVerifierAgent", Effect.fn("Research.runVerifierAgent")(function* (input: VerifierAgentRunInput) {
       yield* assertExecutionCheckpoint(input.taskID, undefined, "verifier")
 	      const task = yield* getTask(input.taskID)
 	      const run = yield* getRunForTask(input.taskID, input.runID)
@@ -8308,9 +8698,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        },
 	      })
 	      return { ...result, artifact, decisionArtifact }
-	    })
+	    }))
 
-	    const runReflectionAgent = Effect.fn("Research.runReflectionAgent")(function* (input: ReflectionAgentInput) {
+	    const runReflectionAgent = logPhaseMethod("runReflectionAgent", Effect.fn("Research.runReflectionAgent")(function* (input: ReflectionAgentInput) {
       yield* assertExecutionCheckpoint(input.taskID, undefined, "reflection")
 	      yield* bus.publish(Event.ReflectionAgentStarted, {
 	        taskID: input.taskID,
@@ -8331,6 +8721,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          candidates,
 	          champion,
 	          stoppedReason: input.stoppedReason,
+	          maxIterations: input.maxIterations,
 	        })
 
 	        // Minimal context: find latest candidate for current hypothesis (pure in-memory, no I/O).
@@ -8356,7 +8747,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          agent: "research-reflection",
 	          stageLabel: "Reflection",
 	          taskID: task.id,
-	          user: buildReflectionSessionUserPrompt(task, baseResult.analysis, latestCandidate?.rationale || undefined),
+	          user: buildReflectionSessionUserPrompt(task, baseResult.analysis, latestCandidate?.rationale || undefined, baseResult.maxIterations),
 	          modelRef: mapToModelRef(reflectionConfig),
 	          onDelta: (delta) => bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta }),
 	          onPartUpdated: (part) => {
@@ -8421,6 +8812,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              const llmContext: ReflectionLLMContext = {
 	                taskSpec: task.taskSpec,
 	                taskObjective,
+	                maxIterations: baseResult.maxIterations,
 	                currentHypothesis: latestCandidate?.rationale || undefined,
 	                experimentDesign: latestCandidate?.candidateSpec,
 	                trainingCurve,
@@ -8459,6 +8851,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              reflectionNotesMarkdown: result.reflectionNotesMarkdown,
 	              nextExperimentPlanMarkdown: result.nextExperimentPlanMarkdown,
 	              failureLogMarkdown: result.failureLogMarkdown,
+	              maxIterations: result.maxIterations,
 	              llm: result.llm,
 	            }, null, 2),
 	            "utf8",
@@ -8547,9 +8940,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          }),
 	        ),
 	      )
-	    })
+	    }))
 
-	    const runPublishAgent = Effect.fn("Research.runPublishAgent")(function* (input: ExportTaskArtifactInput) {
+	    const runPublishAgent = logPhaseMethod("runPublishAgent", Effect.fn("Research.runPublishAgent")(function* (input: ExportTaskArtifactInput) {
       yield* assertExecutionCheckpoint(input.taskID, undefined, "publish")
       yield* updateTaskStatus({ taskID: input.taskID, status: "publishing" })
       yield* bus.publish(Event.PublishAgentStarted, {
@@ -8570,23 +8963,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            run.status === "succeeded",
 	        )
 	        if (publishRefTestRun === undefined) {
-	          const pendingApprovals = yield* listApprovals({ taskID: input.taskID, status: "pending" })
-	          const existingPending = pendingApprovals.find(
-	            (approval) => approval.kind === "ref_test" && approval.candidateID === publishChampion.candidateID,
-	          )
-	          const approval =
-	            existingPending ??
-	            (yield* createApproval({
-	              taskID: input.taskID,
-	              candidateID: publishChampion.candidateID,
-	              kind: "ref_test",
-	              reason: "Auto-approved by PublishAgent for final reference test evaluation.",
-	            }))
-	          yield* replyApproval({
-	            approvalID: approval.id,
-	            status: "approved",
-	            replyMessage: "Auto-approved by PublishAgent.",
-	          })
+          const task = yield* getTask(input.taskID)
+          const approvals = yield* listApprovals({ taskID: input.taskID })
+          const existing = approvals.find((approval) => approval.kind === "ref_test" && approval.candidateID === publishChampion.candidateID)
+          if (existing?.status === "rejected") throw new PipelineBlockedError({ taskID: input.taskID, reason: "human_checkpoint_rejected" })
+          const approval = existing ?? (yield* createApproval({ taskID: input.taskID, candidateID: publishChampion.candidateID, kind: "ref_test", reason: "Reference test required for final publication." }))
+          if (approval.status !== "approved") {
+            yield* replyApproval({ approvalID: approval.id, status: "approved", replyMessage: "Approved by the existing autonomous publication policy." })
+          }
 	          const currentArtifacts = yield* listArtifacts(input.taskID)
 	          const championRunnerArtifact = currentArtifacts.find(
 	            (artifact) => artifact.kind === "runner_artifact" && artifact.runID === publishChampion.runID,
@@ -8821,9 +9205,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          }),
 	        ),
 	      )
-	    })
+	    }))
 
-    const runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult> = Effect.fn(
+    const runFullPipeline: (input: RunFullPipelineInput) => Effect.Effect<RunFullPipelineResult> = logPhaseMethod("runFullPipeline", Effect.fn(
       "Research.runFullPipeline",
     )(function* (input: RunFullPipelineInput) {
       const initialTask = yield* getTask(input.taskID)
@@ -9250,19 +9634,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             phase: "search_space_confirmed",
             reason: ssReason,
           })
-          if (ssCheckpoint.status === "pending") {
+          if (ssCheckpoint.status !== "approved") {
             yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
             throw new PipelineBlockedError({
               taskID: input.taskID,
-              reason: "human_checkpoint_required",
+              reason: ssCheckpoint.status === "rejected" ? "human_checkpoint_rejected" : "human_checkpoint_required",
               checkpointPhase: "search_space_confirmed",
             })
           }
           yield* updateTaskWorkflow({
             taskID: input.taskID,
-            completedPhases: currentWorkflow.completedPhases.includes("searching")
-              ? currentWorkflow.completedPhases
-              : [...currentWorkflow.completedPhases, "searching"],
             lastCheckpoint: "search_space_confirmed",
           })
         } else {
@@ -9328,11 +9709,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             })
           }
           if (budgetCheckpoint.status === "approved") {
+            const extendedMaxIterations = autonomousLoopMaxIterations(input.maxIterations, currentTask) + 5
+            extendSearchCycle(input.taskID, extendedMaxIterations)
             nas = yield* runNASAgent({
               taskID: input.taskID,
               stage: input.stage,
               description: input.description,
-              maxIterations: (input.maxIterations ?? 20) + 5,
+              maxIterations: extendedMaxIterations,
               targetMetricValue: input.targetMetricValue,
               minRelativeImprovement: input.minRelativeImprovement,
               maxNoImprove: input.maxNoImprove,
@@ -9364,44 +9747,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           ].join("\n"),
         })
         yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
-        if (finalCheckpoint.status === "pending") {
+        if (finalCheckpoint.status !== "approved") {
           yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
           throw new PipelineBlockedError({
             taskID: input.taskID,
-            reason: "human_checkpoint_required",
+            reason: finalCheckpoint.status === "rejected" ? "human_checkpoint_rejected" : "human_checkpoint_required",
             checkpointPhase: "final_model_selection",
           })
         }
       }
       if (intent.intentSpec.interaction_mode === "socratic") {
-        const nasAlreadyExtended = currentWorkflow.completedPhases.includes("nas_budget_extended")
-        if (!nasAlreadyExtended && nas.loop.stoppedReason === "max_iterations") {
-          yield* bus.publish(Event.CheckpointAutoApproved, {
-            taskID: input.taskID,
-            phase: "experiment_budget_extended",
-            reason: [
-              "## NAS 搜索已达迭代上限（Socratic 模式自动继续）",
-              "",
-              `**完成迭代：** ${nas.iterationCount} 轮`,
-              `**成功运行：** ${nas.succeededCount}，**失败：** ${nas.failedCount}`,
-              "",
-              nas.leaderboardMarkdown.replace(/^# Leaderboard/, "### 当前工作区实验结果"),
-            ].join("\n"),
-          })
-          nas = yield* runNASAgent({
-            taskID: input.taskID,
-            stage: input.stage,
-            description: input.description,
-            maxIterations: (input.maxIterations ?? 20) + 5,
-            targetMetricValue: input.targetMetricValue,
-            minRelativeImprovement: input.minRelativeImprovement,
-            maxNoImprove: input.maxNoImprove,
-            timeBudgetSeconds: input.timeBudgetSeconds,
-            maxCrashStreak: input.maxCrashStreak ?? 5,
-            explorationRate: input.explorationRate,
-          })
-          yield* markWorkflowPhase("nas_budget_extended")
-        }
         const champion = yield* getChampion(input.taskID)
         yield* bus.publish(Event.CheckpointAutoApproved, {
           taskID: input.taskID,
@@ -9428,31 +9783,23 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const reflection = yield* recoverReflection(currentTask, nas.loop.stoppedReason)
 
       if (reflection.analysis.decision === "request_human" && !currentWorkflow.completedPhases.includes("reflection")) {
-        yield* markWorkflowPhase("reflection")
-        yield* ensurePendingApproval({
+        const review = yield* ensureHumanCheckpoint({
           taskID: input.taskID,
-          kind: "protocol",
+          phase: "reflection_review",
           reason: ["Reflection Agent 建议人工介入：", reflection.analysis.decisionReason].join("\n"),
         })
-        yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
-        throw new PipelineBlockedError({
-          taskID: input.taskID,
-          reason: "reflection_requested_human_review",
-        })
+        if (review.status !== "approved") {
+          yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+          throw new PipelineBlockedError({
+            taskID: input.taskID,
+            reason: review.status === "rejected" ? "human_checkpoint_rejected" : "reflection_requested_human_review",
+            checkpointPhase: "reflection_review",
+          })
+        }
       }
       if (!currentWorkflow.completedPhases.includes("reflection")) {
         yield* markWorkflowPhase("reflection")
       }
-
-      const publish = currentWorkflow.completedPhases.includes("publishing")
-        ? yield* recoverPublish(currentTask)
-        : yield* runPublishAgent({
-            taskID: input.taskID,
-            kind: "model_export_package",
-            outputDir: input.outputDir,
-          }).pipe(
-            Effect.tap(() => markWorkflowPhase("publishing")),
-          )
 
       if (intent.intentSpec.interaction_mode === "companion") {
         const releaseCheckpoint = yield* ensureHumanCheckpoint({
@@ -9467,21 +9814,31 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             "**建议操作：** approve 发布最终模型包，reject 放弃本次发布。",
           ].join("\n"),
         })
-        if (releaseCheckpoint.status === "pending") {
+        if (releaseCheckpoint.status !== "approved") {
           yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
           throw new PipelineBlockedError({
             taskID: input.taskID,
-            reason: "human_checkpoint_required",
+            reason: releaseCheckpoint.status === "rejected" ? "human_checkpoint_rejected" : "human_checkpoint_required",
             checkpointPhase: "report_release",
           })
         }
         yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "report_release" })
-        yield* updateTaskStatus({ taskID: input.taskID, status: "completed" })
       }
 
+      const publish = currentWorkflow.completedPhases.includes("publishing")
+        ? yield* recoverPublish(currentTask)
+        : yield* runPublishAgent({
+            taskID: input.taskID,
+            kind: "model_export_package",
+            outputDir: input.outputDir,
+          }).pipe(
+            Effect.tap(() => markWorkflowPhase("publishing")),
+          )
+
+      yield* updateTaskStatus({ taskID: input.taskID, status: "completed" })
       const completed = yield* getTask(input.taskID)
       return { task: completed, intent, dataAnalysis, literature, hypoPlanning, nas, reflection, publish }
-    })
+    }))
 
     const createMemory = Effect.fn("Research.createMemory")(function* (input: CreateMemoryInput) {
       yield* getTask(input.taskID)
@@ -9599,6 +9956,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     return Service.of({
       createTask,
+      ensureCockpitChat,
+      reconcileInterruptedRuns,
       listTasks,
       getTask,
       updateTaskStatus,

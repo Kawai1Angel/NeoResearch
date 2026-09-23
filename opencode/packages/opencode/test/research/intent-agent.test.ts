@@ -64,6 +64,7 @@ function task(input: {
       maxRuns: 12,
       latencyBudget: "batch inference under 500ms",
       parameterBudget: "under 2M parameters preferred",
+      loop: { maxIterations: 20, maxNoImprove: 5 },
       ...input.budget,
     },
     time: { created: 1, updated: 1 },
@@ -84,11 +85,27 @@ test("socratic intent spec uses expanded slots and asks one focused question", (
   expect(result.intentSpec.lookback_window).toBe(96)
   expect(result.intentSpec.prediction_horizon).toEqual([24, 96])
   expect(result.intentSpec.exogenous_variables).toEqual([])
+  expect(result.intentSpec.max_iterations).toBe(20)
+  expect(result.intentSpec.max_no_improve).toBe(5)
   expect(result.missingFields).toEqual(["intent.business_context"])
   expect(result.clarifyingQuestions).toHaveLength(1)
   expect(result.dialogueStrategy.maxQuestionsPerTurn).toBe(1)
   expect(result.intentSpecMarkdown).toContain("# Intent Spec")
   expect(result.intentSpecMarkdown).toContain("## Open Questions")
+  expect(result.intentSpecMarkdown).toContain("NAS planned iterations: 20")
+  expect(result.intentSpecMarkdown).toContain("Stop after no improvement: 5")
+})
+
+test("socratic intent applies optional NAS defaults without asking extra questions", () => {
+  const result = analyzeIntentTask({ task: task({ budget: { loop: {} } }) })
+
+  expect(result.intentSpec.max_iterations).toBe(25)
+  expect(result.intentSpec.max_no_improve).toBe(7)
+  expect(result.missingFields).toEqual([])
+  expect(result.clarifyingQuestions).toEqual([])
+  expect(result.intentSpecMarkdown).toContain("NAS planned iterations: 25")
+  expect(result.intentSpecMarkdown).toContain("Stop after no improvement: 7")
+  expect(result.intentSpecMarkdown).not.toContain("Max runs")
 })
 
 test("companion intent spec uses compact question batches and checkpoint phases", () => {

@@ -9,6 +9,7 @@ export type HomeRoute = {
 
 export type CockpitRoute = {
   type: "cockpit"
+  taskID?: string
   researchGoal?: string
   newCsvTask?: boolean
 }

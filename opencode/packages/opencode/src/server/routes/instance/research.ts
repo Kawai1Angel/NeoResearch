@@ -1,6 +1,29 @@
+import { Effect } from "effect"
+import {
+  ResumeStateSchema,
+  HistoryPageSchema,
+  OperationReceiptSchema,
+  ResearchEventSchema,
+} from "@/research/recovery-schema"
+import { ownerExited } from "@/research/owner"
+import { Database, and, eq } from "@/storage"
+import { ResearchOperationTable } from "@/research/research.sql"
+import {
+  HistoryQuery,
+  ResumeInput,
+  CycleInput,
+  createResearchCycle,
+  researchHistory,
+  resumeState,
+  researchEvents,
+  researchTasksForSession,
+} from "@/research/recovery"
 import { Hono } from "hono"
 import { describeRoute, resolver, validator } from "hono-openapi"
 import z from "zod"
+import { Instance } from "@/project/instance"
+import { ResearchOperations } from "@/research/operation"
+import { runRequest } from "./trace"
 import { Research } from "@/research"
 import { lazy } from "@/util/lazy"
 import { errors } from "../../error"
@@ -38,6 +61,228 @@ const researchManagerTraceSchema = z
 
 export const ResearchRoutes = lazy(() =>
   new Hono()
+    .post("/tasks/:taskID/cycles", validator("param", taskParam), validator("json", CycleInput), (c) => {
+      const result = createResearchCycle(Instance.project.id, c.req.valid("param").taskID, c.req.valid("json"))
+      return c.json(result.body, result.status)
+    })
+    .get("/sessions/:sessionID/tasks", (c) =>
+      c.json(researchTasksForSession(Instance.project.id, c.req.param("sessionID"))),
+    )
+    .get(
+      "/tasks/:taskID/events",
+      describeRoute({
+        summary: "Read research progress after a cursor",
+        operationId: "research.tasks.events",
+        responses: {
+          200: {
+            description: "Persisted progress events",
+            content: { "application/json": { schema: resolver(ResearchEventSchema.array()) } },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      validator(
+        "query",
+        z
+          .object({ directory: z.string().optional(), after: z.coerce.number().int().nonnegative().default(0) })
+          .strict(),
+      ),
+      (c) => {
+        const { taskID } = c.req.valid("param")
+        if (!resumeState(Instance.project.id, taskID)) return c.json({ message: "Research task not found" }, 404)
+        return c.json(researchEvents(taskID, c.req.valid("query").after))
+      },
+    )
+    .get(
+      "/history",
+      describeRoute({
+        summary: "Search research history",
+        operationId: "research.history",
+        responses: {
+          200: {
+            description: "Research history page",
+            content: { "application/json": { schema: resolver(HistoryPageSchema) } },
+          },
+          ...errors(400),
+        },
+      }),
+      validator("query", HistoryQuery),
+      (c) => {
+        try {
+          return c.json(researchHistory(Instance.project.id, c.req.valid("query")))
+        } catch (error) {
+          if (c.req.valid("query").cursor) return c.json({ message: "Invalid history cursor" }, 400)
+          throw error
+        }
+      },
+    )
+    .get(
+      "/tasks/:taskID/resume-state",
+      describeRoute({
+        summary: "Read research recovery state",
+        operationId: "research.tasks.resumeState",
+        responses: {
+          200: {
+            description: "Read-only recovery snapshot",
+            content: { "application/json": { schema: resolver(ResumeStateSchema) } },
+          },
+          ...errors(404),
+        },
+      }),
+      validator("param", taskParam),
+      (c) => {
+        const state = resumeState(Instance.project.id, c.req.valid("param").taskID)
+        return state ? c.json(state) : c.json({ message: "Research task not found in this project" }, 404)
+      },
+    )
+    .post("/tasks/:taskID/chat", validator("param", taskParam), async (c) =>
+      c.json(
+        await runRequest(
+          "ResearchRoutes.tasks.chat",
+          c,
+          Research.Service.use((svc) => svc.ensureCockpitChat(c.req.valid("param").taskID)),
+        ),
+      ),
+    )
+    .post(
+      "/tasks/:taskID/resume",
+      describeRoute({
+        summary: "Resume or attach research",
+        operationId: "research.tasks.resume",
+        responses: {
+          202: {
+            description: "Durable operation receipt",
+            content: { "application/json": { schema: resolver(OperationReceiptSchema) } },
+          },
+          ...errors(400, 404, 409),
+        },
+      }),
+      validator("param", taskParam),
+      validator("json", ResumeInput),
+      async (c) => {
+        const { taskID } = c.req.valid("param")
+        const input = c.req.valid("json")
+        const state = resumeState(Instance.project.id, taskID)
+        if (!state) return c.json({ message: "Research task not found in this project" }, 404)
+        const previous = ResearchOperations.request(Instance.project.id, taskID, input.requestKey)
+        if (previous)
+          return previous.request_digest === JSON.stringify(input)
+            ? c.json(previous.receipt, 202)
+            : c.json({ name: "ResearchRequestConflict", state }, 409)
+        if (state.revision !== input.expectedRevision) return c.json({ name: "ResearchResumeConflict", state }, 409)
+        if (state.activeOperation?.recoveryRequired) {
+          const receipt = Database.use((db) =>
+            db
+              .select()
+              .from(ResearchOperationTable)
+              .where(
+                and(
+                  eq(ResearchOperationTable.id, state.activeOperation!.id),
+                  eq(ResearchOperationTable.project_id, Instance.project.id),
+                ),
+              )
+              .get(),
+          )
+          if (receipt && ownerExited(receipt.owner_id)) {
+            await runRequest(
+              "ResearchRoutes.tasks.reconcile",
+              c,
+              Research.Service.use((svc) => svc.reconcileInterruptedRuns(taskID)),
+            )
+            const runs = await runRequest(
+              "ResearchRoutes.tasks.reconcile",
+              c,
+              Research.Service.use((svc) => svc.listRuns(taskID)),
+            )
+            const safe =
+              !runs.some((run) => run.status === "running" || run.status === "queued") &&
+              state.currentPhase !== "publishing"
+            ResearchOperations.reconcile(Instance.project.id, taskID, safe)
+            return c.json({ name: "ResearchReconciled", state: resumeState(Instance.project.id, taskID) }, 409)
+          }
+        }
+        if (state.activeOperation)
+          return state.activeOperation.recoveryRequired ? c.json({ state }, 409) : c.json(state.activeOperation, 202)
+        if (state.revision !== input.expectedRevision || state.recoveryState !== "resumable")
+          return c.json({ name: "ResearchResumeConflict", state }, 409)
+        // No await separates the revision check and acquisition of the execution lock.
+        const started = ResearchOperations.start(
+          Instance.project.id,
+          taskID,
+          "resume",
+          (signal) => {
+            return runRequest(
+              "ResearchRoutes.tasks.resume",
+              c,
+              Research.Service.use((svc) => svc.runFullPipeline({ taskID })).pipe(
+                Effect.onInterrupt(() =>
+                  Research.Service.use((svc) =>
+                    Effect.gen(function* () {
+                      const runs = yield* svc.listRuns(taskID)
+                      for (const run of runs.filter((run) => run.status === "running" || run.status === "queued"))
+                        yield* svc.updateRunStatus({
+                          runID: run.id,
+                          status: "failed",
+                          error: "Research operation canceled by user",
+                        })
+                      yield* svc.updateTaskStatus({ taskID, status: "paused" })
+                    }),
+                  ),
+                ),
+              ),
+              signal,
+            )
+          },
+          input.requestKey,
+          JSON.stringify(input),
+          input.expectedRevision,
+        )
+        if (started.conflict) return c.json({ name: "ResearchRequestConflict", state }, 409)
+        if (!started.started && !started.resumed)
+          return started.operation.recoveryRequired ? c.json({ state }, 409) : c.json(started.operation, 202)
+        return c.json(started.operation, 202)
+      },
+    )
+    .get("/tasks/:taskID/operations/active", validator("param", taskParam), async (c) => {
+      const { taskID } = c.req.valid("param")
+      await runRequest(
+        "ResearchRoutes.operation.active",
+        c,
+        Research.Service.use((svc) => svc.getTask(taskID)),
+      )
+      return c.json(ResearchOperations.active(Instance.project.id, taskID) ?? null)
+    })
+    .get(
+      "/tasks/:taskID/operations/:operationID",
+      validator("param", taskParam.extend({ operationID: z.string() })),
+      async (c) => {
+        const { taskID, operationID } = c.req.valid("param")
+        await runRequest(
+          "ResearchRoutes.operation.get",
+          c,
+          Research.Service.use((svc) => svc.getTask(taskID)),
+        )
+        const operation = ResearchOperations.get(Instance.project.id, taskID, operationID)
+        return operation
+          ? c.json(operation)
+          : c.json({ message: "Research operation not found; refresh task state before retrying" }, 404)
+      },
+    )
+    .post(
+      "/tasks/:taskID/operations/:operationID/cancel",
+      validator("param", taskParam.extend({ operationID: z.string() })),
+      async (c) => {
+        const { taskID, operationID } = c.req.valid("param")
+        await runRequest(
+          "ResearchRoutes.operation.cancel",
+          c,
+          Research.Service.use((svc) => svc.getTask(taskID)),
+        )
+        const operation = ResearchOperations.cancel(Instance.project.id, taskID, operationID)
+        return operation ? c.json(operation) : c.json({ message: "Research operation not found" }, 404)
+      },
+    )
     .get(
       "/domains",
       describeRoute({
@@ -407,10 +652,32 @@ export const ResearchRoutes = lazy(() =>
         }),
     )
     .post(
+      "/tasks/:taskID/intent/start",
+      describeRoute({
+        summary: "Start intent gathering",
+        description: "Run IntentAgent for a new task without starting model search or training.",
+        operationId: "research.tasks.startIntent",
+        responses: {
+          200: {
+            description: "Intent agent result",
+            content: { "application/json": { schema: resolver(Research.JsonRecord.zod) } },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", taskParam),
+      async (c) =>
+        jsonRequest("ResearchRoutes.tasks.startIntent", c, function* () {
+          const svc = yield* Research.Service
+          return yield* svc.runIntentAgent(c.req.valid("param").taskID)
+        }),
+    )
+    .post(
       "/tasks/:taskID/intent/answer",
       describeRoute({
         summary: "Answer intent clarification questions",
-        description: "Provide slot answers to intent clarification questions for a research task, re-run the intent agent, and trigger the full pipeline if all fields are satisfied.",
+        description:
+          "Provide slot answers to intent clarification questions for a research task, re-run the intent agent, and trigger the full pipeline if all fields are satisfied.",
         operationId: "research.tasks.answerIntent",
         responses: {
           200: {
@@ -444,7 +711,8 @@ export const ResearchRoutes = lazy(() =>
       "/tasks/:taskID/intent/modify",
       describeRoute({
         summary: "Modify intent slots via natural language",
-        description: "Interpret a natural-language modification message and apply the resulting slot updates to the research task intent spec.",
+        description:
+          "Interpret a natural-language modification message and apply the resulting slot updates to the research task intent spec.",
         operationId: "research.tasks.modifyIntent",
         responses: {
           200: {
@@ -579,7 +847,9 @@ export const ResearchRoutes = lazy(() =>
                     task: Research.ResearchTask.zod,
                     intent: z.object({ taskID: Research.ResearchTaskID.zod }).passthrough(),
                     dataAnalysis: z.object({ artifact: Research.ResearchArtifact.zod }).passthrough(),
-                    nas: z.object({ loop: z.object({ artifact: Research.ResearchArtifact.zod }).passthrough() }).passthrough(),
+                    nas: z
+                      .object({ loop: z.object({ artifact: Research.ResearchArtifact.zod }).passthrough() })
+                      .passthrough(),
                     publish: z.object({ artifact: Research.ResearchArtifact.zod, path: z.string() }).passthrough(),
                   }),
                 ),

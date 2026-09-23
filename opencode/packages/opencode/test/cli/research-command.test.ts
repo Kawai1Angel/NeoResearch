@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { mkdir, readFile, writeFile } from "fs/promises"
 import path from "path"
+import yargs from "yargs/yargs"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
 import type { DomainRunPlan } from "../../src/research/domain"
@@ -9,8 +10,11 @@ import { createFileResearchRuntime, researchJobFromRunPlan } from "../../src/res
 import {
   ResearchCommand,
   ResearchCreateCommand,
+  ResearchIterateCommand,
+  ResearchLoopCommand,
   ResearchPipelineCommand,
   ResearchProfileCommand,
+  ResearchRunCommand,
   ResearchRequestBlindTestCommand,
   ResearchRequestRefTestCommand,
   ResearchRequestShadowHoldoutCommand,
@@ -63,6 +67,18 @@ afterEach(async () => {
 })
 
 describe("research CLI commands", () => {
+  test("autonomous commands default to full training while direct candidate runs default to smoke", async () => {
+    const stageDefault = async (command: typeof ResearchRunCommand) => {
+      if (typeof command.builder !== "function") throw new Error("research command builder must be callable")
+      const configured = await command.builder(yargs([]))
+      return (configured as unknown as { getOptions: () => { default: Record<string, unknown> } }).getOptions().default.stage
+    }
+    for (const command of [ResearchIterateCommand, ResearchLoopCommand, ResearchPipelineCommand]) {
+      expect(await stageDefault(command)).toBe("full")
+    }
+    expect(await stageDefault(ResearchRunCommand)).toBe("smoke")
+  })
+
   test("registers a command for requesting candidate reference-test gates", () => {
     expect(ResearchRequestRefTestCommand.command).toBe("request-ref-test <taskID> <candidateID>")
     expect(ResearchRequestRefTestCommand.describe).toContain("reference-test")

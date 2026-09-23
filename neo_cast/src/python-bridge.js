@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const { randomUUID } = require("crypto");
 const path = require("path");
 const { spawn } = require("child_process");
 const { getRuntimePaths, runtimeReady } = require("./runtime");
@@ -66,6 +67,12 @@ function runPythonCommand(projectRoot, commandArgs, options = {}) {
   let timeout = null;
   let hardKillTimeout = null;
   let settled = false;
+  const startedAt = Date.now();
+  const logDir = path.join(resolvedProjectRoot, ".neo-cast", "logs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `${startedAt}-${randomUUID()}.jsonl`);
+  const archive = (record) => fs.appendFileSync(logPath, `${JSON.stringify({ time: new Date().toISOString(), ...record })}\n`);
+  archive({ event: "started", executable: pythonCommand, args: commandArgs });
 
   return new Promise((resolve, reject) => {
     const child = spawn(pythonCommand, commandArgs, {
@@ -104,6 +111,7 @@ function runPythonCommand(projectRoot, commandArgs, options = {}) {
 
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
+      archive({ stream: "stdout", text });
       stdout += text;
       if (options.onStdout) options.onStdout(text, child);
       if (shouldMirrorOutput) stdoutTarget.write(text);
@@ -111,6 +119,7 @@ function runPythonCommand(projectRoot, commandArgs, options = {}) {
 
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
+      archive({ stream: "stderr", text });
       stderr += text;
       if (options.onStderr) options.onStderr(text, child);
       if (shouldMirrorOutput) stderrTarget.write(text);
@@ -120,6 +129,7 @@ function runPythonCommand(projectRoot, commandArgs, options = {}) {
       cleanup();
       if (settled) return;
       settled = true;
+      archive({ event: "failed", error: error.message, durationMs: Date.now() - startedAt });
       reject(error);
     });
 
@@ -127,7 +137,9 @@ function runPythonCommand(projectRoot, commandArgs, options = {}) {
       cleanup();
       if (settled) return;
       settled = true;
+      archive({ event: aborted ? "canceled" : timedOut ? "timeout" : "finished", code, signal, durationMs: Date.now() - startedAt });
       resolve({
+        logPath,
         status: typeof code === "number" ? code : null,
         signal,
         stdout,

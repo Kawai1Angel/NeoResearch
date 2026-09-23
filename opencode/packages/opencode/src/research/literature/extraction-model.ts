@@ -1,6 +1,6 @@
 import { createHash } from "crypto"
 import {
-  apiKeyFor, requestNeoCastLLM, resolveNeoCastLLMConfig, type LLMTokenUsage,
+  requestNeoCastLLM, resolveEffectiveLLMConfig, resolveNeoCastLLMConfig, type LLMTokenUsage,
 } from "../llm-proposal"
 import {
   CandidateClaimSchema, EvidenceVerificationSchema,
@@ -108,10 +108,9 @@ export class ConfiguredLLMExtractionModel implements LiteratureExtractionModel {
   }
 
   static async create(input: { workspaceRoot: string; neoCastRoot: string }) {
-    const config = await resolveNeoCastLLMConfig({ workspaceRoot: input.workspaceRoot, neoCastProjectRoot: input.neoCastRoot })
-    const key = apiKeyFor(config)
-    if (!key) return undefined
-    return new ConfiguredLLMExtractionModel(config, key)
+    const resolved = await resolveEffectiveLLMConfig({ workspaceRoot: input.workspaceRoot, neoCastProjectRoot: input.neoCastRoot })
+    if (!resolved) return undefined
+    return new ConfiguredLLMExtractionModel(resolved.config, resolved.apiKey)
   }
 
   drainCallRecords() { return this.calls.splice(0) }

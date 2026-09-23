@@ -1,4 +1,5 @@
 import type { LLMTokenUsage } from "../llm-proposal"
+import { NAS_DEFAULT_MAX_ITERATIONS } from "../defaults"
 import type {
   JsonRecord,
   ResearchArtifact,
@@ -73,6 +74,7 @@ export interface ReflectionLLMAnalysis {
 export interface ReflectionAgentResult {
   readonly agent: "ReflectionAgent"
   readonly taskID: ResearchTaskID
+  readonly maxIterations: number
   readonly reflectionNotesMarkdown: string
   readonly nextExperimentPlanMarkdown: string
   readonly failureLogMarkdown: string
@@ -93,6 +95,7 @@ interface ReflectionInputs {
   readonly candidates: readonly ResearchCandidate[]
   readonly champion?: ResearchChampion
   readonly stoppedReason?: string
+  readonly maxIterations?: number
   readonly artifact?: ResearchArtifact
 }
 
@@ -111,6 +114,16 @@ function objectiveMetricName(objective: ResearchTask["objective"]) {
 function objectiveDirection(objective: ResearchTask["objective"]): "minimize" | "maximize" {
   const direction = recordValue(objective).direction
   return direction === "maximize" ? "maximize" : "minimize"
+}
+
+function plannedMaxIterations(task: ResearchTask, explicit?: number) {
+  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit)
+  const budget = recordValue(task.budget)
+  const loop = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
+  const value = loop.maxIterations
+  return typeof value === "number" && Number.isFinite(value) && value >= 1
+    ? Math.floor(value)
+    : NAS_DEFAULT_MAX_ITERATIONS
 }
 
 function metricValue(metrics: ResearchRun["metrics"], metricName: string) {
@@ -313,6 +326,7 @@ export function buildReflectionNotesMarkdown(input: {
   readonly task: ResearchTask
   readonly analysis: ReflectionAnalysis
   readonly stoppedReason?: string
+  readonly maxIterations?: number
 }) {
   const { task, analysis, stoppedReason } = input
   const lines: string[] = [
@@ -322,6 +336,7 @@ export function buildReflectionNotesMarkdown(input: {
     `- Task ID: ${task.id}`,
     `- Domain: ${task.domainID}`,
     `- Primary metric: ${analysis.primaryMetricName} (${analysis.direction})`,
+    `- NAS planned max iterations: ${plannedMaxIterations(task, input.maxIterations)}`,
     stoppedReason ? `- NAS stopped reason: ${stoppedReason}` : `- NAS stopped reason: (none)`,
     "",
     "## Run Summary",
@@ -449,11 +464,13 @@ export function summarizeReflectionAgent(input: ReflectionInputs): ReflectionAge
   return {
     agent: "ReflectionAgent",
     taskID: input.task.id,
+    maxIterations: plannedMaxIterations(input.task, input.maxIterations),
     analysis,
     reflectionNotesMarkdown: buildReflectionNotesMarkdown({
       task: input.task,
       analysis,
       stoppedReason: input.stoppedReason,
+      maxIterations: input.maxIterations,
     }),
     nextExperimentPlanMarkdown: buildNextExperimentPlanMarkdown({
       task: input.task,
@@ -480,5 +497,6 @@ export function reflectionAgentMetadata(result: ReflectionAgentResult): JsonReco
     rejectedRuns: result.analysis.rejectedRuns,
     failureCount: result.analysis.failures.length,
     failureCategories: result.analysis.failures.map((failure) => failure.category),
+    maxIterations: result.maxIterations,
   }
 }

@@ -334,18 +334,17 @@ test("data_leakage_verifier accepts ordered expanding-window CV", () => {
   expect(result.accepted).toBe(true)
 })
 
-test("data_leakage_verifier rejects when max_horizon >= context_length", () => {
+test("data_leakage_verifier accepts a prediction length longer than the context", () => {
   const report = runVerifiers(ctx({
     run: run({ id: "r_ctx", status: "succeeded", metrics: { val_avg_mse: 0.4 } }),
     task: {
       ...task(),
-      taskSpec: { contextLength: 96, predictionLengths: [96, 192] },
+      taskSpec: { contextLength: 336, predictionLengths: [96, 192, 336, 720] },
     } as unknown as typeof task extends () => infer T ? T : never,
   }))
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
-  expect(result.accepted).toBe(false)
-  expect(result.reason).toContain("192")
-  expect(result.reason).toContain("96")
+  expect(result.accepted).toBe(true)
+  expect(result.evidence).toMatchObject({ contextLength: 336, maxHorizon: 720 })
 })
 
 test("data_leakage_verifier rejects suspiciously low val/train ratio", () => {
@@ -426,4 +425,22 @@ test("data_leakage_verifier decision record maps to audit_split_boundaries", () 
   })
   expect(record.failure?.category).toBe("data_leakage")
   expect(record.failure?.recoveryAction.type).toBe("audit_split_boundaries")
+})
+
+test("cost_perf_verifier uses absolute parameter counts from the execution contract", () => {
+  const report = runVerifiers({
+    ...ctx(), task: { ...task(), taskSpec: { constraints: { maxParams: 5_000_000 } }, budget: { parameterBudget: 5_000_000 } },
+    run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: 0.3, params_M: 20 } }),
+  })
+  const result = report.results.find((r) => r.name === "cost_perf_verifier")!
+  expect(result.accepted).toBe(false)
+  expect(result.evidence.budgetM).toBe(5)
+})
+
+test("cost_perf_verifier does not turn a textual size preference into a hard limit", () => {
+  const report = runVerifiers({
+    ...ctx(), task: { ...task(), taskSpec: { metadata: { parameterBudgetEnforcement: "preference_only" } }, budget: { parameterBudget: "prefer under 5M when possible" } },
+    run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: 0.3, params_M: 20 } }),
+  })
+  expect(report.results.find((r) => r.name === "cost_perf_verifier")!.accepted).toBe(true)
 })

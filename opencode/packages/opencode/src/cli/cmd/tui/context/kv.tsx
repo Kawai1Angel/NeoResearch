@@ -41,6 +41,9 @@ export const { use: useKV, provider: KVProvider } = createSimpleContext({
       })
 
     const result = {
+      flush() {
+        return write
+      },
       get ready() {
         return ready()
       },

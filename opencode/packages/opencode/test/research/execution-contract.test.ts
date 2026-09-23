@@ -224,6 +224,46 @@ test("Gate A creates a blocker without starting Python smoke", async () => {
   })
 })
 
+test("rejecting a contract checkpoint supersedes the bad candidate and returns the task to design", async () => {
+  await using tmp = await tmpdir({ git: true })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const { task, candidate } = await setup(path.join(tmp.path, "no-runner"))
+      const wrongCandidate = await run((svc) =>
+        svc.createCandidate({
+          taskID: task.id,
+          domainID: "tsf",
+          hypothesisID: "H1",
+          candidateSpec: { ...candidate.candidateSpec, backbone: { type: "linear" } },
+          rationale: "incorrect backbone",
+          generatedBy: "human",
+          riskLevel: "low",
+          approvalStatus: "auto_approved",
+        }),
+      )
+      await expect(
+        run((svc) => svc.executeRun({ taskID: task.id, candidateID: wrongCandidate.id, stage: "smoke" })),
+      ).rejects.toThrow()
+      const approval = (await run((svc) => svc.listApprovals({ taskID: task.id })))[0]!
+      await run((svc) => svc.replyApproval({ approvalID: approval.id, status: "rejected" }))
+
+      expect(await run((svc) => svc.resumeExecutionContractCheckpoint(task.id))).toBeUndefined()
+      expect((await run((svc) => svc.getTask(task.id))).status).toBe("searching")
+      const rejected = (await run((svc) => svc.listCandidates(task.id))).find((item) => item.id === wrongCandidate.id)
+      expect(rejected?.approvalStatus).toBe("rejected")
+      const blocker = (await run((svc) => svc.listArtifacts(task.id))).find(
+        (item) => item.kind === "execution_contract_violation_json" && item.metadata.candidateID === wrongCandidate.id,
+      )!
+      expect(blocker.metadata.status).toBe("superseded")
+      expect(JSON.parse(await readFile(blocker.uri.slice(7), "utf8"))).toMatchObject({
+        status: "superseded",
+        superseded_reason: "candidate_rejected_for_redesign",
+      })
+    },
+  })
+})
+
 test("Gate A preserves selected preprocessing order and task covariate declarations", () => {
   const candidate = {
     hypothesisID: "H1",

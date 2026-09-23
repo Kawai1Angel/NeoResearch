@@ -2,6 +2,11 @@ import { EOL } from "os"
 import { Locale } from "@/util"
 import type { Research } from "@/research"
 import type { ResearchWorkerOnceResult } from "@/research/runtime"
+import {
+  NAS_DEFAULT_MAX_ITERATIONS,
+  NAS_DEFAULT_MAX_NO_IMPROVE,
+  RESEARCH_MAX_RUNS_SAFETY_LIMIT,
+} from "@/research/defaults"
 
 export type ResearchOutputFormat = "table" | "json"
 export type ResearchInteractionMode = "companion" | "socratic"
@@ -14,6 +19,8 @@ export type TsfResearchTaskDefaults = {
   predictionLengths?: number[]
   bridgeOnly?: boolean
   maxRuns?: number
+  maxIterations?: number
+  maxNoImprove?: number
   maxTrainingSeconds?: number
   interactionMode?: ResearchInteractionMode
   metadata?: Research.JsonRecord
@@ -83,6 +90,11 @@ export function buildDefaultTsfResearchTaskInput(input: {
 } & TsfResearchTaskDefaults): Research.CreateTaskInput {
   const interactionMode = input.interactionMode ?? interactionModeForResearchMode(input.mode)
   const mode = input.interactionMode === undefined ? input.mode : researchModeForInteractionMode(interactionMode)
+  const loop = {
+    maxIterations: input.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS,
+    maxNoImprove: input.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE,
+    ...(input.maxTrainingSeconds === undefined ? {} : { timeBudgetSeconds: input.maxTrainingSeconds }),
+  }
   return {
     title: input.title ?? (mode === "review" ? "TSF Review Research" : "TSF Autonomous Research"),
     domainID: "tsf",
@@ -96,11 +108,11 @@ export function buildDefaultTsfResearchTaskInput(input: {
       direction: "minimize",
     },
     budget: {
-      maxRuns: input.maxRuns ?? 50,
+      maxRuns: input.maxRuns ?? RESEARCH_MAX_RUNS_SAFETY_LIMIT,
       maxParallel: 1,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
       parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
-      ...(input.maxTrainingSeconds === undefined ? {} : { loop: { timeBudgetSeconds: input.maxTrainingSeconds } }),
+      loop,
     },
   } as Research.CreateTaskInput
 }
@@ -173,6 +185,12 @@ export function parseTsfResearchGoalInput(value: string): TsfResearchTaskDefault
       if (Number.isFinite(runs) && runs > 0) result.maxRuns = Math.floor(runs)
     } else if (key === "time" || key === "time-budget" || key === "seconds" || key === "max-training-seconds") {
       result.maxTrainingSeconds = parseDurationSeconds(raw)
+    } else if (key === "iterations" || key === "max-iterations") {
+      const iterations = Number(raw)
+      if (Number.isFinite(iterations) && iterations > 0) result.maxIterations = Math.floor(iterations)
+    } else if (key === "max-no-improve" || key === "patience-rounds") {
+      const rounds = Number(raw)
+      if (Number.isFinite(rounds) && rounds > 0) result.maxNoImprove = Math.floor(rounds)
     }
   }
   return result
@@ -194,10 +212,14 @@ export function buildDefaultTsfResearchTaskInputFromGoal(input: {
   title?: string
   neoCastProjectRoot?: string
   interactionMode?: ResearchInteractionMode
+  maxIterations?: number
+  maxNoImprove?: number
 }) {
   const defaults = parseTsfResearchGoalInput(input.goal)
   return buildDefaultTsfResearchTaskInput({
     ...defaults,
+    ...(input.maxIterations === undefined ? {} : { maxIterations: input.maxIterations }),
+    ...(input.maxNoImprove === undefined ? {} : { maxNoImprove: input.maxNoImprove }),
     mode: input.mode,
     interactionMode: input.interactionMode ?? interactionModeForResearchMode(input.mode),
     title: input.title ?? goalTitle(input.goal, defaults),

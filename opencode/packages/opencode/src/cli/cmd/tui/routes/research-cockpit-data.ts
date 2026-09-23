@@ -1,3 +1,9 @@
+import { taskExecutionRoot } from "@/research/task-isolation"
+import {
+  NAS_DEFAULT_MAX_ITERATIONS,
+  NAS_DEFAULT_MAX_NO_IMPROVE,
+  RESEARCH_MAX_RUNS_SAFETY_LIMIT,
+} from "@/research/defaults"
 import { literatureSummary } from "./research-literature-state"
 import { spawnSync } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
@@ -190,10 +196,12 @@ export type ResearchCockpitRecommendation = {
     | "run_autonomous_loop"
     | "resume_publish_pipeline"
     | "run_smoke"
+    | "run_full"
     | "export_report"
     | "review_state"
   title: string
   detail: string
+  candidateID?: string
 }
 
 export type ResearchCockpitNbaAction = {
@@ -201,6 +209,7 @@ export type ResearchCockpitNbaAction = {
   title: string
   detail: string
   action: ResearchCockpitRecommendation["action"]
+  candidateID?: string
 }
 
 const researchRefreshEventTypes = new Set([
@@ -268,7 +277,9 @@ export function buildResearchCockpitWorkflow(input: ResearchCockpitWorkflowInput
   const agentWorkflow = buildResearchCockpitAgentWorkflow(input)
   const hasTrainEval = agentWorkflow.some((item) => item.label === "TrainEval Agent" && item.status === "done")
   const hasPendingApproval = input.approvals.some((approval) => approval.status === "pending")
-  const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
+  const hasBundle = input.artifacts.some(
+    (artifact) => artifact.kind === "research_final_bundle" || artifact.kind === "model_export_package",
+  )
   const canPublish = Boolean(input.champion) || hasTrainEval
 
   return [
@@ -384,6 +395,19 @@ export function buildResearchCockpitRecommendation(input: ResearchCockpitWorkflo
       action: nba.action,
       title: nba.title,
       detail: nba.detail,
+      candidateID: nba.candidateID,
+    }
+  }
+  if (
+    input.task &&
+    input.artifacts.some(
+      (artifact) => artifact.kind === "research_final_bundle" || artifact.kind === "model_export_package",
+    )
+  ) {
+    return {
+      action: "review_state",
+      title: "Review final report",
+      detail: "Open the final PublishAgent report and exported research artifacts.",
     }
   }
   if (input.runs.some((run) => run.status === "queued" || run.status === "running")) {
@@ -421,7 +445,9 @@ export function selectNextBestAction(input: ResearchCockpitWorkflowInput): Resea
   const intentConfirmed = hasIntentConfirmation(input) || hasProfile
   const hasCandidates = input.candidates.length > 0
   const hasSucceededRun = input.runs.some((run) => run.status === "succeeded" && run.stage !== "profile")
-  const hasBundle = input.artifacts.some((artifact) => artifact.kind === "research_final_bundle")
+  const hasBundle = input.artifacts.some(
+    (artifact) => artifact.kind === "research_final_bundle" || artifact.kind === "model_export_package",
+  )
   const runnableCandidate = input.candidates.find(canRunResearchCockpitCandidate)
   const hasActiveRun = input.runs.some((run) => run.status === "queued" || run.status === "running")
 
@@ -433,6 +459,7 @@ export function selectNextBestAction(input: ResearchCockpitWorkflowInput): Resea
       detail: "Enter a research goal to create a full-recipe autonomous task, or use /new csv to bind a local CSV.",
     }
   }
+  if (hasBundle) return null
   if (hasActiveRun) return null
   if (pendingApproval) {
     return {
@@ -516,6 +543,23 @@ export function selectNextBestAction(input: ResearchCockpitWorkflowInput): Resea
         action: "resume_publish_pipeline",
         title: "Resume pipeline: reflection & publish",
         detail: "Model selection approved — resume pipeline to run reflection, ref_test, and export the final bundle.",
+      }
+    }
+    const verifiedSmoke = input.runs
+      .filter((run) => run.stage === "smoke" && run.status === "succeeded" && run.candidateID &&
+        asRecord(run.resourceUsage?.executionContract).status === "verified")
+      .toSorted((a, b) => b.time.created - a.time.created)
+      .find((run) =>
+        input.candidates.some((candidate) => candidate.id === run.candidateID && canRunResearchCockpitCandidate(candidate)) &&
+        !input.runs.some((other) => other.candidateID === run.candidateID && other.stage === "full"),
+      )
+    if (verifiedSmoke) {
+      return {
+        command: "/run full",
+        action: "run_full",
+        title: "Run full training",
+        candidateID: verifiedSmoke.candidateID,
+        detail: `Smoke verification passed for ${verifiedSmoke.candidateID}. Run full training to produce the primary metric.`,
       }
     }
     return {
@@ -648,12 +692,12 @@ function hasRequirementsConfirmation(input: Pick<ResearchCockpitWorkflowInput, "
 }
 
 function modelDesignerIteration(input: Pick<ResearchCockpitWorkflowInput, "task" | "runs">) {
-  // Capped at the autonomous loop's default maxIterations (20, see autonomousLoopMaxIterations
-  // in research/service.ts) so the displayed denominator never promises more iterations than the
-  // loop will actually run.
-  const maxRuns =
-    typeof input.task?.budget.maxRuns === "number" ? Math.min(20, Math.max(1, Math.floor(input.task.budget.maxRuns))) : undefined
-  if (!maxRuns) return undefined
+  const budget = asRecord(input.task?.budget)
+  const loop = asRecord(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
+  const maxIterations =
+    typeof loop.maxIterations === "number" && Number.isFinite(loop.maxIterations)
+      ? Math.max(1, Math.floor(loop.maxIterations))
+      : NAS_DEFAULT_MAX_ITERATIONS
   const candidateIDs = new Set(
     input.runs
       .filter((run) => run.stage !== "profile" && typeof run.candidateID === "string" && run.candidateID.length > 0)
@@ -661,8 +705,8 @@ function modelDesignerIteration(input: Pick<ResearchCockpitWorkflowInput, "task"
   )
   const fallbackAttemptCount = input.runs.filter((run) => run.stage !== "profile").length
   const completedAttempts = candidateIDs.size > 0 ? candidateIDs.size : fallbackAttemptCount
-  const iteration = Math.min(maxRuns, completedAttempts + 1)
-  return `iteration ${iteration}/${maxRuns}`
+  const iteration = Math.min(maxIterations, completedAttempts + 1)
+  return `iteration ${iteration}/${maxIterations}`
 }
 
 export function researchCockpitArtifactTarget(artifact: ResearchCockpitArtifact) {
@@ -912,15 +956,20 @@ export function researchCockpitIntentCheckpointSignature(task: ResearchCockpitTa
   const dataset = asRecord(spec.dataset)
   const objective = asRecord(task.objective)
   const budget = asRecord(task.budget)
+  const loop = asRecord(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   return [
     `mode=${compactIntentValue(interactionModeForTask(task) ?? task.mode)}`,
     `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
     `targets=${compactIntentValue(dataset.targetCols)}`,
+    `pastCovariates=${compactIntentValue(dataset.observedPastCovariates)}`,
+    `futureCovariates=${compactIntentValue(dataset.knownFutureCovariates)}`,
+    `covariateSchema=${compactIntentValue(asRecord(asRecord(spec.metadata).resolvedCovariates).schemaFingerprint)}`,
     `context=${compactIntentValue(spec.contextLength)}`,
     `horizons=${compactIntentValue(spec.predictionLengths)}`,
     `metric=${compactIntentValue(objective.primaryMetric)}`,
     `direction=${compactIntentValue(objective.direction)}`,
-    `maxRuns=${compactIntentValue(budget.maxRuns)}`,
+    `maxIterations=${compactIntentValue(loop.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS)}`,
+    `maxNoImprove=${compactIntentValue(loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
   ].join("|")
 }
 
@@ -929,6 +978,7 @@ export function formatResearchCockpitIntentCheckpointReason(task: ResearchCockpi
   const dataset = asRecord(spec.dataset)
   const objective = asRecord(task.objective)
   const budget = asRecord(task.budget)
+  const loop = asRecord(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   const metadata = asRecord(spec.metadata)
   return [
     "[checkpoint:intent_confirmed]",
@@ -943,7 +993,8 @@ export function formatResearchCockpitIntentCheckpointReason(task: ResearchCockpi
     `Context length: ${compactIntentValue(spec.contextLength)}`,
     `Prediction lengths: ${compactIntentValue(spec.predictionLengths)}`,
     `Primary metric: ${compactIntentValue(objective.primaryMetric)}`,
-    `Budget max runs: ${compactIntentValue(budget.maxRuns)}`,
+    `NAS planned iterations: ${compactIntentValue(loop.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS)}`,
+    `Stop after no improvement: ${compactIntentValue(loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
     `Business context: ${compactIntentValue(metadata.businessContext ?? metadata.business_context)}`,
     "",
     "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并更新 taskSpec/intent slots 后重新运行。",
@@ -1568,7 +1619,7 @@ export function getResearchCockpitRunnerStatus(
     }
   }
   const projectRoot = path.resolve(options.projectRoot ?? process.env.NEO_CAST_PROJECT_ROOT ?? resolvedRoot)
-  if (!preparedDatasetSpecMatchesTask(task, projectRoot)) {
+  if (!preparedDatasetSpecMatchesTask(task, taskExecutionRoot(task, projectRoot))) {
     return {
       configured: true,
       ready: false,
@@ -1839,6 +1890,8 @@ export type TsfResearchTaskDefaults = {
   predictionLengths?: number[]
   bridgeOnly?: boolean
   maxRuns?: number
+  maxIterations?: number
+  maxNoImprove?: number
   maxTrainingSeconds?: number
   interactionMode?: ResearchInteractionMode
   metadata?: JsonRecord
@@ -2043,6 +2096,8 @@ export type SocraticIntentSlotID =
   | "error_preferences"
   | "latency_budget"
   | "parameter_budget"
+  | "max_iterations"
+  | "max_no_improve"
   | "interpretability"
   | "deployment_target"
 
@@ -2121,6 +2176,18 @@ const socraticIntentSlotDefinitions: Array<Omit<SocraticIntentSlot, "status" | "
     id: "parameter_budget",
     label: "参数预算",
     question: "模型参数量或资源预算有什么限制？",
+  },
+  {
+    id: "max_iterations",
+    label: "NAS 计划迭代数",
+    required: false,
+    question: "本次 NAS 搜索计划运行多少轮？默认是 25 轮；请确认默认值或给出新的计划迭代上限。系统安全运行上限会独立执行。",
+  },
+  {
+    id: "max_no_improve",
+    label: "连续无提升停止轮数",
+    required: false,
+    question: "NAS 连续多少轮没有改善时应提前停止？默认是 7 轮，请确认或修改。",
   },
   {
     id: "interpretability",
@@ -2227,6 +2294,8 @@ export function slotFromSocraticQuestion(question: string): string {
   if (/误差偏好|error.*prefer/i.test(question)) return "error_preferences"
   if (/延迟预算|latency.*budget/i.test(question)) return "latency_budget"
   if (/参数预算|parameter.*budget/i.test(question)) return "parameter_budget"
+  if (/NAS.*运行多少轮|计划迭代|planned.*iterations|max.?iterations/i.test(question)) return "max_iterations"
+  if (/连续多少轮.*没有改善|无提升停止|no.?improve/i.test(question)) return "max_no_improve"
   if (/可解释性|interpretab/i.test(question)) return "interpretability"
   if (/部署目标|deployment.*target/i.test(question)) return "deployment_target"
   if (/交互模式|interaction.*mode/i.test(question)) return "interaction_mode"
@@ -2348,6 +2417,16 @@ function socraticSlotValue(
     const value = budget.parameterBudget
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
   }
+  if (slot === "max_iterations") {
+    const loop = asRecord(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
+    const value = loop.maxIterations
+    return typeof value === "number" && Number.isFinite(value) ? String(value) : String(NAS_DEFAULT_MAX_ITERATIONS)
+  }
+  if (slot === "max_no_improve") {
+    const loop = asRecord(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
+    const value = loop.maxNoImprove ?? loop.maxNoImproveRounds
+    return typeof value === "number" && Number.isFinite(value) ? String(value) : String(NAS_DEFAULT_MAX_NO_IMPROVE)
+  }
   if (slot === "interpretability") {
     const value = taskSpec.interpretability ?? objective.interpretability ?? metadata.interpretability
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
@@ -2431,13 +2510,15 @@ export function buildDefaultTsfResearchTask(
       direction: "minimize",
     },
     budget: {
-      maxRuns: defaults.maxRuns ?? 50,
+      maxRuns: defaults.maxRuns ?? RESEARCH_MAX_RUNS_SAFETY_LIMIT,
       maxParallel: 1,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
       parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
-      ...(defaults.maxTrainingSeconds === undefined
-        ? {}
-        : { loop: { timeBudgetSeconds: defaults.maxTrainingSeconds } }),
+      loop: {
+        maxIterations: defaults.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS,
+        maxNoImprove: defaults.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE,
+        ...(defaults.maxTrainingSeconds === undefined ? {} : { timeBudgetSeconds: defaults.maxTrainingSeconds }),
+      },
     },
   }
 }

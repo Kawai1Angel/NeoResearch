@@ -13,6 +13,7 @@ import {
   canExecuteResearchCockpitTask,
   canRunResearchCockpitCandidate,
   findBestResearchCockpitMetric,
+  formatResearchCockpitIntentCheckpointReason,
   formatResearchCockpitArtifactMetadata,
   formatResearchCockpitCandidateArchitectureExpandedLines,
   formatResearchCockpitCandidateRecipeLines,
@@ -35,6 +36,7 @@ import {
   researchCockpitArtifactTarget,
   researchCockpitCandidatePipeline,
   researchCockpitCandidateTitle,
+  researchCockpitIntentCheckpointSignature,
   resolveResearchCockpitProjectRunnerRoot,
   selectNextBestAction,
   shouldRefreshResearchCockpitOnEvent,
@@ -241,6 +243,60 @@ describe("research cockpit data helpers", () => {
       action: "create_task",
       title: "Create a dataset-backed TSF task",
     })
+  })
+
+  test("treats a model export package as a completed PublishAgent result", () => {
+    const currentTask = task({ id: "task_published", status: "completed" })
+    const input = {
+      task: currentTask,
+      candidates: [],
+      runs: [],
+      artifacts: [artifact({ id: "artifact_package", kind: "model_export_package", uri: "file:///tmp/package" })],
+      approvals: [],
+      champion: null,
+      fingerprint: {},
+      runnerReady: false,
+    }
+    expect(buildResearchCockpitWorkflow(input).find((item) => item.label === "Export bundle")?.status).toBe("done")
+    expect(buildResearchCockpitRecommendation(input)).toMatchObject({
+      action: "review_state",
+      title: "Review final report",
+    })
+  })
+
+  test("recommends full training for a verified smoke candidate without a full run", () => {
+    const smoke: ResearchCockpitRun = {
+      id: "smoke_a",
+      candidateID: "candidate_a",
+      stage: "smoke",
+      status: "succeeded",
+      metrics: { val_avg_mse: 0.2 },
+      resourceUsage: { executionContract: { status: "verified" } },
+      time: { created: 2, updated: 2 },
+    }
+    const input = {
+      task: task({ id: "task_a", mode: "autonomous", status: "paused" }),
+      candidates: [candidate({ id: "candidate_a" })],
+      runs: [smoke],
+      artifacts: [],
+      approvals: [],
+      champion: null,
+      fingerprint: { datasetProfile: { rowCount: 100 } },
+      runnerReady: true,
+    }
+
+    expect(selectNextBestAction(input)).toMatchObject({
+      action: "run_full",
+      command: "/run full",
+      candidateID: "candidate_a",
+    })
+    expect(selectNextBestAction({
+      ...input,
+      runs: [...input.runs, {
+        id: "full_a", candidateID: "candidate_a", stage: "full" as const,
+        status: "succeeded" as const, metrics: { cv_avg_mse: 0.3 }, time: { created: 3, updated: 3 },
+      }],
+    })?.action).toBe("run_autonomous_loop")
   })
 
   test("builds cockpit workflow from real task state", () => {
@@ -694,7 +750,7 @@ describe("research cockpit data helpers", () => {
         },
         metadata: { interactionMode: "socratic" },
       },
-      budget: { maxRuns: 50, maxParallel: 1 },
+      budget: { maxRuns: 200, maxParallel: 1, loop: { maxIterations: 25, maxNoImprove: 7 } },
     })
     expect(companionTask).toMatchObject({
       mode: "autonomous",
@@ -946,9 +1002,10 @@ describe("research cockpit data helpers", () => {
       time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
     })
     const projectRoot = await mkdtemp(path.join(tmpdir(), "neo-cast-project-dataset-"))
-    await mkdir(path.join(projectRoot, ".neo-cast"), { recursive: true })
+    const executionRoot = path.join(projectRoot, ".neo-research", "workspaces", "isolated_dataset_state")
+    await mkdir(path.join(executionRoot, ".neo-cast"), { recursive: true })
     await writeFile(
-      path.join(projectRoot, ".neo-cast", "dataset_spec.json"),
+      path.join(executionRoot, ".neo-cast", "dataset_spec.json"),
       `${JSON.stringify({
         schema_version: "dataset.v1",
         source_csv: "/data/ETTh1.csv",
@@ -969,6 +1026,7 @@ describe("research cockpit data helpers", () => {
       task({
         id: "isolated_dataset_state",
         taskSpec: {
+          metadata: { executionIsolation: "task" },
           contextLength: 96,
           predictionLengths: [24],
           dataset: { path: "/data/ETTh1.csv", targetCols: ["OT"] },
@@ -1563,7 +1621,7 @@ describe("research cockpit data helpers", () => {
     expect(result.missingSlots).toEqual(["data_source", "target_columns"])
     expect(result.nextQuestion).toBe("NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
     expect(result.questionCount).toBe(2)
-    expect(result.slots).toHaveLength(15)
+    expect(result.slots).toHaveLength(17)
     expect(result.slots.find((s) => s.id === "data_source")).toMatchObject({
       id: "data_source",
       label: "CSV 数据集路径",
@@ -1603,8 +1661,10 @@ describe("research cockpit data helpers", () => {
       [],
     )
     expect(result.active).toBe(false)
-    expect(result.slots).toHaveLength(15)
+    expect(result.slots).toHaveLength(17)
     expect(result.missingSlots).toContain("primary_metric")
+    expect(result.missingSlots).not.toContain("max_iterations")
+    expect(result.missingSlots).not.toContain("max_no_improve")
     expect(result.missingSlots).not.toContain("data_source")
     expect(result.missingSlots).not.toContain("target_columns")
     expect(result.missingSlots).not.toContain("prediction_horizon")
@@ -1625,6 +1685,16 @@ describe("research cockpit data helpers", () => {
       label: "主指标",
       question: "模型搜索应该优化哪个验证指标？",
       status: "missing",
+    })
+    expect(result.slots.find((s) => s.id === "max_iterations")).toMatchObject({
+      required: false,
+      status: "filled",
+      value: "25",
+    })
+    expect(result.slots.find((s) => s.id === "max_no_improve")).toMatchObject({
+      required: false,
+      status: "filled",
+      value: "7",
     })
   })
 
@@ -1649,6 +1719,26 @@ describe("research cockpit data helpers", () => {
     )
     expect(result.active).toBe(true)
     expect(result.nextQuestion).toBe("预测对象是什么？")
+  })
+
+  test("shows user-confirmed NAS limits and hides the system run cap in the Intent checkpoint", () => {
+    const researchTask = task({
+      id: "task_budget",
+      budget: {
+        maxRuns: 50,
+        loop: { maxIterations: 12, maxNoImprove: 4 },
+      },
+    })
+
+    const signature = researchCockpitIntentCheckpointSignature(researchTask)
+    const reason = formatResearchCockpitIntentCheckpointReason(researchTask)
+    expect(signature).toContain("maxIterations=12")
+    expect(signature).toContain("maxNoImprove=4")
+    expect(signature).not.toContain("maxRuns")
+    expect(reason).toContain("NAS planned iterations: 12")
+    expect(reason).toContain("Stop after no improvement: 4")
+    expect(reason).not.toContain("Budget max runs")
+    expect(reason).not.toContain("maxRuns=50")
   })
 
   test("prefers a newer intent_confirmed checkpoint approval over a stale unresolved ask_user clarification", () => {

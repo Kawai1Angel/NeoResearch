@@ -1,5 +1,6 @@
 import type { JsonRecord, ResearchMemory, ResearchRun, ResearchTask, ResearchTaskID } from "../schema"
 import type { TaskEvidenceBundle, TaskEvidenceEntry, TaskEvidenceRole } from "../retrieve/contract"
+import { NAS_DEFAULT_MAX_ITERATIONS, NAS_DEFAULT_MAX_NO_IMPROVE } from "../defaults"
 
 export type HypothesisStatus = "pending" | "active" | "testing" | "confirmed" | "rejected" | "abandoned"
 
@@ -438,10 +439,11 @@ function hypothesisSearchBiases(hypotheses: readonly HypothesisObject[]) {
   )
 }
 
-function budgetNumber(task: ResearchTask, ...keys: readonly string[]) {
+function loopBudgetNumber(task: ResearchTask, ...keys: readonly string[]) {
   const budget = recordValue(task.budget)
+  const loop = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   for (const key of keys) {
-    const value = numberValue(budget[key])
+    const value = numberValue(loop[key] ?? budget[key])
     if (value !== undefined) return value
   }
   return undefined
@@ -514,10 +516,16 @@ export function buildExperimentPlan(input: {
     ...taskSearchBiases(input.task),
     ...hypothesisSearchBiases(input.hypotheses),
   ])
-  const maxTrials = Math.max(1, Math.floor(budgetNumber(input.task, "maxTrials", "maxRuns") ?? 50))
+  const maxTrials = Math.max(
+    1,
+    Math.floor(loopBudgetNumber(input.task, "maxIterations", "maxTrials") ?? NAS_DEFAULT_MAX_ITERATIONS),
+  )
   const noImprovementRounds = Math.max(
     1,
-    Math.floor(budgetNumber(input.task, "noImprovementRounds", "maxNoImprove") ?? 20),
+    Math.floor(
+      loopBudgetNumber(input.task, "maxNoImprove", "maxNoImproveRounds", "noImprovementRounds") ??
+        NAS_DEFAULT_MAX_NO_IMPROVE,
+    ),
   )
   const targetMetricValue = objectiveNumber(input.task, "targetMetricValue", "targetMetric")
   const toolReferenceBaselineValid =

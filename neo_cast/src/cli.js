@@ -94,7 +94,7 @@ Usage:
   neo-cast design --requirement "small transformer for ETTh1" [--mode socratic|companion] [--max-candidates 3]
                   [--mock-llm] [--use-mutation] [--use-reflection] [--stop-on-keep] [--require-approval]
   neo-cast design --requirement "small transformer for ETTh1" --autonomous [--time-budget 2h]
-                  [--max-no-improve 25] [--mock-llm] [--use-reflection] [--use-mutation]
+                  [--max-no-improve 7] [--mock-llm] [--use-reflection] [--use-mutation]
 
 Commands:
   doctor         Check python3, uv, API key, and resolved config
@@ -115,7 +115,7 @@ Design flags:
   --autonomous       Continue iterating until budget, plateau, or crash stopping conditions are met
   --require-approval Pause after model design and require: neo-cast checkpoint approve model_design
   --time-budget      Autonomous wall-clock budget, e.g. 2h, 90m, 3600s
-  --max-no-improve   Autonomous plateau limit; defaults to 25 consecutive non-improving runs
+  --max-no-improve   Autonomous plateau limit; defaults to 7 consecutive non-improving runs
 
 No API key?
   Use \`--mock-llm\` on design commands, or set \`NEO_CAST_USE_MOCK=1\`, to run the
@@ -914,7 +914,7 @@ async function handleDesign(positionals, rawFlags) {
 
   if (isAutonomous) {
     const { parseTimeBudget, runAutonomousLoop } = require("./loop");
-    const maxNoImprove = Number(rawFlags["max-no-improve"] || 25);
+    const maxNoImprove = Number(rawFlags["max-no-improve"] || 7);
     if (!Number.isFinite(maxNoImprove) || maxNoImprove < 1) {
       console.error("--max-no-improve must be a positive integer");
       return 1;

@@ -1,9 +1,15 @@
-import { updateLiteratureView, type LiteratureView } from "./research-literature-state"
+import { DialogResearchResults } from "@tui/component/dialog-research-results"
+import { useKV } from "@tui/context/kv"
+import { DialogResearchHistory } from "@tui/component/dialog-research-history"
+import type { ResumeState } from "@/research/recovery"
+import { RESEARCH_MAX_RUNS_SAFETY_LIMIT } from "@/research/defaults"
+import { deferBusyIntentReply, isResearchOperation, waitForResearchOperation } from "./research-operation-client"
+import { literatureResultRows, updateLiteratureView, type LiteratureView } from "./research-literature-state"
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
 import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js"
 import { appendFile, mkdir, readFile, writeFile } from "fs/promises"
 import path from "path"
 import { useCommandDialog } from "@tui/component/dialog-command"
@@ -44,7 +50,6 @@ import {
   hasIntentConfirmation,
   interactionModeForTask,
   parseTsfCsvTaskInput,
-  slotFromSocraticQuestion,
   validateTsfCsvTaskInput,
   researchInteractionModeLabel,
   researchCockpitCandidateTitle,
@@ -111,11 +116,14 @@ const researchAgentWorkflowOrder = [
 ]
 const researchAgentFullStageOrder = ["intent", "data", ...researchAgentWorkflowOrder, "publish"]
 
+const requestPreferences = new WeakMap<object, ReturnType<typeof useKV>>()
+
 async function researchRequest<T>(
   sdk: ReturnType<typeof useSDK>,
   path: string,
   init: RequestInit = {},
   timeoutMs = 90_000,
+  onQueued?: () => void,
 ): Promise<T> {
   const url = new URL(path, sdk.url)
   if (sdk.directory) url.searchParams.set("directory", sdk.directory)
@@ -125,8 +133,21 @@ async function researchRequest<T>(
     headers.set("content-type", "application/json")
   }
 
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const signal =
+  const background = isResearchOperation(path, init.method)
+  const preferences = requestPreferences.get(sdk)
+  const receiptKey = `research.request:${sdk.url}:${sdk.directory}:${path}:${typeof init.body === "string" ? init.body : ""}`
+  const clearReceiptKey = () => requestPreferences.get(sdk)?.set(receiptKey, undefined)
+  if (background) {
+    headers.set("prefer", "respond-async")
+    if (!headers.has("idempotency-key")) {
+      const key = preferences?.get(receiptKey) ?? crypto.randomUUID()
+      headers.set("idempotency-key", key)
+      preferences?.set(receiptKey, key)
+    }
+  }
+  // Once accepted, background work is tracked by its operation receipt, not this deadline.
+  const timeoutSignal = AbortSignal.timeout(background ? 30_000 : timeoutMs)
+  const signal = background ? timeoutSignal :
     init.signal && !init.signal.aborted
       ? (AbortSignal as unknown as { any: (signals: AbortSignal[]) => AbortSignal }).any?.([
           init.signal,
@@ -139,14 +160,36 @@ async function researchRequest<T>(
     response = await sdk.fetch(url, { ...init, headers, signal })
   } catch (err) {
     if (err instanceof Error && err.name === "TimeoutError") {
+      if (background) throw Object.assign(new Error("Lost the research start receipt. Work may still be running; resume the same command to reconnect."), { name: "ResearchOperationUnknown" })
       throw new Error(`Request timed out after ${timeoutMs / 1000}s (${path})`)
     }
+    if (background) throw Object.assign(new Error(`Unable to confirm research start; resume the same command to reconnect. ${formatError(err)}`), { name: "ResearchOperationUnknown" })
     throw err
+  }
+  if (background && response.status === 409) {
+    response = await deferBusyIntentReply({
+      response, url, headers, signal: init.signal, onQueued,
+      fetch: (target, options) => sdk.fetch(target, options),
+      retry: () => sdk.fetch(url, { ...init, headers, signal: AbortSignal.timeout(30_000) }),
+    }).catch((error) => {
+      if (error?.name !== "ResearchOperationUnknown" && init.signal?.reason !== "detached") clearReceiptKey()
+      throw error
+    })
   }
   if (!response.ok) {
     const text = await response.text()
     throw new Error(text || `${response.status} ${response.statusText}`)
   }
+  if (response.status === 202 && background) {
+    return waitForResearchOperation<T>({
+      operation: await response.json(), url, headers, signal: init.signal,
+      fetch: (target, options) => sdk.fetch(target, options),
+    }).then((result) => { clearReceiptKey(); return result }).catch((error) => {
+      if (error?.name !== "ResearchOperationUnknown" && init.signal?.reason !== "detached") clearReceiptKey()
+      throw error
+    })
+  }
+  if (background) clearReceiptKey()
   return (await response.json()) as T
 }
 
@@ -220,14 +263,15 @@ function isHumanCheckpointRequired(err: unknown): boolean {
   const payload = parseBlockedErrorPayload(err)
   if (!payload) return false
   return (
-    payload.reason === "human_checkpoint_required" || payload.reason === "reflection_requested_human_review" || payload.reason === "execution_contract_violation"
+    payload.reason === "human_checkpoint_required" || payload.reason === "human_checkpoint_rejected" || payload.reason === "reflection_requested_human_review" || payload.reason === "execution_contract_violation"
   )
 }
 
 function formatCheckpointMessage(err: unknown): string {
   const blocked = parseBlockedErrorPayload(err)
   if (!blocked) return "等待 checkpoint 确认"
-  if (blocked.reason === "execution_contract_violation") return "执行契约不一致，任务已暂停。查看 protocol checkpoint 和 blocker，修复后 /approve 重新验证原 candidate。"
+  if (blocked.reason === "human_checkpoint_rejected") return `${blocked.checkpointPhase ?? "当前"} 已拒绝，流程已暂停；修改决定并批准后才会继续。`
+  if (blocked.reason === "execution_contract_violation") return "执行契约不一致，任务已暂停。实现错误修复后 /approve 重试原 candidate；candidate 设计错误则 /reject 废弃并重新设计。"
   if (blocked.reason === "reflection_requested_human_review") return "Reflection Agent 建议人工介入 — /approve 确认后继续发布"
   return blocked.checkpointPhase ? `等待 ${blocked.checkpointPhase} checkpoint 确认` : "等待 checkpoint 确认"
 }
@@ -437,7 +481,12 @@ function progressRecordNumber(record: JsonRecord, key: string) {
 function formatRunnerProgressLine(data: RunnerProgressLineEvent): string | null {
   if (data.event === "batch_progress") return null
   if (data.event === "epoch_end") {
-    return `epoch ${data.epoch ?? "?"} | h${data.horizon ?? "?"} | val_loss ${data.valLoss?.toFixed(4) ?? "?"}`
+    const record = parseRunnerProgressRecord(data.line)
+    const foldIndex = data.foldIndex ?? progressRecordNumber(record, "foldIndex") ?? progressRecordNumber(record, "cv_fold_index")
+    const fold = foldIndex === undefined ? undefined : `fold ${foldIndex + 1}`
+    return [fold, `epoch ${data.epoch ?? "?"}`, `h${data.horizon ?? "?"}`, `val_loss ${data.valLoss?.toFixed(4) ?? "?"}`]
+      .filter((part): part is string => part !== undefined)
+      .join(" | ")
   }
   if (data.event === "timeout") {
     return `timeout after ${data.elapsedS === undefined ? "?" : Math.round(data.elapsedS)}s`
@@ -608,6 +657,7 @@ type RunnerProgressLineEvent = {
   horizon?: number
   valLoss?: number
   elapsedS?: number
+  foldIndex?: number
 }
 
 type StreamingChatTextPart = {
@@ -897,7 +947,7 @@ function hasMeaningfulFingerprint(value: unknown) {
 
 function isFinalResearchArtifact(artifact: ResearchCockpitArtifact) {
   const kind = artifact.kind.toLowerCase()
-  return kind.includes("final") || kind.includes("bundle")
+  return kind.includes("final") || kind.includes("bundle") || kind === "model_export_package"
 }
 
 function compactStreamTextParts(value: string) {
@@ -1155,6 +1205,8 @@ export function ResearchCockpit() {
   let promptInput: TextareaRenderable | undefined
   let focusTimer: ReturnType<typeof setTimeout> | undefined
   const sdk = useSDK()
+  const kv = useKV()
+  requestPreferences.set(sdk, kv)
   const event = useEvent()
   const route = useRoute()
   const dimensions = useTerminalDimensions()
@@ -1168,11 +1220,26 @@ export function ResearchCockpit() {
   let streamEventID = 0
   const [refresh, setRefresh] = createSignal(0)
   const [selectedIndex, setSelectedIndex] = createSignal(0)
-  const [selectedTaskID, setSelectedTaskID] = createSignal<string>()
+  const [selectedTaskID, setSelectedTaskID] = createSignal<string | undefined>(route.data.type === "cockpit" ? route.data.taskID : undefined)
+  createEffect(() => { if (route.data.type === "cockpit" && route.data.taskID) setSelectedTaskID(route.data.taskID) })
+  let restoredPreference = false
+  createEffect(() => {
+    if (!kv.ready || restoredPreference) return
+    restoredPreference = true
+    if (route.data.type === "cockpit" && !route.data.taskID && !route.data.researchGoal && !route.data.newCsvTask && !selectedTaskID()) {
+      const previous = kv.get(`research.lastTask:${sdk.directory ?? sdk.url}`)
+      if (typeof previous === "string") setSelectedTaskID(previous)
+    }
+  })
+  createEffect(() => {
+    const id = selectedTaskID()
+    if (id) untrack(() => kv.set(`research.lastTask:${sdk.directory ?? sdk.url}`, id))
+  })
   const [selectedCandidateIndex, setSelectedCandidateIndex] = createSignal(0)
   const [selectedCandidateID, setSelectedCandidateID] = createSignal<string>()
   const [selectedAgentStageIndex, setSelectedAgentStageIndex] = createSignal<number>()
   const [busy, setBusy] = createSignal<string>()
+  const [busyStartedAt, setBusyStartedAt] = createSignal<number>()
   const [chatBusy, setChatBusy] = createSignal<string>()
   const [error, setError] = createSignal<string>()
   const [errorEvents, setErrorEvents] = createSignal<Array<{ id: number; action: string; text: string }>>([])
@@ -1215,6 +1282,7 @@ export function ResearchCockpit() {
     taskID?: string
     text: string
     done: boolean
+    afterTraining: boolean
   } | undefined>()
   type HypoPartEntry =
     | { partID: string; kind: "text"; text: string }
@@ -1332,9 +1400,10 @@ export function ResearchCockpit() {
     void showResearchCockpitOnboarding()
   })
   onCleanup(() => {
+    requestPreferences.delete(sdk)
     if (focusTimer) clearTimeout(focusTimer)
     stopActiveApiTimer()
-    activeActionAbort?.abort()
+    activeActionAbort?.abort("detached")
     activeChatAbort?.abort()
   })
 
@@ -1501,6 +1570,9 @@ export function ResearchCockpit() {
   })
 
   const sortedTasks = createMemo(() => sortResearchCockpitTasks(tasks() ?? []))
+  createEffect(() => {
+    if (kv.ready && !selectedTaskID() && sortedTasks()[0]) setSelectedTaskID(sortedTasks()[0].id)
+  })
   const selectedTaskIndex = createMemo(() => {
     const tasks = sortedTasks()
     if (tasks.length === 0) return 0
@@ -1511,44 +1583,152 @@ export function ResearchCockpit() {
     }
     return Math.max(0, Math.min(selectedIndex(), tasks.length - 1))
   })
-  const selectedTask = createMemo(() => sortedTasks()[selectedTaskIndex()])
+  const [directTask] = createResource(() => selectedTaskID() ? { id: selectedTaskID()!, refresh: refresh() } : undefined, async ({ id }) => {
+    try { return await researchRequest<ResearchCockpitTask>(sdk, `/research/tasks/${encodeURIComponent(id)}`) }
+    catch (error) {
+      if (selectedTaskID() === id) {
+        const text = `无法打开研究 ${id}：${formatError(error)}`
+        setError(text)
+        setErrorEvents([{ id: ++streamEventID, action: "历史研究", text }])
+      }
+      return undefined
+    }
+  })
+  const selectedTask = createMemo(() => selectedTaskID()
+    ? directTask()?.id === selectedTaskID() ? directTask() : sortedTasks().find((task) => task.id === selectedTaskID())
+    : sortedTasks()[selectedTaskIndex()])
+  const selectedTaskKey = createMemo(() => selectedTask()?.id)
   const selectedTaskSource = createMemo(() => {
-    const task = selectedTask()
-    if (!task) return undefined
+    const taskID = selectedTaskKey()
+    if (!taskID) return undefined
     return {
-      taskID: task.id,
+      taskID,
       refresh: refresh(),
     }
   })
-  let selectedAgentStageTaskID: string | undefined
-
+  const [recovery] = createResource(selectedTaskSource, async ({ taskID }) =>
+    researchRequest<ResumeState>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume-state`))
+  const [historyEvents, setHistoryEvents] = createSignal<Array<{ sequence: number; summary: string }>>([])
   createEffect(() => {
-    const count = sortedTasks().length
-    const id = selectedTaskID()
-    if (count === 0) {
-      if (selectedIndex() !== 0) setSelectedIndex(0)
-      setSelectedTaskID(undefined)
+    const taskID = selectedTaskKey()
+    setHistoryEvents([])
+    if (!taskID) return
+    let disposed = false
+    let pending = false
+    let cursor = 0
+    const pull = async () => {
+      if (pending || disposed) return
+      pending = true
+      try {
+        const events = await researchRequest<Array<{ sequence: number; summary: string }>>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/events?after=${cursor}`)
+        if (disposed || !Array.isArray(events)) return
+        const fresh = events.filter((event) => event.sequence > cursor)
+        if (!fresh.length) return
+        cursor = fresh.at(-1)!.sequence
+        setHistoryEvents((previous) => [...previous, ...fresh].slice(-100))
+        setRefresh((value) => value + 1)
+      } catch { /* A later pull resumes from the same cursor after a disconnect. */ }
+      finally { pending = false }
+    }
+    void pull()
+    const timer = setInterval(pull, 2000)
+    onCleanup(() => { disposed = true; clearInterval(timer) })
+  })
+  type CockpitHistoryPart = {
+    id?: string
+    type: string
+    text?: string
+    synthetic?: boolean
+    tool?: string
+    state?: {
+      status?: string
+      input?: Record<string, unknown>
+      output?: string
+      error?: string
+      time?: { start?: number; end?: number }
+    }
+  }
+  type CockpitHistoryMessage = {
+    source: "chat" | "intent"
+    info: { role: string; time?: { created: number } }
+    parts: CockpitHistoryPart[]
+  }
+  const [historyMessages] = createResource(() => {
+    const state = recovery()
+    if (!state || state.taskID !== selectedTask()?.id) return undefined
+    const sessions: Array<{ sessionID: string; source: "chat" | "intent" }> = []
+    if (state.chatSessionID) sessions.push({ sessionID: state.chatSessionID, source: "chat" })
+    if (state.intentSessionID) sessions.push({ sessionID: state.intentSessionID, source: "intent" })
+    return sessions.length ? JSON.stringify({ taskID: state.taskID, sessions }) : undefined
+  }, async (key) => {
+    const { taskID, sessions } = JSON.parse(key) as {
+      taskID: string
+      sessions: Array<{ sessionID: string; source: "chat" | "intent" }>
+    }
+    const groups = await Promise.all(sessions.map(async ({ sessionID, source }) => {
+      try {
+        const messages = await researchRequest<Array<Omit<CockpitHistoryMessage, "source">>>(sdk, `/session/${encodeURIComponent(sessionID)}/message`)
+        return messages.map((message) => ({ ...message, source }))
+      } catch { return [] as CockpitHistoryMessage[] }
+    }))
+    return { taskID, messages: groups.flat().sort((a, b) => (a.info.time?.created ?? 0) - (b.info.time?.created ?? 0)) }
+  })
+
+  async function appendResearch() {
+    const taskID = selectedTask()?.id
+    if (!taskID) return
+    const value = await DialogPrompt.show(dialog, "追加研究：迭代预算（系统运行安全上限固定为 200）", { placeholder: "例如 5", value: "5" })
+    if (!value) return
+    const maxIterations = Number(value)
+    if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 200) { toast.show({ variant: "error", message: "请输入 1–200 的整数" }); return }
+    const state = await researchRequest<ResumeState>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume-state`)
+    await runAction("追加研究", async () => {
+      await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/cycles`, { method: "POST", body: JSON.stringify({ expectedRevision: state.revision, requestKey: crypto.randomUUID(), maxIterations, maxRuns: RESEARCH_MAX_RUNS_SAFETY_LIMIT }) })
+      return "新研究周期已创建；点击继续研究开始执行"
+    })
+  }
+
+  const recoveryActionLabel = () => ({ running: "查看运行", waiting_input: "查看问题 / 审批", resumable: "继续研究", needs_reconciliation: "检查状态", blocked: "查看原因", completed: "查看结果" })[recovery()?.recoveryState ?? "resumable"]
+  async function resumeResearch() {
+    const taskID = selectedTask()?.id
+    if (!taskID) return
+    const state = await researchRequest<ResumeState>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume-state`)
+    if (state.activeOperation && !state.activeOperation.recoveryRequired) {
+      await runAction("查看运行", async (signal) => {
+        await waitForResearchOperation({ operation: state.activeOperation!, url: new URL(sdk.url), headers: new Headers(sdk.directory ? { "x-opencode-directory": sdk.directory } : {}), signal, fetch: (url, init) => sdk.fetch(url, init) })
+        return "研究操作已结束"
+      }, { startedAt: state.activeOperation.startedAt })
       return
     }
-    if (id && !sortedTasks().some((task) => task.id === id)) {
-      setSelectedTaskID(undefined)
-    }
-    const index = selectedTaskIndex()
-    if (selectedIndex() !== index) {
-      setSelectedIndex(index)
-    }
-  })
+    if (state.recoveryState === "completed") { dialog.replace(() => <DialogResearchResults taskID={taskID} />); return }
+    if (state.recoveryState !== "resumable" && state.recoveryState !== "needs_reconciliation") { appendCockpitNotice("resume-state", state.summary); return }
+    await runAction("继续研究", async (signal) => {
+      await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume`, { method: "POST", signal, body: JSON.stringify({ expectedRevision: state.revision, requestKey: crypto.randomUUID() }) })
+      return "研究已继续，状态已更新"
+    })
+  }
+
+  let selectedAgentStageTaskID: string | undefined
 
   createEffect(() => {
     const taskID = selectedTask()?.id
     if (selectedAgentStageTaskID === taskID) return
     selectedAgentStageTaskID = taskID
+    setStreamingChat(undefined)
+    setPromptEvents([])
+    setActionEvents([])
+    setErrorEvents([])
+    setRunnerOutputLines([])
+    setDesignLLMLines([])
     setSelectedAgentStageIndex(undefined)
   })
 
   const unsubscribeResearchEvents = event.subscribe((payload) => {
     handleStreamingChatEvent(payload)
     const researchPayload = payload as { type: string; properties?: unknown }
+    const props = researchPayload.properties as { taskID?: string; task?: { id: string }; run?: { taskID: string }; candidate?: { taskID: string }; approval?: { taskID: string } } | undefined
+    const eventTaskID = props?.taskID ?? props?.task?.id ?? props?.run?.taskID ?? props?.candidate?.taskID ?? props?.approval?.taskID
+    if (eventTaskID && eventTaskID !== selectedTask()?.id) return
     if (researchPayload.type === "research.runner.progress.line") {
       const data = researchPayload.properties as Partial<RunnerProgressLineEvent> | undefined
       if (!data || typeof data.runID !== "string" || typeof data.line !== "string") return
@@ -1584,10 +1764,6 @@ export function ResearchCockpit() {
       if (!next || next === previous) return
       setLiteratureView(next)
       setLiveAgentEventStage(next.status === "running" ? "LiteratureAgent" : undefined)
-      if (next.status !== "running" && (previous?.taskID !== next.taskID || previous?.status !== next.status)) {
-        appendDesignLLMLines(next.rows.map((row) => ({ id: ++streamEventID, taskID: next.taskID, text: row.text,
-          tone: next.status === "failed" ? "error" as const : "muted" as const })))
-      }
       setRefresh((value) => value + 1)
       return
     }
@@ -1672,7 +1848,11 @@ export function ResearchCockpit() {
       const task = selectedTask()
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("HypoPlanner Agent")
-      setHypoPlannerStream({ id: ++streamEventID, taskID, text: "", done: false })
+      setHypoPlannerStream({ id: ++streamEventID, taskID, text: "", done: false,
+        afterTraining: taskRuns().some((run) =>
+          (run.stage === "low_fidelity" || run.stage === "full" || run.stage === "ref_test" || run.stage === "blind_test") &&
+          (run.status === "succeeded" || run.status === "failed")),
+      })
       setHypoPartMap(new Map())
       setHypoPartOrder([])
       currentHypoTextPartID = undefined
@@ -2058,6 +2238,12 @@ export function ResearchCockpit() {
         setRefresh((value) => value + 1)
         return
       } else if (researchPayload.type === "research.agent.hypoPlanner.completed") {
+        if (hypoPlannerStream() && !hypoPlannerStream()!.afterTraining) {
+          setHypoPlannerStream((prev) => prev ? { ...prev, done: true } : prev)
+          setLiveAgentEventStage(undefined)
+          setRefresh((value) => value + 1)
+          return
+        }
         // Push HypoPlanner result into the chronological designLLMLines so it appears
         // after Reflection output at the bottom — not above it in the fixed stream block.
         const hypoNewLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
@@ -2114,6 +2300,7 @@ export function ResearchCockpit() {
       if (task && taskID && taskID !== task.id) return
       const meta = data?.metadata ?? {}
       const artifactPath = typeof meta.path === "string" ? meta.path : undefined
+      const reportPath = typeof meta.reportPath === "string" ? meta.reportPath : undefined
       const kind = typeof meta.kind === "string" ? meta.kind : undefined
       const championCandidateID = typeof meta.championCandidateID === "string" ? meta.championCandidateID : undefined
       const championPrimaryMetric = typeof meta.championPrimaryMetric === "number" ? meta.championPrimaryMetric : undefined
@@ -2165,6 +2352,10 @@ export function ResearchCockpit() {
         }
       }
       if (artifactPath) newLines.push({ id: ++streamEventID, taskID, text: `  ${artifactPath}`, tone: "muted" })
+      if (reportPath) {
+        const target = reportPath.startsWith("file://") ? reportPath.slice("file://".length) : reportPath
+        newLines.push({ id: ++streamEventID, taskID, text: `  最终研究报告: ${target}`, tone: "success" })
+      }
       appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
       setRefresh((value) => value + 1)
@@ -2243,7 +2434,7 @@ export function ResearchCockpit() {
       const phase = data?.phase ?? "checkpoint"
       const reasonLines = (data?.reason ?? "")
         .split("\n")
-        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+        .filter((l) => l.trim().length > 0 && !l.startsWith("Checkpoint signature:") && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
       appendDesignLLMLines([
         { id: ++streamEventID, taskID, text: `[Checkpoint:${phase}] ✓ auto-approved`, tone: "muted" as const },
         ...reasonLines.map((l) => ({ id: ++streamEventID, taskID, text: `  ${l}`, tone: "muted" as const })),
@@ -2273,7 +2464,7 @@ export function ResearchCockpit() {
   })
 
   const [runs] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitRun[]>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/runs`)
+    return researchRequest<ResearchCockpitRun[]>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/runs`).then((items) => items.map((item) => ({ ...item, taskID: source.taskID })))
   })
 
   const [candidates] = createResource(selectedTaskSource, async (source) => {
@@ -2290,15 +2481,17 @@ export function ResearchCockpit() {
     )
   })
 
-  const [taskFingerprint] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<JsonRecord>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/fingerprint`)
-  })
+  const [fingerprintSnapshot] = createResource(selectedTaskSource, async (source) => ({
+    taskID: source.taskID,
+    value: await researchRequest<JsonRecord>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/fingerprint`),
+  }))
+  const taskFingerprint = () => fingerprintSnapshot()?.taskID === selectedTask()?.id ? fingerprintSnapshot()?.value : undefined
 
   const [approvals] = createResource(selectedTaskSource, async (source) => {
     return researchRequest<ResearchCockpitApproval[]>(
       sdk,
       `/research/tasks/${encodeURIComponent(source.taskID)}/approvals?limit=20`,
-    )
+    ).then((items) => items.map((item) => ({ ...item, taskID: source.taskID })))
   })
 
   const [champion] = createResource(selectedTaskSource, async (source) => {
@@ -2308,7 +2501,11 @@ export function ResearchCockpit() {
     )
   })
 
-  const pendingApproval = createMemo(() => approvals()?.find((approval) => approval.status === "pending"))
+  const pendingApproval = createMemo(() => approvals()?.find((approval) => approval.taskID === selectedTask()?.id && approval.status === "pending"))
+  const rejectedCheckpoint = createMemo(() => selectedTask()?.status === "paused"
+    ? approvals()?.find((item) => item.taskID === selectedTask()?.id && item.status === "rejected" && item.kind === "protocol" &&
+      /\[checkpoint:(search_space_confirmed|final_model_selection|reflection_review|report_release)\]/.test(item.reason))
+    : undefined)
   const chatAwaitingFirstToken = createMemo(() => !!chatBusy() || (!!streamingChat() && !streamingChat()?.text))
   const currentActionProposal = createMemo(() => parseAgentActionProposal(streamingChat()?.text))
   const activeApiAction = createMemo(() => {
@@ -2325,7 +2522,7 @@ export function ResearchCockpit() {
     }
     if (activeApiActionKey !== active) {
       activeApiActionKey = active
-      setActiveApiStartedAt(Date.now())
+      setActiveApiStartedAt(busyStartedAt() ?? Date.now())
       setActiveApiTick(0)
     }
     if (!activeApiTimer) {
@@ -2344,12 +2541,16 @@ export function ResearchCockpit() {
     if (!active || !elapsed) return undefined
     return workingActionText(active, elapsed, activeApiTick())
   })
-  const runnerStatus = createMemo(() => getResearchCockpitRunnerStatus(selectedTask(), { validateRuntime: true }))
+  const runnerStatus = createMemo(() => {
+    // Dataset preparation changes files without necessarily changing the task record.
+    refresh()
+    return getResearchCockpitRunnerStatus(selectedTask(), { validateRuntime: true, projectRoot: sdk.directory })
+  })
   const runnerReady = createMemo(() => runnerStatus().ready)
-  const taskCandidates = createMemo(() => candidates() ?? [])
-  const taskRuns = createMemo(() => runs() ?? [])
-  const taskArtifacts = createMemo(() => artifacts() ?? [])
-  const taskApprovals = createMemo(() => approvals() ?? [])
+  const taskCandidates = createMemo(() => (candidates() ?? []).filter((item) => item.taskID === selectedTask()?.id))
+  const taskRuns = createMemo(() => (runs() ?? []).filter((item) => item.taskID === selectedTask()?.id))
+  const taskArtifacts = createMemo(() => (artifacts() ?? []).filter((item) => item.taskID === selectedTask()?.id))
+  const taskApprovals = createMemo(() => (approvals() ?? []).filter((item) => item.taskID === selectedTask()?.id))
   const intentConfirmed = createMemo(() =>
     hasIntentConfirmation({
       task: selectedTask(),
@@ -2466,13 +2667,21 @@ export function ResearchCockpit() {
       runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
     }),
   )
-  async function runAction(name: string, fn: (signal: AbortSignal) => Promise<string>) {
+  async function runAction(
+    name: string,
+    fn: (signal: AbortSignal) => Promise<string>,
+    options: { startedAt?: number } = {},
+  ) {
+    const actionTaskID = selectedTask()?.id
     const run = async () => {
+      if (actionTaskID !== selectedTask()?.id) return
       const abortController = new AbortController()
       activeActionAbort = abortController
+      setBusyStartedAt(options.startedAt)
       setBusy(name)
       try {
         const message = await fn(abortController.signal)
+        if (actionTaskID !== selectedTask()?.id) return
         setError(undefined)
         setActionEvents((events) => [
           ...events.slice(-(promptEventHistoryLimit - 1)),
@@ -2481,6 +2690,7 @@ export function ResearchCockpit() {
         toast.show({ variant: "info", message })
         setRefresh((value) => value + 1)
       } catch (err) {
+        if (actionTaskID !== selectedTask()?.id) return
         if (!abortController.signal.aborted && isHumanCheckpointRequired(err)) {
           const message = formatCheckpointMessage(err)
           setActionEvents((events) => [
@@ -2490,7 +2700,7 @@ export function ResearchCockpit() {
           toast.show({ variant: "info", message })
           setRefresh((value) => value + 1)
         } else {
-          const message = abortController.signal.aborted
+          const message = abortController.signal.aborted && !(err instanceof Error && err.name === "ResearchOperationUnknown")
             ? name === "chat"
               ? "Chat request canceled."
               : `${name} canceled.`
@@ -2503,8 +2713,10 @@ export function ResearchCockpit() {
           toast.show({ variant: "error", message })
         }
       } finally {
+        if (actionTaskID === selectedTask()?.id) setRefresh((value) => value + 1)
         if (activeActionAbort === abortController) activeActionAbort = undefined
         setBusy(undefined)
+        setBusyStartedAt(undefined)
       }
     }
     const queued = actionQueue.then(run, run)
@@ -2554,6 +2766,28 @@ export function ResearchCockpit() {
       activeActionAbort?.abort()
       return true
     }
+    const task = selectedTask()
+    if (task && notifyIdle) {
+      void runAction("cancel-research-operation", async () => {
+        const operation = await researchRequest<import("@/research/operation").ResearchOperation | null>(
+          sdk, `/research/tasks/${encodeURIComponent(task.id)}/operations/active`,
+        )
+        if (!operation) return "No active research operation to abort."
+        const controller = new AbortController()
+        controller.abort()
+        const url = new URL(`/research/tasks/${encodeURIComponent(task.id)}/pipeline`, sdk.url)
+        if (sdk.directory) url.searchParams.set("directory", sdk.directory)
+        try {
+          await waitForResearchOperation({ operation, url, headers: new Headers(), signal: controller.signal,
+            fetch: (target, options) => sdk.fetch(target, options),
+          })
+        } catch (error) {
+          if (!(error instanceof Error && error.name === "AbortError")) throw error
+        }
+        return "Research operation stopped."
+      })
+      return true
+    }
     if (notifyIdle) {
       toast.show({
         variant: "info",
@@ -2565,11 +2799,13 @@ export function ResearchCockpit() {
   }
 
   async function runChatAction(fn: (signal: AbortSignal) => Promise<string>) {
+    const actionTaskID = selectedTask()?.id
     const abortController = new AbortController()
     activeChatAbort = abortController
     setChatBusy("chat")
     try {
       const message = await fn(abortController.signal)
+      if (selectedTask()?.id !== actionTaskID) return
       setError(undefined)
       if (message) {
         setActionEvents((events) => [
@@ -2580,6 +2816,7 @@ export function ResearchCockpit() {
       }
       setRefresh((value) => value + 1)
     } catch (err) {
+      if (selectedTask()?.id !== actionTaskID) return
       const message = abortController.signal.aborted ? "Chat request canceled." : formatError(err)
       setError(message)
       setErrorEvents((events) => [
@@ -2624,6 +2861,10 @@ export function ResearchCockpit() {
           ...(interactionMode === undefined ? {} : { interactionMode }),
         },
       )
+      const selectedModel = local?.model.current()
+      if (selectedModel) payload.taskSpec.metadata = {
+        ...(payload.taskSpec.metadata as JsonRecord ?? {}), sessionModel: selectedModel,
+      }
       const task = await researchRequest<ResearchCockpitTask>(sdk, "/research/tasks", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -2631,24 +2872,17 @@ export function ResearchCockpit() {
       registerNewTask(task)
       setSelectedIndex(0)
       setSelectedTaskID(task.id)
+      route.navigate({ type: "cockpit", taskID: task.id })
       kickOffIntentAgent(task.id)
       return `${task.title} created`
     })
   }
 
-  // runFullPipeline() runs the IntentAgent session first, before anything else — for a
-  // brand-new task with unfilled slots it always pauses there (PipelineBlockedError,
-  // "intent_clarification_required"), which is expected and not surfaced to the user; the
-  // point of this call is purely the side effect of starting the session so the cockpit's
-  // [IntentAgent] stream (read_taskspec / ask_user / ...) begins immediately instead of
-  // waiting for some other trigger. Fire-and-forget: nothing here should block task creation.
+  // Start the IntentAgent session so its stream appears as soon as a task is created.
+  // The training pipeline starts only after the user chooses a research action.
   function kickOffIntentAgent(taskID: string) {
-    // Bound maxIterations so the rare "all slots already filled" case (e.g. a fully
-    // specified CSV input) can't silently run a long autonomous loop as a side effect of
-    // task creation — it should still stop and let the user drive iteration from there.
-    void researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/pipeline`, {
+    void researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/intent/start`, {
       method: "POST",
-      body: JSON.stringify({ stage: "smoke", maxIterations: 1 }),
     }).catch(() => undefined)
   }
 
@@ -2705,18 +2939,18 @@ export function ResearchCockpit() {
       await confirmIntentCheckpoint()
       return
     }
-    await runAction("seed-baselines", async () => {
+    await runAction("seed-baselines", async (signal) => {
       const seeded = await researchRequest<{ candidates: unknown[]; approvals: unknown[] }>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/baselines`,
-        { method: "POST" },
+        { method: "POST", signal },
       )
       return `${seeded.candidates.length} candidates seeded`
     })
   }
 
   async function replyPendingApproval(status: "approved" | "rejected") {
-    const approval = pendingApproval()
+    const approval = pendingApproval() ?? (status === "approved" ? rejectedCheckpoint() : undefined)
     if (!approval) return
     await runAction(`${status === "approved" ? "approve" : "reject"}-pending`, async () => {
       const updated = await researchRequest<ResearchCockpitApproval>(
@@ -2732,12 +2966,12 @@ export function ResearchCockpit() {
       // the checkpoint content stays visible instead of vanishing. Matches any checkpoint
       // phase (not just search_space_confirmed/final_model_selection), including
       // intent_confirmed from check_taskspec.
-      const phaseMatch = approval.reason.match(/\[checkpoint:([^\]]+)\]/)
+      const phaseMatch = updated.reason.match(/\[checkpoint:([^\]]+)\]/)
       if (status === "approved" && phaseMatch) {
         const phase = phaseMatch[1] ?? "checkpoint"
-        const reasonLines = approval.reason
+        const reasonLines = updated.reason
           .split(/\r?\n/)
-          .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+          .filter((l) => l.trim().length > 0 && !l.startsWith("Checkpoint signature:") && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
         const taskID = selectedTask()?.id
         if (phase === "intent_confirmed") {
           // intent_confirmed gates DataAnalysis/HypoPlanner — keep its banner pinned in the
@@ -2790,7 +3024,7 @@ export function ResearchCockpit() {
       )
       const reasonLines = reason
         .split(/\r?\n/)
-        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+        .filter((l) => l.trim().length > 0 && !l.startsWith("Checkpoint signature:") && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
       setIntentConfirmedBanner({
         id: ++streamEventID,
         taskID: task.id,
@@ -2807,13 +3041,13 @@ export function ResearchCockpit() {
   async function runAutonomousIteration(description = "cockpit autonomous iteration") {
     const task = selectedTask()
     if (!task || task.mode !== "autonomous" || !runnerReady()) return
-    await runAction("autonomous-iteration", async () => {
+    await runAction("autonomous-iteration", async (signal) => {
       const result = await researchRequest<ResearchCockpitIterationResult>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/autonomous/iterate`,
         {
-          method: "POST",
-          body: JSON.stringify({ stage: "smoke", description }),
+          method: "POST", signal,
+          body: JSON.stringify({ stage: "full", description }),
         },
       )
       return formatResearchCockpitIteration(result)
@@ -2876,11 +3110,11 @@ export function ResearchCockpit() {
   async function ensureChatSession() {
     const contextKey = currentChatContextKey()
     const existing = chatSessionByContext()[contextKey]
-    if (existing) return existing
-    const session = await researchRequest<{ id: string }>(sdk, "/session", {
-      method: "POST",
-      body: JSON.stringify({ title: "NeoResearch Cockpit" }),
-    })
+    const task = selectedTask()
+    if (!task && existing) return existing
+    const session = task
+      ? await researchRequest<{ id: string }>(sdk, `/research/tasks/${encodeURIComponent(task.id)}/chat`, { method: "POST" })
+      : await researchRequest<{ id: string }>(sdk, "/session", { method: "POST", body: JSON.stringify({ title: "NeoResearch Cockpit" }) })
     setChatSessionByContext((current) => ({
       ...current,
       [contextKey]: session.id,
@@ -2928,6 +3162,7 @@ export function ResearchCockpit() {
         resolvedDefaults ? Promise.resolve(resolvedDefaults) : resolveChatDefaults(),
       ])
       persistStreamingChat()
+      if (currentChatContextKey() !== contextKey) return ""
       setStreamingChat({ id: ++streamEventID, sessionID, contextKey, text: "", parts: [], modelLabel: defaults.modelLabel })
       setChatBusy(`chat:${defaults.modelLabel}`)
       try {
@@ -2972,7 +3207,7 @@ export function ResearchCockpit() {
         `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "smoke", description: "data analysis + hypo planning", maxIterations: 3 }),
+          body: JSON.stringify({ stage: "full", description: "data analysis + hypo planning" }),
           signal,
         },
         600_000,
@@ -2994,7 +3229,7 @@ export function ResearchCockpit() {
         `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "smoke", description: "hypothesis planning", maxIterations: 3 }),
+          body: JSON.stringify({ stage: "full", description: "hypothesis planning" }),
           signal,
         },
         600_000,
@@ -3016,7 +3251,7 @@ export function ResearchCockpit() {
         `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "full", maxIterations: 50, description: "resume pipeline: reflection & publish" }),
+          body: JSON.stringify({ stage: "full", description: "resume pipeline: reflection & publish" }),
           signal,
         },
         600_000,
@@ -3066,7 +3301,7 @@ export function ResearchCockpit() {
           `/research/tasks/${encodeURIComponent(task.id)}/pipeline`,
           {
             method: "POST",
-            body: JSON.stringify({ stage: "full", maxIterations: 50, description: "cockpit companion pipeline" }),
+            body: JSON.stringify({ stage: "full", description: "cockpit companion pipeline" }),
             signal,
           },
           600_000,
@@ -3080,7 +3315,7 @@ export function ResearchCockpit() {
         `/research/tasks/${encodeURIComponent(task.id)}/autonomous/loop`,
         {
           method: "POST",
-          body: JSON.stringify({ stage: "full", maxIterations: 50, description: "cockpit autonomous loop" }),
+          body: JSON.stringify({ stage: "full", description: "cockpit autonomous loop" }),
           signal,
         },
       )
@@ -3140,12 +3375,12 @@ export function ResearchCockpit() {
   async function prepareCandidate(candidate: ResearchCockpitCandidate, stage: CandidateRunStage = "smoke") {
     const task = selectedTask()
     if (!task || !canRunResearchCockpitCandidate(candidate)) return
-    await runAction(`prepare-${stage}-${candidate.id}`, async () => {
+    await runAction(`prepare-${stage}-${candidate.id}`, async (signal) => {
       const result = await researchRequest<{ run: ResearchCockpitRun }>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/candidates/${encodeURIComponent(candidate.id)}/prepare-run`,
         {
-          method: "POST",
+          method: "POST", signal,
           body: JSON.stringify({ stage, description: `cockpit ${stage} run` }),
         },
       )
@@ -3156,12 +3391,12 @@ export function ResearchCockpit() {
   async function executeCandidate(candidate: ResearchCockpitCandidate, stage: CandidateRunStage = "smoke") {
     const task = selectedTask()
     if (!task || !runnerReady() || !canRunResearchCockpitCandidate(candidate)) return
-    await runAction(`execute-${stage}-${candidate.id}`, async () => {
+    await runAction(`execute-${stage}-${candidate.id}`, async (signal) => {
       const result = await researchRequest<{ run: ResearchCockpitRun }>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/candidates/${encodeURIComponent(candidate.id)}/execute-run`,
         {
-          method: "POST",
+          method: "POST", signal,
           body: JSON.stringify({ stage, description: `cockpit ${stage} run` }),
         },
       )
@@ -3172,12 +3407,12 @@ export function ResearchCockpit() {
   async function executeCandidateSeedSweep(candidate: ResearchCockpitCandidate) {
     const task = selectedTask()
     if (!task || !runnerReady() || !canRunResearchCockpitCandidate(candidate)) return
-    await runAction(`seed-sweep-${candidate.id}`, async () => {
+    await runAction(`seed-sweep-${candidate.id}`, async (signal) => {
       const result = await researchRequest<ResearchCockpitSeedSweepResult>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/candidates/${encodeURIComponent(candidate.id)}/seed-sweep`,
         {
-          method: "POST",
+          method: "POST", signal,
           body: JSON.stringify({ stage: "smoke", description: "cockpit smoke seed sweep" }),
         },
       )
@@ -3188,12 +3423,12 @@ export function ResearchCockpit() {
   async function exportTaskArtifact() {
     const task = selectedTask()
     if (!task) return
-    await runAction("export-artifact", async () => {
+    await runAction("export-artifact", async (signal) => {
       const result = await researchRequest<ResearchCockpitExportResult>(
         sdk,
           `/research/tasks/${encodeURIComponent(task.id)}/export`,
           {
-            method: "POST",
+            method: "POST", signal,
             body: JSON.stringify({ kind: "research_final_bundle", outputDir: ".neo-research/final" }),
           },
         )
@@ -3208,12 +3443,12 @@ export function ResearchCockpit() {
       await confirmIntentCheckpoint()
       return
     }
-    await runAction("profile-task", async () => {
+    await runAction("profile-task", async (signal) => {
       const result = await researchRequest<ResearchCockpitProfileResult>(
         sdk,
         `/research/tasks/${encodeURIComponent(task.id)}/profile`,
         {
-          method: "POST",
+          method: "POST", signal,
           body: JSON.stringify({}),
         },
       )
@@ -3237,6 +3472,7 @@ export function ResearchCockpit() {
     const next = (selectedTaskIndex() + offset + count) % count
     setSelectedIndex(next)
     setSelectedTaskID(tasks[next]?.id)
+    route.navigate({ type: "cockpit", taskID: tasks[next]?.id })
   }
 
   function selectCandidateOffset(offset: number) {
@@ -3318,7 +3554,8 @@ export function ResearchCockpit() {
 
   async function runRecommendedAction() {
     const task = selectedTask()
-    const next = recommendation().action
+    const recommended = recommendation()
+    const next = recommended.action
     if (!task) {
       promptInput?.focus()
       toast.show({
@@ -3326,6 +3563,10 @@ export function ResearchCockpit() {
         message: "描述一个预测目标来创建下一个研究任务。",
         duration: 4000,
       })
+      return
+    }
+    if (next === "review_state" && hasResultArtifact()) {
+      dialog.replace(() => <DialogResearchResults taskID={task.id} />)
       return
     }
     if (pendingApproval()) {
@@ -3371,6 +3612,11 @@ export function ResearchCockpit() {
     const candidate = taskCandidates().find(canRunResearchCockpitCandidate)
     if (next === "run_smoke" && candidate && runnerReady()) {
       await executeCandidate(candidate)
+      return
+    }
+    if (next === "run_full" && runnerReady()) {
+      const promotable = taskCandidates().find((item) => item.id === recommended.candidateID)
+      if (promotable) await executeCandidate(promotable, "full")
       return
     }
     if (next === "export_report") {
@@ -3430,7 +3676,7 @@ export function ResearchCockpit() {
     if (name === "help") {
       appendCockpitNotice(
         "help",
-        "Commands: /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export, /abort, /home",
+        "Commands: /history, /resume, /append, /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export, /abort, /home",
       )
       return
     }
@@ -3488,6 +3734,9 @@ export function ResearchCockpit() {
       await profileTask()
       return
     }
+    if (name === "history") { dialog.replace(() => <DialogResearchHistory />); return }
+    if (name === "append") { await appendResearch(); return }
+    if (name === "resume") { await resumeResearch(); return }
     if (name === "task") {
       if (arg(0) === "next") {
         selectTaskOffset(1)
@@ -3507,7 +3756,8 @@ export function ResearchCockpit() {
         if (index >= 0) {
           setSelectedIndex(index)
           setSelectedTaskID(sortedTasks()[index]?.id)
-        } else appendCockpitNotice("task-select", `No task matched ${args[1]}.`)
+          route.navigate({ type: "cockpit", taskID: sortedTasks()[index]?.id })
+        } else { setSelectedTaskID(args[1]); route.navigate({ type: "cockpit", taskID: args[1] }) }
         return
       }
       await createTask("autonomous", fullDefaults())
@@ -3709,13 +3959,18 @@ export function ResearchCockpit() {
           ...(source === "home" ? { source: "home" } : {}),
         },
       }
+      const selectedModel = local?.model.current()
+      if (selectedModel) payload.taskSpec.metadata = {
+        ...(payload.taskSpec.metadata as JsonRecord ?? {}), sessionModel: selectedModel,
+      }
       const task = await researchRequest<ResearchCockpitTask>(sdk, "/research/tasks", {
         method: "POST",
         body: JSON.stringify(payload),
       })
       registerNewTask(task)
       setSelectedTaskID(task.id)
-      const runnerOptions = { validateRuntime: true }
+      route.navigate({ type: "cockpit", taskID: task.id })
+      const runnerOptions = { validateRuntime: true, projectRoot: sdk.directory }
       const executableTask = canExecuteResearchCockpitTask(task, runnerOptions) ? task : { ...task, taskSpec: payload.taskSpec }
       let detail = eventDetail
       let actionMessage = `${task.title} ${detail}`
@@ -3728,7 +3983,7 @@ export function ResearchCockpit() {
           `/research/tasks/${encodeURIComponent(executableTask.id)}/pipeline`,
           {
             method: "POST",
-            body: JSON.stringify({ stage: "smoke", description: value, maxIterations: 50 }),
+            body: JSON.stringify({ stage: "full", description: value }),
           },
         )
         detail = `${eventDetail}; completed multi-agent pipeline`
@@ -3799,94 +4054,26 @@ export function ResearchCockpit() {
       return
     }
     const clarification = socraticClarification()
-    // Companion and socratic mode: allow slot fill when idle (task just created, pipeline not yet started).
-    // Review mode: allow slot fill when idle after intent reject (intentPendingReview flag set).
-    const isCompanion = interactionModeForTask(task) === "companion"
-    const isSocratic = interactionModeForTask(task) === "socratic"
-    const isReviewMode = clarification.reviewMode === true && task.status === "idle"
-    if (isReviewMode) {
+    const intentCheckpointPending = taskApprovals().some(
+      (approval) => approval.status === "pending" && /\[checkpoint:intent_confirmed\]/.test(approval.reason),
+    )
+    const intentEditable = task.status === "paused" || task.status === "idle" || task.status === "intent_gathering"
+    const intentReply = intentCheckpointPending || (intentEditable && (
+      clarification.active || clarification.reviewMode || task.status === "intent_gathering" ||
+      ((interactionModeForTask(task) === "companion" || interactionModeForTask(task) === "socratic") && !!clarification.nextQuestion)
+    ))
+    if (intentReply) {
       markIntentTurn()
-      // Snapshot before-state so we can diff after the LLM call
-      const slotsBefore = new Map<string, string | undefined>(clarification.slots.map((s) => [s.id as string, s.value]))
-      await runAction("intent-modify", async () => {
-        type ModifyResult = {
-          llm?: { status: string; provider?: string; model?: string; error?: string }
-          intentSpec?: Record<string, unknown>
-        }
-        const result = await researchRequest<ModifyResult>(
-          sdk,
-          `/research/tasks/${encodeURIComponent(task.id)}/intent/modify`,
-          { method: "POST", body: JSON.stringify({ message: value }) },
-        )
-        const llm: { status?: string; provider?: string; model?: string; error?: string } = result.llm ?? {}
-        if (llm.status === "not_configured") return "LLM 未配置，无法解析修改意图"
-        if (llm.status === "failed") return `LLM 调用失败：${llm.error ?? "未知错误"}`
-        if (llm.status !== "used") return "LLM 未启用 (需设置 API key 或 NEO_RESEARCH_INTENT_LLM=1)"
-        const llmTag = `[${llm.provider ?? "?"}/${llm.model ?? "?"}]`
-        const spec = (result.intentSpec ?? {}) as Record<string, unknown>
-        const slotLabels: Record<string, string> = {
-          forecast_object: "预测对象", data_source: "数据来源", target_columns: "目标列",
-          lookback_window: "lookback window", prediction_horizon: "预测 horizon",
-          time_grain: "时间粒度", exogenous_variables: "外生变量", business_context: "业务背景",
-          primary_metric: "主指标", secondary_metrics: "辅助指标", error_preferences: "误差偏好",
-          latency_budget: "延迟预算", parameter_budget: "参数预算",
-          interpretability: "可解释性", deployment_target: "部署目标",
-        }
-        const changes: string[] = []
-        for (const [slotID, label] of Object.entries(slotLabels)) {
-          const raw = spec[slotID]
-          if (raw === undefined || raw === null) continue
-          const after = Array.isArray(raw) ? raw.join(", ") : String(raw)
-          // skip empty values (e.g. exogenous_variables=[]) — no real change to report
-          if (after.trim() === "") continue
-          const before = slotsBefore.get(slotID) ?? ""
-          if (after !== before) changes.push(`${label} → ${after}`)
-        }
-        if (changes.length === 0) return `LLM ${llmTag} 调用成功，未识别到需修改的字段`
-        return `LLM ${llmTag} 已更新 ${changes.length} 个字段：${changes.join(" · ")}`
+      // Preserve the user's full message and let the existing IntentAgent session interpret it.
+      await runAction("intent-modify", async (signal) => {
+        await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/modify`, {
+          method: "POST", signal,
+          body: JSON.stringify({ message: value }),
+        }, 90_000, () => toast.show({ variant: "info", message: "回答已保留，等待上一轮 IntentAgent 结束后自动发送。" }))
+        return "需求修改已发送至 IntentAgent"
       })
       promptInput?.focus()
       return
-    }
-    // Both companion and socratic modes: fill slots from chat input whenever idle, paused, or intent_gathering.
-    // "intent_gathering" is also valid: after the first answer runIntentAgent sets this status while the
-    // LLM runs; the second answer must still route to the slot-fill path, not fall through to chat.
-    if (task.status === "paused" || task.status === "idle" || task.status === "intent_gathering") {
-      if (clarification.active) {
-        // A live IntentAgent session turn is mid-conversation (it called ask_user) — forward the
-        // user's free-text reply straight into that same session so the LLM interprets it itself
-        // (via update_taskspec/read_taskspec/check_taskspec) instead of guessing a single slot id
-        // from the LLM's own free-form question text, which the regex-based slotFromSocraticQuestion
-        // match can't reliably do. Without this, replies never reach the session, the LLM never gets
-        // a chance to call check_taskspec, and the intent checkpoint never opens.
-        markIntentTurn()
-        try {
-          await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/modify`, {
-            method: "POST",
-            body: JSON.stringify({ message: value }),
-          })
-        } catch {
-          // DB changes (task update, pending approval) propagate via SSE events
-        }
-        promptInput?.focus()
-        return
-      }
-      if ((isCompanion || isSocratic) && clarification.nextQuestion) {
-        const slotID = slotFromSocraticQuestion(clarification.nextQuestion)
-        if (slotID !== "unknown") {
-          markIntentTurn()
-          try {
-            await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/answer`, {
-              method: "POST",
-              body: JSON.stringify({ slots: { [slotID]: value } }),
-            })
-          } catch {
-            // DB changes (task update, pending approval) propagate via SSE events
-          }
-          promptInput?.focus()
-          return
-        }
-      }
     }
     if (task.mode === "autonomous" && runnerReady()) {
       await sendChatPrompt(value)
@@ -3977,6 +4164,9 @@ export function ResearchCockpit() {
   }
 
   command.register(() => [
+    { title: "历史研究", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
+    { title: "追加研究（设置新周期预算）", value: "research.append", category: "Research", slash: { name: "append" }, onSelect: () => void appendResearch() },
+    { title: recovery()?.recoveryState === "running" ? "查看运行" : "继续研究 / 查看恢复状态", value: "research.resume", category: "Research", slash: { name: "resume" }, onSelect: () => void resumeResearch() },
     {
       title: "Create or import research task",
       description: "/new csv --mode autonomous --full",
@@ -4213,7 +4403,7 @@ export function ResearchCockpit() {
       title: "Approve pending research candidate",
       value: "research.approve.pending",
       category: "Research",
-      enabled: !!pendingApproval(),
+      enabled: !!pendingApproval() || !!rejectedCheckpoint(),
       hidden: true,
       onSelect: () => void approvePending(),
     },
@@ -4439,6 +4629,50 @@ export function ResearchCockpit() {
     pushHypoPartLines(lines, batch, map, streamID, done)
   }
 
+  function pushRestoredIntentHistoryLines(lines: StreamLine[], messages: CockpitHistoryMessage[]) {
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+      const message = messages[messageIndex]!
+      for (let partIndex = 0; partIndex < message.parts.length; partIndex++) {
+        const part = message.parts[partIndex]!
+        const partID = part.id ?? `${messageIndex}-${partIndex}`
+        if (part.type === "text") {
+          const text = part.text ?? ""
+          if (!text || part.synthetic) continue
+          if (message.info.role === "user" && text.startsWith("Begin intent gathering for research task ") && text.includes("Follow your workflow:")) continue
+          const textLines = compactStreamTextParts(text)
+          textLines.forEach((textLine, lineIndex) => {
+            lines.push({
+              id: `intent-history-${partID}-${lineIndex}`,
+              text: message.info.role === "user" && lineIndex === 0 ? `  You: ${textLine}` : `  ${textLine}`,
+              tone: message.info.role === "user" ? "text" : "muted",
+            })
+          })
+          continue
+        }
+        if (part.type !== "tool" || !part.tool) continue
+        const status = part.state?.status
+        const toolState: "pending" | "running" | "completed" | "error" =
+          status === "completed" || status === "error" || status === "running" ? status : "pending"
+        const start = part.state?.time?.start
+        const end = part.state?.time?.end
+        const toolDurationMs = typeof start === "number" && typeof end === "number" ? end - start : undefined
+        const restored = new Map([
+          [partID, {
+            partID,
+            kind: "tool" as const,
+            toolName: part.tool,
+            toolInput: part.state?.input,
+            toolOutput: status === "completed" ? part.state?.output : undefined,
+            toolState,
+            toolDurationMs,
+            toolError: status === "error" ? part.state?.error : undefined,
+          }],
+        ])
+        pushHypoPartLines(lines, [partID], restored, -1, true)
+      }
+    }
+  }
+
   const streamLines = createMemo<StreamLine[]>(() => {
     const lines: StreamLine[] = []
     const ambientLines: StreamLine[] = []
@@ -4454,7 +4688,7 @@ export function ResearchCockpit() {
       const hasLiveDaStream = !!daStreamForDedupe && (!task || !daStreamForDedupe.taskID || daStreamForDedupe.taskID === task.id)
       for (const item of formatResearchCockpitTaskAgentLLMLines(taskArtifacts())) {
         if (hasLiveDaStream && item.id.startsWith("llm-data-")) continue
-        if (item.id.startsWith("literature-") && designLLMLines().some((line) => line.taskID === task.id && line.text.startsWith("[LiteratureAgent] 完成"))) continue
+        if (item.id.startsWith("literature-")) continue
         ambientLines.push({ id: item.id, text: item.text, tone: item.tone })
       }
       const champ = validChampion()
@@ -4485,16 +4719,22 @@ export function ResearchCockpit() {
     const isIntentCheckpointPending = !!approval && /\[checkpoint:intent_confirmed\]/.test(approval.reason)
     const istreamPersistent = intentStream()
     const istreamForTask = istreamPersistent && (!task || !istreamPersistent.taskID || istreamPersistent.taskID === task.id)
+    const history = historyMessages()
+    const restoredIntentMessages = history && history.taskID === task?.id
+      ? history.messages.filter((message) => message.source === "intent")
+      : []
     const intentPartMapSnap = intentPartMap()
     const intentPartOrderSnap = intentPartOrder()
-    const hasLiveAskUserPart =
-      !!istreamForTask &&
-      intentPartOrderSnap.some((partID) => {
+    const hasIntentAskUserPart =
+      (!!istreamForTask && intentPartOrderSnap.some((partID) => {
         const part = intentPartMapSnap.get(partID)
         return part?.kind === "tool" && part.toolName === "ask_user"
-      })
+      })) || restoredIntentMessages.some((message) => message.parts.some((part) => part.type === "tool" && part.tool === "ask_user"))
+    if (istreamForTask || restoredIntentMessages.length > 0) {
+      lines.push({ id: `intent-stream-${istreamForTask ? istreamPersistent.id : "history"}-header`, text: "[IntentAgent]", tone: "muted" })
+      pushRestoredIntentHistoryLines(lines, restoredIntentMessages)
+    }
     if (istreamForTask) {
-      lines.push({ id: `intent-stream-${istreamPersistent.id}-header`, text: "[IntentAgent]", tone: "muted" })
       const intentEchoes = promptEvents()
         .filter((event) => event.intentTurn && (!event.taskID || event.taskID === istreamPersistent.taskID))
         .map((event) => ({ id: event.id, text: event.text }))
@@ -4519,7 +4759,7 @@ export function ResearchCockpit() {
             tone: slot.status === "filled" ? ("success" as const) : ("muted" as const),
           })),
         )
-      } else if (!hasLiveAskUserPart) {
+      } else if (!hasIntentAskUserPart) {
         // No live ask_user tool call to anchor the question to yet (e.g. a paused task restored
         // from the approval/poll state instead of a live SSE turn, or the IntentAgent is still
         // mid-turn before calling ask_user) — render it standalone until the real tool call lands.
@@ -4532,7 +4772,7 @@ export function ResearchCockpit() {
     } else if (isIntentCheckpointPending) {
       const intentReasonLines = approval.reason
         .split(/\r?\n/)
-        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+        .filter((l) => l.trim().length > 0 && !l.startsWith("Checkpoint signature:") && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
       lines.push(
         {
           id: "approval-requested",
@@ -4550,7 +4790,19 @@ export function ResearchCockpit() {
       // standing "approved" banner in this same slot so it never drifts relative to
       // DataAnalysis/HypoPlanner below (see intentConfirmedBanner setters in
       // confirmIntentCheckpoint/replyPendingApproval).
-      const confirmedBanner = intentConfirmedBanner()
+      // Approval update time can put an older snapshot first after a late reply.
+      // Prefer the newest created intent checkpoint, including after reconnect.
+      const latestIntent = taskApprovals()
+        .filter((item) => item.reason.includes("[checkpoint:intent_confirmed]"))
+        .toSorted((a, b) => b.time.created - a.time.created || b.id.localeCompare(a.id))[0]
+      const persistedBanner = latestIntent?.status === "approved" ? {
+        id: latestIntent.id,
+        taskID: latestIntent.taskID,
+        lines: ["[intent_confirmed] approved ✓", ...latestIntent.reason.split(/\r?\n/)
+          .filter((line) => line.trim() && !/^\[checkpoint:[^\]]+\]$/.test(line.trim()))
+          .map((line) => `  ${line}`)],
+      } : undefined
+      const confirmedBanner = persistedBanner ?? (latestIntent && latestIntent.status !== "approved" ? undefined : intentConfirmedBanner())
       if (confirmedBanner && (!task || !confirmedBanner.taskID || confirmedBanner.taskID === task.id)) {
         confirmedBanner.lines.forEach((line, i) => {
           lines.push({
@@ -4579,20 +4831,22 @@ export function ResearchCockpit() {
       }
     }
     const literature = literatureView()
-    if (literature && literature.taskID === selectedTask()?.id && literature.status === "running") {
+    const literatureArtifact = taskArtifacts()
+      .filter((artifact) => artifact.kind === "task_evidence_bundle_json")
+      .toSorted((left, right) => right.time.updated - left.time.updated)[0]
+    const literatureRows = literature && literature.taskID === task?.id
+      ? literature.rows
+      : literatureArtifact ? literatureResultRows(literatureArtifact.metadata) : []
+    if (literatureRows.length > 0 || (literature && literature.taskID === task?.id)) {
       lines.push({ id: "literature-live-header", text: "[LiteratureAgent]", tone: "muted" })
-      for (const row of literature.rows) lines.push({ id: `literature-live-${row.key}`, text: row.text, tone: "muted" })
+      for (const row of literatureRows) lines.push({ id: `literature-live-${row.key}`, text: row.text,
+        tone: row.key === "failure" ? "error" : "muted" })
     }
     // Initial-phase HypoPlanner (before any training): render alongside DA stream, before design lines.
     const hypoStream = hypoPlannerStream()
     const hypoPartOrderSnap = hypoPartOrder()
     const hypoPartMapSnap = hypoPartMap()
-    const hasCompletedTrainingRuns = taskRuns().some(
-      (r) =>
-        (r.stage === "low_fidelity" || r.stage === "full" || r.stage === "ref_test" || r.stage === "blind_test") &&
-        (r.status === "succeeded" || r.status === "failed"),
-    )
-    if (hypoStream && !hasCompletedTrainingRuns && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
+    if (hypoStream && !hypoStream.afterTraining && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
       lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
       if (hypoPartOrderSnap.length > 0) {
         pushHypoPartLines(lines, hypoPartOrderSnap, hypoPartMapSnap, hypoStream.id, hypoStream.done)
@@ -4629,6 +4883,7 @@ export function ResearchCockpit() {
                 horizon: typeof record.horizon === "number" ? record.horizon : undefined,
                 valLoss: typeof record.valLoss === "number" ? record.valLoss : undefined,
                 elapsedS: typeof record.elapsedS === "number" ? record.elapsedS : undefined,
+                foldIndex: typeof record.foldIndex === "number" ? record.foldIndex : undefined,
               }),
               tone: record.event === "timeout" ? ("warning" as const) : ("muted" as const),
             }
@@ -4637,14 +4892,21 @@ export function ResearchCockpit() {
       : []
     const isFinalModelSelectionPending =
       !!approval && /\[checkpoint:final_model_selection\]/.test(approval.reason)
+    const activeRunID = run && (run.status === "queued" || run.status === "running") ? run.id : undefined
+    const activeLiveRunnerLines = activeRunID
+      ? liveRunnerLines.filter((item) => item.runID === activeRunID)
+      : []
+    const unpinnedLiveRunnerLines = activeRunID
+      ? liveRunnerLines.filter((item) => item.runID !== activeRunID)
+      : liveRunnerLines
     // Merge design events and live runner epochs into one chronological stream.
     // Both designLLMLines and runnerOutputLines share the same streamEventID counter,
     // so sorting by numeric id faithfully interleaves ModelDesigner → epochs → Reflection → HypoPlanner.
-    const hasLiveRunnerData = liveRunnerLines.length > 0 && !isFinalModelSelectionPending
+    const hasLiveRunnerData = unpinnedLiveRunnerLines.length > 0 && !isFinalModelSelectionPending
     if (hasLiveRunnerData) {
       const merged = [
         ...liveDesignLines.map((item) => ({ sortId: item.id, id: `design-${item.id}`, text: item.text, tone: item.tone })),
-        ...liveRunnerLines.map((item) => ({ sortId: item.id, id: `runner-${item.id}`, text: item.text, tone: item.tone })),
+        ...unpinnedLiveRunnerLines.map((item) => ({ sortId: item.id, id: `runner-${item.id}`, text: item.text, tone: item.tone })),
       ].sort((a, b) => a.sortId - b.sortId)
       for (const item of merged) {
         lines.push({ id: item.id, text: item.text, tone: item.tone })
@@ -4684,7 +4946,7 @@ export function ResearchCockpit() {
       }
     }
     // Active HypoPlanner stream (fires after Reflection, between iterations): appears at the bottom
-    if (hypoStream && hasCompletedTrainingRuns && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
+    if (hypoStream && hypoStream.afterTraining && (!task || !hypoStream.taskID || hypoStream.taskID === task.id)) {
       lines.push({ id: `hypo-stream-${hypoStream.id}-header`, text: `[HypoPlanner]`, tone: "muted" })
       if (hypoPartOrderSnap.length > 0) {
         pushHypoPartLines(lines, hypoPartOrderSnap, hypoPartMapSnap, hypoStream.id, hypoStream.done)
@@ -4725,7 +4987,7 @@ export function ResearchCockpit() {
       // final_model_selection fire after NAS runs exist, so the old !run gate hid them.
       const reasonLines = approval.reason
         .split(/\r?\n/)
-        .filter((l) => l.trim().length > 0 && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
+        .filter((l) => l.trim().length > 0 && !l.startsWith("Checkpoint signature:") && !/^\[checkpoint:[^\]]+\]$/.test(l.trim()))
       persistentLines.push(
         {
           id: "approval-requested",
@@ -4746,7 +5008,7 @@ export function ResearchCockpit() {
           // unconditionally above, in the istreamPersistent block — the task may already be
           // running its first intent-gathering turn (reading the dataset, reading the taskspec)
           // before any ask_user checkpoint exists, so clarification.active is still false here.
-          if (!istreamPersistent) {
+          if (!istreamPersistent && restoredIntentMessages.length === 0) {
             persistentLines.push({ id: `idle-task-${mode}-waiting`, text: "等待 IntentAgent 启动...", tone: "muted", spinner: true })
           }
         } else {
@@ -4765,6 +5027,13 @@ export function ResearchCockpit() {
           { id: "idle-empty-hint", text: "提示：点击顶栏 /new 创建任务，或输入 /help 查看所有命令。", tone: "muted" },
         )
       }
+    }
+    if (history && history.taskID === selectedTask()?.id) {
+      history.messages.forEach((message, index) => {
+        if (message.source !== "chat") return
+        const text = message.parts.filter((part) => part.type === "text" && !part.synthetic).map((part) => part.text ?? "").join("\n")
+        if (text && text !== streamingChat()?.text) persistentLines.push({ id: `history-chat-${index}`, text: `${message.info.role === "user" ? "你" : "Research Agent"}: ${text}`, tone: "muted" })
+      })
     }
     const timeline = [
       // intentTurn echoes already render inline inside the [IntentAgent] block above
@@ -4865,6 +5134,37 @@ export function ResearchCockpit() {
       timelineLines.push({ id: `error-${item.event.id}`, text: `${item.event.action}: ${item.event.text}`, tone: "error" })
     }
     lines.push(...(timelineLines.length > 0 ? [...persistentLines, ...timelineLines] : [...ambientLines, ...persistentLines]))
+    const finalReport = taskArtifacts()
+      .filter((artifact) => artifact.kind === "final_report_md")
+      .toSorted((left, right) => right.time.created - left.time.created)[0]
+    if (finalReport) {
+      const target = finalReport.uri.startsWith("file://") ? finalReport.uri.slice("file://".length) : finalReport.uri
+      if (!lines.some((line) => line.text.includes(target))) {
+        lines.push({ id: `final-report-${finalReport.id}`, text: `[Publish] 最终研究报告: ${target}`, tone: "success" })
+      }
+    }
+    if (activeRunID && !isFinalModelSelectionPending) {
+      const activeProgress = [
+        ...persistedRunnerLines,
+        ...activeLiveRunnerLines.map((item) => ({ id: `runner-${item.id}`, text: item.text, tone: item.tone })),
+      ]
+      const pinnedIDs = new Set(activeProgress.map((item) => item.id))
+      for (let index = lines.length - 1; index >= 0; index--) {
+        if (pinnedIDs.has(lines[index]!.id)) lines.splice(index, 1)
+      }
+      const uniqueProgress = new Map<string, (typeof activeProgress)[number]>()
+      for (const item of activeProgress) {
+        if (uniqueProgress.has(item.text)) uniqueProgress.delete(item.text)
+        uniqueProgress.set(item.text, item)
+      }
+      lines.push({ id: `runner-live-${activeRunID}`, text: `[TrainEval live | ${run!.stage} | ${activeRunID}]`, tone: "primary" })
+      const recentProgress = [...uniqueProgress.values()].slice(-40)
+      if (recentProgress.length === 0) {
+        lines.push({ id: `runner-live-waiting-${activeRunID}`, text: "等待 runner 输出首个训练进度…", tone: "muted", spinner: true })
+      } else {
+        lines.push(...recentProgress)
+      }
+    }
     return internStreamLines(lines.slice(-streamLineDisplayLimit))
   })
   const promptPlaceholder = createMemo(() => {
@@ -5098,8 +5398,8 @@ export function ResearchCockpit() {
     }
     if (hasResultArtifact()) {
       return {
-        title: "Review final bundle",
-        detail: "Inspect the exported evidence or continue exploration.",
+        title: "Review final report",
+        detail: "Open the PublishAgent report and exported research artifacts.",
       }
     }
     return recommendation()
@@ -5238,6 +5538,8 @@ export function ResearchCockpit() {
             <text fg={cockpitColors.primary} onMouseUp={() => route.navigate({ type: "home" })}>
               Home
             </text>
+            <text fg={cockpitColors.primary} onMouseUp={() => dialog.replace(() => <DialogResearchHistory />)}>历史研究</text>
+            <Show when={selectedTask()}><text fg={cockpitColors.primary} onMouseUp={() => void resumeResearch()}>{recoveryActionLabel()}</text></Show>
             <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/new")}>
               /new
             </text>

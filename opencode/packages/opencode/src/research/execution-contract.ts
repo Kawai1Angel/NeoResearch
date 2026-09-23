@@ -90,7 +90,7 @@ export function validateCandidateAgainstHypothesis(
     itransformer: "transformer",
     nlinear: "linear",
   }
-  const allowed = hypothesis.suggestedBackbones.map((name) => aliases[name] ?? name)
+  const allowed = [...new Set(hypothesis.suggestedBackbones.map((name) => aliases[name] ?? name))]
   if (allowed.length && !allowed.includes(spec.backbone?.type)) add("backbone", allowed, spec.backbone?.type)
   const requiredEmbeddings: Record<string, string> = {
     patch_transformer: "patch",

@@ -1,20 +1,36 @@
 from __future__ import annotations
 
 import math
+import io
+import json
+from contextlib import redirect_stdout
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 PY_ROOT = Path(__file__).resolve().parents[1]
 if str(PY_ROOT) not in sys.path:
     sys.path.insert(0, str(PY_ROOT))
 
-from cv_train import aggregate_cv_metrics, build_ratio_folds, run_cv_folds_parallel, validate_folds
+from cv_train import _run_train, aggregate_cv_metrics, build_ratio_folds, run_cv_folds_parallel, validate_folds
 from prepare_tsf import _split_bounds_with_cv_override
 
 
 class CvTrainTest(unittest.TestCase):
+    def test_fold_output_marks_temporary_artifacts_without_mutating_metrics(self) -> None:
+        process = Mock(stdout=io.StringIO('{"event":"done","artifact_dir":"/tmp/fold","val_avg_mse":1.0}\n'))
+        process.wait.return_value = 0
+        output = io.StringIO()
+        with patch("cv_train.subprocess.Popen", return_value=process), redirect_stdout(output):
+            code, records = _run_train(["fixture"], {"NEO_CAST_CV_FOLD_INDEX": "2"})
+        forwarded = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(forwarded["ephemeral"])
+        self.assertEqual(forwarded["cv_fold_index"], 2)
+        self.assertEqual(forwarded["val_avg_mse"], 1.0)
+        self.assertNotIn("ephemeral", records[0])
+
     def test_builds_expected_ratio_folds(self) -> None:
         folds = build_ratio_folds((0, 10_000), num_folds=4, initial_train_ratio=0.6)
         self.assertEqual(folds[0].train_rows, (0, 6000))

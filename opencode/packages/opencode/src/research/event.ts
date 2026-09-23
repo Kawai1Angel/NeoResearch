@@ -101,6 +101,7 @@ export class ResearchRunnerProgressLine extends Schema.Class<ResearchRunnerProgr
   horizon: Schema.optional(Schema.Number),
   valLoss: Schema.optional(Schema.Number),
   elapsedS: Schema.optional(Schema.Number),
+  foldIndex: Schema.optional(Schema.Number),
 }) {}
 
 export const Event = {

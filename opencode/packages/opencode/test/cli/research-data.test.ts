@@ -110,7 +110,7 @@ describe("research CLI data helpers", () => {
         secondaryMetrics: ["cv_std_mse", "val_avg_mse"],
         direction: "minimize",
       },
-      budget: { maxRuns: 50, maxParallel: 1 },
+      budget: { maxRuns: 200, maxParallel: 1, loop: { maxIterations: 25, maxNoImprove: 7 } },
     })
     expect(buildDefaultTsfResearchTaskInput({ mode: "review", interactionMode: "companion" })).toMatchObject({
       mode: "autonomous",
@@ -129,6 +129,13 @@ describe("research CLI data helpers", () => {
         dataset: { loaderID: "etth1_tslib_v1", targetCols: ["OT"] },
         runtime: { bridgeOnly: false },
       },
+    })
+    expect(buildDefaultTsfResearchTaskInput({
+      mode: "autonomous",
+      maxIterations: 30,
+      maxNoImprove: 6,
+    })).toMatchObject({
+      budget: { loop: { maxIterations: 30, maxNoImprove: 6 } },
     })
   })
 

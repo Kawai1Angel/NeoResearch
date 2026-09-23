@@ -31,7 +31,7 @@ it.live("pipeline orders literature before planning, recovers without replay, an
         runtime: { neoCastProjectRoot: runtimeRoot, pythonExecutable: "bash", bridgeOnly: true },
         metadata: { businessContext: "benchmark", interpretability: "none_required", deploymentTarget: "local_research" } },
       objective: { primaryMetric: "val_avg_mse", direction: "minimize", errorPreferences: "balanced" },
-      budget: { maxRuns: 2, latencyBudget: "no_constraint", parameterBudget: "no_constraint" } })
+      budget: { maxRuns: 2, latencyBudget: "no_constraint", parameterBudget: "no_constraint", loop: { maxIterations: 1, maxNoImprove: 1 } } })
     const events: string[] = []
     const subscriptions = [
       yield* bus.subscribeCallback(Research.Event.DataAnalysisAgentStarted, () => { events.push("data:start") }),

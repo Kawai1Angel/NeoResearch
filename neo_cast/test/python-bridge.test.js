@@ -69,10 +69,19 @@ test("runPythonCommand can abort a running child process", async () => {
     capture: true,
     signal: controller.signal,
     onStdout: (chunk) => {
-      if (chunk.includes("ready")) controller.abort();
+      if (chunk.includes("ready")) {
+        const logDir = path.join(projectRoot, ".neo-cast", "logs");
+        const live = fs.readFileSync(path.join(logDir, fs.readdirSync(logDir)[0]), "utf8");
+        assert.match(live, /ready/, "output must be on disk before completion");
+        controller.abort();
+      }
     },
   });
 
+  const records = fs.readFileSync(result.logPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(records[0].event, "started");
+  assert.equal(records.at(-1).event, "canceled");
+  assert.ok(records.at(-1).durationMs >= 0);
   assert.equal(result.aborted, true);
   assert.equal(result.status, null);
 });

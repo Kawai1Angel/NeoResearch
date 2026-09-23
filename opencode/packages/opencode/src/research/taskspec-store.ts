@@ -7,8 +7,10 @@ import { ResearchApprovalTable, ResearchTaskTable } from "./research.sql"
 import { mapTask } from "./task-mapper"
 import { DomainRegistry } from "./domain-registry"
 import { Event } from "./event"
+import { NAS_DEFAULT_MAX_ITERATIONS, NAS_DEFAULT_MAX_NO_IMPROVE } from "./defaults"
 import { ResearchApproval, ResearchApprovalID, type JsonRecord, type ResearchTask, type ResearchTaskID } from "./schema"
 import {
+  INTENT_SLOT_IDS,
   confidenceFor,
   dialogueStrategy,
   interactionModeForTask,
@@ -67,6 +69,17 @@ function stringArray(value: unknown): string[] {
   if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
   if (typeof value === "string" && value.trim().length > 0) return value.split(",").map((item) => item.trim()).filter(Boolean)
   return []
+}
+
+function explicitParameterLimit(value: unknown): number | undefined {
+  const match = typeof value === "string" ? value.trim().match(/^([+-]?\d+(?:\.\d+)?)\s*([kmb])?(?:\s*(?:parameters?|params|参数))?$/i) : undefined
+  const count = typeof value === "number" ? value : match
+    ? Number(match[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[match[2]?.toLowerCase() ?? ""] ?? 1)
+    : undefined
+  if (count !== undefined && (!Number.isSafeInteger(count) || count <= 0)) {
+    throw new TaskSpecUpdateError("parameter_budget must be a positive integer count, an explicit size such as 5M, or a textual preference")
+  }
+  return count
 }
 
 function parseCsvLine(line: string): string[] {
@@ -177,6 +190,37 @@ export async function applySlotUpdates(
 ): Promise<TaskspecSlotsSnapshot> {
   const task = await loadTask(taskID)
   const normalizedUpdates = normalizeIntentSlotKeys(updates) as Partial<Record<SlotID, unknown>>
+  for (const key of Object.keys(normalizedUpdates)) {
+    if (!INTENT_SLOT_IDS.includes(key as SlotID)) throw new TaskSpecUpdateError(`Unknown intent slot: ${key}`)
+  }
+  for (const slot of ["forecast_object", "data_source", "time_grain", "future_covariate_availability", "business_context", "primary_metric", "error_preferences", "interpretability", "deployment_target"] as const) {
+    if (slot in normalizedUpdates && typeof normalizedUpdates[slot] !== "string") throw new TaskSpecUpdateError(`${slot} must be a string`)
+  }
+  for (const slot of ["target_columns", "exogenous_variables", "secondary_metrics"] as const) {
+    if (!(slot in normalizedUpdates)) continue
+    const value = normalizedUpdates[slot]
+    if (typeof value !== "string" && !(Array.isArray(value) && value.every((item) => typeof item === "string"))) {
+      throw new TaskSpecUpdateError(`${slot} must be a string list or comma-separated text`)
+    }
+  }
+  for (const slot of ["latency_budget", "parameter_budget"] as const) {
+    if (!(slot in normalizedUpdates)) continue
+    const value = normalizedUpdates[slot]
+    if (typeof value !== "string" && !(typeof value === "number" && Number.isFinite(value) && value > 0)) {
+      throw new TaskSpecUpdateError(`${slot} must be a positive number or a textual requirement`)
+    }
+  }
+  for (const slot of ["max_iterations", "max_no_improve"] as const) {
+    if (!(slot in normalizedUpdates)) continue
+    const value = normalizedUpdates[slot]
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+      throw new TaskSpecUpdateError(`${slot} must be a positive integer`)
+    }
+  }
+  if ("interaction_mode" in normalizedUpdates && !["companion", "socratic"].includes(String(normalizedUpdates.interaction_mode))) {
+    throw new TaskSpecUpdateError("interaction_mode must be companion or socratic")
+  }
+  if ("secondary_metrics" in normalizedUpdates) normalizedUpdates.secondary_metrics = stringArray(normalizedUpdates.secondary_metrics)
   if (typeof normalizedUpdates.exogenous_variables === "string") {
     normalizedUpdates.exogenous_variables = /^(none|无|没有)$/i.test(normalizedUpdates.exogenous_variables.trim())
       ? []
@@ -199,7 +243,9 @@ export async function applySlotUpdates(
     if (slotID in normalizedUpdates) datasetPatch[field] = normalizedUpdates[slotID as SlotID]
   }
   const existingDataset = recordValue(task.taskSpec.dataset)
-  const resolved = resolveCovariates(task, nextSlots)
+  const resolved = resolveCovariates({ ...task, taskSpec: {
+    ...task.taskSpec, dataset: { ...existingDataset, ...datasetPatch } as JsonRecord,
+  } }, nextSlots)
   const availability = typeof nextSlots.future_covariate_availability === "string"
     ? nextSlots.future_covariate_availability.trim()
     : undefined
@@ -211,10 +257,47 @@ export async function applySlotUpdates(
     datasetPatch.knownFutureCovariates = unavailable ? [] : resolved.columns
   }
 
+  const nextObjective = { ...task.objective }
+  const nextBudget = { ...task.budget }
+  for (const [slot, field] of Object.entries({ primary_metric: "primaryMetric", secondary_metrics: "secondaryMetrics", error_preferences: "errorPreferences" })) {
+    if (slot in normalizedUpdates) nextObjective[field] = normalizedUpdates[slot as SlotID] as JsonRecord[string]
+  }
+  for (const [slot, field] of Object.entries({ latency_budget: "latencyBudget", parameter_budget: "parameterBudget" })) {
+    if (slot in normalizedUpdates) nextBudget[field] = normalizedUpdates[slot as SlotID] as JsonRecord[string]
+  }
+  if ("max_iterations" in normalizedUpdates || "max_no_improve" in normalizedUpdates) {
+    const loop = { ...recordValue(nextBudget.loop ?? nextBudget.researchLoop ?? nextBudget.autonomousLoop) }
+    if ("max_iterations" in normalizedUpdates) loop.maxIterations = normalizedUpdates.max_iterations
+    if ("max_no_improve" in normalizedUpdates) loop.maxNoImprove = normalizedUpdates.max_no_improve
+    nextBudget.loop = loop as JsonRecord
+  }
+  const metadataPatch: Record<string, JsonRecord[string]> = {}
+  for (const [slot, field] of Object.entries({ interaction_mode: "interactionMode", forecast_object: "forecastObject", business_context: "businessContext", interpretability: "interpretability", time_grain: "timeGrain" })) {
+    if (slot in normalizedUpdates) metadataPatch[field] = normalizedUpdates[slot as SlotID] as JsonRecord[string]
+  }
+  const constraints = { ...recordValue(task.taskSpec.constraints) }
+  if ("parameter_budget" in normalizedUpdates) {
+    const limit = explicitParameterLimit(normalizedUpdates.parameter_budget)
+    if (limit === undefined) delete constraints.maxParams
+    else constraints.maxParams = limit
+    metadataPatch.parameterBudgetEnforcement = limit === undefined ? "preference_only" : "hard_limit"
+  }
   const mergedTaskSpec: JsonRecord = {
     ...task.taskSpec,
+    ...(task.domainID === "tsf" && "parameter_budget" in normalizedUpdates ? { constraints: constraints as JsonRecord } : {}),
+    // TSF readers and runner plans consume these fields, not the intent metadata.
+    // Mirror only explicitly supplied updates, so unrelated edits cannot restore stale slots.
+    ...(task.domainID === "tsf" && "prediction_horizon" in normalizedUpdates
+      ? { predictionLengths: normalizedUpdates.prediction_horizon as JsonRecord[string] } : {}),
+    ...(task.domainID === "tsf" && "lookback_window" in normalizedUpdates
+      ? { contextLength: normalizedUpdates.lookback_window as JsonRecord[string] } : {}),
+    ...(task.domainID === "tsf" && "primary_metric" in normalizedUpdates
+      ? { evaluation: { ...recordValue(task.taskSpec.evaluation), metricPrimary: normalizedUpdates.primary_metric } as JsonRecord } : {}),
+    ...(task.domainID === "tsf" && "deployment_target" in normalizedUpdates
+      ? { runtime: { ...recordValue(task.taskSpec.runtime), deploymentTarget: normalizedUpdates.deployment_target } as JsonRecord } : {}),
     metadata: {
       ...existingMetadata,
+      ...metadataPatch,
       intentSlots: nextSlots,
       ...(resolved.columns.length > 0 ? {
         resolvedCovariates: {
@@ -260,6 +343,8 @@ export async function applySlotUpdates(
       .update(ResearchTaskTable)
       .set({
         task_spec: { ...normalizedTaskSpec, metadata: nextMetadata as unknown as JsonRecord },
+        objective: nextObjective,
+        budget: nextBudget,
         time_updated: Date.now(),
       })
       .where(and(eq(ResearchTaskTable.id, taskID), eq(ResearchTaskTable.project_id, task.projectID)))
@@ -268,6 +353,7 @@ export async function applySlotUpdates(
   )
   if (!row) throw new TaskNotFoundError(taskID)
   const updated = mapTask(row)
+  supersedeIntentCheckpoints(taskID, `Intent signature: ${intentCheckpointSignature(updated)}`)
   void Bus.publish(Event.TaskUpdated, { task: updated }).catch(() => undefined)
   return snapshotFromTask(taskID, updated)
 }
@@ -381,6 +467,7 @@ function intentCheckpointSignature(task: ResearchTask) {
   const dataset = recordValue(spec.dataset)
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
+  const loop = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   return [
     `mode=${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
@@ -392,7 +479,8 @@ function intentCheckpointSignature(task: ResearchTask) {
     `horizons=${compactIntentValue(spec.predictionLengths)}`,
     `metric=${compactIntentValue(objective.primaryMetric)}`,
     `direction=${compactIntentValue(objective.direction)}`,
-    `maxRuns=${compactIntentValue(budget.maxRuns)}`,
+    `maxIterations=${compactIntentValue(loop.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS)}`,
+    `maxNoImprove=${compactIntentValue(loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
   ].join("|")
 }
 
@@ -401,6 +489,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
   const dataset = recordValue(spec.dataset)
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
+  const loop = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   const metadata = recordValue(spec.metadata)
   const intentSlots = recordValue(metadata.intentSlots)
   function slotOr(canonical: unknown, slotKey: string) {
@@ -429,9 +518,10 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Error preferences: ${compactIntentValue(intentSlots.error_preferences ?? objective.errorPreferences)}`,
     `Latency budget: ${compactIntentValue(intentSlots.latency_budget ?? budget.latencyBudget)}`,
     `Parameter budget: ${compactIntentValue(intentSlots.parameter_budget ?? budget.parameterBudget)}`,
+    `NAS planned iterations: ${compactIntentValue(intentSlots.max_iterations ?? loop.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS)}`,
+    `Stop after no improvement: ${compactIntentValue(intentSlots.max_no_improve ?? loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
     `Interpretability: ${compactIntentValue(intentSlots.interpretability ?? spec.interpretability)}`,
     `Deployment target: ${compactIntentValue(intentSlots.deployment_target ?? spec.deploymentTarget)}`,
-    `Budget max runs: ${compactIntentValue(budget.maxRuns)}`,
     `Business context: ${compactIntentValue(intentSlots.business_context ?? metadata.businessContext ?? metadata.business_context)}`,
     "",
     "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并逐一修改 slots 后重新确认。",
@@ -443,6 +533,25 @@ export interface IntentCheckpointResult {
   readonly approvalID: string
 }
 
+// Preserve old approval snapshots for audit, but never leave a superseded intent pending.
+export function supersedeIntentCheckpoints(taskID: ResearchTaskID, signature: string) {
+  const rows = Database.use((d) => d.select().from(ResearchApprovalTable).where(and(
+    eq(ResearchApprovalTable.task_id, taskID),
+    eq(ResearchApprovalTable.kind, "protocol"),
+    eq(ResearchApprovalTable.status, "pending"),
+    isNull(ResearchApprovalTable.candidate_id),
+  )).all())
+  for (const row of rows) {
+    if (!row.reason.includes("[checkpoint:intent_confirmed]")) continue
+    if (row.reason.split(/\r?\n/).includes(signature)) continue
+    const updated = Database.use((d) => d.update(ResearchApprovalTable).set({
+      status: "rejected", reply_message: "Superseded by updated research intent.",
+      time_updated: Date.now(),
+    }).where(and(eq(ResearchApprovalTable.id, row.id), eq(ResearchApprovalTable.status, "pending"))).returning().get())
+    if (updated) void Bus.publish(Event.ApprovalUpdated, { approval: mapApproval(updated) }).catch(() => undefined)
+  }
+}
+
 export async function enterIntentCheckpoint(taskID: ResearchTaskID): Promise<IntentCheckpointResult> {
   let task = await loadTask(taskID)
   const intentSlots = recordValue(recordValue(task.taskSpec.metadata).intentSlots)
@@ -452,6 +561,7 @@ export async function enterIntentCheckpoint(taskID: ResearchTaskID): Promise<Int
   }
   const checkpointTag = "[checkpoint:intent_confirmed]"
   const signature = `Intent signature: ${intentCheckpointSignature(task)}`
+  supersedeIntentCheckpoints(taskID, signature)
   const rows = Database.use((d) =>
     d
       .select()

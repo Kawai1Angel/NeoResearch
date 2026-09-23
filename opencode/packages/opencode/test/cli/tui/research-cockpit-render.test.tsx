@@ -1,12 +1,12 @@
 /** @jsxImportSource @opentui/solid */
-import { beforeAll, describe, expect, test } from "bun:test"
+import { beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { Global } from "@opencode-ai/core/global"
 import { chmod, mkdir, readFile, rm, writeFile } from "fs/promises"
 import path from "path"
 import { CommandProvider, useCommandDialog } from "../../../src/cli/cmd/tui/component/dialog-command"
 import { KeybindProvider } from "../../../src/cli/cmd/tui/context/keybind"
-import { KVProvider } from "../../../src/cli/cmd/tui/context/kv"
+import { KVProvider, useKV } from "../../../src/cli/cmd/tui/context/kv"
 import { ProjectProvider } from "../../../src/cli/cmd/tui/context/project"
 import { RouteProvider, useRoute, type Route } from "../../../src/cli/cmd/tui/context/route"
 import { SDKProvider } from "../../../src/cli/cmd/tui/context/sdk"
@@ -18,6 +18,21 @@ import {
 } from "../../../src/cli/cmd/tui/routes/research-cockpit"
 import { DialogProvider } from "../../../src/cli/cmd/tui/ui/dialog"
 import { ToastProvider } from "../../../src/cli/cmd/tui/ui/toast"
+
+let flushPreferences: (() => Promise<void>) | undefined
+function PreferenceProbe() {
+  const kv = useKV()
+  flushPreferences = () => kv.flush()
+  return null
+}
+
+// Task selection and pending operation keys now survive a renderer restart.
+// Independent fixtures must start with independent UI preferences.
+beforeEach(async () => {
+  await flushPreferences?.()
+  await mkdir(Global.Path.state, { recursive: true })
+  await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+})
 
 const now = 1_765_000_000_000
 const taskID = "task_neo_cast_01"
@@ -368,7 +383,7 @@ async function mockChatResponse(
   if (url.pathname === "/agent") return response([agentFixture()])
   if (method !== "POST") return undefined
   posts.push({ path: url.pathname, body: await requestJson(input, init) })
-  if (url.pathname === "/session") {
+  if ((url.pathname === "/session" || /^\/research\/tasks\/[^/]+\/chat$/.test(url.pathname))) {
     return response({
       id: "session_research_chat",
       title: "NeoResearch Cockpit",
@@ -507,6 +522,7 @@ function ResearchCockpitHarness(
 ) {
   return (
     <KVProvider>
+      <PreferenceProbe />
       <ToastProvider>
         <RouteProvider initialRoute={props.initialRoute ?? { type: "cockpit" }}>
           <TuiConfigProvider config={{ theme: "opencode" }}>
@@ -724,7 +740,7 @@ describe("ResearchCockpit render", () => {
       app.mockInput.pressEnter()
 
       const frame = await waitForFrame(app, "Research Agent: 你好，我在。")
-      expect(posts.map((post) => post.path)).not.toContain("/session")
+      expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/chat`)
       expect(posts.map((post) => post.path)).not.toContain("/session/session_research_chat/message")
       expect(posts.map((post) => post.path)).not.toContain("/session/session_research_chat/prompt_async")
       expect(frame).not.toContain("Waiting for")
@@ -1010,7 +1026,7 @@ describe("ResearchCockpit render", () => {
       app.mockInput.pressEnter()
 
       const frame = await waitForFrame(app, "Research Agent: 当前任务还在 smoke 阶段")
-      expect(posts.map((post) => post.path)).toContain("/session")
+      expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/chat`)
       expect(posts.map((post) => post.path)).toContain("/session/session_research_chat/prompt_async")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
       expect(frame).toContain("请解释当前状态")
@@ -1297,7 +1313,7 @@ describe("ResearchCockpit render", () => {
         return response({ providers: [providerFixture()], default: { openai: "gpt-test" } })
       }
       if (url.pathname === "/agent") return response([agentFixture()])
-      if (method === "POST" && url.pathname === "/session") {
+      if (method === "POST" && (url.pathname === "/session" || /^\/research\/tasks\/[^/]+\/chat$/.test(url.pathname))) {
         return response({
           id: "session_research_chat",
           title: "NeoResearch Cockpit",
@@ -1577,7 +1593,7 @@ describe("ResearchCockpit render", () => {
       if (url.pathname.match(/^\/research\/tasks\/task_usage_[ab]\/(candidates|runs|artifacts|approvals)$/)) return response([])
       if (url.pathname.match(/^\/research\/tasks\/task_usage_[ab]\/champion$/)) return response(null)
       if (url.pathname.match(/^\/research\/tasks\/task_usage_[ab]\/fingerprint$/)) return response({})
-      if (method === "POST" && url.pathname === "/session") {
+      if (method === "POST" && (url.pathname === "/session" || /^\/research\/tasks\/[^/]+\/chat$/.test(url.pathname))) {
         return response({
           id: "session_usage_a",
           title: "NeoResearch Cockpit",
@@ -1771,7 +1787,7 @@ describe("ResearchCockpit render", () => {
       }
       if (url.pathname === "/agent") return response([agentFixture()])
       if (method !== "POST") return mockResearchFetch(input, init)
-      if (url.pathname === "/session") {
+      if ((url.pathname === "/session" || /^\/research\/tasks\/[^/]+\/chat$/.test(url.pathname))) {
         return response({
           id: "session_research_chat",
           title: "NeoResearch Cockpit",
@@ -1903,6 +1919,41 @@ describe("ResearchCockpit render", () => {
 
       expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/baselines`)
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("a single autonomous iteration requests full training after smoke verification", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    const actionFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (init?.method === "POST" && url.pathname.endsWith("/autonomous/iterate")) {
+        posts.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+        return Promise.resolve(response({ iteration: null }))
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 160, height: 48 })
+    try {
+      await waitForFrame(app, "smoke succeeded")
+      await app.mockInput.typeText("/iterate")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+
+      for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+
+      expect(posts).toContainEqual({
+        path: `/research/tasks/${taskID}/autonomous/iterate`,
+        body: { stage: "full", description: "cockpit autonomous iteration" },
+      })
     } finally {
       app.renderer.destroy()
     }
@@ -2309,9 +2360,8 @@ describe("ResearchCockpit render", () => {
       expect(posts[1]).toEqual({
         path: "/research/tasks/task_from_home_goal/pipeline",
         body: {
-          stage: "smoke",
+          stage: "full",
           description: "Forecast ETTh1 horizon 24",
-          maxIterations: 50,
         }
       })
     } finally {
@@ -3220,7 +3270,7 @@ describe("ResearchCockpit render", () => {
         },
       },
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
-      budget: { maxRuns: 12 },
+      budget: { maxRuns: 200, loop: { maxIterations: 12, maxNoImprove: 3 } },
       time: { created: now - 60_000, updated: now },
     }
     const progressFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
@@ -3330,7 +3380,7 @@ describe("ResearchCockpit render", () => {
         },
       },
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
-      budget: { maxRuns: 12 },
+      budget: { maxRuns: 200, loop: { maxIterations: 12, maxNoImprove: 3 } },
       time: { created: now - 60_000, updated: now },
     }
     const candidates = [1, 2, 3].map((index) => ({
@@ -3434,8 +3484,10 @@ describe("ResearchCockpit render", () => {
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
     const bodies: unknown[] = []
+    const postedPaths: string[] = []
     const fetchWithCreate = ((input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(input.toString())
+      if (init?.method === "POST") postedPaths.push(url.pathname)
       if (url.pathname === "/research/tasks" && init?.method === "POST") {
         bodies.push(JSON.parse(String(init.body)))
         return Promise.resolve(
@@ -3480,6 +3532,12 @@ describe("ResearchCockpit render", () => {
           },
         },
       })
+      for (let attempt = 0; attempt < 40 && !postedPaths.includes("/research/tasks/task_full_recipe/intent/start"); attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+      expect(postedPaths).toContain("/research/tasks/task_full_recipe/intent/start")
+      expect(postedPaths).not.toContain("/research/tasks/task_full_recipe/pipeline")
     } finally {
       app.renderer.destroy()
     }
@@ -3958,9 +4016,95 @@ describe("ResearchCockpit render", () => {
 
       expect(posts).toContainEqual({
         path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "full", maxIterations: 50, description: "cockpit autonomous loop" },
+        body: { stage: "full", description: "cockpit autonomous loop" },
       })
     } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("next action promotes a verified smoke candidate to full training", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const posts: Array<{ path: string; body: unknown }> = []
+    const actionFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      if (url.pathname === `/research/tasks/${taskID}/runs` && !init?.method) {
+        return Promise.resolve(response([{
+          id: runID, taskID, candidateID, stage: "smoke", status: "succeeded",
+          metrics: { val_avg_mse: 0.1234 },
+          resourceUsage: { executionContract: { status: "verified" } },
+          artifactRefs: [], time: { created: now - 12_000, updated: now - 8_000 },
+        }]))
+      }
+      if (init?.method === "POST" && url.pathname.endsWith("/execute-run")) {
+        posts.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+        return Promise.resolve(response({ run: { id: "full_run", stage: "full", status: "succeeded", metrics: {} } }))
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    let command: CommandDialog | undefined
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={actionFetch} onCommand={(value) => (command = value)} />,
+      { width: 160, height: 48 },
+    )
+
+    try {
+      await waitForFrame(app, "Run full training")
+      command?.trigger("research.next.run")
+      for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
+        await app.renderOnce()
+        await Bun.sleep(25)
+      }
+      expect(posts).toContainEqual({
+        path: `/research/tasks/${taskID}/candidates/${candidateID}/execute-run`,
+        body: { stage: "full", description: "cockpit full run" },
+      })
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("escape cancels an accepted background research loop and waits for its receipt", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+    let starts = 0
+    let cancels = 0
+    let polls = 0
+    const operation = { id: "background_loop", taskID, action: "ResearchRoutes.tasks.autonomousLoop", status: "running" }
+    const actionFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestURL(input)
+      if (url.pathname.endsWith("/autonomous/loop") && init?.method === "POST") {
+        starts++
+        expect(new Headers(init.headers).get("prefer")).toBe("respond-async")
+        return Response.json(operation, { status: 202 })
+      }
+      if (url.pathname.endsWith("/operations/background_loop/cancel")) {
+        cancels++
+        return Response.json({ ...operation, status: "canceling" })
+      }
+      if (url.pathname.endsWith("/operations/background_loop")) {
+        polls++
+        return Response.json({ ...operation, status: cancels ? "canceled" : "running" })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+    const app = await testRender(() => <ResearchCockpitHarness fetch={actionFetch} />, { width: 170, height: 48 })
+    try {
+      await waitForFrame(app, "smoke succeeded")
+      await app.mockInput.typeText("/loop start")
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+      for (let i = 0; i < 40 && polls === 0; i++) { await app.renderOnce(); await Bun.sleep(25) }
+      expect(starts).toBe(1)
+      expect(polls).toBeGreaterThan(0)
+      app.mockInput.pressKey("ESCAPE")
+      await waitForFrame(app, "autonomous-loop canceled.")
+      expect(cancels).toBe(1)
+    } finally {
+      cancels = 1
       app.renderer.destroy()
     }
   })
@@ -4142,7 +4286,7 @@ describe("ResearchCockpit render", () => {
 
       expect(posts).toContainEqual({
         path: `/research/tasks/${taskID}/autonomous/loop`,
-        body: { stage: "full", maxIterations: 50, description: "cockpit autonomous loop" },
+        body: { stage: "full", description: "cockpit autonomous loop" },
       })
     } finally {
       app.renderer.destroy()
@@ -4455,16 +4599,76 @@ describe("ResearchCockpit render", () => {
         properties: {
           taskID,
           runID: runningRunID,
-          line: '{"event":"epoch_end","horizon":24,"epoch":2,"val_loss":0.12345}',
+          line: '{"event":"epoch_end","horizon":24,"epoch":2,"val_loss":0.12345,"cv_fold_index":2}',
           event: "epoch_end",
           epoch: 2,
           horizon: 24,
           valLoss: 0.12345,
+          foldIndex: 2,
         },
       })
 
-      const frame = await waitForFrame(app, "epoch 2 | h24 | val_loss 0.1235")
+      const frame = await waitForFrame(app, "fold 3 | epoch 2 | h24 | val_loss 0.1235")
       expect(frame).toContain(`smoke running`)
+      expect(frame).toContain(`[TrainEval live | smoke | ${runningRunID}]`)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("replays and pins persisted runner progress after reopening a running task", async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+
+    const runningRunID = "run_recovered_progress"
+    const recoveredFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/runs`) {
+        return Promise.resolve(response([{
+          id: runningRunID,
+          taskID,
+          candidateID,
+          stage: "full",
+          status: "running",
+          metrics: {},
+          resourceUsage: {},
+          artifactRefs: ["artifact_live_progress"],
+          time: { created: now - 120_000, updated: now - 110_000 },
+        }]))
+      }
+      if (path === `/research/tasks/${taskID}/artifacts`) {
+        return Promise.resolve(response([{
+          id: "artifact_live_progress",
+          taskID,
+          runID: runningRunID,
+          kind: "runner_progress_jsonl",
+          uri: "file:///tmp/recovered-progress.jsonl",
+          metadata: {
+            stage: "full",
+            live: true,
+            previewLines: [{
+              line: '{"event":"epoch_end","horizon":720,"epoch":9,"val_loss":0.4567,"cv_fold_index":1}',
+              event: "epoch_end",
+              epoch: 9,
+              horizon: 720,
+              valLoss: 0.4567,
+            }],
+          },
+          time: { created: now - 115_000, updated: now - 1_000 },
+        }]))
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+
+    const app = await testRender(() => <ResearchCockpitHarness fetch={recoveredFetch} />, {
+      width: 170,
+      height: 56,
+    })
+
+    try {
+      const frame = await waitForFrame(app, "fold 2 | epoch 9 | h720 | val_loss 0.4567")
+      expect(frame).toContain(`[TrainEval live | full | ${runningRunID}]`)
+      expect(frame).toContain("full running")
     } finally {
       app.renderer.destroy()
     }
@@ -4828,6 +5032,73 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("Enter prepares the isolated dataset and refreshes runner status and Next after completion", async () => {
+    const projectRoot = path.join("/tmp", `neo-cast-next-prepare-${crypto.randomUUID()}`)
+    const runnerRoot = path.join(projectRoot, "shared-runner")
+    await prepareNeoCastRunnerRoot(runnerRoot)
+    const task = {
+      id: taskID, projectID: "project_neo_cast", title: "Prepare and advance",
+      domainID: "tsf", mode: "autonomous", status: "researching",
+      taskSpec: {
+        contextLength: 96, predictionLengths: [24],
+        metadata: { executionIsolation: "task" },
+        dataset: { loaderID: "etth1", path: "/tmp/ETTh1.csv", targetCols: ["OT"] },
+        runtime: { bridgeOnly: false, neoCastProjectRoot: runnerRoot },
+      },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      budget: { maxRuns: 12, maxParallel: 1 }, time: { created: now, updated: now },
+    }
+    let finish!: () => void
+    const pending = new Promise<void>((resolve) => { finish = resolve })
+    let posts = 0
+    const prepareFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString())
+      // Preparation does not change the task JSON or timestamps.
+      if (url.pathname === "/research/tasks" && !init?.method) return response([task])
+      if (url.pathname === `/research/tasks/${taskID}` && !init?.method) return response(task)
+      if (url.pathname === `/research/tasks/${taskID}/prepare-dataset` && init?.method === "POST") {
+        posts++
+        await pending
+        const root = path.join(projectRoot, ".neo-research", "workspaces", taskID, ".neo-cast")
+        await mkdir(root, { recursive: true })
+        const datasetSpec = {
+          source_csv: "/tmp/ETTh1.csv", input_len: 96, horizons: [24], feature_columns: ["OT"],
+        }
+        await writeFile(path.join(root, "dataset_spec.json"), JSON.stringify(datasetSpec))
+        return response({ artifact: { id: "prepared_next", taskID }, datasetSpec })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+    const app = await testRender(
+      () => <ResearchCockpitHarness fetch={prepareFetch} directory={projectRoot} />,
+      { width: 170, height: 56 },
+    )
+    try {
+      await waitForFrame(app, "Next: Prepare dataset")
+      app.mockInput.pressEnter()
+      await waitForFrame(app, "prepare-dataset")
+      expect(posts).toBe(1)
+      finish()
+      await waitForFrame(app, "Next: Run autonomous loop")
+      let frame = ""
+      for (let attempt = 0; attempt < 80; attempt++) {
+        await app.renderOnce()
+        frame = app.captureCharFrame()
+        if (!frame.includes("Next: Prepare dataset") && !frame.includes("Runner dataset mismatch")) break
+        await Bun.sleep(25)
+      }
+      expect(frame).not.toContain("Next: Prepare dataset")
+      expect(frame).not.toContain("Runner dataset mismatch")
+      expect(frame).toContain("Next:")
+      expect(frame).not.toMatch(/Working.*prepare-dataset/)
+      expect(posts).toBe(1)
+    } finally {
+      finish()
+      app.renderer.destroy()
+      await rm(projectRoot, { recursive: true, force: true })
+    }
+  })
+
   test("start forecast prompt runs the recommended dataset preparation", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -5018,7 +5289,7 @@ describe("ResearchCockpit render", () => {
         { path: `/research/tasks/${taskID}/prepare-dataset`, body: { force: true } },
         {
           path: `/research/tasks/${taskID}/autonomous/loop`,
-          body: { stage: "full", maxIterations: 50, description: "cockpit autonomous loop" },
+          body: { stage: "full", description: "cockpit autonomous loop" },
         },
       ])
     } finally {
@@ -5400,6 +5671,29 @@ describe("ResearchCockpit render", () => {
     }
   })
 
+  test("restores the newest intent snapshot even when an older checkpoint was approved later", async () => {
+    const approvals = [
+      { id: "old_intent", taskID, kind: "protocol", status: "approved",
+        reason: "[checkpoint:intent_confirmed]\nPrediction lengths: 96",
+        time: { created: now - 2000, updated: now + 1000 } },
+      { id: "new_intent", taskID, kind: "protocol", status: "approved",
+        reason: "[checkpoint:intent_confirmed]\nPrediction lengths: 96,192,336,720",
+        time: { created: now - 1000, updated: now } },
+    ]
+    const fetcher = ((input: RequestInfo | URL, init?: RequestInit) => {
+      if (requestURL(input).pathname === `/research/tasks/${taskID}/approvals`) return Promise.resolve(response(approvals))
+      return mockResearchFetch(input, init)
+    }) as typeof fetch
+    const app = await testRender(() => <ResearchCockpitHarness fetch={fetcher} />, { width: 170, height: 56 })
+    try {
+      const frame = await waitForFrame(app, "Prediction lengths: 96,192,336,720")
+      expect(frame).toContain("[intent_confirmed] approved")
+      expect(frame.split("Prediction lengths:")).toHaveLength(2)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("confirmed intent_confirmed banner stays above DataAnalysis and HypoPlanner after /approve", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
@@ -5470,9 +5764,43 @@ test("Literature streams tools, caches and data-only completion while rejecting 
     events.emit({ type: "research.agent.literature.completed", properties: { taskID, metadata: { retrieveRunID: "retrieve_test", readiness: "ready_data_only", callPath: "direct", gapCount: 2 } } })
     const completed = await waitForFrame(app, "ready_data_only")
     expect(completed).toContain("0 papers / 0 cards")
+    expect(completed).toContain("literature_run")
+    expect(completed).toContain("缓存命中")
     events.emit({ type: "research.agent.literature.started", properties: { taskID } })
     events.emit({ type: "research.agent.literature.failed", properties: { taskID } })
     await waitForFrame(app, "证据未交付")
+  } finally { app.renderer.destroy() }
+})
+
+test("Literature paper and card results stay above HypoPlanner after both complete", async () => {
+  await mkdir(Global.Path.state, { recursive: true })
+  await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+  const events = createCockpitEventSource()
+  const app = await testRender(() => <ResearchCockpitHarness fetch={researchFetch} events={events.source} />, { width: 170, height: 48 })
+  try {
+    await waitForFrame(app, "smoke succeeded")
+    events.emit({ type: "research.agent.literature.started", properties: { taskID } })
+    events.emit({ type: "research.agent.literature.part.updated", properties: { taskID, partID: "lit-tool", kind: "tool",
+      toolName: "literature_run", toolState: "completed", toolOutput: "validated receipt" } })
+    events.emit({ type: "research.agent.literature.completed", properties: { taskID, metadata: {
+      readiness: "ready_with_evidence", literaturePaperCount: 1, paperBackedCardCount: 1, selectedEntryCount: 1,
+      paperSummaries: [{ paperID: "paper_a", title: "Forecasting with Patches", status: "completed", acceptedCardCount: 1 }],
+      cardSummaries: [
+        { cardID: "kc_a", paperID: "paper_a", cardType: "model_mechanism", claim: "Patches model local patterns.", selected: true },
+        { cardID: "kc_b", paperID: "paper_a", cardType: "limitation", claim: "Long patches can lose detail.", selected: false },
+      ],
+    } } })
+    events.emit({ type: "research.agent.hypoPlanner.started", properties: { taskID } })
+    events.emit({ type: "research.agent.hypoPlanner.part.updated", properties: { taskID, partID: "hypo-text", kind: "text", text: "Use patch-based forecasting." } })
+    let frame = await waitForFrame(app, "Use patch-based forecasting.")
+    expect(frame).toContain("提取卡片")
+    expect(frameLine(frame, "Long patches can lose detail.")).toBeLessThan(frameLine(frame, "[HypoPlanner]"))
+    expect(frameLine(frame, "[HypoPlanner]")).toBeLessThan(frameLine(frame, "Use patch-based forecasting."))
+    events.emit({ type: "research.agent.hypoPlanner.completed", properties: { taskID } })
+    frame = await waitForFrame(app, "Use patch-based forecasting.")
+    expect(frame).toContain("Forecasting with Patches")
+    expect(frame).toContain("validated receipt")
+    expect(frameLine(frame, "Long patches can lose detail.")).toBeLessThan(frameLine(frame, "[HypoPlanner]"))
   } finally { app.renderer.destroy() }
 })
 
@@ -5484,7 +5812,8 @@ test("Literature completion and child navigation recover from artifact metadata 
       id: "artifact_literature_replay", taskID, kind: "task_evidence_bundle_json", uri: "file:///tmp/task_evidence_bundle.json",
       metadata: { schemaVersion: "task_evidence_bundle_v1", retrieveRunID: "retrieve_replay", readiness: "ready_data_only",
         callPath: "session_tool", sessionID: "session_literature_replay", selectedEntryCount: 0, gapCount: 3,
-        summary: { literaturePaperCount: 0, paperBackedCardCount: 0 } }, time: { created: now, updated: now },
+        summary: { literaturePaperCount: 0, paperBackedCardCount: 0 },
+        paperSummaries: [{ paperID: "paper_replay", title: "Recovered Paper", status: "completed", acceptedCardCount: 0 }] }, time: { created: now, updated: now },
     }])
     return researchFetch(input, init)
   }) as typeof fetch
@@ -5496,8 +5825,206 @@ test("Literature completion and child navigation recover from artifact metadata 
       const frame = await waitForFrame(app, "ready_data_only")
       expect(frame).toContain("session_tool")
       expect(frame).toContain("✓ LiteratureAgent")
+      expect(frame).toContain("Recovered Paper")
       command?.trigger("research.literature.session")
       expect(route?.data).toEqual({ type: "session", sessionID: "session_literature_replay" })
     } finally { app.renderer.destroy() }
   }
 })
+
+test("PublishAgent completion shows the final report path in the cockpit", async () => {
+  const events = createCockpitEventSource()
+  const app = await testRender(
+    () => <ResearchCockpitHarness fetch={researchFetch} events={events.source} />,
+    { width: 170, height: 48 },
+  )
+  try {
+    await waitForFrame(app, "smoke succeeded")
+    events.emit({
+      type: "research.agent.publish.completed",
+      properties: {
+        taskID,
+        metadata: {
+          kind: "model_export_package",
+          path: "/tmp/package",
+          reportPath: "file:///tmp/final_report.md",
+        },
+      },
+    })
+    const frame = await waitForFrame(app, "最终研究报告: /tmp/final_report.md")
+    expect(frame).toContain("[Publish] 发布完成 / model_export_package")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("historical route opens a task outside the recent page and restores chat without writes", async () => {
+  const historicalID = "task_historical_outside_page"
+  const requests: Array<{ path: string; method: string }> = []
+  const recent = await (await mockResearchFetch(new URL("http://mock.local/research/tasks"))).json()
+  const historical = { ...recent[0], id: historicalID, title: "历史任务单独加载", status: "completed" }
+  const historyFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = requestURL(input)
+    requests.push({ path: url.pathname, method: init?.method ?? "GET" })
+    if (url.pathname === `/research/tasks/${historicalID}`) return response(historical)
+    if (url.pathname === `/research/tasks/${historicalID}/resume-state`) return response({ taskID: historicalID, revision: 3, chatSessionID: "session_saved_chat", recoveryState: "completed", summary: "从已保存的进度继续", eventCursor: 0 })
+    if (url.pathname === "/session/session_saved_chat/message") return response([{ info: { role: "assistant" }, parts: [{ type: "text", text: "这是重新进入后的历史对话" }] }])
+    if (url.pathname === `/research/tasks/${historicalID}/approvals`) return response([{
+      id: "stale_pending", taskID: historicalID, kind: "protocol", status: "pending", reason: "stale gate",
+      time: { created: now - 1, updated: now - 1 },
+    }])
+    if (url.pathname === `/research/tasks/${historicalID}/artifacts`) return response([
+      { id: "artifact_package", taskID: historicalID, kind: "model_export_package", uri: "file:///tmp/package", metadata: {}, time: { created: now + 1, updated: now + 1 } },
+      { id: "artifact_saved", taskID: historicalID, kind: "final_report_md", uri: "file:///tmp/saved-report.md", metadata: {}, time: { created: now, updated: now } },
+    ])
+    if (url.pathname === "/file/content") return response({ type: "text", content: "历史报告正文：训练已完成" })
+    if (url.pathname.startsWith(`/research/tasks/${historicalID}/`)) return response(url.pathname.endsWith("champion") ? null : url.pathname.endsWith("fingerprint") ? {} : [])
+    return mockResearchFetch(input, init)
+  }) as typeof fetch
+  const app = await testRender(() => <ResearchCockpitHarness fetch={historyFetch} initialRoute={{ type: "cockpit", taskID: historicalID }} />, { width: 170, height: 48 })
+  try {
+    const frame = await waitForFrame(app, "这是重新进入后的历史对话")
+    expect(frame).toContain("历史任务单独加载")
+    expect(frame).toContain("[Publish] 最终研究报告: /tmp/saved-report.md")
+    expect(frame).toContain("Review final report")
+    expect(requests.some((request) => request.path === `/research/tasks/${historicalID}`)).toBe(true)
+    app.mockInput.pressEnter()
+    await waitForFrame(app, "研究结果与产物")
+    await app.renderOnce()
+    await Bun.sleep(50)
+    app.mockInput.pressEnter()
+    await waitForFrame(app, "历史报告正文：训练已完成")
+    expect(requests.filter((request) => request.method !== "GET")).toHaveLength(0)
+  } finally { app.renderer.destroy() }
+})
+
+test("restored IntentAgent history stays in its stage block instead of the bottom chat history", async () => {
+  const restoredTaskID = "task_restored_intent_order"
+  const recent = await (await mockResearchFetch(new URL("http://mock.local/research/tasks"))).json()
+  const restoredTask = { ...recent[0], id: restoredTaskID, title: "恢复 Intent 顺序", status: "completed" }
+  const restoredFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = requestURL(input)
+    if (url.pathname === `/research/tasks/${restoredTaskID}`) return response(restoredTask)
+    if (url.pathname === `/research/tasks/${restoredTaskID}/resume-state`) {
+      return response({
+        taskID: restoredTaskID,
+        revision: 5,
+        chatSessionID: "session_restored_chat",
+        intentSessionID: "session_restored_intent",
+        recoveryState: "completed",
+        summary: "研究已完成，可查看结果",
+        eventCursor: 0,
+      })
+    }
+    if (url.pathname === "/session/session_restored_chat/message") {
+      return response([{ info: { role: "assistant", time: { created: now + 10 } }, parts: [{ type: "text", text: "这是普通 cockpit 对话" }] }])
+    }
+    if (url.pathname === "/session/session_restored_intent/message") {
+      return response([
+        {
+          info: { role: "user", time: { created: now } },
+          parts: [{ type: "text", synthetic: true, text: `Begin intent gathering for research task "恢复 Intent 顺序".\nFollow your workflow:` }],
+        },
+        {
+          info: { role: "assistant", time: { created: now + 1 } },
+          parts: [
+            { id: "intent-read", type: "tool", tool: "read_taskspec", state: { status: "completed", input: {}, output: "Task spec loaded", time: { start: now, end: now + 4 } } },
+            { id: "intent-summary", type: "text", text: "这是恢复后的 IntentAgent 内容" },
+          ],
+        },
+        {
+          info: { role: "user", time: { created: now + 2 } },
+          parts: [{ id: "intent-answer", type: "text", text: "预测目标是 OT" }],
+        },
+      ])
+    }
+    if (url.pathname.startsWith(`/research/tasks/${restoredTaskID}/`)) {
+      return response(url.pathname.endsWith("champion") ? null : url.pathname.endsWith("fingerprint") ? {} : [])
+    }
+    return mockResearchFetch(input, init)
+  }) as typeof fetch
+  const app = await testRender(
+    () => <ResearchCockpitHarness fetch={restoredFetch} initialRoute={{ type: "cockpit", taskID: restoredTaskID }} />,
+    { width: 170, height: 52 },
+  )
+  try {
+    const frame = await waitForFrame(app, "这是恢复后的 IntentAgent 内容")
+    expect(frame).toContain("[IntentAgent]")
+    expect(frame).toContain("[✓] read_taskspec 4ms")
+    expect(frame).toContain("You: 预测目标是 OT")
+    expect(frame).toContain("Research Agent: 这是普通 cockpit 对话")
+    expect(frame).not.toContain("Research Agent: 这是恢复后的 IntentAgent 内容")
+    expect(frameLine(frame, "[IntentAgent]")).toBeLessThan(frameLine(frame, "这是恢复后的 IntentAgent 内容"))
+    expect(frameLine(frame, "这是恢复后的 IntentAgent 内容")).toBeLessThan(frameLine(frame, "Research Agent: 这是普通 cockpit 对话"))
+  } finally { app.renderer.destroy() }
+})
+
+test("missing historical task reports an error without selecting the recent task", async () => {
+  const historyFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (requestURL(input).pathname === "/research/tasks/missing_history") return new Response("Research task not found", { status: 404 })
+    return mockResearchFetch(input, init)
+  }) as typeof fetch
+  const app = await testRender(() => <ResearchCockpitHarness fetch={historyFetch} initialRoute={{ type: "cockpit", taskID: "missing_history" }} />, { width: 170, height: 48 })
+  try {
+    const frame = await waitForFrame(app, "Research task not found")
+    expect(frame).not.toContain("Neo-Cast Autonomous TSF")
+  } finally { app.renderer.destroy() }
+})
+
+for (const mode of ["autonomous", "companion", "socratic"] as const) {
+  test(`intent checkpoint edits continue IntentAgent instead of generic chat (${mode})`, async () => {
+    await mkdir(Global.Path.state, { recursive: true })
+    await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+    const events = createCockpitEventSource()
+    const posts: Array<{ path: string; body: unknown }> = []
+    const requestKeys: Array<string | null> = []
+    let busyOnce = mode === "autonomous"
+    const edit = "把数据路径改成 /data/new.csv，预测长度改成 48"
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const pathname = requestURL(input).pathname
+      if (pathname === "/research/tasks") {
+        const tasks = await (await mockResearchFetch(input, init)).json()
+        return response(tasks.map((task: Record<string, unknown>) => ({ ...task, mode, status: "paused" })))
+      }
+      if (pathname === `/research/tasks/${taskID}/approvals`) return response([{
+        id: "approval_intent_edit", taskID, kind: "protocol", status: "pending",
+        reason: "[checkpoint:intent_confirmed]\nIntent requirements confirmed.",
+        time: { created: now, updated: now },
+      }])
+      if (pathname === `/research/tasks/${taskID}/operations/prior-intent`) return response({
+        id: "prior-intent", taskID, action: "ResearchRoutes.tasks.pipeline", status: "waiting_input",
+      })
+      if (requestMethod(input, init) === "POST") {
+        posts.push({ path: pathname, body: await requestJson(input, init) })
+        if (pathname === `/research/tasks/${taskID}/intent/modify`) {
+          requestKeys.push(new Headers(init?.headers).get("idempotency-key"))
+          if (busyOnce) {
+            busyOnce = false
+            return Response.json({ name: "ResearchOperationBusy", operation: {
+              id: "prior-intent", taskID, action: "ResearchRoutes.tasks.pipeline", status: "running",
+            } }, { status: 409 })
+          }
+          events.emit({ type: "research.agent.intent.started", properties: { taskID } })
+          events.emit({ type: "research.agent.intent.part.updated", properties: {
+            taskID, partID: "edit-reply", kind: "text", text: "正在原 IntentAgent 会话中处理修改",
+          } })
+          events.emit({ type: "research.agent.intent.completed", properties: { taskID } })
+          return response({ taskID })
+        }
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof globalThis.fetch
+    const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} events={events.source} />, { width: 160, height: 48 })
+    try {
+      await waitForFrame(app, "Approval requested")
+      await app.mockInput.typeText(edit)
+      await app.renderOnce()
+      app.mockInput.pressEnter()
+      await waitForFrame(app, "正在原 IntentAgent 会话中处理修改")
+      const expected = { path: `/research/tasks/${taskID}/intent/modify`, body: { message: edit } }
+      expect(posts).toEqual(mode === "autonomous" ? [expected, expected] : [expected])
+      expect(requestKeys[0]).toBeTruthy()
+      expect(new Set(requestKeys).size).toBe(1)
+    } finally { app.renderer.destroy() }
+  })
+}

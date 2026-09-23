@@ -1,5 +1,6 @@
 import type { JsonRecord, ResearchTask, ResearchTaskID } from "../schema"
 import { extractJsonObject, requestNeoCastLLM, resolveEffectiveLLMConfig } from "../llm-proposal"
+import { NAS_DEFAULT_MAX_ITERATIONS, NAS_DEFAULT_MAX_NO_IMPROVE } from "../defaults"
 
 export type IntentInteractionMode = "socratic" | "companion"
 
@@ -31,6 +32,8 @@ export interface IntentSpec {
   readonly error_preferences?: string
   readonly latency_budget?: unknown
   readonly parameter_budget?: unknown
+  readonly max_iterations?: number
+  readonly max_no_improve?: number
   readonly interpretability?: string
   readonly deployment_target?: string
   readonly open_questions: string[]
@@ -55,23 +58,13 @@ export interface IntentAgentResult {
   }
 }
 
-export type SlotID =
-  | "interaction_mode"
-  | "forecast_object"
-  | "data_source"
-  | "target_columns"
-  | "lookback_window"
-  | "prediction_horizon"
-  | "exogenous_variables"
-  | "future_covariate_availability"
-  | "business_context"
-  | "primary_metric"
-  | "secondary_metrics"
-  | "error_preferences"
-  | "latency_budget"
-  | "parameter_budget"
-  | "interpretability"
-  | "deployment_target"
+export const INTENT_SLOT_IDS = [
+  "interaction_mode", "forecast_object", "data_source", "target_columns", "lookback_window",
+  "prediction_horizon", "time_grain", "exogenous_variables", "future_covariate_availability",
+  "business_context", "primary_metric", "secondary_metrics", "error_preferences", "latency_budget",
+  "parameter_budget", "max_iterations", "max_no_improve", "interpretability", "deployment_target",
+] as const
+export type SlotID = typeof INTENT_SLOT_IDS[number]
 
 export type IntentSlot = {
   readonly id: SlotID
@@ -177,6 +170,7 @@ export function collectedIntentSlots(task: ResearchTask) {
   const dataset = recordValue(taskSpec.dataset)
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
+  const loopBudget = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
   const runtime = recordValue(taskSpec.runtime)
   const metadata = recordValue(taskSpec.metadata)
   const constraints = recordValue(taskSpec.constraints)
@@ -223,7 +217,7 @@ export function collectedIntentSlots(task: ResearchTask) {
       taskSpec.inputLength,
     ),
     prediction_horizon: numberArray(firstKnown(taskSpec.predictionLengths, taskSpec.predictionHorizon, mergedSlots.prediction_horizon)),
-    time_grain: firstString(mergedSlots.time_grain, taskSpec.timeGrain, taskSpec.frequency, dataset.frequency),
+    time_grain: firstString(mergedSlots.time_grain, taskSpec.timeGrain, taskSpec.frequency, metadata.timeGrain, dataset.frequency),
     exogenous_variables: optionalStringArray(exogenousVariables),
     future_covariate_availability: firstString(
       mergedSlots.future_covariate_availability,
@@ -262,6 +256,11 @@ export function collectedIntentSlots(task: ResearchTask) {
       constraints.maxParameters,
       constraints.maxParams,
     ),
+    max_iterations:
+      firstNumber(mergedSlots.max_iterations, loopBudget.maxIterations) ?? NAS_DEFAULT_MAX_ITERATIONS,
+    max_no_improve:
+      firstNumber(mergedSlots.max_no_improve, loopBudget.maxNoImprove, loopBudget.maxNoImproveRounds) ??
+      NAS_DEFAULT_MAX_NO_IMPROVE,
     interpretability: firstString(
       mergedSlots.interpretability,
       taskSpec.interpretability,
@@ -338,6 +337,15 @@ export function slotDefinitions(task: ResearchTask): IntentSlot[] {
       value: slots.prediction_horizon,
     },
     {
+      id: "time_grain",
+      field: "metadata.timeGrain",
+      label: "时间粒度",
+      required: false,
+      socraticQuestion: "数据的采样时间粒度是什么？",
+      companionQuestion: "时间粒度是什么？",
+      value: slots.time_grain,
+    },
+    {
       id: "exogenous_variables",
       field: "intent.exogenous_variables",
       label: "外生变量",
@@ -408,6 +416,24 @@ export function slotDefinitions(task: ResearchTask): IntentSlot[] {
       socraticQuestion: "模型参数量或资源预算有什么限制？",
       companionQuestion: "参数量/资源预算有什么上限？",
       value: slots.parameter_budget,
+    },
+    {
+      id: "max_iterations",
+      field: "budget.loop.maxIterations",
+      label: "NAS 计划迭代数",
+      required: false,
+      socraticQuestion: "本次 NAS 搜索计划运行多少轮？默认是 25 轮；请确认默认值或给出新的计划迭代上限。系统安全运行上限会独立执行。",
+      companionQuestion: "本次 NAS 搜索计划运行多少轮？默认是 25 轮，请确认或修改。",
+      value: slots.max_iterations,
+    },
+    {
+      id: "max_no_improve",
+      field: "budget.loop.maxNoImprove",
+      label: "连续无提升停止轮数",
+      required: false,
+      socraticQuestion: "NAS 连续多少轮没有改善时应提前停止？默认是 7 轮，请确认或修改。",
+      companionQuestion: "连续多少轮没有改善时停止搜索？默认是 7 轮，请确认或修改。",
+      value: slots.max_no_improve,
     },
     {
       id: "interpretability",
@@ -485,6 +511,8 @@ function intentSpecFrom(task: ResearchTask, missingSlots: IntentSlot[], llmSlots
     ...(merged.error_preferences === undefined ? {} : { error_preferences: merged.error_preferences }),
     ...(merged.latency_budget === undefined ? {} : { latency_budget: merged.latency_budget }),
     ...(merged.parameter_budget === undefined ? {} : { parameter_budget: merged.parameter_budget }),
+    ...(merged.max_iterations === undefined ? {} : { max_iterations: merged.max_iterations }),
+    ...(merged.max_no_improve === undefined ? {} : { max_no_improve: merged.max_no_improve }),
     ...(merged.interpretability === undefined ? {} : { interpretability: merged.interpretability }),
     ...(merged.deployment_target === undefined ? {} : { deployment_target: merged.deployment_target }),
     open_questions: openQuestions,
@@ -543,6 +571,8 @@ function renderIntentSpecMarkdown(input: {
     "",
     `- Latency budget: ${markdownValue(spec.latency_budget)}`,
     `- Parameter budget: ${markdownValue(spec.parameter_budget)}`,
+    `- NAS planned iterations: ${markdownValue(spec.max_iterations)}`,
+    `- Stop after no improvement: ${markdownValue(spec.max_no_improve)}`,
     `- Interpretability: ${markdownValue(spec.interpretability)}`,
     `- Deployment target: ${markdownValue(spec.deployment_target)}`,
     "",
@@ -638,6 +668,8 @@ function normalizeLLMSlots(value: Record<string, unknown>) {
     error_preferences: firstString(value.error_preferences, value.errorPreferences),
     latency_budget: firstKnown(value.latency_budget, value.latencyBudget),
     parameter_budget: firstKnown(value.parameter_budget, value.parameterBudget),
+    max_iterations: firstNumber(value.max_iterations, value.maxIterations),
+    max_no_improve: firstNumber(value.max_no_improve, value.maxNoImprove),
     interpretability: firstString(value.interpretability),
     deployment_target: firstString(value.deployment_target, value.deploymentTarget),
   }
@@ -745,7 +777,7 @@ export async function analyzeIntentTaskWithLLM(input: {
   }
 }
 
-// Canonical snake_case names for all 16 intent slots.
+// Canonical snake_case aliases for supported intent slots.
 const SLOT_KEY_ALIASES: Record<string, string> = {
   interactionMode: "interaction_mode",
   forecastObject: "forecast_object",
@@ -762,6 +794,8 @@ const SLOT_KEY_ALIASES: Record<string, string> = {
   errorPreferences: "error_preferences",
   latencyBudget: "latency_budget",
   parameterBudget: "parameter_budget",
+  maxIterations: "max_iterations",
+  maxNoImprove: "max_no_improve",
   deploymentTarget: "deployment_target",
 }
 

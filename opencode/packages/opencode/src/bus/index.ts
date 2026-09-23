@@ -1,3 +1,4 @@
+import { recordResearchEvent } from "../research/log-archive"
 import { Effect, Exit, Layer, PubSub, Scope, Context, Stream, Schema } from "effect"
 import { EffectBridge } from "@/effect"
 import { Log } from "../util"
@@ -79,6 +80,8 @@ export const layer = Layer.effect(
 
     function publish<D extends BusEvent.Definition>(def: D, properties: BusProperties<D>) {
       return Effect.gen(function* () {
+        const dir = yield* InstanceState.directory
+        recordResearchEvent(dir, def.type, properties)
         const s = yield* InstanceState.get(state)
         const payload: Payload = { type: def.type, properties }
         log.info("publishing", { type: def.type })
@@ -87,7 +90,6 @@ export const layer = Layer.effect(
         if (ps) yield* PubSub.publish(ps, payload)
         yield* PubSub.publish(s.wildcard, payload)
 
-        const dir = yield* InstanceState.directory
         const context = yield* InstanceState.context
         const workspace = yield* InstanceState.workspaceID
 

@@ -1,3 +1,4 @@
+import { ResearchApprovalID } from "../../src/research/schema"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { Instance } from "../../src/project/instance"
@@ -80,6 +81,109 @@ describe("taskspec-store", () => {
     })
   })
 
+  test("horizon and lookback edits update the persisted execution contract and independent readback", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      const horizons = [96, 192, 336, 720]
+      const result = await applySlotUpdates(task.id, { prediction_horizon: horizons, lookback_window: 336 })
+      expect(result.slots.prediction_horizon?.value).toEqual(horizons)
+      expect(result.slots.lookback_window?.value).toBe(336)
+      const reread = await readTaskspecSlots(task.id)
+      expect(reread.slots.prediction_horizon?.value).toEqual(horizons)
+      const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+      expect(stored.taskSpec).toMatchObject({
+        predictionLengths: horizons, contextLength: 336,
+        metadata: { intentSlots: { prediction_horizon: horizons, lookback_window: 336 } },
+      })
+      await applySlotUpdates(task.id, { business_context: "updated description" })
+      expect((await readTaskspecSlots(task.id)).slots.prediction_horizon?.value).toEqual(horizons)
+    } })
+  })
+
+  test("invalid horizon or lookback updates fail before any task data is changed", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      for (const updates of [
+        { prediction_horizon: [] }, { prediction_horizon: [96, -1] },
+        { prediction_horizon: [96, 1.5] }, { prediction_horizon: [96, 9000] },
+        { lookback_window: 0 },
+      ]) {
+        await expect(applySlotUpdates(task.id, updates)).rejects.toThrow()
+        const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(stored.taskSpec).toEqual(task.taskSpec)
+      }
+    } })
+  })
+
+  test("every supported slot round-trips and mirrors its downstream fields", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      const updates = {
+        interaction_mode: "socratic", forecast_object: "power forecasting", data_source: "/data/new.csv",
+        target_columns: ["power"], lookback_window: 336, prediction_horizon: [96, 192, 336, 720],
+        time_grain: "1 hour", exogenous_variables: ["wind"], future_covariate_availability: "unavailable",
+        business_context: "dispatch planning", primary_metric: "cv_avg_mae", secondary_metrics: ["cv_avg_mse"],
+        error_preferences: "short horizon", latency_budget: 200, parameter_budget: "5M",
+        max_iterations: 30, max_no_improve: 7,
+        interpretability: "simple models", deployment_target: "cpu",
+      }
+      await applySlotUpdates(task.id, updates)
+      const snapshot = await readTaskspecSlots(task.id)
+      expect(Object.keys(snapshot.slots).sort()).toEqual(Object.keys(updates).sort())
+      for (const [key, value] of Object.entries(updates)) expect(snapshot.slots[key as keyof typeof updates]?.value).toEqual(value)
+      const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+      expect(stored.interactionMode).toBe("socratic")
+      expect(stored.objective).toMatchObject({ primaryMetric: "cv_avg_mae", secondaryMetrics: ["cv_avg_mse"], errorPreferences: "short horizon" })
+      expect(stored.budget).toMatchObject({
+        latencyBudget: 200,
+        parameterBudget: "5M",
+        loop: { maxIterations: 30, maxNoImprove: 7 },
+      })
+      expect(stored.taskSpec).toMatchObject({
+        contextLength: 336, predictionLengths: [96, 192, 336, 720],
+        evaluation: { metricPrimary: "cv_avg_mae" }, constraints: { maxParams: 5_000_000 },
+        runtime: { deploymentTarget: "cpu" },
+        dataset: { path: "/data/new.csv", targetCols: ["power"], observedPastCovariates: ["wind"], knownFutureCovariates: [] },
+        metadata: { interactionMode: "socratic", timeGrain: "1 hour", forecastObject: "power forecasting", businessContext: "dispatch planning", interpretability: "simple models" },
+      })
+      await applySlotUpdates(task.id, { secondary_metrics: [], parameter_budget: "no_constraint" })
+      const cleared = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+      expect(cleared.objective.secondaryMetrics).toEqual([])
+      expect(cleared.taskSpec.constraints).not.toHaveProperty("maxParams")
+      expect((await readTaskspecSlots(task.id)).slots.secondary_metrics?.value).toEqual([])
+    } })
+  })
+
+  test("changing the CSV recomputes all covariates using the new file", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Bun.write(`${tmp.path}/old.csv`, "date,OT,old_feature\n2026-01-01,1,2\n")
+    await Bun.write(`${tmp.path}/new.csv`, "date,OT,new_feature\n2026-01-01,1,3\n")
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      await applySlotUpdates(task.id, { data_source: `${tmp.path}/old.csv`, exogenous_variables: ["all"] })
+      await applySlotUpdates(task.id, { data_source: `${tmp.path}/new.csv` })
+      const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+      expect(stored.taskSpec.dataset).toMatchObject({ path: `${tmp.path}/new.csv`, observedPastCovariates: ["new_feature"] })
+    } })
+  })
+
+  test("unknown slot names, unsupported metrics and invalid modes cannot silently succeed", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      for (const updates of [{ prediction_horizonn: [96] }, { primary_metric: "imaginary_metric" }, { interaction_mode: "typo" }, { parameter_budget: -1 }, { max_iterations: 0 }, { max_no_improve: 1.5 }, { business_context: {} }, { target_columns: [123] }, { latency_budget: false }]) {
+        await expect(applySlotUpdates(task.id, updates)).rejects.toThrow()
+        const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(stored.taskSpec).toEqual(task.taskSpec)
+        expect(stored.objective).toEqual(task.objective)
+        expect(stored.budget).toEqual(task.budget)
+      }
+    } })
+  })
+
   test("all exogenous variables resolve to non-target numeric columns and both dynamic roles", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     await Bun.write(`${tmp.path}/wind.csv`, [
@@ -151,6 +255,28 @@ describe("taskspec-store", () => {
     })
   })
 
+  test("horizon edits supersede stale checkpoints and reject approval of the old snapshot", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      await applySlotUpdates(task.id, { prediction_horizon: [96] })
+      const old = await enterIntentCheckpoint(task.id)
+      await applySlotUpdates(task.id, { prediction_horizon: [96, 192, 336, 720] })
+      const current = await enterIntentCheckpoint(task.id)
+      expect(current.approvalID).not.toBe(old.approvalID)
+      const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
+      expect(approvals.filter((item) => item.status === "pending")).toHaveLength(1)
+      expect(approvals.find((item) => item.id === current.approvalID)?.reason).toContain("Prediction lengths: 96,192,336,720")
+      await expect(runResearch(Research.Service.use((svc) => svc.replyApproval({
+        approvalID: ResearchApprovalID.make(old.approvalID), status: "approved",
+      })))).rejects.toThrow("outdated")
+      await runResearch(Research.Service.use((svc) => svc.replyApproval({
+        approvalID: ResearchApprovalID.make(current.approvalID), status: "approved",
+      })))
+      expect((await enterIntentCheckpoint(task.id)).status).toBe("approved")
+    } })
+  })
+
   test("enterIntentCheckpoint deletes any leftover pending ask_user approval when opening the checkpoint", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     await Instance.provide({
@@ -165,6 +291,9 @@ describe("taskspec-store", () => {
         const pending = approvals.filter((a) => a.status === "pending")
         expect(pending).toHaveLength(1)
         expect(pending[0]?.reason).toContain("[checkpoint:intent_confirmed]")
+        expect(pending[0]?.reason).toContain("NAS planned iterations: 25")
+        expect(pending[0]?.reason).toContain("Stop after no improvement: 7")
+        expect(pending[0]?.reason).not.toContain("Budget max runs")
       },
     })
   })
@@ -175,5 +304,7 @@ function fillerValueFor(slotID: string): unknown {
   if (slotID === "prediction_horizon") return [24]
   if (slotID === "lookback_window") return 96
   if (slotID === "latency_budget" || slotID === "parameter_budget") return "no_constraint"
+  if (slotID === "max_iterations") return 20
+  if (slotID === "max_no_improve") return 5
   return `filler for ${slotID}`
 }

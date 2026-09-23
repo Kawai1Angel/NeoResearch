@@ -193,6 +193,39 @@ export function DialogSessionList() {
       }}
       keybind={[
         {
+          keybind: { name: "r", ctrl: true, shift: false, meta: false, super: false, leader: false },
+          title: "打开研究",
+          onTrigger: async (option) => {
+            const url = new URL(`/research/sessions/${encodeURIComponent(option.value)}/tasks`, sdk.url)
+            if (sdk.directory) url.searchParams.set("directory", sdk.directory)
+            const response = await sdk.fetch(url)
+            if (!response.ok) {
+              toast.show({ variant: "error", message: await response.text() })
+              return
+            }
+            const tasks = (await response.json()) as Array<{ id: string; title: string }>
+            if (!tasks.length) {
+              toast.show({ variant: "info", message: "此对话未绑定研究会话" })
+              return
+            }
+            const open = (taskID: string) => {
+              route.navigate({ type: "cockpit", taskID })
+              dialog.clear()
+            }
+            if (tasks.length === 1) {
+              open(tasks[0].id)
+              return
+            }
+            dialog.replace(() => (
+              <DialogSelect
+                title="选择研究会话"
+                options={tasks.map((task) => ({ title: task.title, value: task.id }))}
+                onSelect={(item) => open(item.value)}
+              />
+            ))
+          },
+        },
+        {
           keybind: keybind.all.session_delete?.[0],
           title: "delete",
           onTrigger: async (option) => {

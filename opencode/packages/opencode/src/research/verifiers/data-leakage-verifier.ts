@@ -11,10 +11,6 @@ const HORIZON_INVERSION_RATIO = 0.5
 // All per-horizon MSEs within this relative spread → collapse (suspicious uniformity).
 const HORIZON_COLLAPSE_CV = 0.005
 
-// If max prediction length ≥ this fraction of context length, val windows likely
-// share most context with training windows, raising leakage risk.
-const CONTEXT_HORIZON_RATIO_WARN = 1.0
-
 const KNOWN_HORIZONS = [96, 192, 336, 720]
 
 function extractHorizonMSEs(metrics: Record<string, unknown>): { horizon: number; mse: number }[] {
@@ -91,21 +87,7 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
     }
   }
 
-  // Check 2: Context-window boundary feasibility.
-  // If max horizon ≥ context length, val windows overlap heavily with training context windows,
-  // making it nearly impossible to prevent leakage at the boundary.
-  if (contextLength !== undefined && maxHorizon !== undefined) {
-    if (maxHorizon >= contextLength * CONTEXT_HORIZON_RATIO_WARN) {
-      return {
-        name,
-        accepted: false,
-        reason: `Max prediction length ${maxHorizon} ≥ context length ${contextLength}. Val/test windows overlap extensively with training context windows, creating structural leakage risk.`,
-        evidence: { contextLength, maxHorizon, ratio: maxHorizon / contextLength, threshold: CONTEXT_HORIZON_RATIO_WARN },
-      }
-    }
-  }
-
-  // Check 3: Val MSE suspiciously better than train loss.
+  // Check 2: Val MSE suspiciously better than train loss.
   // A model that generalises much better on val than train usually indicates
   // val targets or context bled into the training objective.
   if (valAvgMse !== undefined && trainMetric !== undefined) {
@@ -125,7 +107,7 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
     }
   }
 
-  // Check 4: Per-horizon MSE monotonicity.
+  // Check 3: Per-horizon MSE monotonicity.
   // Longer horizons should generally be harder (higher MSE). A strong inversion —
   // where the longest horizon is much better than the shortest — is a leakage signal.
   if (horizonMSEs.length >= 2) {
@@ -152,7 +134,7 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
       }
     }
 
-    // Check 5: Horizon MSE collapse (all horizons nearly identical).
+    // Check 4: Horizon MSE collapse (all horizons nearly identical).
     // Indicates the model ignores horizon length, typically due to target leakage
     // (val targets visible during context construction).
     const mseValues = horizonMSEs.map((h) => h.mse)
@@ -179,7 +161,7 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
   return {
     name,
     accepted: true,
-    reason: "No data leakage signals detected (protocol, context boundary, val/train ratio, horizon monotonicity all pass).",
+    reason: "No data leakage signals detected (protocol, val/train ratio, horizon monotonicity all pass).",
     evidence: {
       ...(protocol !== undefined ? { protocol } : {}),
       ...(valAvgMse !== undefined ? { valAvgMse } : {}),

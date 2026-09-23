@@ -1,3 +1,4 @@
+import { DialogResearchHistory } from "@tui/component/dialog-research-history"
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
@@ -31,7 +32,7 @@ export function hasNeoResearchApiKey(env: ApiKeyEnv = process.env) {
   return NEO_RESEARCH_API_KEY_ENVS.some((key) => Boolean(env[key]?.trim()))
 }
 
-type HomeAction = "Configure API Key" | "New CSV Task" | "Open Cockpit" | "Run Doctor"
+type HomeAction = "Configure API Key" | "New CSV Task" | "Open Cockpit" | "历史研究" | "Run Doctor"
 
 const neoResearchLogo = [
   " _  _          ___                         _   ",
@@ -78,7 +79,7 @@ export function Home() {
   const verticalGap = createMemo(() => (compactHeight() ? 1 : 2))
   const providerConnected = createMemo(() => Boolean(sync?.data.provider_next.connected.length))
   const needsApiKey = createMemo(() => !hasNeoResearchApiKey() && !providerConnected())
-  const actions: HomeAction[] = ["Configure API Key", "New CSV Task", "Open Cockpit", "Run Doctor"]
+  const actions: HomeAction[] = ["Configure API Key", "New CSV Task", "Open Cockpit", "历史研究", "Run Doctor"]
   const promptMetadataText = createMemo(() => {
     const selectedModel = local?.model.current()
     if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
@@ -174,6 +175,7 @@ export function Home() {
 
   function runSlashInput(value: string) {
     const command = value.slice(1).trim().toLowerCase()
+    if (command === "history") { dialog.replace(() => <DialogResearchHistory />); return }
     if (command === "cockpit") {
       openCockpit()
       return
@@ -216,6 +218,7 @@ export function Home() {
   })
 
   command.register(() => [
+    { title: "历史研究", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
     {
       title: "Open research cockpit",
       value: "research.cockpit.open",
@@ -271,6 +274,7 @@ export function Home() {
   ])
 
   function runAction(action: HomeAction) {
+    if (action === "历史研究") { dialog.replace(() => <DialogResearchHistory />); return }
     if (action === "Configure API Key") {
       openProviderDialog()
       return

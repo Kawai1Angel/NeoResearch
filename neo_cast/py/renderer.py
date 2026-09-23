@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from model_recipe import compile_model_recipe, is_model_recipe_payload, prediction_horizons_from_input
-from prepare_tsf import DATASET, HORIZONS, INPUT_LEN, NUM_CHANNELS, PARAM_BUDGET, SEED, TIME_BUDGET
+from runtime_config import DATASET, HORIZONS, INPUT_LEN, NUM_CHANNELS, PARAM_BUDGET, SEED, TIME_BUDGET
 from recipe_bridge import is_recipe_payload, normalize_recipe_id
 from validate import detect_payload_kind, validate_payload
 

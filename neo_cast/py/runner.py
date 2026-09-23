@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from prepare_tsf import DATASET, PROMOTION_TOKEN_ENV, query_blind_test, query_ref_test
+from runtime_config import DATASET, PROMOTION_TOKEN_ENV
 from research_trace import append_trace_jsonl
 
 
@@ -688,6 +688,8 @@ def _artifact_dir_for_run(run_id: str) -> Path:
 
 
 def run_ref_test(state: RunnerState, *, run_id: str | None) -> int:
+    from prepare_tsf import query_ref_test
+
     target_run_id = run_id or state.best_run_id
     if not target_run_id:
         raise ValueError("No run_id provided and no best_run_id is available in runner state.")
@@ -726,6 +728,8 @@ def run_ref_test(state: RunnerState, *, run_id: str | None) -> int:
 
 
 def run_blind_test(state: RunnerState, *, run_id: str | None) -> int:
+    from prepare_tsf import query_blind_test
+
     target_run_id = run_id or state.best_run_id
     if not target_run_id:
         raise ValueError("No run_id provided and no best_run_id is available in runner state.")

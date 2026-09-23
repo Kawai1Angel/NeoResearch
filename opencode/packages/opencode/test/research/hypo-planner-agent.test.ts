@@ -30,7 +30,7 @@ function task(extraSpec: Record<string, unknown> = {}, extraBudget: Record<strin
       ...extraSpec,
     },
     objective: { primaryMetric: "val_avg_mse", direction: "minimize", targetMetricValue: 0.2 },
-    budget: { maxRuns: 9, maxNoImprove: 2, ...extraBudget },
+    budget: { maxRuns: 200, loop: { maxIterations: 9, maxNoImprove: 2 }, ...extraBudget },
     time: { created: 1, updated: 1 },
   } as unknown as ResearchTask
 }

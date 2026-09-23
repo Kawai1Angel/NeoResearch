@@ -233,7 +233,7 @@ async function proposeCandidate(requirementBundle, history, previousRow, resolve
 async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}) {
   const projectRoot = options.projectRoot || process.cwd();
   const timeBudgetMs = options.timeBudgetMs || null;
-  const maxNoImprove = Number(options.maxNoImprove || 25);
+  const maxNoImprove = Number(options.maxNoImprove || 7);
   const maxCandidates = options.maxCandidates ?? Infinity;
   const sessionStartMs = Date.now();
   let attempt = 0;

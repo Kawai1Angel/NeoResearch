@@ -86,6 +86,46 @@ afterEach(async () => {
 })
 
 describe("research routes", () => {
+  test("intent kickoff records intent without starting a smoke or full run", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const task = await json<Research.ResearchTask>(
+          await app().request(ResearchPaths.tasks, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              title: "Intent only kickoff",
+              domainID: "tsf",
+              mode: "autonomous",
+              taskSpec: {
+                contextLength: 96,
+                predictionLengths: [24],
+                dataset: { loaderID: "local_csv", path: "./dataset.csv", targetCols: ["OT"] },
+                metadata: { businessContext: "Forecast transformer temperature", interpretability: "simple models", deploymentTarget: "local" },
+              },
+              objective: { primaryMetric: "val_avg_mse", direction: "minimize", errorPreferences: "average error" },
+              budget: { maxRuns: 3, latencyBudget: "offline", parameterBudget: "small" },
+            }),
+          }),
+        )
+
+        const intent = await json<{ agent: string; missingFields: string[] }>(
+          await app().request(pathFor(ResearchPaths.taskStartIntent, { taskID: task.id }), { method: "POST", headers }),
+        )
+        expect(intent.agent).toBe("IntentAgent")
+        expect(intent.missingFields).toEqual([])
+        const runs = await json<Research.ResearchRun[]>(
+          await app().request(pathFor(ResearchPaths.taskRuns, { taskID: task.id }), { headers }),
+        )
+        expect(runs).toEqual([])
+      },
+    })
+  })
+
   test("exposes TSF domain metadata, baselines, and candidate validation", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }

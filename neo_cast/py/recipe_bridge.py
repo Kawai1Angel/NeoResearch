@@ -5,7 +5,7 @@ import string
 from typing import Any
 
 from model_recipe import compile_model_recipe, is_model_recipe_payload
-from prepare_tsf import INPUT_LEN
+from runtime_config import INPUT_LEN
 from registry.action_specs import validate_recipe_against_registry
 
 
@@ -72,4 +72,3 @@ def _recipe_constraints(recipe: dict[str, Any]) -> dict[str, Any]:
         "time_budget_seconds": int(strategy_budget["time_budget_s"]),
         "latency_priority": constraints.get("latency_priority", "medium"),
     }
-

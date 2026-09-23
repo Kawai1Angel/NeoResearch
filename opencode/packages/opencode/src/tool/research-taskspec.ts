@@ -1,3 +1,4 @@
+import { INTENT_SLOT_IDS } from "@/research/agents/intent-agent"
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import {
@@ -13,23 +14,6 @@ import {
 const NOT_IN_RESEARCH_SESSION =
   "This tool can only be used inside a research task session — could not resolve the current research task."
 
-const SLOT_IDS = [
-  "interaction_mode",
-  "forecast_object",
-  "data_source",
-  "target_columns",
-  "lookback_window",
-  "prediction_horizon",
-  "exogenous_variables",
-  "business_context",
-  "primary_metric",
-  "secondary_metrics",
-  "error_preferences",
-  "latency_budget",
-  "parameter_budget",
-  "interpretability",
-  "deployment_target",
-] as const
 
 // ---------------------------------------------------------------------------
 // read_taskspec
@@ -40,7 +24,7 @@ export const ReadTaskspecTool = Tool.define(
   Effect.succeed({
     description:
       "Read the current research task's intent slots: their values, whether each is still " +
-      `missing, and whether it is required. Known slot ids: ${SLOT_IDS.join(", ")}. ` +
+      `missing, and whether it is required. Known slot ids: ${INTENT_SLOT_IDS.join(", ")}. ` +
       "Call this before asking the user anything and before deciding whether intent gathering " +
       "is complete — never rely on your own memory of previous values, as they may have " +
       "changed through other channels.",
@@ -68,8 +52,11 @@ export const ReadTaskspecTool = Tool.define(
 const UpdateTaskspecParameters = Schema.Struct({
   updates: Schema.Record(Schema.String, Schema.Unknown).annotate({
     description:
-      `Map of slot_id -> new value, after you have understood the user's answer. Valid slot ids: ${SLOT_IDS.join(", ")}. ` +
-      "Only include slots the user's message actually resolves — never invent values for slots not addressed.",
+      `Map of slot_id -> new value, after you have understood the user's answer. Valid slot ids: ${INTENT_SLOT_IDS.join(", ")}. ` +
+      "Only include slots the user's message actually resolves — never invent values for slots not addressed. " +
+      "parameter_budget: use an absolute integer count or an explicit size such as 5M for a hard limit; descriptive text is a preference. " +
+      "latency_budget records an inference requirement, not a training timeout. " +
+      "max_iterations and max_no_improve must be positive integers when supplied; their defaults are 25 and 7 respectively.",
   }),
 })
 

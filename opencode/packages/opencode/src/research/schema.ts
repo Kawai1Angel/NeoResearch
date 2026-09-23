@@ -182,6 +182,8 @@ export class ResearchTask extends Schema.Class<ResearchTask>("ResearchTask")({
   id: ResearchTaskID,
   projectID: ProjectID,
   sessionID: Schema.optional(SessionID),
+  cockpitChatSessionID: Schema.optional(SessionID),
+  stateRevision: Schema.optional(Schema.Number),
   title: Schema.String,
   domainID: Schema.String,
   mode: ResearchMode,
@@ -557,6 +559,7 @@ export class ReflectionAgentInput extends Schema.Class<ReflectionAgentInput>("Re
   taskID: ResearchTaskID,
   outputDir: Schema.optional(Schema.String),
   stoppedReason: Schema.optional(Schema.String),
+  maxIterations: Schema.optional(Schema.Number),
 }) {
   static readonly zod = zod(this)
 }

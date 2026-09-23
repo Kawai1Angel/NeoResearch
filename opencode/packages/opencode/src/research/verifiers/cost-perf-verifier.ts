@@ -16,6 +16,13 @@ function objectiveDirection(task: VerifierContext["task"]): "minimize" | "maximi
 }
 
 function paramBudgetM(task: VerifierContext["task"]): number | undefined {
+  const spec = task.taskSpec as Record<string, unknown>
+  const constraints = spec.constraints as Record<string, unknown> | undefined
+  const metadata = spec.metadata as Record<string, unknown> | undefined
+  // New slot writes normalize explicit limits to an absolute parameter count.
+  // Free-text preferences do not constitute a hard constraint.
+  if (metadata?.parameterBudgetEnforcement === "preference_only") return undefined
+  if (typeof constraints?.maxParams === "number") return constraints.maxParams / 1_000_000
   const budget = task.budget as Record<string, unknown>
   const raw = budget.parameterBudget ?? budget.maxParams ?? budget.maxParamsM
   if (typeof raw === "number" && Number.isFinite(raw)) return raw

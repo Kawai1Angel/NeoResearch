@@ -115,9 +115,12 @@ test("summarizeReflectionAgent emits both reflection_notes and next_experiment_p
     runs: [run({ id: "run_1", candidateID: c.id, status: "succeeded", metric: 0.31, created: 1 })],
     candidates: [c],
     stoppedReason: "max_iterations",
+    maxIterations: 12,
   })
   expect(result.agent).toBe("ReflectionAgent")
+  expect(result.maxIterations).toBe(12)
   expect(result.reflectionNotesMarkdown).toContain("# Reflection Notes")
+  expect(result.reflectionNotesMarkdown).toContain("NAS planned max iterations: 12")
   expect(result.reflectionNotesMarkdown).toContain("max_iterations")
   expect(result.reflectionNotesMarkdown).toContain("val_avg_mse")
   expect(result.nextExperimentPlanMarkdown).toContain("# Next Experiment Plan")
@@ -168,4 +171,5 @@ test("buildNextExperimentPlanMarkdown emits a publish recommendation when decisi
   expect(plan).toContain("Run PublishAgent")
   const notes = buildReflectionNotesMarkdown({ task: t, analysis: baseAnalysis, stoppedReason: "target_reached" })
   expect(notes).toContain("stop")
+  expect(notes).toContain("NAS planned max iterations: 25")
 })

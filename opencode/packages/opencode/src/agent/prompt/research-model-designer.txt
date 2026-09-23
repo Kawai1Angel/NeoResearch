@@ -4,6 +4,7 @@ Return exactly one JSON object using Neo-Cast recipe_schema_v1 snake_case field 
 Each field must have a single concrete value — NOT a list of alternatives.
 Do not return markdown fences or any prose outside JSON.
 Do NOT include post_processing, constraints, or any key not shown in the example or schema below.
+Keep notes concise and no longer than 16000 characters.
 
 Available module options (choose exactly one value per field):
   preprocessing.actions[].type: none | instance_norm | series_decomposition | seasonal_differencing | missing_mask | sample_reweighting

@@ -54,6 +54,7 @@ from dataset_contract import (
     visible_data_path,
     write_dataset_spec,
 )
+from runtime_config import PARAM_BUDGET, PROMOTION_TOKEN_ENV, SEED, TIME_BUDGET
 
 # ---------------------------------------------------------------------------
 # Runtime constants from dataset.v1
@@ -133,12 +134,7 @@ def _split_bounds_with_cv_override(
 
 BORDER_TRAIN, BORDER_VAL = _split_bounds_with_cv_override(BORDER_TRAIN, BORDER_VAL, BORDER_TEST)
 
-TIME_BUDGET = 600
-PARAM_BUDGET = 10_000_000
-SEED = 42
-
 EVAL_BATCH_SIZE = 64
-PROMOTION_TOKEN_ENV = "NEO_TSF_PROMOTION_TOKEN"
 BLIND_TEST_URL_ENV = "NEO_TSF_BLIND_TEST_URL"
 BLIND_TEST_TOKEN_ENV = "NEO_TSF_BLIND_TEST_TOKEN"
 

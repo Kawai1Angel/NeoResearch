@@ -1,4 +1,4 @@
-import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core"
+import { index, uniqueIndex, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { ProjectTable } from "@/project/project.sql"
 import { SessionTable } from "@/session/session.sql"
 import { Timestamps } from "@/storage/schema.sql"
@@ -27,6 +27,10 @@ export const ResearchTaskTable = sqliteTable(
     session_id: text()
       .$type<SessionID>()
       .references(() => SessionTable.id, { onDelete: "set null" }),
+    cockpit_chat_session_id: text()
+      .$type<SessionID>()
+      .references(() => SessionTable.id, { onDelete: "set null" }),
+    state_revision: integer().notNull().default(0),
     title: text().notNull(),
     domain_id: text().notNull(),
     mode: text().notNull(),
@@ -37,6 +41,7 @@ export const ResearchTaskTable = sqliteTable(
     ...Timestamps,
   },
   (table) => [
+    uniqueIndex("research_task_chat_idx").on(table.cockpit_chat_session_id),
     index("research_task_project_idx").on(table.project_id),
     index("research_task_domain_idx").on(table.domain_id),
     index("research_task_status_idx").on(table.status),
@@ -76,9 +81,11 @@ export const ResearchRunTable = sqliteTable(
       .$type<ResearchTaskID>()
       .notNull()
       .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
-    candidate_id: text().$type<ResearchCandidateID>().references(() => ResearchCandidateTable.id, {
-      onDelete: "cascade",
-    }),
+    candidate_id: text()
+      .$type<ResearchCandidateID>()
+      .references(() => ResearchCandidateTable.id, {
+        onDelete: "cascade",
+      }),
     stage: text().notNull(),
     status: text().notNull(),
     metrics: text({ mode: "json" }).notNull().$type<JsonRecord>(),
@@ -181,11 +188,13 @@ export const ResearchHypothesisTable = sqliteTable(
     risk: text().notNull(),
     testable: integer({ mode: "boolean" }).notNull(),
     dataset_evidence_paths: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
-    literature_evidence: text({ mode: "json" }).notNull().default([]).$type<Array<{
-      cardID: string
-      cardRevision: number
-      role: TaskEvidenceRole
-    }>>(),
+    literature_evidence: text({ mode: "json" }).notNull().default([]).$type<
+      Array<{
+        cardID: string
+        cardRevision: number
+        role: TaskEvidenceRole
+      }>
+    >(),
     applicability_assumptions: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
     falsification_criteria: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
     evidence_level: text().notNull().default("data_only"),
@@ -218,4 +227,73 @@ export const ResearchChampionTable = sqliteTable("research_champion", {
   utility: real().notNull(),
   accepted_at: integer().notNull(),
   ...Timestamps,
+})
+
+// Durable receipts survive HTTP disconnects and service restarts. Active receipts
+// remain locked until the owner finishes; an expired heartbeat is not proof that
+// its external runner has exited.
+export const ResearchOperationTable = sqliteTable(
+  "research_operation",
+  {
+    id: text().primaryKey(),
+    project_id: text().notNull(),
+    task_id: text()
+      .notNull()
+      .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+    request_key: text(),
+    request_digest: text().notNull(),
+    active_task: text().unique(),
+    active_workspace: text().unique(),
+    owner_id: text().notNull(),
+    heartbeat_at: integer().notNull(),
+    receipt: text({ mode: "json" }).notNull().$type<import("./operation").ResearchOperation>(),
+  },
+  (table) => [uniqueIndex("research_operation_request_idx").on(table.task_id, table.request_key)],
+)
+
+export const ResearchCycleTable = sqliteTable("research_cycle", {
+  id: text().primaryKey(),
+  request_key: text().unique(),
+  request_digest: text(),
+  task_id: text()
+    .notNull()
+    .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+  active_task: text().unique(),
+  policy: text({ mode: "json" }).notNull().$type<Record<string, number | undefined>>(),
+  iterations: integer().notNull().default(0),
+  crash_streak: integer().notNull().default(0),
+  elapsed_ms: integer().notNull().default(0),
+  input_digest: text().notNull(),
+})
+
+export const ResearchEventTable = sqliteTable("research_event", {
+  sequence: integer().primaryKey({ autoIncrement: true }),
+  task_id: text()
+    .notNull()
+    .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+  kind: text().notNull(),
+  summary: text().notNull(),
+  time: integer().notNull(),
+})
+
+export const ResearchPhaseExecutionTable = sqliteTable("research_phase_execution", {
+  id: text().primaryKey(),
+  task_id: text()
+    .notNull()
+    .references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+  cycle_id: text(),
+  phase: text().notNull(),
+  step_key: text().notNull(),
+  input_digest: text().notNull(),
+  implementation_version: text().notNull(),
+  output_artifact_ids: text({ mode: "json" }).notNull().$type<string[]>(),
+  status: text().notNull(),
+  time_finished: integer().notNull(),
+})
+
+export const ResearchRunnerLockTable = sqliteTable("research_runner_lock", {
+  workspace: text().primaryKey(),
+  run_id: text()
+    .notNull()
+    .references(() => ResearchRunTable.id, { onDelete: "cascade" }),
 })

@@ -248,13 +248,13 @@ function outputFormat(yargs: Argv) {
   })
 }
 
-function runOptions(yargs: Argv) {
+function runOptions(yargs: Argv, defaultStage: "smoke" | "full" = "smoke") {
   return yargs
     .option("stage", {
       describe: "research run stage",
       type: "string",
       choices: ["baseline", "smoke", "low_fidelity", "full", "ref_test", "blind_test"] as const,
-      default: "smoke" as const,
+      default: defaultStage,
     })
     .option("description", {
       describe: "run description",
@@ -761,6 +761,7 @@ export const ResearchIterateCommand = cmd({
           type: "string",
           demandOption: true,
         }),
+        "full",
       ).option("force-explore", {
         describe: "force this iteration to create an exploratory candidate",
         type: "boolean",
@@ -803,12 +804,16 @@ export const ResearchLoopCommand = cmd({
           .option("max-iterations", {
             describe: "maximum autonomous iterations to run",
             type: "number",
-            default: 20,
+          })
+          .option("max-no-improve", {
+            describe: "stop after this many iterations without improvement",
+            type: "number",
           })
           .option("exploration", {
             describe: "forced exploration rate from 0 to 1",
             type: "number",
           }),
+        "full",
       ),
     ),
   handler: async (
@@ -817,6 +822,7 @@ export const ResearchLoopCommand = cmd({
       stage?: Research.ExecutableRunStage
       description?: string
       maxIterations?: number
+      maxNoImprove?: number
       exploration?: number
     },
   ) => {
@@ -828,6 +834,7 @@ export const ResearchLoopCommand = cmd({
         stage: args.stage,
         description: args.description,
         maxIterations: args.maxIterations,
+        maxNoImprove: args.maxNoImprove,
         explorationRate: args.exploration,
       }),
     )
@@ -884,7 +891,10 @@ export const ResearchPipelineCommand = cmd({
         .option("max-iterations", {
           describe: "maximum autonomous iterations to run",
           type: "number",
-          default: 20,
+        })
+        .option("max-no-improve", {
+          describe: "stop after this many iterations without improvement",
+          type: "number",
         })
         .option("exploration", {
           describe: "forced exploration rate from 0 to 1",
@@ -893,7 +903,7 @@ export const ResearchPipelineCommand = cmd({
         .option("stage", {
           describe: "execution stage for model search",
           choices: ["baseline", "smoke", "low_fidelity", "full", "ref_test", "blind_test"] as const,
-          default: "smoke" as const,
+          default: "full" as const,
         })
         .option("description", {
           describe: "pipeline run description",
@@ -909,6 +919,7 @@ export const ResearchPipelineCommand = cmd({
     args: FormatArg & {
       taskID?: string
       maxIterations?: number
+      maxNoImprove?: number
       stage?: Research.ExecutableRunStage
       description?: string
       outputDir?: string
@@ -923,6 +934,7 @@ export const ResearchPipelineCommand = cmd({
         stage: args.stage,
         description: args.description,
         maxIterations: args.maxIterations,
+        maxNoImprove: args.maxNoImprove,
         explorationRate: args.exploration,
         outputDir: args.outputDir,
       }),
@@ -946,7 +958,10 @@ export const ResearchVibeCommand = cmd({
         .option("max-iterations", {
           describe: "maximum autonomous iterations to run",
           type: "number",
-          default: 20,
+        })
+        .option("max-no-improve", {
+          describe: "stop after this many iterations without improvement",
+          type: "number",
         })
         .option("exploration", {
           describe: "forced exploration rate from 0 to 1",
@@ -967,6 +982,7 @@ export const ResearchVibeCommand = cmd({
     args: FormatArg & {
       goal?: string[]
       maxIterations?: number
+      maxNoImprove?: number
       exploration?: number
       runnerRoot?: string
       interactionMode?: ResearchInteractionMode
@@ -982,6 +998,8 @@ export const ResearchVibeCommand = cmd({
             goal,
             mode: researchModeForInteractionMode(interactionMode),
             interactionMode,
+            maxIterations: args.maxIterations,
+            maxNoImprove: args.maxNoImprove,
             neoCastProjectRoot: args.runnerRoot ?? process.cwd(),
           }),
         )
@@ -989,7 +1007,6 @@ export const ResearchVibeCommand = cmd({
           taskID: task.id,
           stage: pipelineStageForInteractionMode(interactionMode),
           description: goal,
-          maxIterations: args.maxIterations,
           explorationRate: args.exploration,
           outputDir: ".neo-research/final",
         })

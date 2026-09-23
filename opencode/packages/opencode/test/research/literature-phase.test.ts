@@ -35,6 +35,8 @@ test("literature phase persists evidence, repairs cache and hands data-only evid
       expect(result.taskEvidence.readiness).toBe("ready_data_only")
       const artifacts = yield* svc.listArtifacts(task.id)
       const bundleArtifact = artifacts.find((item) => item.kind === "task_evidence_bundle_json")!
+      expect(bundleArtifact.metadata.paperSummaries).toEqual([])
+      expect(bundleArtifact.metadata.cardSummaries).toEqual([])
       expect(yield* Effect.promise(() => loadTaskEvidenceForTask(task.id))).toEqual(result.taskEvidence)
       const resultArtifact = artifacts.find((item) => item.kind === "literature_retrieve_result_json")!
       yield* Effect.promise(() => writeFile(resultArtifact.uri.slice(7), "broken cache"))

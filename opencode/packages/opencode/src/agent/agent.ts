@@ -1,3 +1,4 @@
+import PROMPT_RESEARCH_PUBLISH from "./prompt/research-publish.txt"
 import PROMPT_RESEARCH_LITERATURE from "./prompt/research-literature.txt"
 import { Config } from "../config"
 import z from "zod"
@@ -235,6 +236,16 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_SUMMARY,
+          },
+          "research-publish": {
+            name: "research-publish",
+            description: "NeoResearch final report from a frozen, verified experiment snapshot.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(defaults, user, Permission.fromConfig({ "*": "deny" })),
+            prompt: PROMPT_RESEARCH_PUBLISH,
           },
           "research-literature": {
             name: "research-literature", description: "Bound Literature phase tools", mode: "primary", steps: 12,

@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from prepare_tsf import ACTIVE_SPEC, HORIZONS, INPUT_LEN
+from runtime_config import ACTIVE_SPEC, HORIZONS, INPUT_LEN
 
 
 PY_ROOT = Path(__file__).resolve().parent
@@ -87,13 +87,21 @@ def _run_train(cmd: list[str], env: dict[str, str]) -> tuple[int, list[dict[str,
     records: list[dict[str, Any]] = []
     assert process.stdout is not None
     for line in process.stdout:
-        print(line.rstrip("\n"), flush=True)
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            print(line.rstrip("\n"), flush=True)
             continue
         if isinstance(record, dict):
             records.append(record)
+            forwarded = dict(record)
+            if "NEO_CAST_CV_FOLD_INDEX" in env:
+                forwarded["cv_fold_index"] = int(env["NEO_CAST_CV_FOLD_INDEX"])
+                if "artifact_dir" in forwarded:
+                    forwarded["ephemeral"] = True
+            print(json.dumps(forwarded), flush=True)
+        else:
+            print(line.rstrip("\n"), flush=True)
     return process.wait(), records
 
 

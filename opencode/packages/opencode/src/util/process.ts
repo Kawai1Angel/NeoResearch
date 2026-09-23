@@ -14,6 +14,7 @@ export interface Options {
   stderr?: Stdio
   shell?: Shell
   abort?: AbortSignal
+  tree?: boolean
   kill?: NodeJS.Signals | number
   timeout?: number
 }
@@ -23,6 +24,7 @@ export interface RunOptions extends Omit<Options, "stdout" | "stderr"> {
 }
 
 export interface StreamingRunOptions extends RunOptions {
+  onSpawn?: (pid: number) => void
   onStdoutLine?: (line: string) => void
   onStderrLine?: (line: string) => void
 }
@@ -70,6 +72,7 @@ export function spawn(cmd: string[], opts: Options = {}): Child {
     env: opts.env === null ? {} : opts.env ? { ...process.env, ...opts.env } : undefined,
     stdio: [opts.stdin ?? "ignore", opts.stdout ?? "ignore", opts.stderr ?? "ignore"],
     windowsHide: process.platform === "win32",
+    detached: opts.tree && process.platform !== "win32",
   })
 
   let closed = false
@@ -80,7 +83,14 @@ export function spawn(cmd: string[], opts: Options = {}): Child {
     if (proc.exitCode !== null || proc.signalCode !== null) return
     closed = true
 
-    proc.kill(opts.kill ?? "SIGTERM")
+    if (opts.tree && proc.pid) {
+      if (process.platform === "win32") {
+        const killer = launch("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+        killer.on("error", () => proc.kill("SIGKILL"))
+      } else {
+        try { process.kill(-proc.pid, "SIGKILL") } catch { proc.kill("SIGKILL") }
+      }
+    } else proc.kill(opts.kill ?? "SIGTERM")
 
     const ms = opts.timeout ?? 5_000
     if (ms <= 0) return
@@ -122,6 +132,7 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<Result>
     stdin: opts.stdin,
     shell: opts.shell,
     abort: opts.abort,
+    tree: opts.tree,
     kill: opts.kill,
     timeout: opts.timeout,
     stdout: "pipe",
@@ -191,12 +202,20 @@ export async function runStreaming(cmd: string[], opts: StreamingRunOptions = {}
     stdin: opts.stdin,
     shell: opts.shell,
     abort: opts.abort,
+    tree: opts.tree,
     kill: opts.kill,
     timeout: opts.timeout,
     stdout: "pipe",
     stderr: "pipe",
   })
 
+  if (proc.pid) {
+    try { opts.onSpawn?.(proc.pid) } catch (error) {
+      try { if (opts.tree && process.platform !== "win32") process.kill(-proc.pid, "SIGKILL"); else proc.kill("SIGKILL") } catch {}
+      await proc.exited.catch(() => undefined)
+      throw error
+    }
+  }
   if (!proc.stdout || !proc.stderr) throw new Error("Process output not available")
 
   const out = await Promise.all([

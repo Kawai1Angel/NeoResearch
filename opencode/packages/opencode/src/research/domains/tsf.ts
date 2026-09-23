@@ -523,7 +523,7 @@ export const TSFCandidateRecipe = z
           .strict(),
       })
       .strict(),
-    notes: z.string().max(2000).optional(),
+    notes: z.string().max(16000).optional(),
   })
   .strict()
 export type TSFCandidateRecipe = z.infer<typeof TSFCandidateRecipe>

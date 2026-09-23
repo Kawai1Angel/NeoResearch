@@ -529,6 +529,16 @@ export function buildUserPrompt(input: {
   readonly dataAnalysisMarkdown?: string
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
+  readonly validationFeedback?: {
+    readonly attempt: number
+    readonly issues: readonly {
+      readonly path: string
+      readonly message: string
+      readonly expected?: unknown
+      readonly actual?: unknown
+    }[]
+    readonly rejectedCandidate?: JsonRecord
+  }
 }) {
   const profile = profileRecord(input.proposalContext.taskFingerprint)
   const searchBiases = isRecord(input.proposalContext.taskFingerprint)
@@ -556,6 +566,15 @@ export function buildUserPrompt(input: {
       memory: representativeMemory(input.proposalContext),
       forbidden_signatures: forbiddenCandidateSignatures(input.proposalContext),
       champion: input.proposalContext.champion,
+      ...(input.validationFeedback
+        ? {
+            candidateValidationFeedback: {
+              ...input.validationFeedback,
+              instruction:
+                "Correct the rejected candidate while preserving its intended experiment and selected hypothesis. Return one complete replacement JSON object.",
+            },
+          }
+        : {}),
       instruction:
         "Propose a new candidate that is different from existing candidates and suitable for the task; do not repeat forbidden_signatures. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
     },
@@ -928,6 +947,7 @@ export async function proposeLLMCandidate(input: {
   readonly dataAnalysisMarkdown?: string
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
+  readonly validationFeedback?: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
 }): Promise<LLMProposalResult> {
   const runtime = isRecord(input.task.taskSpec.runtime) ? input.task.taskSpec.runtime : {}
   const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -966,6 +986,7 @@ export async function proposeLLMCandidate(input: {
     dataAnalysisMarkdown: input.dataAnalysisMarkdown,
     hypoPlanMarkdown: input.hypoPlanMarkdown,
     previousReflectionMarkdown: input.previousReflectionMarkdown,
+    validationFeedback: input.validationFeedback,
   })
   const maxAttempts = 3
   let lastError: unknown
