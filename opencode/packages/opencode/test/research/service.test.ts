@@ -1,3 +1,4 @@
+import { NAS_DEFAULT_MAX_NO_IMPROVE } from "../../src/research/defaults"
 import { existsSync } from "node:fs"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Cause, Effect, Layer } from "effect"
@@ -105,19 +106,19 @@ function phaseTwoTsfCandidateSpec() {
 
 function benchmarkInvertTsfCandidateSpec() {
   return {
-    recipeVersion: "recipe_schema_v1",
+    recipeVersion: "recipe_schema_v2",
     recipeID: "benchmark_accepted_invert_rnn",
     hypothesis: "Prior inverted RNN trial improved a related benchmark task.",
     preprocessing: { actions: [{ type: "none" }] },
     embedding: { type: "invert", dModel: 64 },
     backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
-    fusion: { type: "feature", variateToken: true, crossAttention: true },
-    predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+    fusion: { type: "variate_attention" },
+    predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
     trainingStrategy: {
       loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
       optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
       scheduler: { type: "one_cycle", warmupSteps: 2 },
-      regularization: { dropout: 0.1, gradClip: 1 },
+      regularization: { gradClip: 1 },
       budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
     },
   } as unknown as Research.JsonRecord
@@ -430,7 +431,7 @@ async function createSearchHypothesis(taskID: Research.ResearchTaskID) {
     statement: "Compare the declared architecture families under a shared evaluation protocol.",
     motivation: ["Exercise search ranking and stopping policy."],
     expectedOutcome: "Select the best verified full-run result.",
-    suggestedBackbones: ["linear", "mlp", "transformer", "rnn", "dlinear", "tcn", "ssm", "mixer", "nbeats", "timesnet"],
+    suggestedBackbones: ["linear", "mlp", "transformer", "rnn", "dlinear", "tcn", "gated_depthwise_conv", "mixer", "nbeats", "timesnet_lite"],
     suggestedPreprocessing: [],
     priority: "high",
     risk: "Architecture ranking is dataset-dependent.",
@@ -1668,6 +1669,9 @@ describe("Research service", () => {
         })
         const payload = JSON.parse(await readFile(prepared.path, "utf8"))
         expect(payload.command.args).toContain("--source")
+        expect(payload.command.args.slice(payload.command.args.indexOf("--train-rows"), payload.command.args.indexOf("--train-rows") + 2)).toEqual(["--train-rows", "0:67"])
+        expect(payload.command.args.slice(payload.command.args.indexOf("--val-rows"), payload.command.args.indexOf("--val-rows") + 2)).toEqual(["--val-rows", "67:76"])
+        expect(payload.command.args.slice(payload.command.args.indexOf("--ref-test-rows"), payload.command.args.indexOf("--ref-test-rows") + 2)).toEqual(["--ref-test-rows", "76:96"])
         expect(payload.datasetSpec.source_csv).toBe(path.resolve(datasetPath))
         const other = await runResearch(Research.Service.use((svc) => svc.createTask({
           title: "Different horizons", domainID: "tsf", mode: "autonomous",
@@ -1679,6 +1683,30 @@ describe("Research service", () => {
         const secondSpec = JSON.parse(await readFile(path.join(root, other.id, ".neo-cast", "dataset_spec.json"), "utf8"))
         expect(firstSpec.horizons).toEqual([8])
         expect(secondSpec.horizons).toEqual([4])
+
+        const explicit = await runResearch(Research.Service.use((svc) => svc.createTask({
+          title: "Explicit row ranges", domainID: "tsf", mode: "autonomous",
+          taskSpec: {
+            ...task.taskSpec,
+            dataset: {
+              ...((task.taskSpec.dataset ?? {}) as Research.JsonRecord),
+              split: {
+                method: "row_ranges",
+                trainRows: [0, 60],
+                validationRows: [60, 76],
+                testRows: [76, 96],
+              },
+            },
+          },
+          objective: {}, budget: {},
+        })))
+        const explicitPrepared = await runResearch(
+          Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: explicit.id })),
+        )
+        const explicitPayload = JSON.parse(await readFile(explicitPrepared.path, "utf8"))
+        expect(explicitPayload.command.args).toContain("0:60")
+        expect(explicitPayload.command.args).toContain("60:76")
+        expect(explicitPayload.command.args).toContain("76:96")
 
       },
     })
@@ -1791,7 +1819,7 @@ describe("Research service", () => {
 
         await expect(
           runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id }))),
-        ).rejects.toThrow(/Dataset is too short for automatic tsl_custom_70_10_20 splits/)
+        ).rejects.toThrow(/Dataset is too short for ratio split 7:1:2/)
       },
     })
   })
@@ -2904,7 +2932,7 @@ describe("Research service", () => {
         expect(prepared.run.status).toBe("queued")
         expect(prepared.run.candidateID).toBe(candidate.id)
         expect(prepared.runPlan.validation.ok).toBe(true)
-        expect(prepared.runPlan.writes[0]!.content.recipe_version).toBe("recipe_schema_v1")
+        expect(prepared.runPlan.writes[0]!.content.recipe_version).toBe("recipe_schema_v3")
       },
     })
   })
@@ -3076,7 +3104,7 @@ describe("Research service", () => {
         const writtenCandidate = JSON.parse(
           await readFile(path.join(tmp.path, ".neo-research", "workspaces", task.id, ".neo-cast", "current_candidate.json"), "utf8"),
         )
-        expect(writtenCandidate.recipe_version).toBe("recipe_schema_v1")
+        expect(writtenCandidate.recipe_version).toBe("recipe_schema_v3")
 
         const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
         expect(artifacts.some((artifact) => artifact.kind === "runner_plan_json")).toBe(true)
@@ -3110,6 +3138,29 @@ describe("Research service", () => {
           bridgeOnly: true,
         })
         expect(memory[0]!.candidateSummary.primaryMetric).toBe(0.101)
+      },
+    })
+  })
+
+  test("cached experiments do not add independent metric evidence", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const root = path.join(tmp.path, "cached-runner")
+        await writeTrainingFakeNeoCastRunner(root)
+        const runner = path.join(root, "py", "runner.py")
+        const script = await readFile(runner, "utf8")
+        await writeFile(runner, script.replace('{"event":"done","status":"success"}', '{"event":"done","status":"success","reused":true}'))
+        const task = await createTSFTask("cached experiment", { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" })
+        const candidate = await createCandidate({ taskID: task.id })
+        await executeFixtureSmoke(task.id, candidate.id)
+        const result = await runResearch(Research.Service.use((svc) => svc.executeRun({ taskID: task.id, candidateID: candidate.id, stage: "full" })))
+        expect(result.run.status).toBe("succeeded")
+        expect(result.run.metrics).toEqual({})
+        expect(result.run.resourceUsage.independentEvidence).toBe(false)
+        expect(result.run.resourceUsage.duplicateExperiment).toBe(true)
+        expect(await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))).toBeUndefined()
       },
     })
   })
@@ -4410,7 +4461,7 @@ describe("Research service", () => {
     })
   })
 
-  test("autonomous loop defaults plateau to 25 rounds against the current task best", async () => {
+  test("autonomous loop uses the default plateau threshold against the current task best", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4455,7 +4506,7 @@ describe("Research service", () => {
         )
 
         expect(loop.stoppedReason).toBe("plateau")
-        expect(loop.iterations).toHaveLength(25)
+        expect(loop.iterations).toHaveLength(NAS_DEFAULT_MAX_NO_IMPROVE)
         expect(loop.iterations.every((iteration) => iteration.run.metrics.val_avg_mse === 0.101)).toBe(true)
       },
     })
@@ -4768,7 +4819,7 @@ describe("Research service", () => {
               {
                 message: {
                   content: JSON.stringify({
-                    recipe_version: "recipe_schema_v1",
+                    recipe_version: "recipe_schema_v2",
                     recipe_id: "recipe_llm_patch_mlp_candidate",
                     hypothesis: "LLM proposes a compact patch MLP after baselines are exhausted.",
                     preprocessing: { actions: [{ type: "none" }] },
@@ -4780,7 +4831,7 @@ describe("Research service", () => {
                       loss: { base: "mse", horizon_weighting: "uniform" },
                       optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.01 },
                       scheduler: { type: "none", warmup_steps: 0 },
-                      regularization: { dropout: 0.1, grad_clip: 1 },
+                      regularization: { grad_clip: 1 },
                       budget: { max_epochs: 5, time_budget_s: 120, batch_size: 16, patience: 2, seed: 42 },
                     },
                     notes,
@@ -5276,7 +5327,7 @@ describe("Research service", () => {
             parentCandidateID: undefined,
             domainID: "tsf",
             candidateSpec: {
-              recipeVersion: "recipe_schema_v1",
+              recipeVersion: "recipe_schema_v2",
               recipeID: "tsf_linear_raw_baseline",
               hypothesis: "A raw linear temporal baseline should establish the simplest forecasting floor.",
               notes: "Seeded baseline candidate",

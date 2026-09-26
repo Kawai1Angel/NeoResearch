@@ -25,19 +25,19 @@ def base_recipe(
     channel_mode: str = "independent",
 ) -> dict[str, Any]:
     return {
-        "recipe_version": "recipe_schema_v1",
+        "recipe_version": "recipe_schema_v2",
         "recipe_id": "recipe_base",
         "hypothesis": "Base recipe used for mutation tests.",
         "preprocessing": {"actions": [{"type": "none"}]},
         "embedding": embedding or {"type": "patch", "patch_len": 16, "stride": 8, "d_model": 64},
         "backbone": backbone or {"type": "mlp", "depth": 1, "hidden_dim": 64, "activation": "gelu", "dropout": 0.1},
         "fusion": {"type": "temporal", "channel_mode": channel_mode},
-        "prediction_head": {"type": "linear", "output_distribution": "point", "share_across_horizons": False},
+        "prediction_head": {"type": "linear", "output_distribution": "point"},
         "training_strategy": {
             "loss": {"base": "mse", "horizon_weighting": "uniform"},
             "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
             "scheduler": {"type": "none", "warmup_steps": 0},
-            "regularization": {"dropout": 0.1, "grad_clip": 1.0},
+            "regularization": { "grad_clip": 1.0},
             "budget": {"max_epochs": 2, "time_budget_s": 60, "batch_size": 16, "patience": 2, "seed": 42},
         },
         "constraints": {"max_params": 1000000, "latency_priority": "medium"},
@@ -103,7 +103,7 @@ class MutateRecipeTest(unittest.TestCase):
         self.assertNotEqual(mutated["backbone"]["type"], "linear")
         self.assertIn(
             mutated["backbone"]["type"],
-            {"tcn", "rnn", "ssm", "mixer", "transformer", "dlinear", "nbeats", "timesnet"},
+            {"tcn", "rnn", "gated_depthwise_conv", "mixer", "transformer", "dlinear", "nbeats", "timesnet_lite"},
         )
         self.assert_valid_recipe(mutated)
 

@@ -15,7 +15,7 @@ def _random_suffix(length: int = 6) -> str:
 
 
 def is_recipe_payload(payload: dict[str, Any]) -> bool:
-    return payload.get("recipe_version") == "recipe_schema_v1"
+    return payload.get("recipe_version") in {"recipe_schema_v2", "recipe_schema_v3"}
 
 
 def to_candidate_recipe(payload: dict[str, Any]) -> dict[str, Any]:
@@ -23,7 +23,7 @@ def to_candidate_recipe(payload: dict[str, Any]) -> dict[str, Any]:
         return payload
     if is_model_recipe_payload(payload):
         return compile_model_recipe(payload)
-    raise ValueError("Expected recipe_schema_v1 or model_recipe.v1 payload")
+    raise ValueError("Expected recipe_schema_v2 or model_recipe.v1 payload")
 
 
 def normalize_recipe_id(recipe: dict[str, Any]) -> str:

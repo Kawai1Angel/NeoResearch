@@ -1,5 +1,6 @@
 import { NotFoundError } from "@/storage"
 import {
+  type DomainSummaryContext,
   type DomainArtifactContext,
   type DomainCapability,
   type DomainInfo,
@@ -56,8 +57,8 @@ export function createTaskSpec(domainID: string, input: unknown): JsonRecord {
   return get(domainID).createTaskSpec(input)
 }
 
-export function summarizeTask(domainID: string, taskSpec: JsonRecord): JsonRecord {
-  return get(domainID).summarizeTask?.(taskSpec) ?? {}
+export function summarizeTask(domainID: string, taskSpec: JsonRecord, context?: DomainSummaryContext): JsonRecord {
+  return get(domainID).summarizeTask?.(taskSpec, context) ?? {}
 }
 
 export function buildBaselines(domainID: string, taskSpec: JsonRecord) {

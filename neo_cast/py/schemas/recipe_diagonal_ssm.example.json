@@ -1,0 +1,74 @@
+{
+  "recipe_version": "recipe_schema_v3",
+  "recipe_id": "recipe_diagonal_ssm_example",
+  "hypothesis": "Evaluate the real diagonal_ssm sequence encoder with an explicit mean readout.",
+  "preprocessing": {
+    "actions": [
+      {
+        "type": "instance_norm",
+        "affine": false,
+        "eps": 0.00001
+      }
+    ]
+  },
+  "embedding": {
+    "type": "none"
+  },
+  "backbone": {
+    "type": "diagonal_ssm",
+    "d_model": 16,
+    "state_dim": 8,
+    "depth": 1,
+    "dropout": 0.1
+  },
+  "fusion": {
+    "type": "temporal",
+    "channel_mode": "independent"
+  },
+  "prediction_head": {
+    "type": "linear",
+    "output_distribution": "point"
+  },
+  "post_processing": {
+    "type": "auto"
+  },
+  "training_strategy": {
+    "loss": {
+      "base": "mae",
+      "horizon_weighting": "uniform"
+    },
+    "optimizer": {
+      "type": "adamw",
+      "lr": 0.001,
+      "weight_decay": 0.0001
+    },
+    "scheduler": {
+      "type": "cosine",
+      "warmup_steps": 0
+    },
+    "regularization": {
+      "grad_clip": 1
+    },
+    "budget": {
+      "max_epochs": 2,
+      "time_budget_s": 120,
+      "batch_size": 16,
+      "patience": 2,
+      "seed": 42
+    }
+  },
+  "constraints": {
+    "max_params": 1000000,
+    "max_latency_ms": 80,
+    "latency_priority": "medium"
+  },
+  "notes": "V3 typed encoder; each horizon is trained independently.",
+  "representation": {
+    "layout": "sequence_latent",
+    "readout": "mean",
+    "latent_dim": 16
+  },
+  "composition": {
+    "type": "single"
+  }
+}

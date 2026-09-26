@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from families import FAMILY_REGISTRY
+from training_identity import deduplicate_training
 from prepare_tsf import (
     ACTIVE_SPEC,
     DATASET,
@@ -82,20 +83,20 @@ def set_seed(seed: int) -> None:
 
 def build_default_candidate() -> dict[str, Any]:
     default_recipe: dict[str, Any] = {
-        "recipe_version": "recipe_schema_v1",
+        "recipe_version": "recipe_schema_v2",
         "recipe_id": "baseline_nlinear",
         "hypothesis": "Fallback NLinear baseline for direct train.py execution.",
-        "preprocessing": {"actions": [{"type": "none"}]},
+        "preprocessing": {"actions": [{"type": "last_value_centering"}]},
         "embedding": {"type": "none"},
         "backbone": {"type": "linear", "shared": False, "bias": True},
         "fusion": {"type": "temporal", "channel_mode": "independent"},
-        "prediction_head": {"type": "linear", "output_distribution": "point", "share_across_horizons": False},
+        "prediction_head": {"type": "linear", "output_distribution": "point"},
         "training_strategy": {
             "loss": {"base": "mse", "horizon_weighting": "uniform"},
             "optimizer": {"type": "adam", "lr": 1e-3, "weight_decay": 0.0},
             "scheduler": {"type": "none", "warmup_steps": 0},
-            "regularization": {"dropout": 0.1, "grad_clip": 1.0},
-            "budget": {"max_epochs": 100, "time_budget_s": 600, "batch_size": 32, "patience": 7, "seed": SEED},
+            "regularization": { "grad_clip": 1.0},
+            "budget": {"max_epochs": 100, "time_budget_s": 1200, "batch_size": 32, "patience": 7, "seed": SEED},
         },
     }
     return {
@@ -114,7 +115,7 @@ def build_default_candidate() -> dict[str, Any]:
         },
         "constraints": {
             "param_budget_m": 1.0,
-            "time_budget_s": 600,
+            "time_budget_s": 1200,
             "latency_priority": "medium",
         },
         "smoke_config": {
@@ -150,6 +151,9 @@ def load_resolved_candidate(path: Path) -> dict[str, Any]:
 
 
 def _with_native_channel_roles(model_config: dict[str, Any]) -> dict[str, Any]:
+    from dataset_contract import reject_unsupported_covariates
+
+    reject_unsupported_covariates(model_config)
     config = copy.deepcopy(model_config)
     if ACTIVE_SPEC.schema_version != "dataset.v2":
         return config
@@ -185,8 +189,9 @@ def run_epoch(
     on_batch=None,
     batch_report_interval: int = 50,
     deadline: float | None = None,
-) -> None:
+) -> int:
     model.train()
+    updates = 0
     for batch_idx, batch in enumerate(loader):
         if deadline is not None and time.time() >= deadline:
             break
@@ -195,15 +200,19 @@ def run_epoch(
         pred = predict_fn(model, x) if predict_fn is not None else model(x)
         context = x["target_history"] if isinstance(x, dict) else x
         loss = loss_fn(pred, y, context)
+        if not torch.isfinite(loss):
+            raise ValueError("Non-finite training loss")
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip is not None:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        updates += 1
 
         if on_batch is not None and (batch_idx + 1) % batch_report_interval == 0:
             on_batch(batch_idx + 1)
+    return updates
 
 
 @torch.no_grad()
@@ -326,6 +335,11 @@ def _build_train_loss(candidate: dict[str, Any]):
     strategy = _recipe_training_strategy(candidate)
     loss_cfg = strategy.get("loss", {})
     loss_base = loss_cfg.get("base", "mse")
+    from registry.action_specs import validate_output_contract
+
+    errors = validate_output_contract(_recipe_prediction_head(candidate), loss_cfg)
+    if errors:
+        raise ValueError("; ".join(errors))
     if _recipe_prediction_head(candidate).get("output_distribution") == "gaussian" and loss_base != "gaussian_nll":
         raise ValueError("Gaussian output requires gaussian_nll loss")
     horizon_weighting = str(loss_cfg.get("horizon_weighting", "uniform"))
@@ -363,14 +377,11 @@ def _build_train_loss(candidate: dict[str, Any]):
 
         def quantile_loss(pred: torch.Tensor, target: torch.Tensor, context=None) -> torch.Tensor:
             q = pred.new_tensor(quantiles).view(1, 1, 1, -1)
-            if pred.dim() == target.dim() + 1:
-                error = target.unsqueeze(-1) - pred
-            elif pred.dim() == target.dim():
-                error = target.unsqueeze(-1) - pred.unsqueeze(-1)
-            else:
+            if tuple(pred.shape) != (*target.shape, len(quantiles)):
                 raise ValueError(
-                    f"Quantile loss expected prediction rank {target.dim()} or {target.dim() + 1}, got {pred.dim()}"
+                    f"Quantile loss expected prediction shape {(*target.shape, len(quantiles))}, got {tuple(pred.shape)}"
                 )
+            error = target.unsqueeze(-1) - pred
             per_quantile = torch.maximum(q * error, (q - 1.0) * error)
             return _reduce_loss(per_quantile.mean(dim=-1), horizon_weighting, sample_scheme, target)
 
@@ -408,6 +419,7 @@ def _predict_for_training(model: nn.Module, candidate: dict[str, Any], x) -> tor
     if isinstance(x, dict):
         inputs = {
             "target_history": x["target_history"],
+            **({"missing_mask": x["missing_mask"]} if "missing_mask" in x else {}),
             "exogenous_past": x["exogenous_past"],
             "exogenous_future": x["exogenous_future"],
             **({"calendar_features": x["calendar_features"]} if "calendar_features" in x else {}),
@@ -429,6 +441,7 @@ def _slice_context_window(x: torch.Tensor, input_len: int) -> torch.Tensor:
         return {
             **x,
             "target_history": x["target_history"][:, -input_len:, :],
+            **({"missing_mask": x["missing_mask"][:, -input_len:, :]} if "missing_mask" in x else {}),
             "exogenous_past": x["exogenous_past"][:, -input_len:, :],
             **({"calendar_features": x["calendar_features"][:, -input_len:, :]} if "calendar_features" in x else {}),
         }
@@ -474,6 +487,35 @@ def measure_latency_ms(model: nn.Module, inputs, repeats: int = 10) -> float:
 
 
 def _build_runtime_model(family_module, candidate: dict[str, Any], input_len: int, horizon: int) -> nn.Module:
+    fusion = candidate.get("model_config", {}).get("recipe", {}).get("fusion", {})
+    if fusion.get("type") == "graph" and fusion.get("adjacency_source", "learned") != "learned":
+        import prepare_tsf as data
+        config = candidate["model_config"]
+        if "graph_adjacency" not in config or fusion["adjacency_source"] == "correlation":
+            names = list((*data.TARGET_COLUMNS, *data.PAST_COVARIATE_COLUMNS))
+            source = fusion["adjacency_source"]
+            if source == "correlation":
+                bundle = data._load_visible_bundle()
+                values = np.concatenate([bundle.target_values, bundle.past_covariate_values], axis=1)[data.BORDER_TRAIN[0]:data.BORDER_TRAIN[1]]
+                matrix = np.atleast_2d(np.nan_to_num(np.corrcoef(values, rowvar=False), nan=0.0))
+                np.fill_diagonal(matrix, 1)
+                provenance = {"source": source, "train_rows": list(data.BORDER_TRAIN), "channel_names": names}
+            else:
+                path = Path(fusion["topology_artifact"]).expanduser().resolve()
+                topology = json.loads(path.read_text())
+                if topology.get("channel_names") != names:
+                    raise ValueError("static topology channel_names must exactly match dataset input order")
+                matrix = np.asarray(topology["adjacency"], dtype=np.float32)
+                provenance = {"source": source, "channel_names": names, "artifact": str(path)}
+            if matrix.shape != (len(names), len(names)) or not np.isfinite(matrix).all():
+                raise ValueError("graph adjacency must be finite C x C")
+            actions = config["recipe"]["preprocessing"]["actions"]
+            if any(a.get("type") == "missing_mask" and a.get("mask_channel", True) for a in actions):
+                expanded = np.eye(len(names) * 2, dtype=np.float32)
+                expanded[:len(names), :len(names)] = matrix
+                matrix = expanded
+            config["graph_adjacency"] = matrix.tolist()
+            config["graph_provenance"] = provenance
     return family_module.build_model(_with_native_channel_roles(candidate["model_config"]), input_len, horizon)
 
 
@@ -513,6 +555,7 @@ def _recipe_execution_summary(candidate: dict[str, Any]) -> dict[str, Any]:
         quantiles = [float(value) for value in loss_cfg["quantiles"]]
 
     summary: dict[str, Any] = {
+        "implementation_status": "paper_derived" if recipe.get("backbone", {}).get("type") == "timesnet_lite" else "native",
         "preprocessing_actions": preprocessing_actions,
         "embedding": str(recipe.get("embedding", {}).get("type", "unknown")),
         "backbone": str(recipe.get("backbone", {}).get("type", "unknown")),
@@ -538,12 +581,16 @@ def _build_optimizer(
 ) -> torch.optim.Optimizer:
     strategy = _recipe_training_strategy(candidate)
     optimizer_type = strategy.get("optimizer", {}).get("type", "adam")
+    parameters = [
+        {"params": [p for p in model.parameters() if not getattr(p, "_no_weight_decay", False)]},
+        {"params": [p for p in model.parameters() if getattr(p, "_no_weight_decay", False)], "weight_decay": 0.0},
+    ]
     if optimizer_type == "adam":
-        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
     if optimizer_type == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
     if optimizer_type == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+        return torch.optim.SGD(parameters, lr=lr, weight_decay=weight_decay)
     raise ValueError(f"Unsupported optimizer: {optimizer_type}")
 
 
@@ -713,6 +760,9 @@ def save_run_artifacts(
 
     torch.save(
         {
+            "runtime_semantics_revision": training_summary.get("runtime_semantics_revision", 2),
+            "model_manifests": training_summary.get("model_manifests", {}),
+            "model_manifest_digest": training_summary.get("model_manifest_digest"),
             "run_id": run_id,
             "candidate": candidate,
             "model_family": candidate["model_family"],
@@ -738,11 +788,14 @@ def save_run_artifacts(
     )
 
 
+@deduplicate_training
 def train_models(
     *,
     candidate: dict[str, Any],
     smoke: bool,
     artifact_root: Path,
+    experiment_identity: dict | None = None,
+    artifact_callback=None,
     execution_contract_path: str | None = None,
     candidate_path: str | None = None,
     verification_path: str | None = None,
@@ -828,6 +881,8 @@ def train_models(
         for h in horizons
     }
     calendar = {"include_calendar": True} if any(getattr(m, "embedding_type", None) == "calendar" for m in models.values()) else {}
+    if any(getattr(m, "uses_missing_mask", False) for m in models.values()):
+        calendar["include_missing_mask"] = True
     train_loaders = {h: make_dataloader("train", h, batch_size, shuffle=True, **calendar) for h in horizons}
     val_loaders = {h: make_dataloader("val", h, batch_size, shuffle=False, **calendar) for h in horizons}
     latency_by_horizon = {}
@@ -852,6 +907,7 @@ def train_models(
     patience_counters = {h: 0 for h in horizons}
     stopped = {h: False for h in horizons}
     timed_out = False
+    update_counts = {h: 0 for h in horizons}
 
     def mark_timeout() -> None:
         nonlocal timed_out
@@ -877,7 +933,7 @@ def train_models(
             def _on_batch(batch_idx: int, _h: int = horizon, _e: int = epoch) -> None:
                 emit("batch_progress", horizon=_h, epoch=_e, batch=batch_idx, elapsed_s=round(time.time() - t_start, 1))
 
-            run_epoch(
+            updates = run_epoch(
                 models[horizon],
                 train_loaders[horizon],
                 optimizers[horizon],
@@ -888,6 +944,7 @@ def train_models(
                 on_batch=_on_batch,
                 deadline=t_start + time_budget_s,
             )
+            update_counts[horizon] += updates or 0
             val_loss = compute_val_loss(models[horizon], val_loaders[horizon], device, predict_fn)
             if schedulers[horizon] is not None:
                 _step_scheduler(schedulers[horizon], val_loss)
@@ -910,6 +967,11 @@ def train_models(
         if timed_out:
             break
 
+    if any(getattr(model, "runtime_semantics_revision", 2) == 3 for model in models.values()) and any(count == 0 for count in update_counts.values()):
+        emit("error", kind="untrained_horizon", message="Budget expired before every independent horizon received an optimizer update")
+        emit("done", status="full_fail" if not smoke else "smoke_fail")
+        return 124
+
     for horizon in horizons:
         models[horizon].load_state_dict(best_states[horizon])
         models[horizon].eval()
@@ -927,6 +989,10 @@ def train_models(
         torch.cuda.max_memory_allocated(device) / 1024 / 1024 if torch.cuda.is_available() else 0.0
     )
     training_summary: dict[str, Any] = {
+        **(experiment_identity or {}),
+        "export_spec": {key: family_spec[key] for key in ("model_impl_entry", "state_dict_layout")},
+        "runtime_semantics_revision": next(iter(models.values())).runtime_semantics_revision if candidate["model_family"] == "recipe_factory" else 2,
+        "model_manifests": {str(h): __import__("execution_contract").describe_model(model) for h, model in models.items()},
         "training_seconds": round(t_train_end - t_start, 6),
         "total_seconds": round(time.time() - t_start, 6),
         "peak_vram_mb": round(peak_vram_mb, 6),
@@ -934,16 +1000,16 @@ def train_models(
         **_recipe_execution_summary(candidate),
         "target_columns": list(ACTIVE_SPEC.target_columns),
         "used_observed_past_covariates": list(ACTIVE_SPEC.observed_past_covariates),
-        "used_known_future_covariates": list(ACTIVE_SPEC.known_future_covariates),
         "target_channels": NUM_CHANNELS,
         "past_exogenous_channels": len(PAST_COVARIATE_COLUMNS),
         "future_exogenous_channels": len(KNOWN_FUTURE_COVARIATES),
         "model_input_channels": NUM_CHANNELS + len(PAST_COVARIATE_COLUMNS),
         "model_output_channels": NUM_CHANNELS,
-        "future_covariate_mode": candidate["model_config"].get("future_covariate_mode", "none"),
         "first_batch_shapes": first_batch_shapes,
         "latency_ms_by_horizon": latency_by_horizon,
     }
+    from execution_contract import digest
+    training_summary["model_manifest_digest"] = digest(training_summary["model_manifests"])
 
     run_id = _make_run_id()
     artifact_dir = _artifact_dir_for_run(artifact_root, run_id, smoke=smoke)
@@ -957,7 +1023,14 @@ def train_models(
         training_summary=training_summary,
     )
     if smoke:
+        if training_summary["runtime_semantics_revision"] == 3:
+            from recipe_identity import behavior_probe
+            probes = {str(h): behavior_probe(model) for h, model in models.items()}
+            (artifact_dir / "behavior_probe.json").write_text(json.dumps(probes, indent=2))
+            emit("behavior_probe", path=str(artifact_dir / "behavior_probe.json"), diagnostic_only=True)
         _gc_smoke_artifacts(artifact_root)
+    if artifact_callback:
+        artifact_callback(artifact_dir)
 
     emit("smoke_eval_done" if smoke else "eval_done", **{k: round(v, 6) for k, v in val_results.items()})
     emit("artifact_ready", artifact_dir=str(artifact_dir.resolve()), run_id=run_id)
@@ -976,9 +1049,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     resolved_candidate_path = Path(args.resolved_candidate).expanduser()
     artifacts_dir = Path(args.artifacts_dir).expanduser()

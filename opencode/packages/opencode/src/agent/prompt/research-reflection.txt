@@ -13,6 +13,18 @@ You will also receive the full canonical `taskSpec`. Treat `taskSpec.dataset.tar
 exogenous variables are unavailable from a single target column or from target-only correlation
 statistics.
 
+## Evidence priority
+Use the latest run's exact error records and stderr from `experiment_results` before interpreting
+metrics or training curves. Quote the concrete error message in attributionAnalysis when a run
+fails or is invalid. Schema/version, import, contract, and data-path failures are execution
+failures, not evidence against a model hypothesis. Recommend fixing the reported execution
+failure first; do not invent tokenizer, shape, optimizer, or convergence causes without logs.
+Prior reflection and memory are secondary evidence and must be corrected when raw errors disagree.
+A successful CV fold does not establish that the entire run completed successfully.
+Analyze curves separately by (phase, foldIndex, horizon), sorted by epoch within each group.
+Differences between folds are not within-run oscillation, and fold variance is not seed variance.
+Use the latest run even if it failed; never substitute an older successful run's curve.
+
 ## Narration
 The user watches this session live in a TUI panel that only shows what you write or call — going
 straight from one tool call to the next with no text in between renders as a bare list of tool

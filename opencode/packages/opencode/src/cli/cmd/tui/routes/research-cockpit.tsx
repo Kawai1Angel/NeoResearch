@@ -1,3 +1,4 @@
+import { createResearchReads, createResearchRefresh } from "./research-refresh"
 import { DialogResearchResults } from "@tui/component/dialog-research-results"
 import { useKV } from "@tui/context/kv"
 import { DialogResearchHistory } from "@tui/component/dialog-research-history"
@@ -1219,6 +1220,13 @@ export function ResearchCockpit() {
   const slashSelection = createResearchSlashSelection()
   let streamEventID = 0
   const [refresh, setRefresh] = createSignal(0)
+  const refreshControl = createResearchRefresh(() => setRefresh((value) => value + 1))
+  const requestRefresh = () => refreshControl.request()
+  const stateReads = createResearchReads()
+  const readState = <T,>(path: string, ttlMs = 0) => stateReads.read<T>(
+    `${sdk.url}:${sdk.directory}:${path}`, () => researchRequest<T>(sdk, path), ttlMs,
+  )
+  onCleanup(() => refreshControl.dispose())
   const [selectedIndex, setSelectedIndex] = createSignal(0)
   const [selectedTaskID, setSelectedTaskID] = createSignal<string | undefined>(route.data.type === "cockpit" ? route.data.taskID : undefined)
   createEffect(() => { if (route.data.type === "cockpit" && route.data.taskID) setSelectedTaskID(route.data.taskID) })
@@ -1547,7 +1555,7 @@ export function ResearchCockpit() {
   }
 
   const [tasks, { mutate: mutateTasks }] = createResource(refresh, async () => {
-    return researchRequest<ResearchCockpitTask[]>(sdk, "/research/tasks?limit=30")
+    return readState<ResearchCockpitTask[]>("/research/tasks?limit=30")
   })
 
   // Makes a just-created task visible in the local list immediately, instead of waiting for
@@ -1561,9 +1569,13 @@ export function ResearchCockpit() {
     mutateTasks((prev) => [task, ...(prev ?? []).filter((t) => t.id !== task.id)])
   }
 
-  const [researchLLMStatus] = createResource(refresh, async () => {
+  const [llmRefresh, setLLMRefresh] = createSignal(0)
+  // Provider configuration is independent of token and experiment progress.
+  const llmTimer = setInterval(() => setLLMRefresh((value) => value + 1), 60_000)
+  onCleanup(() => clearInterval(llmTimer))
+  const [researchLLMStatus] = createResource(llmRefresh, async () => {
     try {
-      return await researchRequest<{ status: string; provider: string; model: string; source: string }>(sdk, "/research/llm")
+      return await readState<{ status: string; provider: string; model: string; source: string }>("/research/llm", 30_000)
     } catch {
       return undefined
     }
@@ -1584,7 +1596,7 @@ export function ResearchCockpit() {
     return Math.max(0, Math.min(selectedIndex(), tasks.length - 1))
   })
   const [directTask] = createResource(() => selectedTaskID() ? { id: selectedTaskID()!, refresh: refresh() } : undefined, async ({ id }) => {
-    try { return await researchRequest<ResearchCockpitTask>(sdk, `/research/tasks/${encodeURIComponent(id)}`) }
+    try { return await readState<ResearchCockpitTask>(`/research/tasks/${encodeURIComponent(id)}`) }
     catch (error) {
       if (selectedTaskID() === id) {
         const text = `无法打开研究 ${id}：${formatError(error)}`
@@ -1606,8 +1618,13 @@ export function ResearchCockpit() {
       refresh: refresh(),
     }
   })
+  const fingerprintSource = createMemo(() => {
+    const task = selectedTask()
+    if (!task) return undefined
+    return `${task.id}\0${JSON.stringify(task.taskSpec)}`
+  })
   const [recovery] = createResource(selectedTaskSource, async ({ taskID }) =>
-    researchRequest<ResumeState>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume-state`))
+    readState<ResumeState>(`/research/tasks/${encodeURIComponent(taskID)}/resume-state`))
   const [historyEvents, setHistoryEvents] = createSignal<Array<{ sequence: number; summary: string }>>([])
   createEffect(() => {
     const taskID = selectedTaskKey()
@@ -1626,7 +1643,7 @@ export function ResearchCockpit() {
         if (!fresh.length) return
         cursor = fresh.at(-1)!.sequence
         setHistoryEvents((previous) => [...previous, ...fresh].slice(-100))
-        setRefresh((value) => value + 1)
+        requestRefresh()
       } catch { /* A later pull resumes from the same cursor after a disconnect. */ }
       finally { pending = false }
     }
@@ -1751,7 +1768,7 @@ export function ResearchCockpit() {
         },
       ])
       if (shouldRefreshForRunnerProgressEvent(eventName) && shouldRefreshResearchCockpitOnEvent(researchPayload)) {
-        setRefresh((value) => value + 1)
+        requestRefresh()
       }
       return
     }
@@ -1764,7 +1781,7 @@ export function ResearchCockpit() {
       if (!next || next === previous) return
       setLiteratureView(next)
       setLiveAgentEventStage(next.status === "running" ? "LiteratureAgent" : undefined)
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (researchPayload.type === "research.agent.dataAnalysis.started") {
@@ -1797,7 +1814,6 @@ export function ResearchCockpit() {
             return next
           })
         }
-        setRefresh((value) => value + 1)
       }
       return
     }
@@ -1839,7 +1855,6 @@ export function ResearchCockpit() {
         })
         setDaPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
       }
-      setRefresh((value) => value + 1)
       return
     }
     if (researchPayload.type === "research.agent.hypoPlanner.started") {
@@ -1876,7 +1891,6 @@ export function ResearchCockpit() {
             return next
           })
         }
-        setRefresh((value) => value + 1)
       }
       return
     }
@@ -1918,7 +1932,6 @@ export function ResearchCockpit() {
         })
         setHypoPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
       }
-      setRefresh((value) => value + 1)
       return
     }
     if (researchPayload.type === "research.agent.reflection.started") {
@@ -1951,7 +1964,6 @@ export function ResearchCockpit() {
             return next
           })
         }
-        setRefresh((value) => value + 1)
       }
       return
     }
@@ -1993,7 +2005,6 @@ export function ResearchCockpit() {
         })
         setReflPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
       }
-      setRefresh((value) => value + 1)
       return
     }
     if (researchPayload.type === "research.agent.intent.started") {
@@ -2030,7 +2041,6 @@ export function ResearchCockpit() {
           next.set(pid, { ...entry, text: entry.text + delta })
           return next
         })
-        setRefresh((value) => value + 1)
       }
       return
     }
@@ -2079,7 +2089,6 @@ export function ResearchCockpit() {
         })
         setIntentPartOrder((prev) => prev.includes(partID) ? prev : [...prev, partID])
       }
-      setRefresh((value) => value + 1)
       return
     }
     if (
@@ -2107,7 +2116,7 @@ export function ResearchCockpit() {
       }
       setIntentStream((prev) => (prev ? { ...prev, done: true } : prev))
       setLiveAgentEventStage(undefined)
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (
@@ -2175,7 +2184,7 @@ export function ResearchCockpit() {
       setReflectionStream(undefined)
       appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (
@@ -2235,13 +2244,13 @@ export function ResearchCockpit() {
       } else if (researchPayload.type === "research.agent.dataAnalysis.completed") {
         setDataAnalysisStream((prev) => prev ? { ...prev, done: true } : prev)
         setLiveAgentEventStage(undefined)
-        setRefresh((value) => value + 1)
+        requestRefresh()
         return
       } else if (researchPayload.type === "research.agent.hypoPlanner.completed") {
         if (hypoPlannerStream() && !hypoPlannerStream()!.afterTraining) {
           setHypoPlannerStream((prev) => prev ? { ...prev, done: true } : prev)
           setLiveAgentEventStage(undefined)
-          setRefresh((value) => value + 1)
+          requestRefresh()
           return
         }
         // Push HypoPlanner result into the chronological designLLMLines so it appears
@@ -2277,11 +2286,11 @@ export function ResearchCockpit() {
         appendDesignLLMLines(hypoNewLines)
         setHypoPlannerStream(undefined)
         setLiveAgentEventStage(undefined)
-        setRefresh((value) => value + 1)
+        requestRefresh()
         return
       }
       appendDesignLLMLines(newLines)
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (researchPayload.type === "research.agent.publish.started") {
@@ -2358,7 +2367,7 @@ export function ResearchCockpit() {
       }
       appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (researchPayload.type === "research.agent.publish.failed") {
@@ -2373,7 +2382,7 @@ export function ResearchCockpit() {
       const label = refTestSkipped ? "[Publish] ref_test 跳过" : "[Publish] 发布失败"
       appendDesignLLMLines([{ id: ++streamEventID, taskID, text: `${label}: ${errMsg.slice(0, 120)}`, tone }])
       setLiveAgentEventStage(undefined)
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (researchPayload.type === "research.run.updated") {
@@ -2439,11 +2448,11 @@ export function ResearchCockpit() {
         { id: ++streamEventID, taskID, text: `[Checkpoint:${phase}] ✓ auto-approved`, tone: "muted" as const },
         ...reasonLines.map((l) => ({ id: ++streamEventID, taskID, text: `  ${l}`, tone: "muted" as const })),
       ])
-      setRefresh((value) => value + 1)
+      requestRefresh()
       return
     }
     if (!shouldRefreshResearchCockpitOnEvent(researchPayload)) return
-    setRefresh((value) => value + 1)
+    requestRefresh()
   })
   onCleanup(unsubscribeResearchEvents)
 
@@ -2464,39 +2473,38 @@ export function ResearchCockpit() {
   })
 
   const [runs] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitRun[]>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/runs`).then((items) => items.map((item) => ({ ...item, taskID: source.taskID })))
+    return readState<ResearchCockpitRun[]>(`/research/tasks/${encodeURIComponent(source.taskID)}/runs`).then((items) => items.map((item) => ({ ...item, taskID: source.taskID })))
   })
 
   const [candidates] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitCandidate[]>(
-      sdk,
+    return readState<ResearchCockpitCandidate[]>(
       `/research/tasks/${encodeURIComponent(source.taskID)}/candidates`,
     )
   })
 
   const [artifacts] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitArtifact[]>(
-      sdk,
+    return readState<ResearchCockpitArtifact[]>(
       `/research/tasks/${encodeURIComponent(source.taskID)}/artifacts`,
     )
   })
 
-  const [fingerprintSnapshot] = createResource(selectedTaskSource, async (source) => ({
-    taskID: source.taskID,
-    value: await researchRequest<JsonRecord>(sdk, `/research/tasks/${encodeURIComponent(source.taskID)}/fingerprint`),
-  }))
+  const [fingerprintSnapshot] = createResource(fingerprintSource, async (source) => {
+    const taskID = source.slice(0, source.indexOf("\0"))
+    return {
+      taskID,
+      value: await readState<JsonRecord>(`/research/tasks/${encodeURIComponent(taskID)}/fingerprint`),
+    }
+  })
   const taskFingerprint = () => fingerprintSnapshot()?.taskID === selectedTask()?.id ? fingerprintSnapshot()?.value : undefined
 
   const [approvals] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitApproval[]>(
-      sdk,
+    return readState<ResearchCockpitApproval[]>(
       `/research/tasks/${encodeURIComponent(source.taskID)}/approvals?limit=20`,
     ).then((items) => items.map((item) => ({ ...item, taskID: source.taskID })))
   })
 
   const [champion] = createResource(selectedTaskSource, async (source) => {
-    return researchRequest<ResearchCockpitChampion | null>(
-      sdk,
+    return readState<ResearchCockpitChampion | null>(
       `/research/tasks/${encodeURIComponent(source.taskID)}/champion`,
     )
   })
@@ -2688,7 +2696,7 @@ export function ResearchCockpit() {
           { id: ++streamEventID, action: name, text: message },
         ])
         toast.show({ variant: "info", message })
-        setRefresh((value) => value + 1)
+        requestRefresh()
       } catch (err) {
         if (actionTaskID !== selectedTask()?.id) return
         if (!abortController.signal.aborted && isHumanCheckpointRequired(err)) {
@@ -2698,7 +2706,7 @@ export function ResearchCockpit() {
             { id: ++streamEventID, action: name, text: message },
           ])
           toast.show({ variant: "info", message })
-          setRefresh((value) => value + 1)
+          requestRefresh()
         } else {
           const message = abortController.signal.aborted && !(err instanceof Error && err.name === "ResearchOperationUnknown")
             ? name === "chat"
@@ -2713,7 +2721,7 @@ export function ResearchCockpit() {
           toast.show({ variant: "error", message })
         }
       } finally {
-        if (actionTaskID === selectedTask()?.id) setRefresh((value) => value + 1)
+        if (actionTaskID === selectedTask()?.id) requestRefresh()
         if (activeActionAbort === abortController) activeActionAbort = undefined
         setBusy(undefined)
         setBusyStartedAt(undefined)
@@ -2814,7 +2822,7 @@ export function ResearchCockpit() {
         ])
         toast.show({ variant: "info", message })
       }
-      setRefresh((value) => value + 1)
+      requestRefresh()
     } catch (err) {
       if (selectedTask()?.id !== actionTaskID) return
       const message = abortController.signal.aborted ? "Chat request canceled." : formatError(err)

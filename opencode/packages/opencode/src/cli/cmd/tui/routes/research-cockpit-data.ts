@@ -231,6 +231,7 @@ const researchRefreshEventTypes = new Set([
 ])
 
 export function shouldRefreshResearchCockpitOnEvent(event: { type: string }) {
+  if (event.type.endsWith(".stream.delta") || event.type.endsWith(".part.updated")) return false
   return researchRefreshEventTypes.has(event.type) || event.type.startsWith("research.agent.")
 }
 
@@ -1094,10 +1095,47 @@ function formatEmbeddingDetail(emb: Record<string, unknown>): string {
   return p ? `${type}(${p})` : type
 }
 
+function formatEmbeddingExpandedDetail(embedding: Record<string, unknown>): string {
+  const type = typeof embedding.type === "string" ? embedding.type : "?"
+  if (type === "none") return "none"
+  const params: string[] = []
+  const patchLen = embedding.patchLen ?? embedding.patch_len
+  const stride = embedding.stride
+  const nFreq = embedding.nFreq ?? embedding.n_freq
+  const dModel = embedding.dModel ?? embedding.d_model
+  const complexMode = embedding.complexMode ?? embedding.complex_mode
+  if (patchLen !== undefined) params.push(`patch=${patchLen}`)
+  if (stride !== undefined) params.push(`stride=${stride}`)
+  if (nFreq !== undefined) params.push(`n_freq=${nFreq}`)
+  if (dModel !== undefined) params.push(`d_model=${dModel}`)
+  if (complexMode !== undefined) params.push(`complex_mode=${complexMode}`)
+  return `${type}${params.length ? `(${params.join(", ")})` : ""}`
+}
+
 function formatBackboneDetail(bb: Record<string, unknown>): string {
   const type = typeof bb.type === "string" ? bb.type : "?"
   const params: Array<string | undefined> = []
-  if (type === "linear") {
+  if (type === "diagonal_ssm") {
+    params.push(fmt("d", bb.dModel ?? bb.d_model))
+    params.push(fmt("state", bb.stateDim ?? bb.state_dim))
+    params.push(fmt("depth", bb.depth))
+    params.push(fmt("drop", bb.dropout))
+  } else if (type === "timesblock_encoder") {
+    params.push(fmt("d", bb.dModel ?? bb.d_model))
+    params.push(fmt("ffn", bb.dFf ?? bb.d_ff))
+    params.push(fmt("depth", bb.depth))
+    params.push(fmt("topK", bb.topK ?? bb.top_k))
+    params.push(fmt("kernels", bb.numKernels ?? bb.num_kernels))
+    params.push(fmt("drop", bb.dropout))
+  } else if (type === "mamba") {
+    params.push(fmt("d", bb.dModel ?? bb.d_model))
+    params.push(fmt("state", bb.dState ?? bb.d_state))
+    params.push(fmt("conv", bb.dConv ?? bb.d_conv))
+    params.push(fmt("expand", bb.expand))
+    params.push(fmt("depth", bb.depth))
+    params.push(fmt("drop", bb.dropout))
+    params.push(fmt("backend", bb.backend))
+  } else if (type === "linear") {
     params.push(fmt("shared", bb.shared))
     params.push(fmt("bias", bb.bias))
   } else if (type === "mlp") {
@@ -1126,6 +1164,11 @@ function formatBackboneDetail(bb: Record<string, unknown>): string {
     params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
     params.push(fmt("act", bb.activation))
     params.push(fmt("drop", bb.dropout))
+  } else if (type === "gated_depthwise_conv") {
+    params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
+    params.push(fmt("depth", bb.depth))
+    params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
+    params.push(fmt("drop", bb.dropout))
   } else if (type === "ssm") {
     params.push(fmt("state", bb.stateDim ?? bb.state_dim))
     params.push(fmt("depth", bb.depth))
@@ -1142,12 +1185,34 @@ function formatBackboneDetail(bb: Record<string, unknown>): string {
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
     params.push(fmt("act", bb.activation))
     params.push(fmt("drop", bb.dropout))
-  } else if (type === "timesnet") {
+  } else if (type === "timesnet" || type === "timesnet_lite") {
     params.push(fmt("h", bb.hiddenDim ?? bb.hidden_dim))
     params.push(fmt("layers", bb.nLayers ?? bb.n_layers))
     params.push(fmt("topK", bb.topK ?? bb.top_k))
     params.push(fmt("k", bb.kernelSize ?? bb.kernel_size))
     params.push(fmt("drop", bb.dropout))
+  }
+  params.push(fmt("attn", bb.attention))
+  const p = params.filter(Boolean).join(",")
+  return p ? `${type}(${p})` : type
+}
+
+function formatRepresentationDetail(representation: Record<string, unknown>): string {
+  const layout = typeof representation.layout === "string" ? representation.layout : "?"
+  const params: Array<string | undefined> = []
+  params.push(fmt("readout", representation.readout))
+  params.push(fmt("latent_dim", representation.latentDim ?? representation.latent_dim))
+  const p = params.filter(Boolean).join(",")
+  return p ? `${layout}(${p})` : layout
+}
+
+function formatCompositionDetail(composition: Record<string, unknown>): string {
+  const type = typeof composition.type === "string" ? composition.type : "?"
+  const params: Array<string | undefined> = []
+  if (type === "parallel_two_branch") params.push(fmt("merge", composition.merge))
+  if (type === "decomposition_two_branch") {
+    params.push(fmt("kernel_size", composition.kernelSize ?? composition.kernel_size))
+    params.push(fmt("merge", composition.merge))
   }
   const p = params.filter(Boolean).join(",")
   return p ? `${type}(${p})` : type
@@ -1216,22 +1281,40 @@ export function formatResearchCockpitCandidateRecipeLines(candidate: ResearchCoc
   const prep = formatPreprocessingDetail(preprocessingActions)
   const emb = formatEmbeddingDetail(asRecord(spec.embedding))
   const bb = formatBackboneDetail(asRecord(spec.backbone))
+  const representation = asRecord(spec.representation)
+  const composition = asRecord(spec.composition)
+  const secondary = asRecord(composition.secondary)
   const fusion = formatFusionDetail(asRecord(spec.fusion))
-  const head = formatHeadDetail(asRecord(spec.predictionHead))
-  const strategy = asRecord(spec.trainingStrategy)
+  const head = formatHeadDetail(asRecord(spec.predictionHead ?? spec.prediction_head))
+  const strategy = asRecord(spec.trainingStrategy ?? spec.training_strategy)
   const lossRec = asRecord(strategy.loss)
   const lossBase = typeof lossRec.base === "string" ? lossRec.base : "?"
   const lossWeight = typeof lossRec.horizonWeighting === "string" && lossRec.horizonWeighting !== "uniform" ? `(${lossRec.horizonWeighting})` : ""
   const loss = `${lossBase}${lossWeight}`
   const opt = formatOptimizerDetail(asRecord(strategy.optimizer))
   const sched = formatSchedulerDetail(asRecord(strategy.scheduler))
-  const architecture = [
+  const architectureParts = [
     `prep=${prep}`,
     `emb=${emb}`,
     `backbone=${bb}`,
-    `fusion=${fusion}`,
-    `head=${head}`,
-  ].join(" / ")
+  ]
+  if (Object.keys(representation).length > 0) architectureParts.push(`repr=${formatRepresentationDetail(representation)}`)
+  if (Object.keys(composition).length > 0) {
+    architectureParts.push(`composition=${formatCompositionDetail(composition)}`)
+    if (Object.keys(secondary).length > 0) {
+      const secondaryParts = [
+        formatEmbeddingDetail(asRecord(secondary.embedding)),
+        formatBackboneDetail(asRecord(secondary.backbone)),
+      ]
+      const secondaryRepresentation = asRecord(secondary.representation)
+      if (Object.keys(secondaryRepresentation).length > 0) {
+        secondaryParts.push(formatRepresentationDetail(secondaryRepresentation))
+      }
+      architectureParts.push(`secondary=${secondaryParts.join("->")}`)
+    }
+  }
+  architectureParts.push(`fusion=${fusion}`, `head=${head}`)
+  const architecture = architectureParts.join(" / ")
   const training = [
     `loss=${loss}`,
     `opt=${opt}`,
@@ -1249,24 +1332,36 @@ export function formatResearchCockpitCandidateArchitectureExpandedLines(candidat
     : [{ type: "none" }]
   lines.push(`  preprocessing:  ${formatPreprocessingDetail(prepActions)}`)
 
-  const emb = asRecord(spec.embedding)
-  const embType = typeof emb.type === "string" ? emb.type : "?"
-  const embParams: string[] = []
-  if (embType !== "none") {
-    const patchLen = emb.patchLen ?? emb.patch_len
-    const stride = emb.stride
-    const nFreq = emb.nFreq ?? emb.n_freq
-    const dModel = emb.dModel ?? emb.d_model
-    const complexMode = emb.complexMode ?? emb.complex_mode
-    if (patchLen !== undefined) embParams.push(`patch=${patchLen}`)
-    if (stride !== undefined) embParams.push(`stride=${stride}`)
-    if (nFreq !== undefined) embParams.push(`n_freq=${nFreq}`)
-    if (dModel !== undefined) embParams.push(`d_model=${dModel}`)
-    if (complexMode !== undefined) embParams.push(`complex_mode=${complexMode}`)
-  }
-  lines.push(`  embedding:      ${embType}${embParams.length ? `(${embParams.join(", ")})` : ""}`)
+  const embeddingDetail = formatEmbeddingExpandedDetail(asRecord(spec.embedding))
+  const backboneDetail = formatBackboneDetail(asRecord(spec.backbone))
+  const representation = asRecord(spec.representation)
+  const representationDetail = Object.keys(representation).length > 0
+    ? formatRepresentationDetail(representation).replaceAll(",", ", ")
+    : undefined
+  const composition = asRecord(spec.composition)
+  const secondary = asRecord(composition.secondary)
 
-  lines.push(`  backbone:       ${formatBackboneDetail(asRecord(spec.backbone))}`)
+  if (Object.keys(secondary).length > 0) {
+    lines.push(`  composition:    ${formatCompositionDetail(composition).replaceAll(",", ", ")}`)
+    lines.push("  primary:")
+    lines.push(`    embedding:      ${embeddingDetail}`)
+    lines.push(`    backbone:       ${backboneDetail}`)
+    if (representationDetail) lines.push(`    representation: ${representationDetail}`)
+    lines.push("  secondary:")
+    lines.push(`    embedding:      ${formatEmbeddingExpandedDetail(asRecord(secondary.embedding))}`)
+    lines.push(`    backbone:       ${formatBackboneDetail(asRecord(secondary.backbone)).replaceAll(",", ", ")}`)
+    const secondaryRepresentation = asRecord(secondary.representation)
+    if (Object.keys(secondaryRepresentation).length > 0) {
+      lines.push(`    representation: ${formatRepresentationDetail(secondaryRepresentation).replaceAll(",", ", ")}`)
+    }
+  } else {
+    lines.push(`  embedding:      ${embeddingDetail}`)
+    lines.push(`  backbone:       ${backboneDetail}`)
+    if (representationDetail) lines.push(`  representation: ${representationDetail}`)
+    if (Object.keys(composition).length > 0) {
+      lines.push(`  composition:    ${formatCompositionDetail(composition).replaceAll(",", ", ")}`)
+    }
+  }
 
   const fusion = asRecord(spec.fusion)
   const fusionType = typeof fusion.type === "string" ? fusion.type : "?"
@@ -1280,6 +1375,10 @@ export function formatResearchCockpitCandidateArchitectureExpandedLines(candidat
   const headParams: string[] = []
   const outputDist = head.outputDistribution ?? head.output_distribution
   if (outputDist !== undefined) headParams.push(`output_dist=${outputDist}`)
+  const baseHead = head.baseHead ?? head.base_head
+  if (baseHead !== undefined) headParams.push(`base_head=${baseHead}`)
+  const correctionDim = head.correctionDim ?? head.correction_dim
+  if (correctionDim !== undefined) headParams.push(`correction_dim=${correctionDim}`)
   lines.push(`  prediction_head: ${headType}${headParams.length ? `(${headParams.join(", ")})` : ""}`)
 
   const strategy = asRecord(spec.trainingStrategy ?? spec.training_strategy)

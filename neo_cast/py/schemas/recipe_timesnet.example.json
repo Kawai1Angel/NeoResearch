@@ -1,5 +1,5 @@
 {
-  "recipe_version": "recipe_schema_v1",
+  "recipe_version": "recipe_schema_v2",
   "recipe_id": "recipe_timesnet_example",
   "hypothesis": "TimesNet-lite uses FFT-derived period grids and compact 2D convolutions, testing periodic structure without allowing arbitrary model code.",
   "preprocessing": {
@@ -15,7 +15,7 @@
     "type": "none"
   },
   "backbone": {
-    "type": "timesnet",
+    "type": "timesnet_lite",
     "hidden_dim": 16,
     "n_layers": 1,
     "top_k": 1,
@@ -28,9 +28,7 @@
   },
   "prediction_head": {
     "type": "linear",
-    "output_distribution": "point",
-    "share_across_horizons": false
-  },
+    "output_distribution": "point"},
   "post_processing": {
     "type": "auto"
   },
@@ -49,7 +47,6 @@
       "warmup_steps": 0
     },
     "regularization": {
-      "dropout": 0.1,
       "grad_clip": 1.0
     },
     "budget": {

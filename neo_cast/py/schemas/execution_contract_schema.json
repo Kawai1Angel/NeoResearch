@@ -49,8 +49,34 @@
         "output_channels"
       ],
       "properties": {
+        "runtime_semantics_revision": {
+          "enum": [
+            2,
+            3
+          ]
+        },
+        "linear_shared": {
+          "type": "boolean"
+        },
+        "fusion_gate_type": {
+          "enum": [
+            "scalar",
+            "channel",
+            "time",
+            "learned"
+          ]
+        },
+        "fusion_gate": {
+          "type": "boolean"
+        },
+        "fusion_residual": {
+          "type": "boolean"
+        },
         "recipe_version": {
-          "const": "recipe_schema_v1"
+          "enum": [
+            "recipe_schema_v2",
+            "recipe_schema_v3"
+          ]
         },
         "embedding": {
           "type": "string"

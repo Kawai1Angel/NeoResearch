@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import sys
+import json
+import os
+import subprocess
+import tempfile
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 
@@ -19,11 +24,93 @@ from export import (  # noqa: E402
     render_mcp_server_py,
     render_tool_schema,
     validate_metadata_payload,
+    write_export_files,
+    update_ref_test_export,
 )
 from research_trace import build_research_trace  # noqa: E402
 
 
 class ExportContractTest(unittest.TestCase):
+    def test_export_cli_uses_snapshots_without_importing_training_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preprocess = {"feature_names": ["fixture"], "scaler_mean": [42.0]}
+            summary = {"export_spec": {"model_impl_entry": "model_impl.py:build_model", "state_dict_layout": "per_horizon"}}
+            for name, payload in {
+                "preprocess.json": preprocess,
+                "resolved_candidate.json": {"candidate_id": "fixture", "model_family": "recipe_factory"},
+                "training_summary.json": summary,
+                "val_metrics.json": {"val_avg_mse": 0.5, "val_h96_mse": 0.5},
+                "cv_metrics.json": {},
+            }.items():
+                (root / name).write_text(json.dumps(payload))
+            before = (root / "preprocess.json").read_bytes()
+            script = """
+import sys, importlib.abc
+class BlockTraining(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'torch', 'prepare_tsf', 'pandas', 'sklearn'}:
+            raise AssertionError('Unexpected training dependency: ' + fullname)
+sys.meta_path.insert(0, BlockTraining())
+import export
+export.main()
+"""
+            result = subprocess.run([sys.executable, "-c", script, "--artifact-dir", str(root), "--run-id", "fixture"],
+                                    env={**os.environ, "PYTHONPATH": str(PY_ROOT)}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "preprocess.json").read_bytes(), before)
+            metadata = json.loads((root / "metadata.json").read_text())
+            self.assertEqual(metadata["feature_names"], ["fixture"])
+            self.assertEqual(validate_metadata_payload(metadata), [])
+
+    def test_ref_test_update_preserves_runtime_and_frozen_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = {"candidate_id": "fixture", "model_family": "recipe_factory"}
+            metadata = build_metadata(run_id="fixture", model_family="recipe_factory",
+                model_impl_entry="model_impl.py:build_model", state_dict_layout="per_horizon",
+                val_metrics={"val_avg_mse": 0.5, "val_h96_mse": 0.5}, horizons=[96],
+                preprocess={"feature_names": ["fixture"]})
+            write_export_files(root, metadata, candidate=candidate, preprocess={"feature_names": ["fixture"]})
+            (root / "resolved_candidate.json").write_text(json.dumps(candidate))
+            unchanged = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()
+                         if p.name not in {"metadata.json", "research_trace.json", "eval_report.md"}}
+            metrics = {"ref_test_avg_mse": 0.25, "ref_test_avg_mae": 0.2,
+                       "ref_test_h96_mse": 0.25, "ref_test_h96_mae": 0.2}
+            with patch("export.build_preprocess_spec", side_effect=AssertionError("must not reload data")):
+                update_ref_test_export(root, run_id="fixture", metrics=metrics)
+            updated = json.loads((root / "metadata.json").read_text())
+            self.assertEqual(updated, {**metadata, "ref_test_metrics": metrics})
+            self.assertIn("0.250000", (root / "eval_report.md").read_text())
+            trace = json.loads((root / "research_trace.json").read_text())
+            expected = build_research_trace(updated, candidate)
+            for entry in trace["entries"]:
+                entry.pop("created_at")
+            for entry in expected["entries"]:
+                entry.pop("created_at")
+            self.assertEqual(trace, expected)
+            for path, snapshot in unchanged.items():
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshot)
+            with self.assertRaisesRegex(ValueError, "run_id"):
+                update_ref_test_export(root, run_id="wrong", metrics=metrics)
+            before_invalid = (root / "metadata.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "Invalid reference-test metadata"):
+                update_ref_test_export(root, run_id="fixture", metrics={"unexpected": 1})
+            self.assertEqual((root / "metadata.json").read_bytes(), before_invalid)
+
+    def test_legacy_export_without_preprocess_snapshot_uses_data_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preprocess = {"feature_names": ["legacy"]}
+            metadata = build_metadata(run_id="legacy", model_family="recipe_factory",
+                model_impl_entry="model_impl.py:build_model", state_dict_layout="per_horizon",
+                val_metrics={"val_avg_mse": 0.5, "val_h96_mse": 0.5}, horizons=[96], preprocess=preprocess)
+            with patch("export.build_preprocess_spec", return_value=preprocess) as build:
+                write_export_files(root, metadata, candidate=None)
+            build.assert_called_once_with()
+            self.assertEqual(json.loads((root / "preprocess.json").read_text()), preprocess)
+
+
     def test_smoke_horizon_is_inferred_from_val_metrics(self) -> None:
         val_metrics = {
             "val_avg_mse": 0.5,
@@ -151,7 +238,7 @@ class ExportContractTest(unittest.TestCase):
         candidate = {
             "candidate_id": "cand_recipe_001",
             "recipe": {
-                "recipe_version": "recipe_schema_v1",
+                "recipe_version": "recipe_schema_v2",
                 "recipe_id": "recipe_001",
                 "preprocessing": {"actions": [{"type": "instance_norm"}]},
                 "embedding": {"type": "patch"},
@@ -187,7 +274,7 @@ class ExportContractTest(unittest.TestCase):
 
         self.assertEqual(model_spec["recipe_id"], "recipe_001")
         self.assertEqual(model_spec["compiled_modules"]["backbone"], "mixer")
-        self.assertEqual(model_spec["output_shape"], [None, 96, 7, 3])
+        self.assertEqual(model_spec["output_shape"], [None, 96, metadata["target_channels"], 3])
         self.assertEqual(model_spec["estimated_params"], 250_000)
         self.assertEqual(patch_bundle["proposal_id"], "cand_recipe_001")
         self.assertEqual(patch_bundle["compiled_model_delta"]["prediction_head"], "quantile")

@@ -139,8 +139,12 @@ function loadCliWithStubs(state = {}) {
         throw new Error("mutation not used");
       },
       runPythonCommand: async () => ({ status: 0 }),
-      runRunner: async (_projectRoot, description) => {
+      runRunner: async (_projectRoot, description, options) => {
         runDescriptions.push(description);
+        if (state.duplicateExperiment) {
+          options.onStdout('{"event":"candidate_');
+          options.onStdout('duplicate","independent_evidence":false}\n');
+        }
         return state.runnerExitCode ?? 0;
       },
       writeCurrentCandidate: (_projectRoot, candidate) => `/tmp/${candidate.candidate_id}.json`,
@@ -222,6 +226,18 @@ test("design honors max-candidates by default after a kept candidate", async () 
     assert.equal(exitCode, 0);
     assert.deepEqual(harness.generatedAttempts, [1, 2, 3]);
     assert.equal(harness.logs.filter((line) => line.startsWith("design_attempt=")).length, 3);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("design bounds repeated experiments without recording new lineage or stopping on keep", async () => {
+  const harness = loadCliWithStubs({ duplicateExperiment: true });
+  try {
+    assert.equal(await harness.cli.runCli(["design", "--requirement", "repeat", "--mode", "companion", "--max-candidates", "8", "--mock-llm", "--stop-on-keep"]), 0);
+    assert.equal(harness.runDescriptions.length, 3);
+    assert.ok(harness.logs.includes("design_stop_reason=no_new_candidate"));
+    assert.equal(harness.logs.filter((line) => line.startsWith("experiment_version=")).length, 0);
   } finally {
     harness.restore();
   }

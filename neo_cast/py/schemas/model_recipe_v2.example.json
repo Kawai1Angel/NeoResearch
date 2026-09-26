@@ -1,0 +1,68 @@
+{
+  "schema_version": "model_recipe.v2",
+  "model_name": "Mamba1Forecaster",
+  "hypothesis": "Test a Mamba-1 selective-state encoder with explicit sequence readout.",
+  "input": {
+    "history_window": 96,
+    "prediction_horizon": 24,
+    "prediction_horizons": [
+      24
+    ],
+    "covariates": true
+  },
+  "architecture": {
+    "preprocessing": {
+      "actions": [
+        {
+          "type": "instance_norm",
+          "affine": false,
+          "eps": 0.00001
+        }
+      ]
+    },
+    "embedding": {
+      "type": "none"
+    },
+    "backbone": {
+      "type": "mamba",
+      "d_model": 16,
+      "d_state": 8,
+      "d_conv": 4,
+      "expand": 2,
+      "depth": 1,
+      "dropout": 0.1,
+      "backend": "torch_reference"
+    },
+    "fusion": {
+      "type": "temporal",
+      "channel_mode": "independent"
+    },
+    "prediction_head": {
+      "type": "linear",
+      "output_distribution": "point"
+    },
+    "representation": {
+      "layout": "sequence_latent",
+      "readout": "mean",
+      "latent_dim": 16
+    },
+    "composition": {
+      "type": "single"
+    }
+  },
+  "training": {
+    "loss": "mse",
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "max_epochs": 8,
+    "time_budget_s": 600,
+    "patience": 4,
+    "seed": 42,
+    "warmup_ratio": 0.25
+  },
+  "constraints": {
+    "max_params": "5M",
+    "latency_sensitive": true
+  }
+}

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, writeFile } from "fs/promises"
 import { tmpdir } from "os"
 import path from "path"
 import { Research } from "../../src/research"
+import { TSFCandidateRecipe, TSFTaskSpec } from "../../src/research/domains/tsf"
 
 const taskSpec = {
   contextLength: 96,
@@ -15,7 +16,12 @@ const taskSpec = {
 
 function validTransformerCandidate() {
   const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", taskSpec)
-  return Research.DomainRegistry.buildBaselines("tsf", normalizedTask)[2]!.candidateSpec
+  return {
+    ...Research.DomainRegistry.buildBaselines("tsf", normalizedTask)[0]!.candidateSpec,
+    recipeID: "tsf_patch_transformer_fixture",
+    embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 64 },
+    backbone: { type: "transformer", dModel: 64, nHeads: 4, nLayers: 1, dropout: 0.1, ffnMult: 4 },
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -24,13 +30,75 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 describe("TSF research domain", () => {
+  test("defaults dataset splitting to 7:1:2 and validates explicit row ranges", () => {
+    const normalized = TSFTaskSpec.parse(taskSpec)
+    expect(normalized.dataset.split).toEqual({ method: "ratio", ratios: [7, 1, 2] })
+
+    const explicit = TSFTaskSpec.parse({
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        split: {
+          method: "row_ranges",
+          trainRows: [0, 700],
+          validationRows: [700, 800],
+          testRows: [800, 1000],
+        },
+      },
+    })
+    expect(explicit.dataset.split.method).toBe("row_ranges")
+    expect(TSFTaskSpec.safeParse({
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        split: {
+          method: "row_ranges",
+          trainRows: [0, 700],
+          validationRows: [701, 800],
+          testRows: [800, 1000],
+        },
+      },
+    }).success).toBe(false)
+  })
+
+  test("rejects unsupported future and static inputs", () => {
+    for (const field of ["knownFutureCovariates", "staticCovariates"]) {
+      const result = TSFTaskSpec.safeParse({ ...taskSpec, dataset: { ...taskSpec.dataset, [field]: ["temperature"] } })
+      expect(result.success).toBe(false)
+      if (!result.success) expect(result.error.issues.some((item) => item.message.includes("UNSUPPORTED_COVARIATE"))).toBe(true)
+    }
+  })
+
+  test("enforces distribution loss combinations and quantile levels", () => {
+    const task = Research.DomainRegistry.createTaskSpec("tsf", taskSpec)
+    const baseline = TSFCandidateRecipe.parse(Research.DomainRegistry.buildBaselines("tsf", task)[0].candidateSpec)
+    for (const head of ["linear", "quantile", "gaussian"] as const) {
+      for (const loss of ["mse", "mae", "huber", "distillation", "quantile", "gaussian_nll"]) {
+        const result = TSFCandidateRecipe.safeParse({
+          ...baseline,
+          predictionHead: head === "quantile" ? { type: head, quantiles: [0.1, 0.5, 0.9] } : { type: head },
+          trainingStrategy: { ...baseline.trainingStrategy, loss: { base: loss } },
+        })
+        expect(result.success).toBe(head === "quantile" ? loss === "quantile" : head === "gaussian" ? loss === "gaussian_nll" : ["mse", "mae", "huber", "distillation"].includes(loss))
+      }
+    }
+    for (const quantiles of [[0.5, 0.1], [0.5, 0.5], [0.2, 0.5, 0.8]]) {
+      const result = TSFCandidateRecipe.safeParse({
+        ...baseline,
+        predictionHead: { type: "quantile", quantiles },
+        trainingStrategy: { ...baseline.trainingStrategy, loss: { base: "quantile", quantiles: [0.1, 0.5, 0.9] } },
+      })
+      expect(result.success).toBe(false)
+    }
+  })
+
   test("registers TSF metadata and builds bridge-valid baseline recipes", () => {
     const info = Research.DomainRegistry.getInfo("tsf")
     expect(info.id).toBe("tsf")
     expect(info.actionRegistry.backbone.transformer.bridgeSupported).toBe(true)
     expect(info.actionRegistry.backbone.dlinear.bridgeSupported).toBe(true)
     expect(info.actionRegistry.embedding.invert.bridgeSupported).toBe(true)
-    expect(info.actionRegistry.fusion.feature.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.fusion.variate_attention.bridgeSupported).toBe(true)
     expect(info.actionRegistry.head.direct_multi_horizon.bridgeSupported).toBe(true)
     expect(info.actionRegistry.scheduler.none.bridgeSupported).toBe(true)
     expect(info.actionRegistry.scheduler.cosine.bridgeSupported).toBe(false)
@@ -47,8 +115,6 @@ describe("TSF research domain", () => {
 
     expect(baselines.map((item) => item.candidateSpec.recipeID)).toEqual([
       "tsf_linear_raw_baseline",
-      "tsf_patch_mlp_baseline",
-      "tsf_patch_transformer_baseline",
     ])
 
     for (const proposal of baselines) {
@@ -126,7 +192,7 @@ describe("TSF research domain", () => {
       "lradj_6",
     ] as const) {
       const candidateSpec = {
-        recipeVersion: "recipe_schema_v1",
+        recipeVersion: "recipe_schema_v2",
         recipeID: `tsf_bridge_only_${schedulerType}_scheduler`,
         hypothesis: "Bridge-only runtime should reject non-none schedulers.",
         preprocessing: { actions: [{ type: "none" }] },
@@ -138,7 +204,7 @@ describe("TSF research domain", () => {
           loss: { base: "mse", horizonWeighting: "uniform" },
           optimizer: { type: "adam", lr: 0.001, weightDecay: 0 },
           scheduler: { type: schedulerType, warmupSteps: 0 },
-          regularization: { dropout: 0.1, gradClip: 1 },
+          regularization: { gradClip: 1 },
           budget: { maxEpochs: 50, timeBudgetS: 600, batchSize: 32, patience: 5, seed: 42 },
         },
       }
@@ -164,7 +230,7 @@ describe("TSF research domain", () => {
       runtime: { bridgeOnly: false },
     })
     const candidateSpec = {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "tsf_warmup_exceeds_max_epochs",
       hypothesis: "warmupSteps must be strictly less than budget.maxEpochs.",
       preprocessing: { actions: [{ type: "none" }] },
@@ -176,7 +242,7 @@ describe("TSF research domain", () => {
         loss: { base: "mse", horizonWeighting: "uniform" },
         optimizer: { type: "adam", lr: 0.001, weightDecay: 0 },
         scheduler: { type: "cosine", warmupSteps: 5 },
-        regularization: { dropout: 0.1, gradClip: 1 },
+        regularization: { gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 600, batchSize: 32, patience: 5, seed: 42 },
       },
     }
@@ -291,7 +357,7 @@ describe("TSF research domain", () => {
         loss: { base: "quantile", horizonWeighting: "uniform", quantiles: [0.1, 0.5, 0.9] },
         optimizer: { type: "adamw", lr: 0.001, weightDecay: 0.01 },
         scheduler: { type: "none", warmupSteps: 0 },
-        regularization: { dropout: 0.1, gradClip: 1 },
+        regularization: { gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 42 },
       },
     }
@@ -344,6 +410,7 @@ describe("TSF research domain", () => {
       dataset: {
         ...taskSpec.dataset,
         path: csvPath,
+        targetCols: ["a", "b", "c"],
       },
     })
     const fingerprint = Research.DomainRegistry.summarizeTask("tsf", normalizedTask)
@@ -364,6 +431,42 @@ describe("TSF research domain", () => {
     expect(fingerprint.searchBiases).toContain("cross_var_correlated")
     expect(fingerprint.searchBiases).toContain("missing_values")
     expect(fingerprint.searchBiases).toContain("distribution_shift")
+  })
+
+  test("bounds profiling work for high-dimensional datasets", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "opencode-tsf-wide-profile-"))
+    const csvPath = path.join(root, "wide.csv")
+    const targetCols = Array.from({ length: 321 }, (_, index) => `target_${index}`)
+    const lines = [`date,${targetCols.join(",")}`]
+    for (let row = 0; row < 5_100; row++) {
+      const values = targetCols.map((_, column) => String((row + column) % 97))
+      lines.push(`2024-01-01T${String(row % 24).padStart(2, "0")}:00:00Z,${values.join(",")}`)
+    }
+    await writeFile(csvPath, `${lines.join("\n")}\n`, "utf8")
+
+    const normalizedTask = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec,
+      dataset: {
+        ...taskSpec.dataset,
+        path: csvPath,
+        targetCols,
+      },
+    })
+    const fingerprint = Research.DomainRegistry.summarizeTask("tsf", normalizedTask)
+    const datasetProfile = asRecord(fingerprint.datasetProfile)
+    const correlationMatrix = asRecord(datasetProfile.correlationMatrix)
+
+    expect(datasetProfile).toMatchObject({
+      rowCount: 5_100,
+      targetCount: 321,
+      numericColumnCount: 321,
+      profiledRowCount: 5_000,
+      profiledColumnCount: 20,
+    })
+    expect(correlationMatrix.columns).toHaveLength(20)
+    expect((correlationMatrix.columns as string[])[0]).toBe("target_0")
+    expect((correlationMatrix.columns as string[]).at(-1)).toBe("target_320")
+    expect(correlationMatrix.values).toHaveLength(20)
   })
 
   test("uses TSF dataset profiles to seed data-driven full-recipe baselines", async () => {
@@ -442,7 +545,7 @@ describe("TSF research domain", () => {
     expect(patchtst?.candidateSpec.trainingStrategy).toMatchObject({
       optimizer: { type: "adam", lr: 0.0001 },
       scheduler: { type: "lradj_type3", warmupSteps: 0 },
-      regularization: { dropout: 0.05 },
+      regularization: { },
       budget: { maxEpochs: 100, batchSize: 128, patience: 100, seed: 2021 },
     })
     expect(dlinear?.candidateSpec.preprocessing).toMatchObject({
@@ -463,7 +566,7 @@ describe("TSF research domain", () => {
       dropout: 0.1,
       ffnMult: 4,
     })
-    expect(itransformer?.candidateSpec.fusion).toMatchObject({ type: "feature" })
+    expect(itransformer?.candidateSpec.fusion).toMatchObject({ type: "variate_attention" })
     expect(itransformer?.candidateSpec.trainingStrategy).toMatchObject({
       optimizer: { type: "adam", lr: 0.0001 },
       scheduler: { type: "lradj_type1", warmupSteps: 0 },
@@ -576,24 +679,24 @@ describe("TSF research domain", () => {
       runtime: { bridgeOnly: false },
     })
     const candidateSpec = {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "tsf_advanced_invert_rnn_direct",
       hypothesis: "A non-bridge TimeRecipe candidate explores variate-token embedding with recurrent modeling.",
       preprocessing: {
         actions: [
+          { type: "missing_mask", maskChannel: true },
           { type: "seasonal_differencing", period: 24, order: 1 },
-          { type: "missing_mask", maskChannel: true, fillPolicy: "mean" },
         ],
       },
       embedding: { type: "invert", dModel: 128 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 128, numLayers: 2, dropout: 0.1 },
-      fusion: { type: "feature", variateToken: true, crossAttention: false },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+      fusion: { type: "variate_attention" },
+      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
       trainingStrategy: {
         loss: { base: "mae", horizonWeighting: "tail_heavy" },
         optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
         scheduler: { type: "one_cycle", warmupSteps: 2 },
-        regularization: { dropout: 0.1, gradClip: 1 },
+        regularization: { gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
       },
     }
@@ -615,17 +718,16 @@ describe("TSF research domain", () => {
     const payload = plan.writes[0]!.content
     expect(payload.preprocessing).toMatchObject({
       actions: [
+        { type: "missing_mask", mask_channel: true},
         { type: "seasonal_differencing", period: 24, order: 1 },
-        { type: "missing_mask", mask_channel: true, fill_policy: "mean" },
       ],
     })
     expect(payload.embedding).toMatchObject({ type: "invert", d_model: 128 })
     expect(payload.backbone).toMatchObject({ type: "rnn", cell: "gru", hidden_dim: 128, num_layers: 2 })
-    expect(payload.fusion).toMatchObject({ type: "feature", variate_token: true, cross_attention: false })
+    expect(payload.fusion).toMatchObject({ type: "variate_attention",})
     expect(payload.prediction_head).toMatchObject({
       type: "direct_multi_horizon",
-      output_distribution: "point",
-      horizon_specific: true,
+      output_distribution: "point"
     })
     expect(payload.training_strategy).toMatchObject({
       loss: { base: "mae", horizon_weighting: "tail_heavy" },
@@ -640,12 +742,12 @@ describe("TSF research domain", () => {
       runtime: { bridgeOnly: false },
     })
     const candidateSpec = {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "tsf_frequency_mixer_runner_names",
       hypothesis: "A frequency mixer candidate should serialize names accepted by the Neo-Cast Python runner.",
       preprocessing: {
         actions: [
-          { type: "missing_mask", maskChannel: true, fillPolicy: "mean" },
+          { type: "missing_mask", maskChannel: true },
           { type: "sample_reweighting", scheme: "outlier_robust" },
         ],
       },
@@ -664,7 +766,7 @@ describe("TSF research domain", () => {
         loss: { base: "quantile", horizonWeighting: "tail_heavy", quantiles: [0.1, 0.5, 0.9] },
         optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
         scheduler: { type: "one_cycle", warmupSteps: 2 },
-        regularization: { dropout: 0.1, gradClip: 1 },
+        regularization: { gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
       },
     }
@@ -679,7 +781,7 @@ describe("TSF research domain", () => {
     expect(plan.command.timeoutMs).toBe(240_000)
     expect(plan.writes[0]!.content.preprocessing).toMatchObject({
       actions: [
-        { type: "missing_mask", mask_channel: true, fill_policy: "mean" },
+        { type: "missing_mask", mask_channel: true},
         { type: "sample_reweighting", scheme: "outlier_robust" },
       ],
     })
@@ -715,7 +817,7 @@ describe("TSF research domain", () => {
         },
         optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
         scheduler: { type: "none", warmupSteps: 0 },
-        regularization: { dropout: 0.1, gradClip: 1 },
+        regularization: { gradClip: 1 },
         budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
       },
     }
@@ -743,7 +845,7 @@ describe("TSF research domain", () => {
         neoCastProjectRoot: "/work/neo_cast",
       },
     })
-    const candidateSpec = Research.DomainRegistry.buildBaselines("tsf", normalizedTask)[2]!.candidateSpec
+    const candidateSpec = validTransformerCandidate()
 
     const plan = Research.DomainRegistry.createRunPlan("tsf", {
       taskSpec: normalizedTask,
@@ -771,15 +873,15 @@ describe("TSF research domain", () => {
     })
 
     const payload = plan.writes[0]!.content
-    expect(payload.recipe_version).toBe("recipe_schema_v1")
-    expect(payload.recipe_id).toBe("tsf_patch_transformer_baseline")
+    expect(payload.recipe_version).toBe("recipe_schema_v3")
+    expect(payload.recipe_id).toBe("tsf_patch_transformer_fixture")
     expect(payload.embedding).toMatchObject({ type: "patch", patch_len: 16, stride: 8, d_model: 64 })
     expect(payload.embedding).not.toHaveProperty("patchLen")
-    expect(payload.backbone).toMatchObject({ type: "transformer", d_model: 64, n_heads: 4, n_layers: 2 })
+    expect(payload.backbone).toMatchObject({ type: "transformer", d_model: 64, n_heads: 4, n_layers: 1 })
     expect(payload.prediction_head).toMatchObject({ type: "linear", output_distribution: "point" })
     expect(payload.training_strategy).toMatchObject({
       optimizer: { type: "adam", weight_decay: 0 },
-      budget: { max_epochs: 50, time_budget_s: 600, batch_size: 32 },
+      budget: { max_epochs: 50, time_budget_s: 1200, batch_size: 32 },
     })
   })
 
@@ -958,7 +1060,7 @@ describe("TSF research domain", () => {
     expect(proposal?.candidateSpec.backbone).toMatchObject({ type: "mixer" })
     expect(proposal?.candidateSpec.preprocessing).toMatchObject({
       actions: [
-        { type: "missing_mask", maskChannel: true, fillPolicy: "mean" },
+        { type: "missing_mask", maskChannel: true },
         { type: "sample_reweighting", scheme: "outlier_robust" },
       ],
     })
@@ -990,7 +1092,7 @@ describe("TSF research domain", () => {
     expect(proposal?.candidateSpec.recipeID).toBe("tsf_ranked_frequency_mixer_profiled")
     expect(proposal?.candidateSpec.preprocessing).toMatchObject({
       actions: [
-        { type: "missing_mask", maskChannel: true, fillPolicy: "mean" },
+        { type: "missing_mask", maskChannel: true },
         { type: "sample_reweighting", scheme: "outlier_robust" },
       ],
     })
@@ -1009,29 +1111,29 @@ describe("TSF research domain", () => {
       loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
       optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
       scheduler: { type: "one_cycle", warmupSteps: 10 },
-      regularization: { dropout: 0.1, gradClip: 1 },
+      regularization: { gradClip: 1 },
       budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
     }
     const failedFrequency = {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "past_failed_frequency_mixer",
       hypothesis: "Prior frequency mixer trial failed on this task family.",
       preprocessing: { actions: [{ type: "none" }] },
       embedding: { type: "frequency", nFreq: 8, complexMode: "magnitude", dModel: 32 },
       backbone: { type: "mixer", hiddenDim: 64, depth: 2, temporalMixing: "mlp", channelMixing: "mlp", dropout: 0.1 },
       fusion: { type: "gated_hybrid", gateType: "channel" },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
       trainingStrategy: priorTraining,
     }
     const acceptedInvert = {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "past_accepted_invert_rnn",
       hypothesis: "Prior inverted RNN trial improved a related task.",
       preprocessing: { actions: [{ type: "none" }] },
       embedding: { type: "invert", dModel: 64 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
-      fusion: { type: "feature", variateToken: true, crossAttention: true },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+      fusion: { type: "variate_attention" },
+      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
       trainingStrategy: priorTraining,
     }
 
@@ -1115,18 +1217,18 @@ describe("TSF research domain", () => {
       loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
       optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
       scheduler: { type: "one_cycle", warmupSteps: 10 },
-      regularization: { dropout: 0.1, gradClip: 1 },
+      regularization: { gradClip: 1 },
       budget: { maxEpochs: 5, timeBudgetS: 120, batchSize: 16, patience: 2, seed: 7 },
     }
     const acceptedInvert = {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "benchmark_accepted_invert_rnn",
       hypothesis: "Prior inverted RNN trial improved a related benchmark task.",
       preprocessing: { actions: [{ type: "none" }] },
       embedding: { type: "invert", dModel: 64 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
-      fusion: { type: "feature", variateToken: true, crossAttention: true },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+      fusion: { type: "variate_attention" },
+      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
       trainingStrategy: priorTraining,
     }
     const taskFingerprint = {
@@ -1243,7 +1345,7 @@ describe("TSF research domain", () => {
     const allIDs = [...new Set([...allFrontierIDs, ...baselineIDs])] as string[]
 
     // Use the patch MLP baseline as champion so the mutation base has a patch embedding
-    const patchCandidate = baselines.find((b) => asRecord(b.candidateSpec).recipeID === "tsf_patch_mlp_baseline")!
+    const patchCandidate = { candidateSpec: { ...validTransformerCandidate(), recipeID: "tsf_patch_mlp_baseline", backbone: { type: "mlp", depth: 1, hiddenDim: 32, activation: "gelu", dropout: 0.1 } } }
     const patchCandidateID = "champion_patch_cand" as Research.ResearchCandidateID
     const existingCandidates = [
       {

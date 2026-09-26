@@ -73,7 +73,7 @@ test("reflection system prompt exposes long-horizon diagnosis protocol and full 
   const prompt = _buildReflectionSystemPrompt({ task_id: "etth1", horizons: [96, 192, 336, 720] });
 
   assert.match(prompt, /h720\/h96 gap/i);
-  for (const value of ["rnn", "ssm", "mixer", "gated_hybrid", "quantile", "gaussian"]) {
+  for (const value of ["rnn", "gated_depthwise_conv", "mixer", "gated_hybrid", "quantile", "gaussian"]) {
     assert.match(prompt, new RegExp(value));
   }
 });
@@ -99,7 +99,7 @@ test("reflection system prompt includes active user correction memory", () => {
 test("reflectAndPropose mock mode returns a schema candidate without calling artifact APIs", async () => {
   const projectRoot = tempProject("neo-cast-reflect-mock-");
   writeCurrentCandidate(projectRoot, {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: "previous_linear",
     embedding: { type: "none" },
     backbone: { type: "linear" },
@@ -114,14 +114,14 @@ test("reflectAndPropose mock mode returns a schema candidate without calling art
   );
 
   assert.equal(result.source, "heuristic_mock");
-  assert.equal(result.candidate.schema_version, "model_recipe.v1");
+  assert.equal(result.candidate.schema_version, "model_recipe.v2");
   assert.match(result.candidate.model_name, /Forecaster/);
 });
 
 test("reflectAndPropose real LLM path tags candidates as llm_reflection", async () => {
   const projectRoot = tempProject("neo-cast-reflect-real-");
   writeCurrentCandidate(projectRoot, {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: "previous_linear",
     preprocessing: { actions: [{ type: "none" }] },
     embedding: { type: "none" },
@@ -142,20 +142,20 @@ test("reflectAndPropose real LLM path tags candidates as llm_reflection", async 
         {
           message: {
             content: JSON.stringify({
-              recipe_version: "recipe_schema_v1",
+              recipe_version: "recipe_schema_v2",
               recipe_id: "recipe_reflect_patch_transformer",
               hypothesis: "Previous linear+none: h720 was much worse than h96. Diagnosis: temporal receptive field bottleneck. Proposed change: patch transformer because attention expands long-horizon context.",
               preprocessing: { actions: [{ type: "instance_norm", affine: false, eps: 0.00001 }] },
               embedding: { type: "patch", patch_len: 16, stride: 8, d_model: 64 },
               backbone: { type: "transformer", d_model: 64, n_heads: 4, n_layers: 2, dropout: 0.1, ffn_mult: 4.0 },
               fusion: { type: "temporal", channel_mode: "shared" },
-              prediction_head: { type: "linear", output_distribution: "point", share_across_horizons: false },
+              prediction_head: { type: "linear", output_distribution: "point"},
               post_processing: { type: "auto" },
               training_strategy: {
                 loss: { base: "mse", horizon_weighting: "uniform" },
                 optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.0 },
                 scheduler: { type: "none", warmup_steps: 0 },
-                regularization: { dropout: 0.1, grad_clip: 1.0 },
+                regularization: { grad_clip: 1.0 },
                 budget: { max_epochs: 10, time_budget_s: 600, batch_size: 32, patience: 5, seed: 42 },
               },
               constraints: { max_params: 1000000, max_latency_ms: 50, latency_priority: "medium" },
@@ -188,7 +188,7 @@ test("reflectAndPropose real LLM path tags candidates as llm_reflection", async 
 test("reflectAndPropose honors llm timeout for OpenAI-compatible requests", async () => {
   const projectRoot = tempProject("neo-cast-reflect-timeout-");
   writeCurrentCandidate(projectRoot, {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: "previous_linear",
     embedding: { type: "none" },
     backbone: { type: "linear" },

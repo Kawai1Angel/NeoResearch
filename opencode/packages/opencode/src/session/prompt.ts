@@ -1,3 +1,4 @@
+import { timedEffect } from "@/util/runtime-timing"
 import path from "path"
 import os from "os"
 import z from "zod"
@@ -415,11 +416,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             return run.promise(
               Effect.gen(function* () {
                 const ctx = context(args, options)
-                yield* plugin.trigger(
+                const timing = { sessionID: ctx.sessionID, messageID: ctx.messageID, callID: ctx.callID, tool: item.id }
+                yield* timedEffect("tool.plugin.before", timing, plugin.trigger(
                   "tool.execute.before",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
                   { args },
-                )
+                ))
                 const result = yield* item.execute(args, ctx)
                 const output = {
                   ...result,
@@ -430,11 +432,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     messageID: input.processor.message.id,
                   })),
                 }
-                yield* plugin.trigger(
+                yield* timedEffect("tool.plugin.after", timing, plugin.trigger(
                   "tool.execute.after",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
                   output,
-                )
+                ))
                 if (options.abortSignal?.aborted) {
                   yield* input.processor.completeToolCall(options.toolCallId, output)
                 }

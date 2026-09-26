@@ -1,0 +1,1801 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/model_recipe_v2_schema.json",
+  "title": "neo-cast ModelRecipe DSL Schema",
+  "description": "Typed model recipe compiled to recipe_schema_v3; each horizon trains independently.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "model_name",
+    "hypothesis",
+    "input",
+    "architecture",
+    "training",
+    "constraints"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "model_recipe.v2"
+    },
+    "model_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{2,63}$"
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 1200
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "history_window",
+        "prediction_horizon",
+        "covariates"
+      ],
+      "properties": {
+        "history_window": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "prediction_horizon": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "prediction_horizons": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          }
+        },
+        "covariates": {
+          "type": "boolean"
+        },
+        "known_future_covariates": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "architecture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "preprocessing",
+        "embedding",
+        "backbone",
+        "fusion",
+        "prediction_head",
+        "representation"
+      ],
+      "properties": {
+        "preprocessing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "actions"
+          ],
+          "properties": {
+            "actions": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/preprocessingAction"
+              }
+            }
+          }
+        },
+        "embedding": {
+          "$ref": "#/$defs/embeddingAction"
+        },
+        "backbone": {
+          "$ref": "#/$defs/backboneAction"
+        },
+        "fusion": {
+          "$ref": "#/$defs/fusionAction"
+        },
+        "prediction_head": {
+          "$ref": "#/$defs/predictionHead"
+        },
+        "representation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "layout",
+            "readout",
+            "latent_dim"
+          ],
+          "properties": {
+            "layout": {
+              "enum": [
+                "channel_latent",
+                "sequence_latent",
+                "channel_sequence"
+              ]
+            },
+            "readout": {
+              "enum": [
+                "mean",
+                "last",
+                "none"
+              ]
+            },
+            "latent_dim": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            }
+          }
+        },
+        "composition": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "single"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type",
+                "secondary",
+                "merge"
+              ],
+              "properties": {
+                "type": {
+                  "const": "parallel_two_branch"
+                },
+                "secondary": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "backbone",
+                    "embedding",
+                    "representation"
+                  ],
+                  "properties": {
+                    "backbone": {
+                      "$ref": "#/$defs/backboneAction"
+                    },
+                    "embedding": {
+                      "$ref": "#/$defs/embeddingAction"
+                    },
+                    "representation": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "layout",
+                        "readout",
+                        "latent_dim"
+                      ],
+                      "properties": {
+                        "layout": {
+                          "enum": [
+                            "channel_latent",
+                            "sequence_latent",
+                            "channel_sequence"
+                          ]
+                        },
+                        "readout": {
+                          "enum": [
+                            "mean",
+                            "last",
+                            "none"
+                          ]
+                        },
+                        "latent_dim": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 512
+                        }
+                      }
+                    }
+                  }
+                },
+                "merge": {
+                  "enum": [
+                    "latent_gate",
+                    "history_time_gate",
+                    "forecast_step_gate"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type",
+                "secondary",
+                "kernel_size"
+              ],
+              "properties": {
+                "type": {
+                  "const": "decomposition_two_branch"
+                },
+                "secondary": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "backbone",
+                    "embedding",
+                    "representation"
+                  ],
+                  "properties": {
+                    "backbone": {
+                      "$ref": "#/$defs/backboneAction"
+                    },
+                    "embedding": {
+                      "$ref": "#/$defs/embeddingAction"
+                    },
+                    "representation": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "layout",
+                        "readout",
+                        "latent_dim"
+                      ],
+                      "properties": {
+                        "layout": {
+                          "enum": [
+                            "channel_latent",
+                            "sequence_latent",
+                            "channel_sequence"
+                          ]
+                        },
+                        "readout": {
+                          "enum": [
+                            "mean",
+                            "last",
+                            "none"
+                          ]
+                        },
+                        "latent_dim": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 512
+                        }
+                      }
+                    }
+                  }
+                },
+                "kernel_size": {
+                  "type": "integer",
+                  "minimum": 3,
+                  "maximum": 255
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "training": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loss",
+        "optimizer",
+        "learning_rate",
+        "batch_size"
+      ],
+      "properties": {
+        "loss": {
+          "type": "string",
+          "enum": [
+            "mse",
+            "mae",
+            "huber",
+            "quantile",
+            "distillation",
+            "gaussian_nll"
+          ]
+        },
+        "optimizer": {
+          "type": "string",
+          "enum": [
+            "adam",
+            "adamw",
+            "sgd"
+          ]
+        },
+        "learning_rate": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "weight_decay": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "max_epochs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "time_budget_s": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "patience": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "grad_clip": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "warmup_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.5,
+          "default": 0,
+          "description": "Fraction of max_epochs (rounded) used for linear LR warmup, from start_factor*lr to lr. 0 disables warmup."
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_params",
+        "latency_sensitive"
+      ],
+      "properties": {
+        "max_params": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)?[KkMmBb]?$"
+            }
+          ]
+        },
+        "latency_sensitive": {
+          "type": "boolean"
+        },
+        "max_latency_ms": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 16000
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "architecture": {
+            "required": [
+              "output_distribution"
+            ],
+            "properties": {
+              "output_distribution": {
+                "const": "gaussian"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "training": {
+            "properties": {
+              "loss": {
+                "const": "gaussian_nll"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "if": {
+          "properties": {
+            "architecture": {
+              "required": [
+                "output_distribution"
+              ],
+              "properties": {
+                "output_distribution": {
+                  "const": "quantile"
+                }
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "training": {
+              "properties": {
+                "loss": {
+                  "const": "quantile"
+                }
+              }
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "training": {
+              "properties": {
+                "loss": {
+                  "enum": [
+                    "mse",
+                    "mae",
+                    "huber",
+                    "distillation"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "preprocessingAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "instance_norm"
+            },
+            "affine": {
+              "type": "boolean"
+            },
+            "eps": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "kernel_size"
+          ],
+          "properties": {
+            "type": {
+              "const": "series_decomposition"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "moving_average"
+              ]
+            },
+            "kernel_size": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 255
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "period"
+          ],
+          "properties": {
+            "type": {
+              "const": "seasonal_differencing"
+            },
+            "period": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000
+            },
+            "order": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "missing_mask"
+            },
+            "mask_channel": {
+              "const": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "sample_reweighting"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "uniform",
+                "horizon_tail",
+                "outlier_robust"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "last_value_centering"
+            }
+          }
+        }
+      ]
+    },
+    "embeddingAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "patch_len",
+            "stride",
+            "d_model"
+          ],
+          "properties": {
+            "type": {
+              "const": "patch"
+            },
+            "patch_len": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 512
+            },
+            "stride": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "scales",
+            "d_model"
+          ],
+          "properties": {
+            "type": {
+              "const": "multiscale_patch"
+            },
+            "scales": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "patch_len",
+                  "stride"
+                ],
+                "properties": {
+                  "patch_len": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 512
+                  },
+                  "stride": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 512
+                  }
+                }
+              }
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            },
+            "num_blocks": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4,
+              "description": "Number of per-scale processing and cross-scale fusion blocks."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "d_model"
+          ],
+          "properties": {
+            "type": {
+              "const": "invert"
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "n_freq",
+            "d_model"
+          ],
+          "properties": {
+            "type": {
+              "const": "frequency"
+            },
+            "n_freq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            },
+            "complex_mode": {
+              "type": "string",
+              "enum": [
+                "magnitude",
+                "real_imag"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "fields",
+            "embed_dim"
+          ],
+          "properties": {
+            "type": {
+              "const": "calendar"
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "hour",
+                  "dayofweek",
+                  "day",
+                  "month",
+                  "position"
+                ]
+              }
+            },
+            "embed_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            }
+          }
+        }
+      ]
+    },
+    "backboneAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "linear"
+            },
+            "shared": {
+              "type": "boolean"
+            },
+            "bias": {
+              "type": "boolean"
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "depth",
+            "hidden_dim",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "mlp"
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 4096
+            },
+            "activation": {
+              "type": "string",
+              "enum": [
+                "gelu",
+                "relu",
+                "silu"
+              ]
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "d_model",
+            "n_heads",
+            "n_layers",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "transformer"
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            },
+            "n_heads": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "n_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "ffn_mult": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 16
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "hidden_dim"
+          ],
+          "properties": {
+            "type": {
+              "const": "rnn"
+            },
+            "cell": {
+              "type": "string",
+              "enum": [
+                "gru",
+                "lstm",
+                "rnn"
+              ]
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 4096
+            },
+            "num_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "kernel_size"
+          ],
+          "properties": {
+            "type": {
+              "const": "dlinear"
+            },
+            "kernel_size": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 255
+            },
+            "bias": {
+              "type": "boolean"
+            },
+            "individual": {
+              "type": "boolean"
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "hidden_dim",
+            "n_layers",
+            "kernel_size",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "tcn"
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 4096
+            },
+            "n_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "kernel_size": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 255
+            },
+            "activation": {
+              "type": "string",
+              "enum": [
+                "gelu",
+                "relu",
+                "silu"
+              ]
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "hidden_dim",
+            "n_blocks",
+            "n_layers",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "nbeats"
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 4096
+            },
+            "n_blocks": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16
+            },
+            "n_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "activation": {
+              "type": "string",
+              "enum": [
+                "gelu",
+                "relu",
+                "silu"
+              ]
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "hidden_dim",
+            "n_layers",
+            "top_k",
+            "kernel_size",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "timesnet_lite"
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 4096
+            },
+            "n_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "top_k": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "kernel_size": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 255
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "hidden_dim"
+          ],
+          "properties": {
+            "type": {
+              "const": "gated_depthwise_conv"
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 1024
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "kernel_size": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 255
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "hidden_dim"
+          ],
+          "properties": {
+            "type": {
+              "const": "mixer"
+            },
+            "hidden_dim": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 4096
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 24
+            },
+            "temporal_mixing": {
+              "type": "string",
+              "enum": [
+                "mlp",
+                "conv"
+              ]
+            },
+            "channel_mixing": {
+              "type": "string",
+              "enum": [
+                "mlp",
+                "identity"
+              ]
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "activation": {
+              "type": "string",
+              "enum": [
+                "gelu",
+                "relu",
+                "silu"
+              ]
+            },
+            "attention": {
+              "type": "string",
+              "enum": [
+                "none",
+                "lightweight",
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "d_model",
+            "state_dim",
+            "depth",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "diagonal_ssm"
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "state_dim": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "exclusiveMaximum": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "d_model",
+            "d_ff",
+            "depth",
+            "top_k",
+            "num_kernels",
+            "dropout"
+          ],
+          "properties": {
+            "type": {
+              "const": "timesblock_encoder"
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "d_ff": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2048
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "top_k": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16
+            },
+            "num_kernels": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "exclusiveMaximum": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "d_model",
+            "d_state",
+            "d_conv",
+            "expand",
+            "depth",
+            "dropout",
+            "backend"
+          ],
+          "properties": {
+            "type": {
+              "const": "mamba"
+            },
+            "d_model": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "d_state": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "d_conv": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "expand": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "dropout": {
+              "type": "number",
+              "minimum": 0,
+              "exclusiveMaximum": 1
+            },
+            "backend": {
+              "enum": [
+                "torch_reference",
+                "cuda_optimized"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "fusionAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "temporal"
+            },
+            "channel_mode": {
+              "type": "string",
+              "enum": [
+                "independent",
+                "shared"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "variate_attention"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "temporal_then_feature"
+            },
+            "gate": {
+              "type": "boolean"
+            },
+            "residual": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "feature_then_temporal"
+            },
+            "gate": {
+              "type": "boolean"
+            },
+            "residual": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "graph"
+            },
+            "adjacency_source": {
+              "type": "string",
+              "enum": [
+                "learned",
+                "static",
+                "correlation"
+              ]
+            },
+            "sparsity": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "topology_artifact": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "gated_hybrid"
+            },
+            "gate_type": {
+              "type": "string",
+              "enum": [
+                "learned",
+                "scalar",
+                "channel",
+                "time"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "feature_mlp"
+            }
+          }
+        }
+      ]
+    },
+    "predictionHead": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_distribution"
+          ],
+          "properties": {
+            "type": {
+              "const": "linear"
+            },
+            "output_distribution": {
+              "const": "point"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_distribution"
+          ],
+          "properties": {
+            "type": {
+              "const": "direct_multi_horizon"
+            },
+            "output_distribution": {
+              "const": "point"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_distribution"
+          ],
+          "properties": {
+            "type": {
+              "const": "quantile"
+            },
+            "output_distribution": {
+              "const": "quantile"
+            },
+            "quantiles": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "exclusiveMaximum": 1
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_distribution"
+          ],
+          "properties": {
+            "type": {
+              "const": "gaussian"
+            },
+            "output_distribution": {
+              "const": "gaussian"
+            },
+            "variance_floor": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_distribution"
+          ],
+          "properties": {
+            "type": {
+              "const": "residual_correction"
+            },
+            "output_distribution": {
+              "const": "point"
+            },
+            "correction_dim": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            }
+          }
+        }
+      ]
+    },
+    "trainingStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loss",
+        "optimizer",
+        "budget"
+      ],
+      "properties": {
+        "loss": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "base"
+          ],
+          "properties": {
+            "base": {
+              "type": "string",
+              "enum": [
+                "mse",
+                "mae",
+                "huber",
+                "quantile",
+                "distillation",
+                "gaussian_nll"
+              ]
+            },
+            "horizon_weighting": {
+              "type": "string",
+              "enum": [
+                "uniform",
+                "front_heavy",
+                "tail_heavy"
+              ]
+            },
+            "delta": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "quantiles": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "exclusiveMaximum": 1
+              }
+            },
+            "supervised_weight": {
+              "type": "number",
+              "minimum": 0
+            },
+            "teacher_weight": {
+              "type": "number",
+              "minimum": 0
+            },
+            "teacher": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "last_value",
+                    "moving_average"
+                  ]
+                },
+                "window": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          }
+        },
+        "optimizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "lr"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "adam",
+                "adamw",
+                "sgd"
+              ]
+            },
+            "lr": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            },
+            "weight_decay": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "scheduler": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "none",
+                "cosine",
+                "one_cycle",
+                "plateau",
+                "lradj_type1",
+                "lradj_type2",
+                "lradj_type3",
+                "lradj_3",
+                "lradj_4",
+                "lradj_5",
+                "lradj_6"
+              ]
+            },
+            "warmup_steps": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of leading epochs used for linear LR warmup (epoch granularity, not mini-batch steps). Must be < training_strategy.budget.max_epochs."
+            },
+            "factor": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 1
+            },
+            "patience": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            }
+          }
+        },
+        "regularization": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "grad_clip": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_epochs",
+            "time_budget_s"
+          ],
+          "properties": {
+            "max_epochs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "time_budget_s": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "batch_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512
+            },
+            "patience": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2147483647
+            }
+          }
+        }
+      }
+    }
+  }
+}

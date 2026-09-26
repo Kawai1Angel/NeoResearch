@@ -1,9 +1,29 @@
 # Recipe Runtime 语义一致性四批次修正方案
 
-> 状态：Draft  
-> 适用范围：`neo_cast` 的 `recipe_schema_v1`、recipe factory、训练数据流、执行契约与语义测试  
+> 状态：剩余方案已实现；批次四选择轻量模块正式改名路线，非完整论文模型实现
+> 适用范围：`neo_cast` 从 `recipe_schema_v1` 升级到 `recipe_schema_v2`，包括 recipe factory、训练数据流、执行契约与语义测试
 > 目标：确保每个可搜索 action 或参数都能真实改变模型结构、前向计算、训练目标或运行约束；无法兑现的能力不得继续被静默接受  
 > 本方案不包含已知未来外生变量的实现。该能力在重新设计前暂时下线。
+
+### 实施记录（2026-09-23）
+
+- B1-01 / B1-02：CLI、数据合同、物化、训练配置、factory 和导出拒绝非空 future/static 配置，固定错误码为 `UNSUPPORTED_COVARIATE`。保留旧空字段兼容；不再生成 `used_known_future_covariates`。observed-past 导出推理无需提供空 future 数组。
+- B1-04：五类 action schema 改为按 `type` 区分的严格 `oneOf`；错误定位到所选分支的 JSON path。高层 ModelRecipe 编译结果和直接 `resolve_recipe` 调用均经过低层校验。
+- B1-05：Python registry、训练入口和 OpenCode domain 统一 point/quantile/Gaussian 的 head–distribution–loss 组合；quantile levels 必须有序、唯一且与 loss 一致，禁止点预测广播为多分位数。
+- B1-06：季节性 mutation 使用合法 moving-average decomposition；mutation 返回前通过 schema 与 registry，切换 fusion 时清除旧 action 字段，并同步 transformer 的 embedding width。
+- B1-07（部分）：新增非法参数、完整输出组合矩阵、quantile/Gaussian 参数梯度、mutation 校验、future/static 拒绝、observed-past 输入敏感性及导出输入测试。
+
+后续实施已补齐剩余项：
+
+- B1-03 / B1-07：删除跨 horizon 共享、旧 feature 开关、base_head、fill_policy、graph_type 和全局 dropout 等无效字段；Python/OpenCode 严格校验同步。增加全 backbone/embedding/preprocessing/fusion/head 结构、输入梯度、配置差异测试与 action 集合同步测试。
+- B2：逐通道独立 linear、模块 dropout、per-variable affine norm、显式 last-value centering、ordered fusion 四种 gate/residual 组合；mask 在物化前保存，覆盖 train/val/ref-test/export，并在 CV fold 内重新填补和拟合 scaler。
+- B3：冻结 [v2 合同](recipe_runtime_v2_contract.md)，encoder 输出 `[B,C,min(T,64)]`，五类真实参数化 head 独占最终 horizon 投影；variate attention、双支 gated hybrid、可训练 trend 分支和 train-only/static/learned graph 已接入。manifest 含实际参数图 digest、head 参数量、dropout、shared、gate 和 adjacency 来源/digest。
+- 兼容：checkpoint/metadata 带 `runtime_semantics_revision=2`；导出检查版本和参数图，旧模型须重训。CV protocol 纳入语义版本，避免旧 champion 与新语义混比。
+- B4：采用方案 B：SSM proxy 正式更名 `gated_depthwise_conv`，TimesNet 轻量路径更名 `timesnet_lite` 并标记 `paper_derived`。完成 [ETTh1 同预算 sanity comparison](recipe_runtime_v2_sanity.md)。完整 SSM、完整 TimesNet、跨配置 horizon 共享属于原方案可选后续工作，本次不宣称实现。
+- 验证：`npm test`（Node 71 项及 Python wrapper）、Python 全量 180 项通过；OpenCode 相关 78 项通过，并完成 typecheck。新增测试包含独立导出往返、旧 checkpoint 拒绝、训练 fold graph/填补隔离、真实物化 mask 的 train/val/ref-test 路径。
+- 扩大检查：`bun test test/research` 为 326 通过、2 失败。两项不属于本次 recipe/runtime 修正：`hypothesis-evidence-tools.test.ts` 的 fixture 未创建 `quantitative.json`；`service.test.ts` 的 plateau 测试期望 25 轮，而当前实现返回 7 轮。未修改这些功能的行为以迎合旧断言。
+
+以下章节保留原问题分析、候选方案与验收要求；最终选择以 v2 合同和上述实施记录为准。保留并明确声明 `temporal/shared` 与 `feature_mlp` 的计算等价关系，禁止将其当作独立机制归因。
 
 ## 1. 背景
 
@@ -664,4 +684,3 @@ disabled capability requested  → validation error, never silent fallback
 - 数据 action 能在真实数据流中获得所需信息；
 - Lite/Derived 实现不再使用完整论文模型名称；
 - 执行契约、artifact 和测试能够证明上述事实，而不是只记录配置标签。
-

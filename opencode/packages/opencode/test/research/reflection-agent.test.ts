@@ -173,3 +173,15 @@ test("buildNextExperimentPlanMarkdown emits a publish recommendation when decisi
   expect(notes).toContain("stop")
   expect(notes).toContain("NAS planned max iterations: 25")
 })
+
+
+test("invalid executions retain full error evidence without contributing model metrics", () => {
+  const error = "recipe_factory requires recipe_schema_v2\nStandard training failed with exit code 1"
+  const analysis = analyzeReflection({ task: task(), candidates: [], runs: [
+    run({ id: "invalid_version", status: "invalid", error, metric: 0.01, created: 1 }),
+  ] })
+  expect(analysis.failures[0]?.summary).toBe(error)
+  expect(analysis.failures[0]?.category).toBe("script_error")
+  expect(analysis.bestMetric).toBeUndefined()
+  expect(analysis.succeededRuns).toBe(0)
+})

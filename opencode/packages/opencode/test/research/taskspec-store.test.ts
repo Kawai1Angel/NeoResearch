@@ -1,4 +1,5 @@
 import { ResearchApprovalID } from "../../src/research/schema"
+import { INTENT_SLOT_IDS } from "../../src/research/agents/intent-agent"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { Instance } from "../../src/project/instance"
@@ -101,6 +102,58 @@ describe("taskspec-store", () => {
     } })
   })
 
+  test("data split defaults to 7:1:2 and can switch between ratios and explicit row ranges", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      const initial = await readTaskspecSlots(task.id)
+      expect(initial.slots.data_split_method?.value).toBe("ratio")
+      expect(initial.slots.data_split_ratios?.value).toEqual([7, 1, 2])
+
+      await applySlotUpdates(task.id, { data_split_ratios: [6, 2, 2] })
+      let stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+      expect(stored.taskSpec.dataset).toMatchObject({ split: { method: "ratio", ratios: [6, 2, 2] } })
+
+      const ranges = { train: [0, 600], validation: [600, 800], test: [800, 1000] }
+      await applySlotUpdates(task.id, { data_split_method: "row_ranges", data_split_row_ranges: ranges })
+      const snapshot = await readTaskspecSlots(task.id)
+      expect(snapshot.slots.data_split_method?.value).toBe("row_ranges")
+      expect(snapshot.slots.data_split_row_ranges?.value).toEqual(ranges)
+      stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+      expect(stored.taskSpec.dataset).toMatchObject({
+        split: {
+          method: "row_ranges",
+          trainRows: [0, 600],
+          validationRows: [600, 800],
+          testRows: [800, 1000],
+        },
+      })
+      await applySlotUpdates(task.id, { data_split_ratios: [8, 1, 1] })
+      const ratioSnapshot = await readTaskspecSlots(task.id)
+      expect(ratioSnapshot.slots.data_split_method?.value).toBe("ratio")
+      expect(ratioSnapshot.slots.data_split_ratios?.value).toEqual([8, 1, 1])
+      expect(ratioSnapshot.slots.data_split_row_ranges?.value).toBeUndefined()
+    } })
+  })
+
+  test("invalid data split updates fail without changing the task", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const task = await createTask()
+      for (const updates of [
+        { data_split_method: "random" },
+        { data_split_ratios: [7, 0, 3] },
+        { data_split_ratios: [7, 3] },
+        { data_split_method: "row_ranges", data_split_row_ranges: { train: [1, 60], validation: [60, 80], test: [80, 100] } },
+        { data_split_method: "row_ranges", data_split_row_ranges: { train: [0, 60], validation: [61, 80], test: [80, 100] } },
+      ]) {
+        await expect(applySlotUpdates(task.id, updates)).rejects.toThrow()
+        const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(stored.taskSpec).toEqual(task.taskSpec)
+      }
+    } })
+  })
+
   test("invalid horizon or lookback updates fail before any task data is changed", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     await Instance.provide({ directory: tmp.path, fn: async () => {
@@ -124,6 +177,7 @@ describe("taskspec-store", () => {
       const updates = {
         interaction_mode: "socratic", forecast_object: "power forecasting", data_source: "/data/new.csv",
         target_columns: ["power"], lookback_window: 336, prediction_horizon: [96, 192, 336, 720],
+        data_split_method: "ratio", data_split_ratios: [7, 1, 2],
         time_grain: "1 hour", exogenous_variables: ["wind"], future_covariate_availability: "unavailable",
         business_context: "dispatch planning", primary_metric: "cv_avg_mae", secondary_metrics: ["cv_avg_mse"],
         error_preferences: "short horizon", latency_budget: 200, parameter_budget: "5M",
@@ -132,7 +186,7 @@ describe("taskspec-store", () => {
       }
       await applySlotUpdates(task.id, updates)
       const snapshot = await readTaskspecSlots(task.id)
-      expect(Object.keys(snapshot.slots).sort()).toEqual(Object.keys(updates).sort())
+      expect(Object.keys(snapshot.slots).sort()).toEqual([...INTENT_SLOT_IDS].sort())
       for (const [key, value] of Object.entries(updates)) expect(snapshot.slots[key as keyof typeof updates]?.value).toEqual(value)
       const stored = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
       expect(stored.interactionMode).toBe("socratic")
@@ -184,7 +238,7 @@ describe("taskspec-store", () => {
     } })
   })
 
-  test("all exogenous variables resolve to non-target numeric columns and both dynamic roles", async () => {
+  test("all exogenous variables resolve to observed-past only and explicit future requests fail", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     await Bun.write(`${tmp.path}/wind.csv`, [
       "date,real_power,wind_speed,temperature,site",
@@ -195,18 +249,22 @@ describe("taskspec-store", () => {
       directory: tmp.path,
       fn: async () => {
         const task = await createTask()
-        await applySlotUpdates(task.id, {
+        await expect(applySlotUpdates(task.id, {
           data_source: `${tmp.path}/wind.csv`,
           target_columns: ["real_power"],
           exogenous_variables: ["all"],
           future_covariate_availability: "weather forecast available at prediction time",
+        })).rejects.toThrow("UNSUPPORTED_COVARIATE")
+        await applySlotUpdates(task.id, {
+          data_source: `${tmp.path}/wind.csv`, target_columns: ["real_power"], exogenous_variables: ["all"],
+          future_covariate_availability: "unavailable",
         })
         const updated = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
         expect(updated.taskSpec).toMatchObject({
           dataset: {
             targetCols: ["real_power"],
             observedPastCovariates: ["wind_speed", "temperature"],
-            knownFutureCovariates: ["wind_speed", "temperature"],
+            knownFutureCovariates: [],
           },
           metadata: {
             intentSlots: { exogenous_variables: ["all"] },

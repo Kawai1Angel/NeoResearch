@@ -23,6 +23,7 @@ import { describeRoute, resolver, validator } from "hono-openapi"
 import z from "zod"
 import { Instance } from "@/project/instance"
 import { ResearchOperations } from "@/research/operation"
+import { taskExecutionRoot } from "@/research/task-isolation"
 import { runRequest } from "./trace"
 import { Research } from "@/research"
 import { lazy } from "@/util/lazy"
@@ -523,7 +524,11 @@ export const ResearchRoutes = lazy(() =>
         jsonRequest("ResearchRoutes.tasks.fingerprint", c, function* () {
           const svc = yield* Research.Service
           const task = yield* svc.getTask(c.req.valid("param").taskID)
-          return Research.DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+          return Research.DomainRegistry.summarizeTask(task.domainID, task.taskSpec, {
+            taskID: task.id,
+            projectRoot: Instance.directory,
+            workspaceRoot: taskExecutionRoot(task, Instance.directory),
+          })
         }),
     )
     .post(

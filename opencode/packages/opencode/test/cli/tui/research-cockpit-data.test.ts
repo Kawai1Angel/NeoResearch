@@ -1242,16 +1242,21 @@ describe("research cockpit data helpers", () => {
 
   test("displays every backbone type with all of its parameters", () => {
     const backbones = [
+      ["diagonal_ssm", { type: "diagonal_ssm", dModel: 64, stateDim: 32, depth: 3, dropout: 0.1 }, "diagonal_ssm(d=64,state=32,depth=3,drop=0.1)"],
+      ["timesblock_encoder", { type: "timesblock_encoder", dModel: 64, dFf: 128, depth: 2, topK: 3, numKernels: 4, dropout: 0.05 }, "timesblock_encoder(d=64,ffn=128,depth=2,topK=3,kernels=4,drop=0.05)"],
+      ["mamba", { type: "mamba", dModel: 64, dState: 16, dConv: 4, expand: 2, depth: 3, dropout: 0.1, backend: "torch_reference" }, "mamba(d=64,state=16,conv=4,expand=2,depth=3,drop=0.1,backend=torch_reference)"],
       ["linear", { type: "linear", shared: false, bias: true }, "linear(shared=false,bias)"],
       ["mlp", { type: "mlp", depth: 3, hidden_dim: 256, activation: "gelu", dropout: 0.1 }, "mlp(depth=3,h=256,act=gelu,drop=0.1)"],
       ["transformer", { type: "transformer", dModel: 128, nHeads: 4, nLayers: 3, dropout: 0.2, ffnMult: 4 }, "transformer(d=128,heads=4,layers=3,drop=0.2,ffn=4)"],
       ["rnn", { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 }, "rnn(cell=gru,h=96,layers=2,drop=0.1)"],
       ["dlinear", { type: "dlinear", kernelSize: 25, bias: false, individual: true }, "dlinear(k=25,bias=false,individual)"],
       ["tcn", { type: "tcn", hidden_dim: 128, n_layers: 4, kernel_size: 5, activation: "relu", dropout: 0.15 }, "tcn(h=128,layers=4,k=5,act=relu,drop=0.15)"],
+      ["gated_depthwise_conv", { type: "gated_depthwise_conv", hiddenDim: 128, depth: 4, kernelSize: 7, dropout: 0.15, attention: "lightweight" }, "gated_depthwise_conv(h=128,depth=4,k=7,drop=0.15,attn=lightweight)"],
       ["ssm", { type: "ssm", state_dim: 64, depth: 3, dropout: 0.05 }, "ssm(state=64,depth=3,drop=0.05)"],
       ["mixer", { type: "mixer", hiddenDim: 192, depth: 4, temporalMixing: "conv", channelMixing: "identity", dropout: 0.2 }, "mixer(h=192,depth=4,tmix=conv,cmix=identity,drop=0.2)"],
       ["nbeats", { type: "nbeats", hidden_dim: 256, n_blocks: 8, n_layers: 4, activation: "silu", dropout: 0.1 }, "nbeats(h=256,blocks=8,layers=4,act=silu,drop=0.1)"],
       ["timesnet", { type: "timesnet", hiddenDim: 128, nLayers: 3, topK: 5, kernelSize: 7, dropout: 0.12 }, "timesnet(h=128,layers=3,topK=5,k=7,drop=0.12)"],
+      ["timesnet_lite", { type: "timesnet_lite", hiddenDim: 64, nLayers: 2, topK: 3, kernelSize: 3, dropout: 0.05 }, "timesnet_lite(h=64,layers=2,topK=3,k=3,drop=0.05)"],
     ] as const
 
     for (const [type, backbone, expected] of backbones) {
@@ -1262,6 +1267,79 @@ describe("research cockpit data helpers", () => {
       expect(formatResearchCockpitCandidateRecipeLines(item).architecture).toContain(`backbone=${expected}`)
       expect(formatResearchCockpitCandidateArchitectureExpandedLines(item)).toContain(`  backbone:       ${expected}`)
     }
+  })
+
+  test("displays both branches and merge details for composed candidates", () => {
+    const item = candidate({
+      id: "candidate_composed",
+      candidateSpec: {
+        preprocessing: { actions: [{ type: "none" }] },
+        embedding: { type: "none" },
+        backbone: { type: "dlinear", kernelSize: 49, bias: true, individual: false },
+        representation: { layout: "channel_latent", readout: "none", latentDim: 64 },
+        composition: {
+          type: "parallel_two_branch",
+          merge: "latent_gate",
+          secondary: {
+            embedding: { type: "none" },
+            backbone: {
+              type: "timesnet_lite",
+              hiddenDim: 64,
+              nLayers: 2,
+              topK: 3,
+              kernelSize: 3,
+              dropout: 0.05,
+            },
+            representation: { layout: "channel_latent", readout: "none", latentDim: 64 },
+          },
+        },
+        fusion: { type: "temporal", channelMode: "independent" },
+        predictionHead: {
+          type: "residual_correction",
+          outputDistribution: "point",
+          correctionDim: 1024,
+        },
+      },
+    })
+
+    expect(formatResearchCockpitCandidateRecipeLines(item).architecture).toContain(
+      "composition=parallel_two_branch(merge=latent_gate) / secondary=none->timesnet_lite(h=64,layers=2,topK=3,k=3,drop=0.05)->channel_latent(readout=none,latent_dim=64)",
+    )
+    expect(formatResearchCockpitCandidateArchitectureExpandedLines(item)).toEqual([
+      "  preprocessing:  none",
+      "  composition:    parallel_two_branch(merge=latent_gate)",
+      "  primary:",
+      "    embedding:      none",
+      "    backbone:       dlinear(k=49,bias,individual=false)",
+      "    representation: channel_latent(readout=none, latent_dim=64)",
+      "  secondary:",
+      "    embedding:      none",
+      "    backbone:       timesnet_lite(h=64, layers=2, topK=3, k=3, drop=0.05)",
+      "    representation: channel_latent(readout=none, latent_dim=64)",
+      "  fusion:         temporal(channel_mode=independent)",
+      "  prediction_head: residual_correction(output_dist=point, correction_dim=1024)",
+      "  loss:           ?",
+      "  optimizer:      ?",
+      "  scheduler:      ?",
+    ])
+  })
+
+  test("preserves frequency embedding details in a secondary branch", () => {
+    const lines = formatResearchCockpitCandidateArchitectureExpandedLines({
+      candidateSpec: {
+        composition: {
+          type: "parallel_two_branch",
+          merge: "latent_gate",
+          secondary: {
+            embedding: { type: "frequency", n_freq: 16, d_model: 96, complex_mode: "real_imag" },
+            backbone: { type: "linear", shared: true, bias: true },
+            representation: { layout: "channel_latent", readout: "none", latent_dim: 64 },
+          },
+        },
+      },
+    })
+
+    expect(lines).toContain("    embedding:      frequency(n_freq=16, d_model=96, complex_mode=real_imag)")
   })
 
   test("checks candidate and runner readiness for per-candidate actions", () => {
@@ -1774,6 +1852,11 @@ describe("research cockpit data helpers", () => {
   })
 
   test("detects research events that should refresh cockpit data", () => {
+    for (const agent of ["hypoPlanner", "reflection", "intent", "dataAnalysis"]) {
+      expect(shouldRefreshResearchCockpitOnEvent({ type: `research.agent.${agent}.stream.delta` })).toBe(false)
+      expect(shouldRefreshResearchCockpitOnEvent({ type: `research.agent.${agent}.part.updated` })).toBe(false)
+      expect(shouldRefreshResearchCockpitOnEvent({ type: `research.agent.${agent}.completed` })).toBe(true)
+    }
     expect(shouldRefreshResearchCockpitOnEvent({ type: "research.artifact.created" })).toBe(true)
     expect(shouldRefreshResearchCockpitOnEvent({ type: "research.runner.progress.line" })).toBe(true)
     expect(shouldRefreshResearchCockpitOnEvent({ type: "research.approval.updated" })).toBe(true)

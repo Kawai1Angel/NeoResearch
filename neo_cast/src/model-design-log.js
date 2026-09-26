@@ -14,18 +14,20 @@ function modelDesignPaths(projectRoot = process.cwd()) {
 }
 
 function architectureDetails(candidate) {
-  if (candidate.schema_version === "model_recipe.v1") {
+  if (["model_recipe.v1", "model_recipe.v2"].includes(candidate.schema_version)) {
     return {
       input: candidate.input || null,
       architecture: candidate.architecture || null,
       constraints: candidate.constraints || null,
     };
   }
-  if (candidate.recipe_version === "recipe_schema_v1") {
+  if (["recipe_schema_v2", "recipe_schema_v3"].includes(candidate.recipe_version)) {
     return {
       preprocessing: candidate.preprocessing || null,
       embedding: candidate.embedding || null,
       backbone: candidate.backbone || null,
+      representation: candidate.representation || null,
+      composition: candidate.composition || null,
       fusion: candidate.fusion || null,
       prediction_head: candidate.prediction_head || null,
       post_processing: candidate.post_processing || null,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+import hashlib
+import json
 
 import torch
 import torch.nn as nn
@@ -13,6 +15,229 @@ FAMILY_SPEC = {
     "state_dict_layout": "per_horizon",
 }
 
+RUNTIME_SEMANTICS_REVISION = 2
+
+
+def parameter_graph_digest(model: nn.Module) -> str:
+    """Portable structural signature used by training and standalone exports."""
+    keys = ("p", "residual", "gate_type", "source", "sparsity", "stride", "eps", "mask_channel", "scheme")
+    if getattr(model, "runtime_semantics_revision", 2) >= 3:
+        keys += ("layout", "readout", "top_k", "variant", "backend", "period_selection")
+    graph = {"modules": [[name, type(module).__name__] for name, module in model.named_modules()],
+             "parameters": {name: list(p.shape) for name, p in model.named_parameters()},
+             "semantics": {name: {key: getattr(module, key) for key in keys
+                                   if isinstance(getattr(module, key, None), (bool, int, float, str, tuple))}
+                           for name, module in model.named_modules()}}
+    return hashlib.sha256(json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+ACTION_FIELDS = {
+    "preprocessing": {
+        "none": [
+            "type"
+        ],
+        "instance_norm": [
+            "type",
+            "affine",
+            "eps"
+        ],
+        "series_decomposition": [
+            "type",
+            "method",
+            "kernel_size"
+        ],
+        "seasonal_differencing": [
+            "type",
+            "period",
+            "order"
+        ],
+        "missing_mask": [
+            "type",
+            "mask_channel"
+        ],
+        "sample_reweighting": [
+            "type",
+            "scheme"
+        ],
+        "last_value_centering": [
+            "type"
+        ]
+    },
+    "embedding": {
+        "none": [
+            "type"
+        ],
+        "patch": [
+            "type",
+            "patch_len",
+            "stride",
+            "d_model"
+        ],
+        "multiscale_patch": [
+            "type",
+            "scales",
+            "d_model",
+            "num_blocks"
+        ],
+        "invert": [
+            "type",
+            "d_model"
+        ],
+        "frequency": [
+            "type",
+            "n_freq",
+            "d_model",
+            "complex_mode"
+        ],
+        "calendar": [
+            "type",
+            "fields",
+            "embed_dim"
+        ]
+    },
+    "backbone": {
+        "linear": [
+            "type",
+            "shared",
+            "bias",
+            "attention"
+        ],
+        "mlp": [
+            "type",
+            "depth",
+            "hidden_dim",
+            "activation",
+            "dropout",
+            "attention"
+        ],
+        "transformer": [
+            "type",
+            "d_model",
+            "n_heads",
+            "n_layers",
+            "ffn_mult",
+            "dropout",
+            "attention"
+        ],
+        "rnn": [
+            "type",
+            "cell",
+            "hidden_dim",
+            "num_layers",
+            "dropout",
+            "attention"
+        ],
+        "dlinear": [
+            "type",
+            "kernel_size",
+            "bias",
+            "individual",
+            "attention"
+        ],
+        "tcn": [
+            "type",
+            "hidden_dim",
+            "n_layers",
+            "kernel_size",
+            "activation",
+            "dropout",
+            "attention"
+        ],
+        "nbeats": [
+            "type",
+            "hidden_dim",
+            "n_blocks",
+            "n_layers",
+            "activation",
+            "dropout",
+            "attention"
+        ],
+        "timesnet_lite": [
+            "type",
+            "hidden_dim",
+            "n_layers",
+            "top_k",
+            "kernel_size",
+            "dropout",
+            "attention"
+        ],
+        "gated_depthwise_conv": [
+            "type",
+            "hidden_dim",
+            "depth",
+            "kernel_size",
+            "dropout",
+            "attention"
+        ],
+        "mixer": [
+            "type",
+            "hidden_dim",
+            "depth",
+            "temporal_mixing",
+            "channel_mixing",
+            "dropout",
+            "activation",
+            "attention"
+        ]
+    },
+    "fusion": {
+        "temporal": [
+            "type",
+            "channel_mode"
+        ],
+        "variate_attention": [
+            "type"
+        ],
+        "temporal_then_feature": [
+            "type",
+            "gate",
+            "residual"
+        ],
+        "feature_then_temporal": [
+            "type",
+            "gate",
+            "residual"
+        ],
+        "graph": [
+            "type",
+            "adjacency_source",
+            "sparsity",
+            "topology_artifact"
+        ],
+        "gated_hybrid": [
+            "type",
+            "gate_type"
+        ],
+        "feature_mlp": [
+            "type"
+        ]
+    },
+    "prediction_head": {
+        "linear": [
+            "type",
+            "output_distribution"
+        ],
+        "direct_multi_horizon": [
+            "type",
+            "output_distribution"
+        ],
+        "quantile": [
+            "type",
+            "output_distribution",
+            "quantiles"
+        ],
+        "gaussian": [
+            "type",
+            "output_distribution",
+            "variance_floor"
+        ],
+        "residual_correction": [
+            "type",
+            "output_distribution",
+            "correction_dim"
+        ]
+    }
+}
+
 
 def _activation(name: str | None) -> nn.Module:
     if name == "relu":
@@ -23,13 +248,13 @@ def _activation(name: str | None) -> nn.Module:
 
 
 class InstanceNormAction(nn.Module):
-    def __init__(self, *, affine: bool = False, eps: float = 1e-5) -> None:
+    def __init__(self, *, affine: bool = False, eps: float = 1e-5, num_channels: int = 1) -> None:
         super().__init__()
         self.affine = affine
         self.eps = eps
         if affine:
-            self.scale = nn.Parameter(torch.ones(1, 1, 1))
-            self.shift = nn.Parameter(torch.zeros(1, 1, 1))
+            self.scale = nn.Parameter(torch.ones(1, 1, num_channels))
+            self.shift = nn.Parameter(torch.zeros(1, 1, num_channels))
 
     def forward_transform(self, x: torch.Tensor, contexts: list[tuple[str, Any]]) -> torch.Tensor:
         mean = x.mean(dim=1, keepdim=True)
@@ -43,14 +268,28 @@ class InstanceNormAction(nn.Module):
     def inverse_transform(self, y: torch.Tensor, context: Any) -> torch.Tensor:
         mean, std = context
         if self.affine:
-            y = (y - self.shift) / self.scale.clamp_min(self.eps)
+            y = (y - self.shift) / self.safe_scale()
         return y * std + mean
+
+    def safe_scale(self) -> torch.Tensor:
+        return torch.where(self.scale >= 0, self.scale.clamp_min(self.eps), self.scale.clamp_max(-self.eps))
+
+
+class LastValueCenteringAction(nn.Module):
+    def forward_transform(self, x: torch.Tensor, contexts: list[tuple[str, Any]]) -> torch.Tensor:
+        location = x[:, -1:, :]
+        contexts.append(("last_value_centering", location))
+        return x - location
+
+    def inverse_transform(self, y: torch.Tensor, context: Any) -> torch.Tensor:
+        return y + context
 
 
 class SeriesDecompositionAction(nn.Module):
-    def __init__(self, *, kernel_size: int) -> None:
+    def __init__(self, *, kernel_size: int, input_len: int | None = None, horizon: int | None = None) -> None:
         super().__init__()
         self.kernel_size = kernel_size
+        self.trend_model = nn.Linear(input_len, horizon) if input_len is not None and horizon is not None else None
 
     def _moving_average(self, x: torch.Tensor) -> torch.Tensor:
         pad = (self.kernel_size - 1) // 2
@@ -61,7 +300,9 @@ class SeriesDecompositionAction(nn.Module):
 
     def forward_transform(self, x: torch.Tensor, contexts: list[tuple[str, Any]]) -> torch.Tensor:
         trend = self._moving_average(x)
-        contexts.append(("series_decomposition", trend[:, -1:, :]))
+        if self.trend_model is None:
+            raise ValueError("Decomposition requires input_len and horizon for its trainable trend branch")
+        contexts.append(("series_decomposition", self.trend_model(trend.transpose(1, 2)).transpose(1, 2)))
         return x - trend
 
     def inverse_transform(self, y: torch.Tensor, context: Any) -> torch.Tensor:
@@ -70,6 +311,7 @@ class SeriesDecompositionAction(nn.Module):
 
 class NoOpPreprocessing(nn.Module):
     def forward_transform(self, x: torch.Tensor, contexts: list[tuple[str, Any]]) -> torch.Tensor:
+        contexts.append(("none", None))
         return x
 
     def inverse_transform(self, y: torch.Tensor, context: Any) -> torch.Tensor:
@@ -119,32 +361,24 @@ class SeasonalDifferencingAction(nn.Module):
 
 
 class MissingMaskAction(nn.Module):
-    def __init__(self, *, fill_policy: str = "zero", mask_channel: bool = False) -> None:
+    def __init__(self, *, mask_channel: bool = True) -> None:
         super().__init__()
-        self.fill_policy = fill_policy
         self.mask_channel = mask_channel
 
-    def forward_transform(self, x: torch.Tensor, contexts: list[tuple[str, Any]]) -> torch.Tensor:
+    def forward_transform(self, x: torch.Tensor, contexts: list[tuple[str, Any]], original_mask: torch.Tensor | None = None) -> torch.Tensor:
         contexts.append(("missing_mask", {"original_channels": x.size(-1)}))
         missing = torch.isnan(x)
+        if original_mask is not None:
+            if original_mask.shape != x.shape or not torch.all((original_mask == 0) | (original_mask == 1)):
+                raise ValueError("missing_mask must be binary and match history [B,T,C]")
+            missing = missing | original_mask.bool()
+            # Dataset-level imputation already ran. The mask must not trigger a second fill.
+            filled = torch.nan_to_num(x, nan=0.0)
+            return torch.cat([filled, missing.to(x.dtype)], dim=-1) if self.mask_channel else filled
         if not bool(missing.any()):
             filled = x
-        elif self.fill_policy == "zero":
-            filled = torch.nan_to_num(x, nan=0.0)
-        elif self.fill_policy == "mean":
-            valid = torch.where(missing, torch.zeros_like(x), x)
-            counts = (~missing).sum(dim=1, keepdim=True).clamp_min(1)
-            means = valid.sum(dim=1, keepdim=True) / counts
-            filled = torch.where(missing, means, x)
-        elif self.fill_policy == "ffill":
-            first = torch.nan_to_num(x[:, :1, :], nan=0.0)
-            values = [first[:, 0, :]]
-            for step in range(1, x.size(1)):
-                current = x[:, step, :]
-                values.append(torch.where(torch.isnan(current), values[-1], current))
-            filled = torch.stack(values, dim=1)
         else:
-            raise ValueError(f"Unsupported missing_mask.fill_policy: {self.fill_policy}")
+            filled = torch.nan_to_num(x, nan=0.0)
         if self.mask_channel:
             return torch.cat([filled, missing.to(dtype=filled.dtype)], dim=-1)
         return filled
@@ -356,14 +590,14 @@ class CalendarEmbedding(nn.Module):
 
 
 class ResidualMLPBlock(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float, activation: str | None) -> None:
+    def __init__(self, hidden_dim: int, dropout: float, activation: str | None, expansion: float = 2.0) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, int(hidden_dim * expansion)),
             _activation(activation),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(int(hidden_dim * expansion), hidden_dim),
             nn.Dropout(dropout),
         )
 
@@ -392,10 +626,20 @@ class ChannelMixer(nn.Module):
 
 
 class GraphChannelMixer(nn.Module):
-    def __init__(self, num_channels: int, *, dropout: float = 0.0) -> None:
+    def __init__(self, num_channels: int, *, dropout: float = 0.0, source: str = "learned", adjacency: list[list[float]] | None = None, sparsity: float = 0.0) -> None:
         super().__init__()
         self.num_channels = num_channels
-        self.adjacency_logits = nn.Parameter(torch.eye(num_channels))
+        self.source = source
+        self.sparsity = sparsity
+        if source == "learned":
+            self.adjacency_logits = nn.Parameter(torch.eye(num_channels))
+        else:
+            if adjacency is None:
+                raise ValueError(f"graph.{source} requires a fitted/persisted adjacency")
+            matrix = torch.tensor(adjacency, dtype=torch.float32)
+            if matrix.shape != (num_channels, num_channels) or not torch.isfinite(matrix).all():
+                raise ValueError("graph adjacency must be a finite C x C matrix in input channel order")
+            self.register_buffer("adjacency", matrix)
         self.proj = nn.Sequential(
             nn.LayerNorm(num_channels),
             nn.Linear(num_channels, num_channels),
@@ -405,25 +649,17 @@ class GraphChannelMixer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(-1) != self.num_channels:
             raise ValueError(f"Expected {self.num_channels} channels, got {x.size(-1)}")
-        adjacency = torch.softmax(self.adjacency_logits, dim=-1)
+        adjacency = self.matrix()
         mixed = torch.einsum("ij,btj->bti", adjacency, x)
         return x + self.proj(mixed)
 
-
-class GatedHybridMixer(nn.Module):
-    def __init__(self, num_channels: int, *, dropout: float = 0.0) -> None:
-        super().__init__()
-        self.feature_branch = ChannelMixer(num_channels, dropout=dropout)
-        self.gate = nn.Sequential(
-            nn.LayerNorm(num_channels),
-            nn.Linear(num_channels, num_channels),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feature = self.feature_branch(x)
-        gate = self.gate(x)
-        return gate * feature + (1.0 - gate) * x
+    def matrix(self) -> torch.Tensor:
+        matrix = self.adjacency_logits.softmax(dim=-1) if self.source == "learned" else self.adjacency
+        keep = max(1, round(self.num_channels * (1 - self.sparsity)))
+        if keep < self.num_channels:
+            indices = matrix.abs().topk(keep, dim=-1).indices
+            matrix = matrix * torch.zeros_like(matrix).scatter(-1, indices, 1)
+        return matrix / matrix.abs().sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
 class DLinearCore(nn.Module):
@@ -696,7 +932,7 @@ class TimesNetLiteCore(nn.Module):
         return self.output_proj(forecast_tokens).squeeze(-1)
 
 
-class SSMTokenBlock(nn.Module):
+class GatedDepthwiseConvBlock(nn.Module):
     def __init__(self, *, hidden_dim: int, kernel_size: int, dropout: float) -> None:
         super().__init__()
         if kernel_size % 2 == 0:
@@ -769,33 +1005,115 @@ class TokenMixerBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.token_norm(x).transpose(1, 2)
         x = x + self.token_mixer(y).transpose(1, 2)
-        return x + self.feature_mlp(self.feature_norm(x))
+        return x if isinstance(self.feature_mlp, nn.Identity) else x + self.feature_mlp(self.feature_norm(x))
+
+
+class LinearHead(nn.Linear):
+    """The sole latent-to-horizon projection for a point forecast."""
+
+
+class DirectMultiHorizonHead(nn.Module):
+    def __init__(self, latent_dim: int, horizon: int) -> None:
+        super().__init__()
+        width = max(8, min(latent_dim, 32))
+        self.towers = nn.ModuleList([nn.Sequential(nn.Linear(latent_dim, width), nn.GELU(), nn.Linear(width, 1)) for _ in range(horizon)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([tower(x) for tower in self.towers], dim=-1)
+
+
+class ChannelLinear(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, channels: int, bias: bool) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(input_dim, output_dim, bias=bias) for _ in range(channels)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        values = x.reshape(-1, len(self.layers), x.size(-1))
+        return torch.stack([layer(values[:, i]) for i, layer in enumerate(self.layers)], dim=1).reshape(-1, self.layers[0].out_features)
+
+
+class OrderedChannelMixer(nn.Module):
+    def __init__(self, channels: int, *, gate: bool, residual: bool, dropout: float) -> None:
+        super().__init__()
+        self.branch = ChannelMixer(channels, dropout=dropout).net
+        self.gate = nn.Sequential(nn.Linear(channels, channels), nn.Sigmoid()) if gate else None
+        self.residual = residual
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        branch = self.branch(x)
+        if self.gate is not None:
+            gate = self.gate(x)
+            return gate * branch + ((1 - gate) * x if self.residual else 0)
+        return branch + (x if self.residual else 0)
+
+
+class VariateAttention(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.attention = nn.MultiheadAttention(width, 1, batch_first=True)
+        self.norm = nn.LayerNorm(width)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        tokens = self.norm(latent)
+        return latent + self.attention(tokens, tokens, tokens, need_weights=False)[0]
+
+
+class HybridLatentFusion(nn.Module):
+    def __init__(self, input_len: int, channels: int, width: int, gate_type: str, dropout: float) -> None:
+        super().__init__()
+        self.gate_type = gate_type
+        self.feature_mixer = ChannelMixer(channels, dropout=dropout)
+        self.feature_encoder = nn.Sequential(nn.Linear(input_len, width), nn.GELU())
+        if gate_type == "learned":
+            self.gate_logits = nn.Parameter(torch.zeros(1, channels, 1))
+        elif gate_type == "scalar":
+            self.gate = nn.Linear(input_len * channels, 1)
+        elif gate_type == "channel":
+            self.gate = nn.Linear(input_len, 1)
+        elif gate_type == "time":
+            self.gate = nn.Linear(channels, 1)
+        else:
+            raise ValueError(f"Unsupported gate_type: {gate_type}")
+
+    def forward(self, history: torch.Tensor, temporal: torch.Tensor) -> torch.Tensor:
+        feature = self.feature_encoder(self.feature_mixer(history).transpose(1, 2))
+        if self.gate_type == "learned":
+            gate = self.gate_logits.sigmoid()
+        elif self.gate_type == "scalar":
+            gate = self.gate(history.flatten(1)).sigmoid().unsqueeze(-1)
+        elif self.gate_type == "channel":
+            gate = self.gate(history.transpose(1, 2)).sigmoid()
+        else:
+            gate = self.gate(history).sigmoid().mean(dim=1, keepdim=True)
+        return gate * temporal + (1 - gate) * feature
 
 
 class ResidualCorrectionHead(nn.Module):
-    def __init__(self, *, horizon: int, correction_dim: int, dropout: float = 0.0) -> None:
+    def __init__(self, *, horizon: int, correction_dim: int, latent_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
+        self.base = LinearHead(latent_dim, horizon)
         self.net = nn.Sequential(
-            nn.LayerNorm(horizon),
-            nn.Linear(horizon, correction_dim),
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, correction_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(correction_dim, horizon),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+        return self.base(x) + self.net(x)
 
 
 class QuantilePointHead(nn.Module):
-    def __init__(self, *, horizon: int, quantiles: list[float]) -> None:
+    def __init__(self, *, horizon: int, quantiles: list[float], latent_dim: int) -> None:
         super().__init__()
         self.quantiles = quantiles or [0.5]
-        self.proj = nn.Linear(1, len(self.quantiles))
+        self.horizon = horizon
+        self.proj = nn.Linear(latent_dim, horizon * len(self.quantiles))
         self.point_index = min(range(len(self.quantiles)), key=lambda idx: abs(self.quantiles[idx] - 0.5))
 
     def forward_quantiles(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x.unsqueeze(-1))
+        return self.proj(x).reshape(*x.shape[:-1], self.horizon, len(self.quantiles))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         quantile_values = self.forward_quantiles(x)
@@ -803,10 +1121,10 @@ class QuantilePointHead(nn.Module):
 
 
 class GaussianPointHead(nn.Module):
-    def __init__(self, *, horizon: int, variance_floor: float = 1e-6) -> None:
+    def __init__(self, *, horizon: int, latent_dim: int, variance_floor: float = 1e-6) -> None:
         super().__init__()
-        self.mean = nn.Linear(horizon, horizon)
-        self.log_var = nn.Linear(horizon, horizon)
+        self.mean = nn.Linear(latent_dim, horizon)
+        self.log_var = nn.Linear(latent_dim, horizon)
         self.variance_floor = variance_floor
         self.quantiles = [0.1, 0.5, 0.9]
 
@@ -863,13 +1181,14 @@ class RecipeModel(nn.Module):
         num_past_covariate_channels: int = 0,
         num_future_covariate_channels: int = 0,
         num_output_channels: int | None = None,
+        graph_adjacency: list[list[float]] | None = None,
     ) -> None:
         super().__init__()
         self.recipe = recipe
         self.input_len = input_len
         self.horizon = horizon
-
-        self.preprocessing = nn.ModuleList(self._build_preprocessing(recipe))
+        self.latent_dim = int(recipe.get("representation", {}).get("latent_dim", min(input_len, 64)))
+        self.runtime_semantics_revision = 3 if recipe.get("recipe_version") == "recipe_schema_v3" else RUNTIME_SEMANTICS_REVISION
         self.embedding_cfg = recipe["embedding"]
         self.backbone_cfg = recipe["backbone"]
         self.fusion_cfg = recipe["fusion"]
@@ -882,11 +1201,25 @@ class RecipeModel(nn.Module):
         self.num_target_channels = int(num_target_channels if num_target_channels is not None else num_channels or 0)
         self.num_past_covariate_channels = int(num_past_covariate_channels)
         self.num_future_covariate_channels = int(num_future_covariate_channels)
+        if self.num_future_covariate_channels:
+            raise ValueError("UNSUPPORTED_COVARIATE: num_future_covariate_channels must be zero")
         self.num_output_channels = int(num_output_channels if num_output_channels is not None else self.num_target_channels)
         self.model_num_channels = self._effective_num_channels(num_channels)
+        self.preprocessing = nn.ModuleList(self._build_preprocessing(recipe))
+        self.uses_missing_mask = any(isinstance(module, MissingMaskAction) for module in self.preprocessing)
+        self.graph_adjacency = graph_adjacency
         self.channel_mixer, self.output_mixer = self._build_fusion_modules()
+        self.latent_mixer: nn.Module = nn.Identity()
+        if self.fusion_type == "variate_attention":
+            self.latent_mixer = VariateAttention(self.latent_dim)
+        elif self.fusion_type == "temporal_then_feature":
+            self.latent_mixer = OrderedChannelMixer(self._require_num_channels("ordered fusion"), gate=self.fusion_cfg.get("gate", False), residual=self.fusion_cfg.get("residual", False), dropout=float(self.backbone_cfg.get("dropout", 0)))
+        elif self.fusion_type == "gated_hybrid":
+            self.latent_mixer = HybridLatentFusion(input_len, self._require_num_channels("hybrid fusion"), self.latent_dim, self.fusion_cfg.get("gate_type", "channel"), float(self.backbone_cfg.get("dropout", 0)))
 
-        if self.backbone_type == "linear":
+        if self.backbone_type in {"diagonal_ssm", "timesblock_encoder", "mamba"}:
+            self.model = self._build_sequence_model()
+        elif self.backbone_type == "linear":
             self.model = self._build_linear_model()
         elif self.backbone_type == "mlp":
             self.model = self._build_mlp_model()
@@ -898,12 +1231,12 @@ class RecipeModel(nn.Module):
             self.model = self._build_tcn_model()
         elif self.backbone_type == "nbeats":
             self.model = self._build_nbeats_model()
-        elif self.backbone_type == "timesnet":
+        elif self.backbone_type == "timesnet_lite":
             self.model = self._build_timesnet_model()
         elif self.backbone_type == "rnn":
             self.model = self._build_rnn_model()
-        elif self.backbone_type == "ssm":
-            self.model = self._build_ssm_model()
+        elif self.backbone_type == "gated_depthwise_conv":
+            self.model = self._build_gated_depthwise_conv_model()
         elif self.backbone_type == "mixer":
             self.model = self._build_mixer_model()
         else:
@@ -912,7 +1245,7 @@ class RecipeModel(nn.Module):
         attention = self.backbone_cfg.get("attention", "none")
         self.input_attention = None
         if self.backbone_type != "transformer" and attention != "none":
-            width = int(self.backbone_cfg.get("hidden_dim", self.backbone_cfg.get("state_dim", 64)))
+            width = int(self.backbone_cfg.get("hidden_dim", 64))
             self.input_attention = nn.Sequential(nn.Linear(1, width), TokenAttention(width, 1, attention), nn.Linear(width, 1))
 
     def _require_num_channels(self, reason: str) -> int:
@@ -925,7 +1258,7 @@ class RecipeModel(nn.Module):
             return None
         multiplier = 1
         for action in self.recipe.get("preprocessing", {}).get("actions", []):
-            if action.get("type") == "missing_mask" and bool(action.get("mask_channel", False)):
+            if action.get("type") == "missing_mask" and bool(action.get("mask_channel", True)):
                 multiplier += 1
         return int(num_channels) * multiplier
 
@@ -941,14 +1274,14 @@ class RecipeModel(nn.Module):
 
         dropout = float(self.backbone_cfg.get("dropout", 0.0))
         channels = self._require_num_channels(f"fusion.type='{self.fusion_type}'")
-        if self.fusion_type in {"feature", "feature_then_temporal"}:
+        if self.fusion_type == "feature_mlp":
             return ChannelMixer(channels, dropout=dropout), nn.Identity()
-        if self.fusion_type == "temporal_then_feature":
-            return nn.Identity(), ChannelMixer(channels, dropout=dropout)
+        if self.fusion_type == "feature_then_temporal":
+            return OrderedChannelMixer(channels, gate=self.fusion_cfg.get("gate", False), residual=self.fusion_cfg.get("residual", False), dropout=dropout), nn.Identity()
+        if self.fusion_type in {"temporal_then_feature", "variate_attention", "gated_hybrid"}:
+            return nn.Identity(), nn.Identity()
         if self.fusion_type == "graph":
-            return GraphChannelMixer(channels, dropout=dropout), nn.Identity()
-        if self.fusion_type == "gated_hybrid":
-            return GatedHybridMixer(channels, dropout=dropout), nn.Identity()
+            return GraphChannelMixer(channels, dropout=dropout, adjacency=self.graph_adjacency, source=self.fusion_cfg.get("adjacency_source", "learned"), sparsity=float(self.fusion_cfg.get("sparsity", 0))), nn.Identity()
         raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
 
     def _build_channel_mixer(self) -> nn.Module:
@@ -963,19 +1296,25 @@ class RecipeModel(nn.Module):
 
     def _build_preprocessing(self, recipe: dict[str, Any]) -> list[nn.Module]:
         modules: list[nn.Module] = []
+        channels = self.num_channels
         for action in recipe.get("preprocessing", {}).get("actions", [{"type": "none"}]):
             action_type = action["type"]
             if action_type == "none":
                 modules.append(NoOpPreprocessing())
+            elif action_type == "last_value_centering":
+                modules.append(LastValueCenteringAction())
             elif action_type == "instance_norm":
+                if action.get("affine") and channels is None:
+                    raise ValueError("affine instance_norm requires num_channels")
                 modules.append(
                     InstanceNormAction(
                         affine=bool(action.get("affine", False)),
                         eps=float(action.get("eps", 1e-5)),
+                        num_channels=channels or 1,
                     )
                 )
             elif action_type == "series_decomposition":
-                modules.append(SeriesDecompositionAction(kernel_size=int(action["kernel_size"])))
+                modules.append(SeriesDecompositionAction(kernel_size=int(action["kernel_size"]), input_len=self.input_len, horizon=self.horizon))
             elif action_type == "seasonal_differencing":
                 modules.append(
                     SeasonalDifferencingAction(
@@ -986,10 +1325,11 @@ class RecipeModel(nn.Module):
             elif action_type == "missing_mask":
                 modules.append(
                     MissingMaskAction(
-                        fill_policy=str(action.get("fill_policy", "zero")),
-                        mask_channel=bool(action.get("mask_channel", False)),
+                        mask_channel=bool(action.get("mask_channel", True)),
                     )
                 )
+                if action.get("mask_channel", True) and channels is not None:
+                    channels *= 2
             elif action_type == "sample_reweighting":
                 modules.append(SampleReweightingAction(scheme=str(action.get("scheme", "uniform"))))
             else:
@@ -1053,16 +1393,21 @@ class RecipeModel(nn.Module):
         raise ValueError(f"Unsupported temporal embedding type: {self.embedding_type}")
 
     def _build_linear_model(self) -> nn.Module:
+        def projection(width: int) -> nn.Module:
+            bias = bool(self.backbone_cfg.get("bias", True))
+            if self.backbone_cfg.get("shared", True):
+                return nn.Linear(width, self.latent_dim, bias=bias)
+            return ChannelLinear(width, self.latent_dim, self._require_num_channels("linear.shared=false"), bias)
         if self.embedding_type == "invert":
-            return nn.Sequential(self._build_temporal_embedding(), nn.Linear(self._embedding_d_model(), self.horizon))
+            return nn.Sequential(self._build_temporal_embedding(), projection(self._embedding_d_model()))
         if self.embedding_type == "none":
-            return nn.Linear(self.input_len, self.horizon, bias=bool(self.backbone_cfg.get("bias", True)))
+            return projection(self.input_len)
 
         d_model = self._embedding_d_model()
         return nn.Sequential(
             self._build_temporal_embedding(d_model),
             nn.Flatten(start_dim=1),
-            nn.Linear(self._embedding_token_count() * d_model, self.horizon),
+            projection(self._embedding_token_count() * d_model),
         )
 
     def _build_mlp_model(self) -> nn.Module:
@@ -1081,7 +1426,7 @@ class RecipeModel(nn.Module):
                         _activation(activation),
                     ]
                 )
-            layers.extend([nn.Dropout(dropout), nn.Linear(hidden_dim, self.horizon)])
+            layers.extend([nn.Dropout(dropout), nn.Linear(hidden_dim, self.latent_dim)])
             return nn.Sequential(*layers)
 
         return nn.ModuleDict(
@@ -1091,7 +1436,7 @@ class RecipeModel(nn.Module):
                 "blocks": nn.Sequential(
                     *[ResidualMLPBlock(hidden_dim, dropout, activation) for _ in range(depth)]
                 ),
-                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.horizon)),
+                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.latent_dim)),
             }
         )
 
@@ -1127,10 +1472,10 @@ class RecipeModel(nn.Module):
                     encoder_layer,
                     num_layers=int(self.backbone_cfg["n_layers"]),
                 ) if self.backbone_cfg.get("attention", "full") == "full" else nn.Sequential(*[
-                    nn.Sequential(TokenAttention(d_model, n_heads, self.backbone_cfg["attention"], float(self.backbone_cfg["dropout"])), ResidualMLPBlock(d_model, float(self.backbone_cfg["dropout"]), "gelu"))
+                    nn.Sequential(TokenAttention(d_model, n_heads, self.backbone_cfg["attention"], float(self.backbone_cfg["dropout"])), ResidualMLPBlock(d_model, float(self.backbone_cfg["dropout"]), "gelu", float(self.backbone_cfg.get("ffn_mult", 4.0))))
                     for _ in range(int(self.backbone_cfg["n_layers"]))
                 ]),
-                "head": nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.horizon)),
+                "head": nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.latent_dim)),
             }
         )
 
@@ -1142,7 +1487,7 @@ class RecipeModel(nn.Module):
         self._require_raw_embedding("dlinear")
         return DLinearCore(
             input_len=self.input_len,
-            horizon=self.horizon,
+            horizon=self.latent_dim,
             kernel_size=int(self.backbone_cfg["kernel_size"]),
             bias=bool(self.backbone_cfg.get("bias", True)),
             individual=bool(self.backbone_cfg.get("individual", False)),
@@ -1152,7 +1497,7 @@ class RecipeModel(nn.Module):
     def _build_tcn_model(self) -> nn.Module:
         self._require_raw_embedding("tcn")
         return TCNCore(
-            horizon=self.horizon,
+            horizon=self.latent_dim,
             hidden_dim=int(self.backbone_cfg["hidden_dim"]),
             n_layers=int(self.backbone_cfg["n_layers"]),
             kernel_size=int(self.backbone_cfg["kernel_size"]),
@@ -1164,7 +1509,7 @@ class RecipeModel(nn.Module):
         self._require_raw_embedding("nbeats")
         return NBeatsCore(
             input_len=self.input_len,
-            horizon=self.horizon,
+            horizon=self.latent_dim,
             hidden_dim=int(self.backbone_cfg["hidden_dim"]),
             n_blocks=int(self.backbone_cfg["n_blocks"]),
             n_layers=int(self.backbone_cfg["n_layers"]),
@@ -1173,10 +1518,10 @@ class RecipeModel(nn.Module):
         )
 
     def _build_timesnet_model(self) -> nn.Module:
-        self._require_raw_embedding("timesnet")
+        self._require_raw_embedding("timesnet_lite")
         return TimesNetLiteCore(
             input_len=self.input_len,
-            horizon=self.horizon,
+            horizon=self.latent_dim,
             hidden_dim=int(self.backbone_cfg["hidden_dim"]),
             n_layers=int(self.backbone_cfg["n_layers"]),
             top_k=int(self.backbone_cfg["top_k"]),
@@ -1208,24 +1553,24 @@ class RecipeModel(nn.Module):
             {
                 "embedding": embedding,
                 "rnn": rnn,
-                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.horizon)),
+                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Dropout(dropout), nn.Linear(hidden_dim, self.latent_dim)),
             }
         )
 
-    def _build_ssm_model(self) -> nn.Module:
-        state_dim = int(self.backbone_cfg["state_dim"])
-        embedding, token_dim, _ = self._build_token_embedding_stack(state_dim)
+    def _build_gated_depthwise_conv_model(self) -> nn.Module:
+        hidden_dim = int(self.backbone_cfg["hidden_dim"])
+        embedding, token_dim, _ = self._build_token_embedding_stack(hidden_dim)
         dropout = float(self.backbone_cfg.get("dropout", 0.0))
         kernel_size = int(self.backbone_cfg.get("kernel_size", 5))
         depth = int(self.backbone_cfg.get("depth", 1))
         return nn.ModuleDict(
             {
                 "embedding": embedding,
-                "input_proj": nn.Identity() if token_dim == state_dim else nn.Linear(token_dim, state_dim),
+                "input_proj": nn.Identity() if token_dim == hidden_dim else nn.Linear(token_dim, hidden_dim),
                 "blocks": nn.Sequential(
-                    *[SSMTokenBlock(hidden_dim=state_dim, kernel_size=kernel_size, dropout=dropout) for _ in range(depth)]
+                    *[GatedDepthwiseConvBlock(hidden_dim=hidden_dim, kernel_size=kernel_size, dropout=dropout) for _ in range(depth)]
                 ),
-                "head": nn.Sequential(nn.LayerNorm(state_dim), nn.Linear(state_dim, self.horizon)),
+                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.latent_dim)),
             }
         )
 
@@ -1254,28 +1599,30 @@ class RecipeModel(nn.Module):
                         for _ in range(depth)
                     ]
                 ),
-                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.horizon)),
+                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.latent_dim)),
             }
         )
 
     def _build_prediction_head(self) -> nn.Module:
         head_type = self.head_cfg["type"]
         if head_type in {"linear", "direct_multi_horizon"}:
-            from execution_contract import LinearHead, DirectMultiHorizonHead
-            return LinearHead() if head_type == "linear" else DirectMultiHorizonHead()
+            return LinearHead(self.latent_dim, self.horizon) if head_type == "linear" else DirectMultiHorizonHead(self.latent_dim, self.horizon)
         if head_type == "residual_correction":
             return ResidualCorrectionHead(
+                latent_dim=self.latent_dim,
                 horizon=self.horizon,
                 correction_dim=int(self.head_cfg.get("correction_dim", max(self.horizon, 8))),
                 dropout=float(self.backbone_cfg.get("dropout", 0.0)),
             )
         if head_type == "quantile":
             return QuantilePointHead(
+                latent_dim=self.latent_dim,
                 horizon=self.horizon,
                 quantiles=[float(value) for value in self.head_cfg.get("quantiles", [0.5])],
             )
         if head_type == "gaussian":
             return GaussianPointHead(
+                latent_dim=self.latent_dim,
                 horizon=self.horizon,
                 variance_floor=float(self.head_cfg.get("variance_floor", 1e-6)),
             )
@@ -1284,17 +1631,18 @@ class RecipeModel(nn.Module):
     def _prepare_flat_series(
         self,
         x: torch.Tensor,
+        missing_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int, int, tuple[torch.Tensor, torch.Tensor], list[tuple[str, Any]]]:
         contexts: list[tuple[str, Any]] = []
         for module in self.preprocessing:
-            x = module.forward_transform(x, contexts)
+            x = module.forward_transform(x, contexts, missing_mask) if isinstance(module, MissingMaskAction) else module.forward_transform(x, contexts)
 
         x = self.channel_mixer(x)
         if self.embedding_type == "invert":
             location = x.mean(dim=1, keepdim=True).detach()
             scale = torch.sqrt(x.var(dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         else:
-            location = x[:, -1:, :]
+            location = torch.zeros_like(x[:, -1:, :])
             scale = torch.ones_like(location)
         series = (x - location) / scale
         batch_size, seq_len, channels = series.shape
@@ -1313,6 +1661,8 @@ class RecipeModel(nn.Module):
         exogenous_past: torch.Tensor | None = None,
         exogenous_future: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if exogenous_future is not None and exogenous_future.numel():
+            raise ValueError("UNSUPPORTED_COVARIATE: exogenous_future is not supported")
         if x is not None:
             if target_history is not None or exogenous_past is not None or exogenous_future is not None:
                 raise ValueError("Provide either x or structured covariate inputs, not both")
@@ -1396,14 +1746,14 @@ class RecipeModel(nn.Module):
 
         def output(module: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
             values = module(tokens if self.embedding_type == "invert" else tokens.mean(dim=1))
-            return values.reshape(-1, self.horizon)
+            return values.reshape(-1, self.latent_dim)
 
         if self.backbone_type == "linear":
             if self.embedding_type == "calendar":
                 return self.model[1:](embed(self.model[0]))
-            return self.model(series).reshape(-1, self.horizon)
+            return self.model(series).reshape(-1, self.latent_dim)
 
-        if self.backbone_type in {"dlinear", "tcn", "nbeats", "timesnet"}:
+        if self.backbone_type in {"dlinear", "tcn", "nbeats", "timesnet_lite"}:
             return self.model(series)
 
         if self.backbone_type == "mlp" and self.embedding_type == "none":
@@ -1420,9 +1770,9 @@ class RecipeModel(nn.Module):
             modules = self.model
             tokens = embed(modules["embedding"])
             encoded, _ = modules["rnn"](tokens)
-            return modules["head"](encoded if self.embedding_type == "invert" else encoded[:, -1, :]).reshape(-1, self.horizon)
+            return modules["head"](encoded if self.embedding_type == "invert" else encoded[:, -1, :]).reshape(-1, self.latent_dim)
 
-        if self.backbone_type == "ssm":
+        if self.backbone_type == "gated_depthwise_conv":
             modules = self.model
             tokens = modules["input_proj"](embed(modules["embedding"]))
             tokens = modules["blocks"](tokens)
@@ -1443,6 +1793,21 @@ class RecipeModel(nn.Module):
             encoded = modules["encoder"](tokens + position)
         return output(modules["head"], encoded)
 
+    def _encode_prepared(self, flat: torch.Tensor, batch: int, channels: int, calendar_features: torch.Tensor | None) -> torch.Tensor:
+        latent = self._forward_core(flat, calendar_features).reshape(batch, channels, self.latent_dim)
+        if isinstance(self.latent_mixer, HybridLatentFusion):
+            history = flat.reshape(batch, channels, self.input_len).transpose(1, 2)
+            latent = self.latent_mixer(history, latent)
+        elif isinstance(self.latent_mixer, OrderedChannelMixer):
+            latent = self.latent_mixer(latent.transpose(1, 2)).transpose(1, 2)
+        else:
+            latent = self.latent_mixer(latent)
+        return latent.reshape(-1, self.latent_dim)
+
+    def encode(self, x: torch.Tensor, *, missing_mask: torch.Tensor | None = None, calendar_features: torch.Tensor | None = None) -> torch.Tensor:
+        flat, batch, channels, _, _ = self._prepare_flat_series(x, missing_mask)
+        return self._encode_prepared(flat, batch, channels, calendar_features).reshape(batch, channels, self.latent_dim)
+
     def forward_quantiles(
         self,
         x: torch.Tensor | None = None,
@@ -1451,9 +1816,10 @@ class RecipeModel(nn.Module):
         exogenous_past: torch.Tensor | None = None,
         exogenous_future: torch.Tensor | None = None,
         calendar_features: torch.Tensor | None = None,
+        missing_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(self.prediction_head, GaussianPointHead):
-            mean, scale = self.forward_distribution(x, target_history=target_history, exogenous_past=exogenous_past, exogenous_future=exogenous_future, calendar_features=calendar_features)
+            mean, scale = self.forward_distribution(x, target_history=target_history, exogenous_past=exogenous_past, exogenous_future=exogenous_future, calendar_features=calendar_features, missing_mask=missing_mask)
             levels = mean.new_tensor(self.prediction_head.quantiles)
             z = torch.distributions.Normal(0.0, 1.0).icdf(levels)
             return mean.unsqueeze(-1) + scale.unsqueeze(-1) * z
@@ -1463,8 +1829,8 @@ class RecipeModel(nn.Module):
             exogenous_past=exogenous_past,
             exogenous_future=exogenous_future,
         )
-        flat, batch_size, channels, normalization, contexts = self._prepare_flat_series(x)
-        base_pred = self._forward_core(flat, calendar_features)
+        flat, batch_size, channels, normalization, contexts = self._prepare_flat_series(x, missing_mask)
+        base_pred = self._encode_prepared(flat, batch_size, channels, calendar_features)
         if hasattr(self.prediction_head, "forward_quantiles"):
             quantiles = self.prediction_head.forward_quantiles(base_pred)
         else:
@@ -1485,6 +1851,7 @@ class RecipeModel(nn.Module):
         exogenous_past: torch.Tensor | None = None,
         exogenous_future: torch.Tensor | None = None,
         calendar_features: torch.Tensor | None = None,
+        missing_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self._merge_history(
             x,
@@ -1492,8 +1859,8 @@ class RecipeModel(nn.Module):
             exogenous_past=exogenous_past,
             exogenous_future=exogenous_future,
         )
-        flat, batch_size, channels, normalization, contexts = self._prepare_flat_series(x)
-        pred = self._forward_core(flat, calendar_features)
+        flat, batch_size, channels, normalization, contexts = self._prepare_flat_series(x, missing_mask)
+        pred = self._encode_prepared(flat, batch_size, channels, calendar_features)
         pred = self.prediction_head(pred)
         return self._slice_output_channels(self._restore_point_forecast(
             pred,
@@ -1503,14 +1870,14 @@ class RecipeModel(nn.Module):
             contexts=contexts,
         ))
 
-    def forward_distribution(self, x: torch.Tensor | None = None, *, calendar_features: torch.Tensor | None = None, **inputs) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_distribution(self, x: torch.Tensor | None = None, *, calendar_features: torch.Tensor | None = None, missing_mask: torch.Tensor | None = None, **inputs) -> tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(self.prediction_head, GaussianPointHead):
             raise ValueError("forward_distribution requires a Gaussian head")
         if not isinstance(self.output_mixer, nn.Identity):
             raise ValueError("Gaussian output requires an identity output fusion; use input fusion")
         x = self._merge_history(x, **inputs)
-        flat, batch, channels, normalization, contexts = self._prepare_flat_series(x)
-        mean, scale = self.prediction_head.forward_distribution(self._forward_core(flat, calendar_features))
+        flat, batch, channels, normalization, contexts = self._prepare_flat_series(x, missing_mask)
+        mean, scale = self.prediction_head.forward_distribution(self._encode_prepared(flat, batch, channels, calendar_features))
         location, normalization_scale = normalization
         mean = mean.reshape(batch, channels, self.horizon).permute(0, 2, 1) * normalization_scale + location
         variance = scale.reshape(batch, channels, self.horizon).permute(0, 2, 1).square() * normalization_scale.square()
@@ -1518,7 +1885,7 @@ class RecipeModel(nn.Module):
             if isinstance(module, InstanceNormAction):
                 factor = context[1]
                 if module.affine:
-                    factor = factor / module.scale.clamp_min(module.eps)
+                    factor = factor / module.safe_scale()
                 variance = variance * factor.square()
             elif isinstance(module, SeasonalDifferencingAction):
                 raise ValueError("Gaussian inverse seasonal differencing requires a joint covariance model")
@@ -1530,19 +1897,47 @@ def _extract_recipe(model_config: dict[str, Any]) -> dict[str, Any]:
     recipe = model_config.get("recipe", model_config)
     if not isinstance(recipe, dict):
         raise ValueError("recipe_factory requires model_config.recipe")
-    if recipe.get("recipe_version") != "recipe_schema_v1":
-        raise ValueError("recipe_factory requires recipe_version='recipe_schema_v1'")
+    if recipe.get("recipe_version") == "recipe_schema_v3":
+        from validate import validate_recipe_object
+        errors = validate_recipe_object(recipe)
+        if errors:
+            raise ValueError("; ".join(errors))
+        return recipe
+    if recipe.get("recipe_version") != "recipe_schema_v2":
+        raise ValueError("recipe_factory requires recipe_version='recipe_schema_v2'")
+    for kind, choices in ACTION_FIELDS.items():
+        actions = recipe.get("preprocessing", {}).get("actions", []) if kind == "preprocessing" else [recipe.get(kind, {})]
+        for action in actions:
+            allowed = choices.get(action.get("type"))
+            if allowed is None or set(action) - set(allowed):
+                raise ValueError(f"Unsupported {kind} fields/action: {action}; migrate to recipe_schema_v2")
+    if "dropout" in recipe.get("training_strategy", {}).get("regularization", {}):
+        raise ValueError("regularization.dropout was removed; configure backbone.dropout")
+    actions = recipe.get("preprocessing", {}).get("actions", [])
+    if any(a.get("type") == "missing_mask" and a.get("mask_channel", True) is not True for a in actions):
+        raise ValueError("missing_mask.mask_channel must be true; remove the action to disable it")
     return recipe
 
 
 def build_model(model_config: dict[str, Any], input_len: int, horizon: int) -> nn.Module:
+    # Keep the exported model implementation self-contained.
+    for field in ("known_future_covariates", "known_future_source", "known_future_available", "static_covariates"):
+        if model_config.get(field):
+            raise ValueError(f"UNSUPPORTED_COVARIATE: {field} is not supported")
+    if model_config.get("future_covariate_mode") not in (None, "", "none") or model_config.get("covariate_fusion"):
+        raise ValueError("UNSUPPORTED_COVARIATE: future conditioning/legacy wrappers require retraining")
     num_channels = model_config.get("num_channels")
     num_target_channels = model_config.get("num_target_channels")
     num_past_covariate_channels = model_config.get("num_past_covariate_channels", 0)
     num_future_covariate_channels = model_config.get("num_future_covariate_channels", 0)
     num_output_channels = model_config.get("num_output_channels")
-    return RecipeModel(
-        _extract_recipe(model_config),
+    recipe = _extract_recipe(model_config)
+    model_class = RecipeModel
+    if recipe.get("recipe_version") == "recipe_schema_v3":
+        from factory.typed_model import TypedRecipeModel
+        model_class = TypedRecipeModel
+    return model_class(
+        recipe,
         input_len=input_len,
         horizon=horizon,
         num_channels=int(num_channels) if num_channels is not None else None,
@@ -1550,4 +1945,5 @@ def build_model(model_config: dict[str, Any], input_len: int, horizon: int) -> n
         num_past_covariate_channels=int(num_past_covariate_channels),
         num_future_covariate_channels=int(num_future_covariate_channels),
         num_output_channels=int(num_output_channels) if num_output_channels is not None else None,
+        graph_adjacency=model_config.get("graph_adjacency"),
     )

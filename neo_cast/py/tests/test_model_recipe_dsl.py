@@ -77,7 +77,7 @@ class ModelRecipeDslTest(unittest.TestCase):
     def test_model_recipe_compiles_to_executable_candidate_recipe(self) -> None:
         compiled = compile_model_recipe(make_model_recipe())
 
-        self.assertEqual(compiled["recipe_version"], "recipe_schema_v1")
+        self.assertEqual(compiled["recipe_version"], "recipe_schema_v2")
         self.assertEqual(compiled["recipe_id"], "recipe_multiscaletinyforecaster")
         self.assertEqual(compiled["preprocessing"]["actions"][0]["type"], "series_decomposition")
         self.assertEqual(compiled["embedding"]["type"], "none")
@@ -104,7 +104,7 @@ class ModelRecipeDslTest(unittest.TestCase):
 
         resolved = resolve_payload(make_model_recipe())
         self.assertEqual(resolved["schema_version"], "resolved_candidate.v1")
-        self.assertEqual(resolved["model_config"]["recipe"]["recipe_version"], "recipe_schema_v1")
+        self.assertEqual(resolved["model_config"]["recipe"]["recipe_version"], "recipe_schema_v2")
         self.assertEqual(resolved["model_recipe"]["schema_version"], "model_recipe.v1")
         self.assertEqual(resolved["task"]["input_len"], 96)
         self.assertEqual(resolved["task"]["horizons"], [24])

@@ -93,6 +93,17 @@ console.log(JSON.stringify({ event: "dataset_prepared", source_csv: spec.source_
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${process.execPath} -e '
+const fs = require("fs"), crypto = require("crypto")
+const file = process.env.NEO_CAST_EXECUTION_CONTRACT
+if (!file || !fs.existsSync(file)) process.exit(0)
+const c = JSON.parse(fs.readFileSync(file))
+const canonical = v => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v)
+const digest = crypto.createHash("sha256").update(canonical(c)).digest("hex")
+const manifest = { event: "executed_model_manifest", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: digest, actual: c.expected }
+console.log(JSON.stringify(manifest))
+console.log(JSON.stringify({ event: "execution_contract_verified", status: "verified", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: digest, manifest }))
+'
 candidate_id="mock_candidate"
 run_suffix="$(printf '%s' "$candidate_id" | tr -cd '[:alnum:]_-' | cut -c1-32)"
 if [[ -z "$run_suffix" ]]; then run_suffix="mock"; fi
@@ -120,6 +131,10 @@ printf '{"event":"done","status":"success"}\\n'
 `,
     "utf8",
   )
+  const fullRunner = (await readFile(path.join(root, "py", "validate.py"), "utf8"))
+    .replace("smoke_eval_done", "eval_done")
+    .replace('"event":"done"', '"event":"cv_eval_done","cv_avg_mse":0.123,"cv_std_mse":0.01,"val_avg_mse":0.123,"val_avg_mae":0.456')
+  await writeFile(path.join(root, "py", "runner.py"), fullRunner, "utf8")
 }
 
 afterEach(async () => {
@@ -168,7 +183,7 @@ describe("AutoResearch alpha e2e smoke", () => {
           Research.Service.use((svc) =>
             svc.runAutonomousLoop({
               taskID: task.id,
-              stage: "smoke",
+              stage: "full",
               maxIterations: 2,
               maxNoImprove: 5,
               description: "alpha e2e mock loop",
@@ -209,5 +224,5 @@ describe("AutoResearch alpha e2e smoke", () => {
         })
       },
     })
-  })
+  }, 30_000)
 })

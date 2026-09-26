@@ -8,24 +8,25 @@ import argparse
 import importlib.util
 import json
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from prepare_tsf import (
-    ACTIVE_SPEC,
-    DATASET,
-    FEATURE_COLUMNS,
-    HORIZONS,
-    INPUT_LEN,
-    KNOWN_FUTURE_COVARIATES,
-    NUM_CHANNELS,
-    PAST_COVARIATE_COLUMNS,
-    build_preprocess_spec,
-)
+from runtime_config import ACTIVE_SPEC, DATASET, HORIZONS, INPUT_LEN, NUM_CHANNELS
 from research_trace import build_research_trace
+
+FEATURE_COLUMNS = ACTIVE_SPEC.feature_columns
+KNOWN_FUTURE_COVARIATES = ACTIVE_SPEC.known_future_covariates
+PAST_COVARIATE_COLUMNS = tuple(dict.fromkeys((*ACTIVE_SPEC.observed_past_covariates, *KNOWN_FUTURE_COVARIATES)))
+
+
+def build_preprocess_spec() -> dict[str, Any]:
+    # Compatibility for old artifacts without the training-time snapshot.
+    from prepare_tsf import build_preprocess_spec as build
+    return build()
 
 
 PY_ROOT = Path(__file__).resolve().parent
@@ -140,12 +141,17 @@ def build_metadata(
     ref_test_metrics: dict[str, Any] | None = None,
     training_summary: dict[str, Any] | None = None,
     created_at: str | None = None,
+    preprocess: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from dataset_contract import reject_unsupported_covariates
+
+    reject_unsupported_covariates(training_summary or {})
     try:
-        feature_names = list(build_preprocess_spec()["feature_names"])
+        feature_names = list((preprocess if preprocess is not None else build_preprocess_spec())["feature_names"])
     except FileNotFoundError:
         feature_names = list(FEATURE_COLUMNS)
     metadata = {
+        "runtime_semantics_revision": (training_summary or {}).get("runtime_semantics_revision", 2),
         "artifact_version": "artifact.v1",
         "dataset_schema_version": ACTIVE_SPEC.schema_version,
         "run_id": run_id,
@@ -160,7 +166,6 @@ def build_metadata(
         "feature_names": feature_names,
         "target_columns": list(ACTIVE_SPEC.target_columns),
         "used_observed_past_covariates": list(ACTIVE_SPEC.observed_past_covariates),
-        "used_known_future_covariates": list(ACTIVE_SPEC.known_future_covariates),
         "target_channels": NUM_CHANNELS,
         "past_exogenous_channels": len(PAST_COVARIATE_COLUMNS),
         "future_exogenous_channels": len(KNOWN_FUTURE_COVARIATES),
@@ -279,6 +284,8 @@ def build_model_spec(metadata: dict[str, Any], candidate: dict[str, Any] | None)
             **({"quantiles": quantiles} if isinstance(quantiles, list) and quantiles else {}),
         },
         "estimated_params": estimated_params,
+        "runtime_semantics_revision": metadata.get("runtime_semantics_revision", 2),
+        "implementation_status": "paper_derived" if _recipe_module_type(recipe, "backbone") == "timesnet_lite" else "native",
     }
 
 
@@ -384,7 +391,7 @@ def render_eval_report(metadata: dict[str, Any], research_trace: dict[str, Any] 
     if "session_id" in metadata:
         lines.append(f"- session_id: `{metadata['session_id']}`")
     if training_summary:
-        for field in ("num_params_M", "training_seconds", "total_seconds", "peak_vram_mb"):
+        for field in ("runtime_semantics_revision", "implementation_status", "backbone", "num_params_M", "training_seconds", "total_seconds", "peak_vram_mb"):
             if field in training_summary:
                 lines.append(f"- {field}: `{training_summary[field]}`")
 
@@ -475,12 +482,13 @@ def _native_model_config(candidate, metadata):
 
 def _normalize_history(history, preprocess):
     if isinstance(history, dict):
-        calendar = {key: history[key] for key in ("timestamps", "calendar_features") if key in history}
+        if np.asarray(history.get("exogenous_future", [])).size:
+            raise ValueError("UNSUPPORTED_COVARIATE: exogenous_future is not supported")
+        calendar = {key: history[key] for key in ("timestamps", "calendar_features", "missing_mask") if key in history}
         if "history" in history:
             return {"history": _normalize_history(history["history"], preprocess), **calendar}
         target = np.asarray(history["target_history"], dtype=np.float32)
         past = np.asarray(history.get("exogenous_past", []), dtype=np.float32)
-        future = np.asarray(history.get("exogenous_future", []), dtype=np.float32)
         target_scaler = preprocess["target_scaler"]
         target = (target - np.asarray(target_scaler["mean"], dtype=np.float32)) / np.asarray(target_scaler["scale"], dtype=np.float32)
         covariate_scaler = preprocess.get("covariate_scaler")
@@ -488,11 +496,7 @@ def _normalize_history(history, preprocess):
             mean = np.asarray(covariate_scaler["mean"], dtype=np.float32)
             std = np.asarray(covariate_scaler["scale"], dtype=np.float32)
             past = (past - mean[:past.shape[-1]]) / std[:past.shape[-1]]
-            future_names = preprocess["known_future_covariate_names"]
-            all_names = list(dict.fromkeys(preprocess["observed_past_covariate_names"] + future_names))
-            indices = [all_names.index(name) for name in future_names]
-            future = (future - mean[indices]) / std[indices]
-        return {"target_history": target, "exogenous_past": past, "exogenous_future": future, **calendar}
+        return {"target_history": target, "exogenous_past": past, **calendar}
     array = np.asarray(history, dtype=np.float32)
     mean = np.asarray(preprocess["scaler_mean"], dtype=np.float32)
     std = np.asarray(preprocess["scaler_std"], dtype=np.float32)
@@ -503,7 +507,15 @@ def load_model(device: str | None = None):
     metadata = _load_json("metadata.json")
     preprocess = _load_json("preprocess.json")
     checkpoint = torch.load(ARTIFACT_DIR / "model.pt", map_location=device or "cpu")
+    if checkpoint.get("runtime_semantics_revision") not in (2, 3) or metadata.get("runtime_semantics_revision") != checkpoint.get("runtime_semantics_revision"):
+        raise ValueError("Incompatible legacy runtime semantics; retrain with recipe_schema_v2")
     candidate = checkpoint["candidate"]
+    for payload in (metadata, metadata.get("training_summary", {}), checkpoint, candidate.get("model_config", {}), preprocess):
+        for field in ("used_known_future_covariates", "known_future_covariate_names", "num_future_covariate_channels", "future_exogenous_channels", "static_covariates", "covariate_fusion"):
+            if payload.get(field):
+                raise ValueError(f"UNSUPPORTED_COVARIATE: legacy artifact contains {field}; retrain without future/static conditioning")
+        if payload.get("future_covariate_mode") not in (None, "", "none"):
+            raise ValueError("UNSUPPORTED_COVARIATE: legacy future_covariate_mode; retrain")
     state_dicts = checkpoint["state_dicts"]
 
     device_obj = torch.device(device or "cpu")
@@ -516,7 +528,13 @@ def load_model(device: str | None = None):
                 "Re-train the candidate with native fusion."
             )
         model = BUILD_MODEL(_native_model_config(candidate, metadata), metadata["input_len"], horizon).to(device_obj)
+        if getattr(model, "runtime_semantics_revision", 2) != checkpoint["runtime_semantics_revision"]:
+            raise ValueError("Recipe and checkpoint runtime revisions differ")
         model.load_state_dict(state_dict)
+        expected_manifest = checkpoint.get("model_manifests", {}).get(str(horizon), {})
+        if expected_manifest.get("parameter_graph_digest"):
+            if MODEL_IMPL.parameter_graph_digest(model) != expected_manifest["parameter_graph_digest"]:
+                raise ValueError("Model parameter graph differs from the trained artifact; retrain")
         model.eval()
         models[horizon] = model
     return {
@@ -534,6 +552,8 @@ def _inference_inputs(bundle, history, horizon):
         raise ValueError(f"Unsupported horizon: {horizon}")
     calendar = None
     if isinstance(history, dict):
+        if np.asarray(history.get("exogenous_future", [])).size:
+            raise ValueError("UNSUPPORTED_COVARIATE: exogenous_future is not supported")
         calendar = history.get("calendar_features")
         if calendar is None and "timestamps" in history:
             dates = np.asarray(history["timestamps"], dtype="datetime64[s]")
@@ -560,7 +580,6 @@ def _inference_inputs(bundle, history, horizon):
             for key, shape in {
                 "target_history": (metadata["input_len"], metadata["target_channels"]),
                 "exogenous_past": (metadata["input_len"], metadata["past_exogenous_channels"]),
-                "exogenous_future": (horizon, metadata["future_exogenous_channels"]),
             }.items()
         }
     else:
@@ -568,6 +587,9 @@ def _inference_inputs(bundle, history, horizon):
         inputs = {"x": tensor(values, (metadata["input_len"], metadata["num_channels"]), "history")}
     if calendar is not None:
         inputs["calendar_features"] = tensor(calendar, (metadata["input_len"], 4), "calendar_features")
+    if isinstance(history, dict) and "missing_mask" in history:
+        channels = metadata.get("model_input_channels", metadata.get("num_channels", metadata.get("target_channels")))
+        inputs["missing_mask"] = tensor(history["missing_mask"], (metadata["input_len"], channels), "missing_mask")
     return inputs
 
 
@@ -822,6 +844,7 @@ def write_export_files(
     metadata: dict[str, Any],
     *,
     candidate: dict[str, Any] | None,
+    preprocess: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -844,13 +867,36 @@ def write_export_files(
     metadata_path.write_text(f"{json.dumps(metadata, indent=2, sort_keys=True)}\n", encoding="utf-8")
     write_json(research_trace_path, research_trace)
     report_path.write_text(render_eval_report(metadata, research_trace=research_trace), encoding="utf-8")
-    write_json(preprocess_path, build_preprocess_spec())
+    # Keep the exact scaler/splits used by training, including on later exports.
+    if not preprocess_path.exists():
+        write_json(preprocess_path, preprocess if preprocess is not None else build_preprocess_spec())
     family_module_path = (
         PY_ROOT / "factory" / "build_model.py"
         if metadata["model_family"] == "recipe_factory"
         else PY_ROOT / "families" / f"{metadata['model_family']}.py"
     )
     model_impl_path.write_text(family_module_path.read_text(encoding="utf-8"), encoding="utf-8")
+    if metadata.get("runtime_semantics_revision") == 3 and metadata["model_family"] == "recipe_factory":
+        # Copy a uniquely named private runtime, avoiding imports from the host workspace.
+        package_name = "_neocast_runtime_" + re.sub(r"[^a-zA-Z0-9_]", "_", metadata["run_id"])
+        package_root = artifact_dir / package_name
+        package_root.mkdir(exist_ok=True)
+        (package_root / "__init__.py").write_text("")
+        for directory in ("factory", "registry", "schemas"):
+            shutil.copytree(PY_ROOT / directory, package_root / directory, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(PY_ROOT / "validate.py", package_root / "validate.py")
+        for source in package_root.rglob("*.py"):
+            code = source.read_text()
+            for module in ("factory", "registry", "validate"):
+                code = code.replace(f"from {module}.", f"from {package_name}.{module}.")
+                code = code.replace(f"from {module} import", f"from {package_name}.{module} import")
+            source.write_text(code)
+        model_impl_path.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parent))\n"
+            f"from {package_name}.factory.build_model import build_model, parameter_graph_digest\n"
+        )
     inference_path.write_text(render_inference_py(), encoding="utf-8")
     write_json(tool_schema_path, render_tool_schema(metadata))
     model_spec = build_model_spec(metadata, candidate)
@@ -880,6 +926,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def update_ref_test_export(artifact_dir: Path, *, run_id: str, metrics: dict[str, Any]) -> tuple[Path, Path]:
+    """Refresh evaluation documents without rebuilding the trained runtime package."""
+    metadata_path = artifact_dir / "metadata.json"
+    metadata = load_json(metadata_path)
+    if metadata["run_id"] != run_id:
+        raise ValueError("Reference-test export run_id does not match the artifact")
+    metadata["ref_test_metrics"] = metrics
+    errors = validate_metadata_payload(metadata)
+    if errors:
+        raise ValueError("Invalid reference-test metadata: " + "; ".join(errors))
+    candidate = load_json(artifact_dir / "resolved_candidate.json")
+    trace = build_research_trace(metadata, candidate)
+    report_path = artifact_dir / metadata["files"]["eval_report_md"]
+    report = render_eval_report(metadata, research_trace=trace)
+    write_json(metadata_path, metadata)
+    write_json(artifact_dir / metadata["files"]["research_trace_json"], trace)
+    report_path.write_text(report, encoding="utf-8")
+    return metadata_path, report_path
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -897,13 +963,16 @@ def main() -> None:
     ref_test_metrics = _load_optional_json(args.ref_test_metrics_json)
     training_summary = _load_optional_json(args.training_summary_json or artifact_dir / "training_summary.json")
     cv_metrics = _load_optional_json(artifact_dir / "cv_metrics.json")
+    preprocess_path = artifact_dir / "preprocess.json"
+    preprocess = load_json(preprocess_path) if preprocess_path.exists() else None
 
     model_family = args.model_family or (candidate or {}).get("model_family")
     if not model_family:
         raise SystemExit("error: model_family is required")
 
-    family_module = _load_family_module(model_family)
-    family_spec = family_module.FAMILY_SPEC
+    family_spec = (training_summary or {}).get("export_spec")
+    if family_spec is None:
+        family_spec = _load_family_module(model_family).FAMILY_SPEC
     model_impl_entry = args.model_impl_entry or family_spec["model_impl_entry"]
     state_dict_layout = args.state_dict_layout or family_spec["state_dict_layout"]
     candidate_id = args.candidate_id or (candidate or {}).get("candidate_id")
@@ -926,6 +995,7 @@ def main() -> None:
         ref_test_metrics=ref_test_metrics,
         training_summary=training_summary,
         created_at=args.created_at,
+        preprocess=preprocess,
     )
 
     errors = validate_metadata_payload(metadata)
@@ -934,7 +1004,7 @@ def main() -> None:
             print(f"error: {item}")
         raise SystemExit(1)
 
-    metadata_path, report_path = write_export_files(artifact_dir, metadata, candidate=candidate)
+    metadata_path, report_path = write_export_files(artifact_dir, metadata, candidate=candidate, preprocess=preprocess)
     print("export_status: success")
     print(f"artifact_dir: {artifact_dir}")
     print(f"metadata_path: {metadata_path}")

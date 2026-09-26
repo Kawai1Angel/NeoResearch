@@ -218,7 +218,7 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
   const direction = objectiveDirection(input.task.objective)
   const candidatesByID = new Map(input.candidates.map((candidate) => [candidate.id, candidate] as const))
 
-  const ordered = input.runs.filter((run) => run.status !== "invalid").sort((a, b) => a.time.created - b.time.created)
+  const ordered = [...input.runs].sort((a, b) => a.time.created - b.time.created)
   const succeeded: { run: ResearchRun; metric: number }[] = []
   const ineffective: ReflectionIneffectiveChange[] = []
   const effective: ReflectionEffectiveChange[] = []
@@ -265,15 +265,15 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
       }
       succeeded.push({ run, metric: value })
       failedStreak = 0
-    } else if (run.status === "failed" || run.status === "rejected") {
+    } else if (run.status === "failed" || run.status === "rejected" || run.status === "invalid") {
       const candidate = run.candidateID ? candidatesByID.get(run.candidateID) : undefined
       failures.push({
         runID: run.id,
         candidateID: candidate?.id,
         category: classifyFailure(run),
-        summary: run.error?.split("\n")[0] ?? `${run.status} run`,
+        summary: run.error ?? `${run.status} run`,
       })
-      failedStreak += 1
+      if (run.status !== "invalid") failedStreak += 1
     }
   }
 

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdtemp } from "fs/promises"
 import { tmpdir } from "os"
 import path from "path"
-import { proposeLLMCandidate } from "../../src/research/llm-proposal"
+import { buildUserPrompt, proposeLLMCandidate } from "../../src/research/llm-proposal"
 import type { DomainProposalContext } from "../../src/research/domain"
 import type { ResearchTask } from "../../src/research/schema"
 
@@ -29,7 +29,7 @@ afterEach(() => {
 
 function llmRecipe() {
   return {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: "recipe_llm_native_candidate",
     hypothesis: "LLM proposes a native candidate.",
     preprocessing: { actions: [{ type: "none" }] },
@@ -41,7 +41,7 @@ function llmRecipe() {
       loss: { base: "mse", horizon_weighting: "uniform" },
       optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.01 },
       scheduler: { type: "none", warmup_steps: 0 },
-      regularization: { dropout: 0.1, grad_clip: 1 },
+      regularization: { grad_clip: 1 },
       budget: { max_epochs: 5, time_budget_s: 120, batch_size: 16, patience: 2, seed: 42 },
     },
   }
@@ -49,7 +49,7 @@ function llmRecipe() {
 
 function bridgeSafeLLMRecipe(overrides: Record<string, unknown> = {}) {
   return {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: "recipe_llm_bridge_safe",
     hypothesis: "LLM proposes a conservative bridge-safe candidate.",
     preprocessing: { actions: [{ type: "none" }] },
@@ -61,7 +61,7 @@ function bridgeSafeLLMRecipe(overrides: Record<string, unknown> = {}) {
       loss: { base: "mse", horizon_weighting: "uniform" },
       optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.01 },
       scheduler: { type: "none", warmup_steps: 0 },
-      regularization: { dropout: 0.1, grad_clip: 1 },
+      regularization: { grad_clip: 1 },
       budget: { max_epochs: 5, time_budget_s: 120, batch_size: 16, patience: 2, seed: 42 },
     },
     ...overrides,
@@ -164,7 +164,7 @@ test("bridge-mode LLM proposals require review when the content raises execution
     loss: { base: "mse", horizon_weighting: "uniform" },
     optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.01 },
     scheduler: { type: "none", warmup_steps: 0 },
-    regularization: { dropout: 0.1, grad_clip: 1 },
+    regularization: { grad_clip: 1 },
     budget: { max_epochs: 200, time_budget_s: 1_800, batch_size: 4_096, patience: 10, seed: 42 },
   }
   globalThis.fetch = (() =>
@@ -250,6 +250,115 @@ test("LLM proposal prompt exposes profile-derived search directives", async () =
   expect(prompt).toContain("sample_reweighting")
   expect(prompt).toContain("huber")
   expect(prompt).toContain("acfMainPeriod")
+})
+
+test("ModelDesigner prompt summarizes correlation matrices and other unbounded arrays", () => {
+  const width = 321
+  const columns = Array.from({ length: width }, (_, index) => String(index))
+  const values = Array.from({ length: width }, (_, left) =>
+    Array.from({ length: width }, (_, right) => left === right ? 1 : Number((1 / (1 + Math.abs(left - right))).toFixed(6))),
+  )
+  const datasetProfile = {
+    targetCount: width,
+    crossVarCorrelation: 0.5,
+    correlationMatrix: { columns, values },
+  }
+  const prompt = JSON.parse(buildUserPrompt({
+    task: {
+      ...task(false),
+      taskSpec: { dataset: { targetCols: columns } },
+    },
+    proposalContext: {
+      ...proposalContext,
+      taskFingerprint: { datasetProfile },
+      runs: [{
+        candidateID: "candidate_large_metrics",
+        stage: "full",
+        status: "failed",
+        metrics: {
+          perTargetMSE: Array.from({ length: width }, (_, index) => index / width),
+          residualMatrix: [[1, 2, 3], [2, 4, 6]],
+          trainingCurve: [
+            { phase: "cv", foldIndex: 1, horizon: 96, epoch: 1, valLoss: 0.5 },
+            { phase: "cv", foldIndex: 1, horizon: 96, epoch: 2, valLoss: 0.4 },
+            { phase: "cv", foldIndex: 2, horizon: 96, epoch: 1, valLoss: 0.7 },
+          ],
+        },
+      }],
+      memory: [{
+        scope: "task",
+        outcome: "failed",
+        lesson: "large fingerprint must be summarized",
+        fingerprintSummary: { datasetProfile },
+        candidateSummary: {},
+      }],
+    },
+    dataAnalysisMarkdown: [
+      "# Dataset Analysis Report",
+      "",
+      "## Correlation Matrix",
+      "",
+      "FULL_MATRIX_SENTINEL",
+      "",
+      "## Search Handoff",
+      "",
+      "- cross_var_correlated",
+    ].join("\n"),
+  }))
+
+  expect(prompt.taskFingerprint.datasetProfile).toBeUndefined()
+  expect(prompt.taskFingerprint.datasetProfileAnalysis.correlationStructure).toMatchObject({
+    kind: "correlation_matrix_summary",
+    rows: width,
+    columns: width,
+  })
+  expect(prompt.taskFingerprint.datasetProfileAnalysis.metrics.crossVarCorrelation).toMatchObject({
+    value: 0.5,
+    assessment: expect.any(String),
+    modelingImplication: expect.any(String),
+  })
+  expect(prompt.taskFingerprint.datasetProfileAnalysis.correlationStructure.strongestPairs.length).toBeLessThanOrEqual(12)
+  expect(prompt.memory[0].fingerprintSummary).toBeUndefined()
+  expect(prompt.memory[0].fingerprintAnalysis).toEqual({ relationship: "same_task" })
+  expect(prompt.runs[0].metrics.perTargetMSE).toMatchObject({
+    kind: "numeric_array_analysis",
+    count: width,
+    mean: expect.any(Number),
+    standardDeviation: expect.any(Number),
+    analysis: expect.any(String),
+  })
+  expect(prompt.runs[0].metrics.residualMatrix).toMatchObject({
+    kind: "numeric_matrix_analysis",
+    rows: 2,
+    columns: 3,
+    valueDistribution: expect.objectContaining({
+      mean: 3,
+      analysis: expect.any(String),
+    }),
+    rowMeanDistribution: expect.objectContaining({ analysis: expect.any(String) }),
+    columnMeanDistribution: expect.objectContaining({ analysis: expect.any(String) }),
+  })
+  expect(prompt.runs[0].metrics.trainingCurve).toMatchObject({
+    kind: "training_curve_analysis",
+    rawPointCount: 3,
+    validPointCount: 3,
+    analysis: expect.stringContaining("independently"),
+  })
+  expect(prompt.runs[0].metrics.trainingCurve.series).toHaveLength(2)
+  expect(prompt.runs[0].metrics.trainingCurve.series[0]).toMatchObject({
+    firstValLoss: 0.5,
+    lastValLoss: 0.4,
+    analysis: expect.stringContaining("improved"),
+  })
+  expect(prompt.task.taskSpec.dataset.targetCols).toMatchObject({
+    kind: "collection_analysis",
+    count: width,
+    uniqueCount: width,
+    analysis: expect.any(String),
+  })
+  expect(prompt.dataAnalysisReport).not.toContain("FULL_MATRIX_SENTINEL")
+  expect(prompt.dataAnalysisReport).toContain("Full matrix omitted from LLM context")
+  expect(JSON.stringify(prompt).length).toBeLessThan(50_000)
 })
 
 test("LLM proposal prompt samples representative candidate, run, and memory history", async () => {

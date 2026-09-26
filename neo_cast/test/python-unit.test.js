@@ -41,6 +41,8 @@ test("python unit tests pass", () => {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
+        OMP_NUM_THREADS: "1",
+        MKL_NUM_THREADS: "1",
         PYTHONPATH: path.join(REPO_ROOT, "py"),
         NEO_TSF_DATA_ROOT: dataRoot,
       },

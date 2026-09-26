@@ -24,7 +24,7 @@ class ExecutionContractTests(unittest.TestCase):
         )
         self.recipe["embedding"] = {"type": "none"}
         self.recipe["backbone"] = {
-            "type": "timesnet",
+            "type": "timesnet_lite",
             "hidden_dim": 8,
             "n_layers": 1,
             "top_k": 2,
@@ -68,7 +68,7 @@ class ExecutionContractTests(unittest.TestCase):
     def test_timesnet_verified(self):
         manifests, mismatches = self.verify()
         self.assertEqual(mismatches, [])
-        self.assertEqual(manifests[0]["actual"]["backbone"], "timesnet")
+        self.assertEqual(manifests[0]["actual"]["backbone"], "timesnet_lite")
 
     def test_recipe_claims_timesnet_but_instantiated_mlp(self):
         import torch.nn as nn

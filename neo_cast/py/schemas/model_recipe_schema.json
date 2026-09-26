@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ustc-time-series.github.io/neo-cast/schemas/model_recipe_schema.json",
   "title": "neo-cast ModelRecipe DSL Schema",
-  "description": "High-level, user-facing model recipe compiled into recipe_schema_v1 for the native model factory.",
+  "description": "High-level, user-facing model recipe compiled into recipe_schema_v2 for the native model factory.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -78,12 +78,13 @@
             "temporal_conv",
             "dlinear",
             "nbeats",
-            "timesnet",
+            "timesnet_lite",
             "rnn",
-            "ssm",
+            "gated_depthwise_conv",
             "mixer"
           ]
         },
+        "last_value_centering": {"type": "boolean"},
         "decomposition": {
           "type": "boolean"
         },
@@ -108,7 +109,7 @@
         },
         "channel_fusion": {
           "type": "string",
-          "enum": ["independent", "shared", "feature", "gated_hybrid"]
+          "enum": ["independent", "shared", "variate_attention", "gated_hybrid"]
         },
         "hidden_dim": {
           "type": "integer",

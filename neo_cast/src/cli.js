@@ -85,7 +85,7 @@ Usage:
   neo-cast task-spec validate [.neo-cast/task_spec.json]
   neo-cast checkpoint <status|request|approve|reject> [stage]
   neo-cast correction <add|list> [--scope data_schema] [--field column] [--correction "..."]
-  neo-cast prepare-data --source /path/to/data.csv [--target-cols y] [--observed-past-covariates x1,x2] [--known-future-covariates x1,x2]
+  neo-cast prepare-data --source /path/to/data.csv [--target-cols y] [--observed-past-covariates x1,x2]
   neo-cast runner init [--force]
   neo-cast runner run --description "baseline"
   neo-cast runner ref-test [--run-id 20260424-...]
@@ -528,6 +528,12 @@ function handleInitRuntime(rawFlags) {
 }
 
 async function handlePrepareData(rawFlags) {
+  for (const flag of ["known-future-covariates", "static-covariates", "known-future-source", "known-future-available"]) {
+    if (rawFlags[flag]) {
+      console.error(`UNSUPPORTED_COVARIATE: --${flag} is unavailable; use --target-cols and --observed-past-covariates.`);
+      return 1;
+    }
+  }
   const projectRoot = process.cwd();
   const source = rawFlags.source || rawFlags["source-csv"];
   if (!source || source === true) {
@@ -955,6 +961,7 @@ async function handleDesign(positionals, rawFlags) {
   let hadHardFailure = false;
   let stopRequested = false;
   let previousRow = null;
+  let duplicateStreak = 0;
 
   // Companion mode: watch stdin for "stop" between rounds
   const stopWatcher = mode === "companion"
@@ -1102,11 +1109,21 @@ async function handleDesign(positionals, rawFlags) {
     const pulse = startCompanionPulse(formatPulseLabel(labels.training), { frames: ["|", "/", "-", "\\"] });
 
     let roundExitCode = 0;
+    let runnerOutput = "";
+    let duplicateExperiment = false;
     try {
       roundExitCode = await runRunner(projectRoot, description, {
         skipSmoke: Boolean(rawFlags["skip-smoke"]),
-        onStdout: () => {
+        onStdout: (text) => {
           if (pulse) pulse.onOutput();
+          runnerOutput += text;
+          const lines = runnerOutput.split("\n");
+          runnerOutput = lines.pop();
+          for (const line of lines) {
+            try {
+              if (JSON.parse(line).event === "candidate_duplicate") duplicateExperiment = true;
+            } catch { /* Runner also emits human-readable progress. */ }
+          }
         },
         onStderr: () => {
           if (pulse) pulse.onOutput();
@@ -1120,6 +1137,16 @@ async function handleDesign(positionals, rawFlags) {
           : `${formatPulseLabel(labels.training)}${labels.aborted}`);
       }
     }
+    if (duplicateExperiment && roundExitCode === 0) {
+      duplicateStreak += 1;
+      console.log(`design_duplicate_streak=${duplicateStreak}`);
+      if (duplicateStreak >= 3) {
+        console.log("design_stop_reason=no_new_candidate");
+        break;
+      }
+      continue;
+    }
+    duplicateStreak = 0;
     history = loadResults(projectRoot);
     previousRow = getLatestSessionRow(projectRoot);
     if (previousRow && previousRow.run_id) {

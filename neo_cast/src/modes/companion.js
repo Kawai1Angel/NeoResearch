@@ -109,7 +109,7 @@ function _candidateFamily(candidate) {
     const multiscale = Number(candidate.architecture?.multiscale_blocks || 0) > 1 ? "+multiscale" : "";
     return `model_recipe:${backbone}${multiscale}`;
   }
-  if (candidate.recipe_version === "recipe_schema_v1") {
+  if (candidate.recipe_version === "recipe_schema_v2") {
     const embedding = candidate.embedding?.type || "unknown_embedding";
     const backbone = candidate.backbone?.type || "unknown_backbone";
     return `recipe:${embedding}+${backbone}`;

@@ -1,3 +1,4 @@
+import { timedEffect } from "@/util/runtime-timing"
 import { Effect, Schema } from "effect"
 import type { MessageV2 } from "../session/message-v2"
 import type { Permission } from "../permission"
@@ -95,6 +96,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           "message.id": ctx.messageID,
           ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
         }
+        const timing = { sessionID: ctx.sessionID, messageID: ctx.messageID, callID: ctx.callID, tool: id }
         return Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
             Effect.mapError((error) =>
@@ -106,12 +108,12 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                   ),
             ),
           )
-          const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
+          const result = yield* timedEffect("tool.body", timing, execute(decoded as Schema.Schema.Type<Parameters>, ctx))
           if (result.metadata.truncated !== undefined) {
             return result
           }
           const agent = yield* agents.get(ctx.agent)
-          const truncated = yield* truncate.output(result.output, {}, agent)
+          const truncated = yield* timedEffect("tool.truncate", timing, truncate.output(result.output, {}, agent))
           return {
             ...result,
             output: truncated.content,
@@ -121,7 +123,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               ...(truncated.truncated && { outputPath: truncated.outputPath }),
             },
           }
-        }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
+        }).pipe((effect) => timedEffect("tool.execute", timing, effect), Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
       }
       return toolInfo
     })

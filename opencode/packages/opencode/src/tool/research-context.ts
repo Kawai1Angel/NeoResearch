@@ -1,3 +1,5 @@
+import { extractTrainingCurve, recoverRunnerFailure } from "../research/runner-evidence"
+export { extractTrainingCurve } from "../research/runner-evidence"
 import { Effect, Schema } from "effect"
 import { readdir, readFile } from "node:fs/promises"
 import path from "node:path"
@@ -130,7 +132,7 @@ export const ExperimentResultsTool = Tool.define(
             .where(
               and(
                 eq(ResearchRunTable.task_id, taskID),
-                inArray(ResearchRunTable.status, ["succeeded", "failed"]),
+                inArray(ResearchRunTable.status, ["succeeded", "failed", "invalid", "rejected"]),
               ),
             )
             .orderBy(desc(ResearchRunTable.time_updated))
@@ -155,7 +157,12 @@ export const ExperimentResultsTool = Tool.define(
           if (c.hypothesis_id) hypoIDByCandidate.set(c.id, c.hypothesis_id)
         }
 
-        const results = runs.map((r) => {
+        const results = await Promise.all(runs.map(async (r) => {
+          const execution = r.status !== "succeeded" ? Database.use((d) =>
+            d.select({ uri: ResearchArtifactTable.uri }).from(ResearchArtifactTable)
+              .where(and(eq(ResearchArtifactTable.task_id, taskID), eq(ResearchArtifactTable.run_id, r.id), eq(ResearchArtifactTable.kind, "runner_execution_log_json"))).get(),
+          ) : undefined
+          const error = execution ? await recoverRunnerFailure(execution.uri.replace(/^file:\/\//, ""), r.error ?? undefined) : r.error
           const metrics = r.metrics as Record<string, unknown> | null | undefined
           const metricVal = metrics ? metrics[primaryMetric] : undefined
           const hypoID = r.candidate_id ? hypoIDByCandidate.get(r.candidate_id) : undefined
@@ -166,9 +173,9 @@ export const ExperimentResultsTool = Tool.define(
             ...(hypoID ? { hypoID, hypothesisID: hypoID } : {}),
             ...(r.status === "invalid" ? { evidence_disposition: "inconclusive" } : {}),
             ...(r.status !== "invalid" && typeof metricVal === "number" ? { [primaryMetric]: metricVal } : {}),
-            ...(r.error ? { error: r.error.slice(0, 160) } : {}),
+            ...(error ? { error } : {}),
           }
-        })
+        }))
 
         return {
           title: "experiment_results",
@@ -183,60 +190,16 @@ export const ExperimentResultsTool = Tool.define(
 // Shared helper: parse + optionally sample a training-curve JSONL file
 // ---------------------------------------------------------------------------
 
-interface TrainingCurvePoint {
-  readonly epoch: number
-  readonly valLoss: number
-  readonly horizon?: number
-  readonly elapsedS?: number
-}
-
-function finiteNumber(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined
-}
-
-export async function extractTrainingCurve(filePath: string, maxPoints = 60): Promise<TrainingCurvePoint[]> {
-  let raw: string
-  try {
-    raw = await readFile(filePath, "utf8")
-  } catch {
-    return []
-  }
-  const points: TrainingCurvePoint[] = []
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line.trim()) continue
-    try {
-      const r = JSON.parse(line) as Record<string, unknown>
-      const epoch = finiteNumber(r.epoch)
-      const valLoss = finiteNumber(r.val_loss) ?? finiteNumber(r.valLoss)
-      if (epoch === undefined || valLoss === undefined) continue
-      points.push({
-        epoch,
-        valLoss,
-        ...(finiteNumber(r.horizon) !== undefined ? { horizon: finiteNumber(r.horizon)! } : {}),
-        ...(finiteNumber(r.elapsed_s) !== undefined ? { elapsedS: finiteNumber(r.elapsed_s)! } : {}),
-        ...(finiteNumber(r.elapsedS) !== undefined ? { elapsedS: finiteNumber(r.elapsedS)! } : {}),
-      })
-    } catch { /* skip unparseable lines */ }
-  }
-  if (points.length <= maxPoints) return points
-  const step = (points.length - 1) / (maxPoints - 1)
-  const sampled: TrainingCurvePoint[] = []
-  for (let i = 0; i < maxPoints; i++) {
-    sampled.push(points[Math.round(i * step)]!)
-  }
-  return sampled
-}
-
 // ---------------------------------------------------------------------------
 // read_training_curve
 // ---------------------------------------------------------------------------
 
 const ReadTrainingCurveParameters = Schema.Struct({
   runID: Schema.optional(Schema.String).annotate({
-    description: "ID of the run to read. Omit to use the most recent succeeded run (or the latest run as fallback).",
+    description: "ID of the run to read. Omit to use the latest run, including failed or invalid attempts.",
   }),
   maxPoints: Schema.optional(Schema.Number).annotate({
-    description: "Maximum number of data points to return (1–120, default: 60). Uniformly sampled; first and last points are always included.",
+    description: "Maximum points per fold/horizon series (1–120, default: 60). One point keeps the last epoch; otherwise preserve both endpoints.",
   }),
 })
 
@@ -247,8 +210,8 @@ export const ReadTrainingCurveTool = Tool.define(
   Effect.succeed({
     description:
       "Read the training curve (epoch-by-epoch val loss) for a run in the current research task. " +
-      "Returns an ordered array of { epoch, valLoss, horizon?, elapsedS? } points, uniformly " +
-      "sampled to maxPoints if the raw log is longer. Returns { available: false } if no " +
+      "Returns points grouped by phase, foldIndex and horizon, ordered by epoch within each group, " +
+      "sampled to maxPoints per group. Never compare adjacent points across groups. Defaults to the latest run, including failures. Returns { available: false } if no " +
       "progress artifact exists for the requested run.",
     parameters: ReadTrainingCurveParameters,
     execute: (args: ReadTrainingCurveArgs, ctx: Tool.Context) =>
@@ -284,32 +247,16 @@ export const ReadTrainingCurveTool = Tool.define(
           }
           runStatus = row.status
         } else {
-          const succeededRun = Database.use((d) =>
-            d
-              .select({ id: ResearchRunTable.id, status: ResearchRunTable.status })
+          const latest = Database.use((d) =>
+            d.select({ id: ResearchRunTable.id, status: ResearchRunTable.status })
               .from(ResearchRunTable)
-              .where(and(eq(ResearchRunTable.task_id, taskID), eq(ResearchRunTable.status, "succeeded")))
-              .orderBy(desc(ResearchRunTable.time_updated))
-              .limit(1)
-              .get(),
+              .where(eq(ResearchRunTable.task_id, taskID))
+              .orderBy(desc(ResearchRunTable.time_created))
+              .limit(1).get(),
           )
-          if (succeededRun) {
-            runID = succeededRun.id
-            runStatus = succeededRun.status
-          } else {
-            const anyRun = Database.use((d) =>
-              d
-                .select({ id: ResearchRunTable.id, status: ResearchRunTable.status })
-                .from(ResearchRunTable)
-                .where(eq(ResearchRunTable.task_id, taskID))
-                .orderBy(desc(ResearchRunTable.time_updated))
-                .limit(1)
-                .get(),
-            )
-            if (anyRun) {
-              runID = anyRun.id
-              runStatus = anyRun.status
-            }
+          if (latest) {
+            runID = latest.id
+            runStatus = latest.status
           }
         }
 
@@ -339,7 +286,7 @@ export const ReadTrainingCurveTool = Tool.define(
           return {
             title: "read_training_curve",
             metadata: { available: false },
-            output: JSON.stringify({ available: false }, null, 2),
+            output: JSON.stringify({ available: false, runID, runStatus }, null, 2),
           }
         }
 
@@ -348,10 +295,11 @@ export const ReadTrainingCurveTool = Tool.define(
 
         return {
           title: "read_training_curve",
-          metadata: { available: true as boolean },
+          metadata: { available: curve.length > 0 },
           output: JSON.stringify(
             {
-              available: true,
+              available: curve.length > 0,
+              grouping: ["phase", "foldIndex", "horizon"],
               runID,
               runStatus,
               pointCount: curve.length,

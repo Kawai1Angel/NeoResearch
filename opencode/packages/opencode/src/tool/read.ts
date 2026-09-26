@@ -1,3 +1,4 @@
+import { timedEffect } from "@/util/runtime-timing"
 import { Effect, Option, Schema, Scope } from "effect"
 import { createReadStream } from "fs"
 import * as path from "path"
@@ -156,6 +157,7 @@ export const ReadTool = Tool.define(
         return yield* Effect.fail(new Error("offset must be greater than or equal to 1"))
       }
 
+      const timing = { sessionID: ctx.sessionID, messageID: ctx.messageID, callID: ctx.callID, tool: "read" }
       let filepath = params.filePath
       if (!path.isAbsolute(filepath)) {
         filepath = path.resolve(Instance.directory, filepath)
@@ -214,12 +216,12 @@ export const ReadTool = Tool.define(
         }
       }
 
-      const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
-      const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
+      const loaded = yield* timedEffect("read.instructions", timing, instruction.resolve(ctx.messages, filepath, ctx.messageID))
+      const sample = yield* timedEffect("read.sample", timing, readSample(filepath, Number(stat.size), SAMPLE_BYTES))
 
       const mime = sniffAttachmentMime(sample, AppFileSystem.mimeType(filepath))
       if (isImageAttachment(mime) || isPdfAttachment(mime)) {
-        const bytes = yield* fs.readFile(filepath)
+        const bytes = yield* timedEffect("read.bytes", timing, fs.readFile(filepath))
         const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
         return {
           title,
@@ -243,9 +245,9 @@ export const ReadTool = Tool.define(
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      const file = yield* Effect.promise(() =>
+      const file = yield* timedEffect("read.lines", timing, Effect.promise(() =>
         lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset ?? 1 }),
-      )
+      ))
       if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
         return yield* Effect.fail(
           new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
@@ -267,7 +269,7 @@ export const ReadTool = Tool.define(
       }
       output += "\n</content>"
 
-      yield* warm(filepath)
+      yield* timedEffect("read.warm", timing, warm(filepath))
 
       if (loaded.length > 0) {
         output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`

@@ -84,6 +84,8 @@ test("socratic intent spec uses expanded slots and asks one focused question", (
   expect(result.intentSpec.interaction_mode).toBe("socratic")
   expect(result.intentSpec.lookback_window).toBe(96)
   expect(result.intentSpec.prediction_horizon).toEqual([24, 96])
+  expect(result.intentSpec.data_split_method).toBe("ratio")
+  expect(result.intentSpec.data_split_ratios).toEqual([7, 1, 2])
   expect(result.intentSpec.exogenous_variables).toEqual([])
   expect(result.intentSpec.max_iterations).toBe(20)
   expect(result.intentSpec.max_no_improve).toBe(5)
@@ -94,6 +96,35 @@ test("socratic intent spec uses expanded slots and asks one focused question", (
   expect(result.intentSpecMarkdown).toContain("## Open Questions")
   expect(result.intentSpecMarkdown).toContain("NAS planned iterations: 20")
   expect(result.intentSpecMarkdown).toContain("Stop after no improvement: 5")
+  expect(result.intentSpecMarkdown).toContain("Data split ratios (train/validation/test): 7, 1, 2")
+})
+
+test("intent agent reads explicit row-range split settings", () => {
+  const result = analyzeIntentTask({
+    task: task({
+      taskSpec: {
+        dataset: {
+          path: "/tmp/etth1.csv",
+          targetCols: ["OT"],
+          exogenousCols: [],
+          split: {
+            method: "row_ranges",
+            trainRows: [0, 700],
+            validationRows: [700, 800],
+            testRows: [800, 1000],
+          },
+        },
+      },
+    }),
+  })
+
+  expect(result.intentSpec.data_split_method).toBe("row_ranges")
+  expect(result.intentSpec.data_split_row_ranges).toEqual({
+    train: [0, 700],
+    validation: [700, 800],
+    test: [800, 1000],
+  })
+  expect(result.missingFields).not.toContain("dataset.split.rowRanges")
 })
 
 test("socratic intent applies optional NAS defaults without asking extra questions", () => {

@@ -240,6 +240,7 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
   let history = loadResults(projectRoot);
   let previousRow = getLatestSessionRow(projectRoot);
   let stoppedReason = null;
+  let duplicateStreak = 0;
 
   console.log(`LOOP:START=autonomous`);
   console.log(`LOOP:TIME=${formatMinutes(timeBudgetMs)}`);
@@ -291,9 +292,30 @@ async function runAutonomousLoop(requirementBundle, resolvedConfig, options = {}
     console.log(`model_designs_path=${designLog.markdownPath}`);
 
     const description = candidate.hypothesis || `${describeCandidateFamily(candidate)} autonomous attempt ${attempt}`;
+    let outputBuffer = "";
+    let duplicateExperiment = false;
     const exitCode = await runRunner(projectRoot, description, {
       skipSmoke: Boolean(options.skipSmoke),
+      onStdout: (text) => {
+        outputBuffer += text;
+        const lines = outputBuffer.split("\n");
+        outputBuffer = lines.pop();
+        for (const line of lines) {
+          try {
+            if (JSON.parse(line).event === "candidate_duplicate") duplicateExperiment = true;
+          } catch { /* Human-readable runner progress is not an event. */ }
+        }
+      },
     });
+    if (duplicateExperiment && exitCode === 0) {
+      duplicateStreak += 1;
+      if (duplicateStreak >= 3 || attempt >= maxCandidates) {
+        stoppedReason = "no_new_candidate";
+        break;
+      }
+      continue;
+    }
+    duplicateStreak = 0;
     history = loadResults(projectRoot);
     previousRow = getLatestSessionRow(projectRoot);
     if (previousRow && previousRow.run_id) {

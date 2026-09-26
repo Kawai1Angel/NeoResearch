@@ -1,3 +1,4 @@
+import { timedAsync, startTiming } from "@/util/runtime-timing"
 import { and, desc, eq, Database } from "@/storage"
 import { Bus } from "@/bus"
 import { SessionTable } from "@/session/session.sql"
@@ -242,7 +243,19 @@ export async function loadTaskEvidenceForTask(taskID: ResearchTaskID, artifactID
     return undefined
   }
   if (!artifact.uri.startsWith("file://")) throw new Error(`Task evidence artifact must use a file URI: ${artifact.uri}`)
-  const bundle = TaskEvidenceBundleSchema.parse(JSON.parse(await readFile(artifact.uri.slice("file://".length), "utf8")))
+  const content = await timedAsync("hypothesis.evidence.read", { taskID, artifactID: artifact.id },
+    () => readFile(artifact.uri.slice("file://".length), "utf8"))
+  const finish = startTiming("hypothesis.evidence.parse", { taskID, artifactID: artifact.id })
+  const bundle = (() => {
+    try {
+      const value = TaskEvidenceBundleSchema.parse(JSON.parse(content))
+      finish("completed")
+      return value
+    } catch (error) {
+      finish("failed")
+      throw error
+    }
+  })()
   if (bundle.taskID !== taskID || artifact.metadata.retrieveRunID !== bundle.retrieveRunID) {
     throw new Error(`Task evidence provenance mismatch for artifact ${artifact.id}`)
   }

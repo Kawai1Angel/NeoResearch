@@ -33,7 +33,7 @@ def make_recipe(
     channel_mode: str = "independent",
 ) -> dict[str, Any]:
     return {
-        "recipe_version": "recipe_schema_v1",
+        "recipe_version": "recipe_schema_v2",
         "recipe_id": "test_recipe",
         "hypothesis": "Test recipe for native recipe factory.",
         "preprocessing": {"actions": preprocessing or [{"type": "none"}]},
@@ -42,14 +42,13 @@ def make_recipe(
         "fusion": fusion or {"type": "temporal", "channel_mode": channel_mode},
         "prediction_head": prediction_head or {
             "type": "linear",
-            "output_distribution": "point",
-            "share_across_horizons": False,
+            "output_distribution": "point"
         },
         "training_strategy": training_strategy or {
             "loss": {"base": "mse", "horizon_weighting": "uniform"},
             "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
             "scheduler": {"type": "none", "warmup_steps": 0},
-            "regularization": {"dropout": 0.1, "grad_clip": 1.0},
+            "regularization": { "grad_clip": 1.0},
             "budget": {"max_epochs": 1, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
         },
         "constraints": {"max_params": 1000000, "latency_priority": "medium"},
@@ -59,7 +58,7 @@ def make_recipe(
 class RecipeFactoryTest(unittest.TestCase):
     def assert_forward_shape(self, recipe: dict[str, Any], *, input_len: int = 32, horizon: int = 8) -> None:
         torch.manual_seed(7)
-        model_config = {"recipe": recipe}
+        model_config = {"recipe": recipe, "num_channels": 3}
         if recipe["embedding"]["type"] == "invert" or recipe["fusion"].get("type") != "temporal" or recipe["fusion"].get("channel_mode") == "shared":
             model_config["num_channels"] = 3
         model = build_model(model_config, input_len=input_len, horizon=horizon)
@@ -191,7 +190,7 @@ class RecipeFactoryTest(unittest.TestCase):
         recipe = make_recipe(
             embedding={"type": "none"},
             backbone={
-                "type": "timesnet",
+                "type": "timesnet_lite",
                 "hidden_dim": 16,
                 "n_layers": 1,
                 "top_k": 2,
@@ -219,11 +218,10 @@ class RecipeFactoryTest(unittest.TestCase):
             preprocessing=[{"type": "seasonal_differencing", "period": 4, "order": 1}],
             embedding={"type": "invert", "d_model": 12},
             backbone={"type": "rnn", "cell": "gru", "hidden_dim": 16, "num_layers": 1, "dropout": 0.0},
-            fusion={"type": "feature"},
+            fusion={"type": "variate_attention"},
             prediction_head={
                 "type": "direct_multi_horizon",
-                "output_distribution": "point",
-                "horizon_specific": True,
+                "output_distribution": "point"
             },
         )
 
@@ -232,7 +230,7 @@ class RecipeFactoryTest(unittest.TestCase):
 
     def test_frequency_mixer_gated_hybrid_quantile_recipe_forward(self) -> None:
         recipe = make_recipe(
-            preprocessing=[{"type": "missing_mask", "mask_channel": True, "fill_policy": "mean"}],
+            preprocessing=[{"type": "missing_mask", "mask_channel": True}],
             embedding={"type": "frequency", "n_freq": 6, "d_model": 10, "complex_mode": "real_imag"},
             backbone={
                 "type": "mixer",
@@ -252,7 +250,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "quantile", "quantiles": [0.1, 0.5, 0.9], "horizon_weighting": "uniform"},
                 "optimizer": {"type": "adamw", "lr": 0.001, "weight_decay": 0.0001},
                 "scheduler": {"type": "one_cycle", "warmup_steps": 0},
-                "regularization": {"dropout": 0.1, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 1, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )
@@ -262,7 +260,7 @@ class RecipeFactoryTest(unittest.TestCase):
 
     def test_quantile_head_exposes_full_distribution_for_training(self) -> None:
         recipe = make_recipe(
-            preprocessing=[{"type": "missing_mask", "mask_channel": True, "fill_policy": "mean"}],
+            preprocessing=[{"type": "missing_mask", "mask_channel": True}],
             embedding={"type": "frequency", "n_freq": 6, "d_model": 10, "complex_mode": "real_imag"},
             backbone={
                 "type": "mixer",
@@ -282,7 +280,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "quantile", "quantiles": [0.1, 0.5, 0.9], "horizon_weighting": "uniform"},
                 "optimizer": {"type": "adamw", "lr": 0.001, "weight_decay": 0.0001},
                 "scheduler": {"type": "none", "warmup_steps": 0},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 1, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )
@@ -315,7 +313,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "num_channels": 3,
                 "num_target_channels": 1,
                 "num_past_covariate_channels": 2,
-                "num_future_covariate_channels": 1,
+                "num_future_covariate_channels": 0,
                 "num_input_channels": 3,
                 "num_output_channels": 1,
                 "future_covariate_mode": "none",
@@ -325,7 +323,7 @@ class RecipeFactoryTest(unittest.TestCase):
         )
         target_history = torch.randn(2, 32, 1)
         exogenous_past = torch.randn(2, 32, 2)
-        exogenous_future = torch.randn(2, 8, 1)
+        exogenous_future = torch.empty(2, 8, 0)
 
         with torch.no_grad():
             point = model(
@@ -346,7 +344,7 @@ class RecipeFactoryTest(unittest.TestCase):
         recipe = make_recipe(
             preprocessing=[
                 {"type": "seasonal_differencing", "period": 4, "order": 1},
-                {"type": "missing_mask", "mask_channel": True, "fill_policy": "mean"},
+                {"type": "missing_mask", "mask_channel": True},
             ],
             embedding={"type": "frequency", "n_freq": 6, "d_model": 10, "complex_mode": "real_imag"},
             backbone={"type": "mixer", "hidden_dim": 16, "depth": 1, "dropout": 0.0},
@@ -360,7 +358,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "quantile", "quantiles": [0.1, 0.5, 0.9], "horizon_weighting": "tail_heavy"},
                 "optimizer": {"type": "adamw", "lr": 0.001, "weight_decay": 0.0001},
                 "scheduler": {"type": "plateau", "warmup_steps": 0},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 1, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )
@@ -379,11 +377,11 @@ class RecipeFactoryTest(unittest.TestCase):
 
     def test_missing_mask_channel_expands_fusion_width_and_restores_output_channels(self) -> None:
         recipe = make_recipe(
-            preprocessing=[{"type": "missing_mask", "mask_channel": True, "fill_policy": "zero"}],
-            fusion={"type": "feature"},
+            preprocessing=[{"type": "missing_mask", "mask_channel": True}],
+            fusion={"type": "variate_attention"},
         )
         model = build_model({"recipe": recipe, "num_channels": 3}, input_len=32, horizon=8)
-        self.assertEqual(model.channel_mixer.num_channels, 6)
+        self.assertEqual(model.model_num_channels, 6)
 
         x = torch.randn(2, 32, 3)
         x[0, 0, 0] = float("nan")
@@ -396,8 +394,8 @@ class RecipeFactoryTest(unittest.TestCase):
         recipe = make_recipe(
             preprocessing=[{"type": "sample_reweighting", "scheme": "horizon_tail"}],
             embedding={"type": "calendar", "fields": ["hour", "dayofweek"], "embed_dim": 12},
-            backbone={"type": "ssm", "state_dim": 14, "depth": 2, "dropout": 0.1},
-            fusion={"type": "graph", "graph_type": "learned"},
+            backbone={"type": "gated_depthwise_conv", "hidden_dim": 14, "depth": 2, "dropout": 0.1},
+            fusion={"type": "graph"},
             prediction_head={"type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.0001},
         )
         recipe["training_strategy"]["loss"]["base"] = "gaussian_nll"
@@ -410,7 +408,6 @@ class RecipeFactoryTest(unittest.TestCase):
             prediction_head={
                 "type": "residual_correction",
                 "output_distribution": "point",
-                "base_head": "linear",
                 "correction_dim": 16,
             },
         )
@@ -421,8 +418,8 @@ class RecipeFactoryTest(unittest.TestCase):
     def test_phase2_recipe_schema_accepts_native_action_space(self) -> None:
         recipe = make_recipe(
             preprocessing=[
+                {"type": "missing_mask", "mask_channel": True},
                 {"type": "seasonal_differencing", "period": 24, "order": 1},
-                {"type": "missing_mask", "mask_channel": False, "fill_policy": "ffill"},
             ],
             embedding={"type": "frequency", "n_freq": 8, "d_model": 16, "complex_mode": "magnitude"},
             backbone={"type": "mixer", "hidden_dim": 16, "depth": 1, "dropout": 0.0},
@@ -430,14 +427,13 @@ class RecipeFactoryTest(unittest.TestCase):
             prediction_head={
                 "type": "residual_correction",
                 "output_distribution": "point",
-                "base_head": "linear",
                 "correction_dim": 16,
             },
             training_strategy={
-                "loss": {"base": "quantile", "quantiles": [0.1, 0.5, 0.9], "horizon_weighting": "tail_heavy"},
+                "loss": {"base": "huber", "horizon_weighting": "tail_heavy"},
                 "optimizer": {"type": "adamw", "lr": 0.001, "weight_decay": 0.0001},
                 "scheduler": {"type": "plateau", "warmup_steps": 0},
-                "regularization": {"dropout": 0.1, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 2, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )
@@ -473,7 +469,7 @@ class RecipeFactoryTest(unittest.TestCase):
 
     def test_recipe_schema_accepts_opencode_fusion_parameters(self) -> None:
         for fusion in (
-            {"type": "feature", "variate_token": True, "cross_attention": False},
+            {"type": "variate_attention",},
             {"type": "temporal_then_feature", "gate": True, "residual": True},
             {"type": "feature_then_temporal", "gate": True, "residual": True},
             {"type": "graph", "adjacency_source": "correlation", "sparsity": 0.1},
@@ -485,8 +481,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 fusion=fusion,
                 prediction_head={
                     "type": "direct_multi_horizon",
-                    "output_distribution": "point",
-                    "horizon_specific": True,
+                    "output_distribution": "point"
                 },
             )
             with tempfile.TemporaryDirectory() as tmp:
@@ -504,12 +499,11 @@ class RecipeFactoryTest(unittest.TestCase):
                 recipe = make_recipe(
                     preprocessing=[{"type": "sample_reweighting", "scheme": "horizon_tail"}],
                     embedding={"type": "calendar", "fields": ["position", "dayofweek"], "embed_dim": 12},
-                    backbone={"type": "ssm", "state_dim": 12, "depth": 1, "dropout": 0.0},
+                    backbone={"type": "gated_depthwise_conv", "hidden_dim": 12, "depth": 1, "dropout": 0.0},
                     fusion=fusion,
                     prediction_head={
                         "type": "direct_multi_horizon",
-                        "output_distribution": "point",
-                        "horizon_specific": True,
+                        "output_distribution": "point"
                     },
                 )
 
@@ -527,7 +521,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "quantile", "quantiles": [0.1, 0.5, 0.9], "horizon_weighting": "front_heavy"},
                 "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
                 "scheduler": {"type": "plateau", "warmup_steps": 0},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 2, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )
@@ -555,7 +549,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "mse", "horizon_weighting": "uniform"},
                 "optimizer": {"type": "adam", "lr": 0.0001, "weight_decay": 0.0},
                 "scheduler": {"type": "lradj_type1", "warmup_steps": 0},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 10, "time_budget_s": 10, "batch_size": 2, "patience": 3, "seed": 42},
             },
         )
@@ -593,7 +587,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 },
                 "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
                 "scheduler": {"type": "none", "warmup_steps": 0},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 1, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             }
         )
@@ -611,7 +605,7 @@ class RecipeFactoryTest(unittest.TestCase):
             "loss": {"base": "mse", "horizon_weighting": "uniform"},
             "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
             "scheduler": {"type": "none", "warmup_steps": 0},
-            "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+            "regularization": { "grad_clip": 1.0},
             "budget": {"max_epochs": 1, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
         })
         robust = make_recipe(
@@ -700,7 +694,7 @@ class RecipeFactoryTest(unittest.TestCase):
             {"type": "dlinear", "kernel_size": 9, "bias": True},
             {"type": "tcn", "hidden_dim": 16, "n_layers": 2, "kernel_size": 3, "dropout": 0.1},
             {"type": "nbeats", "hidden_dim": 32, "n_blocks": 2, "n_layers": 2, "dropout": 0.1},
-            {"type": "timesnet", "hidden_dim": 16, "n_layers": 1, "top_k": 2, "kernel_size": 3, "dropout": 0.1},
+            {"type": "timesnet_lite", "hidden_dim": 16, "n_layers": 1, "top_k": 2, "kernel_size": 3, "dropout": 0.1},
         ):
             recipe = make_recipe(
                 embedding={"type": "patch", "patch_len": 8, "stride": 4, "d_model": 16},
@@ -753,7 +747,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "mse", "horizon_weighting": "uniform"},
                 "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
                 "scheduler": {"type": "cosine", "warmup_steps": 1},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 3, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )
@@ -778,7 +772,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 "loss": {"base": "mse", "horizon_weighting": "uniform"},
                 "optimizer": {"type": "adam", "lr": 0.001, "weight_decay": 0.0},
                 "scheduler": {"type": "none", "warmup_steps": 0},
-                "regularization": {"dropout": 0.0, "grad_clip": 1.0},
+                "regularization": { "grad_clip": 1.0},
                 "budget": {"max_epochs": 3, "time_budget_s": 10, "batch_size": 2, "patience": 1, "seed": 42},
             },
         )

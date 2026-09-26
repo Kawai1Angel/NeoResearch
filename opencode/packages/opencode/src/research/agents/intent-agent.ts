@@ -20,6 +20,13 @@ export interface IntentSpec {
   readonly domain_id: string
   readonly forecast_object?: string
   readonly data_source?: string
+  readonly data_split_method: "ratio" | "row_ranges"
+  readonly data_split_ratios?: number[]
+  readonly data_split_row_ranges?: {
+    readonly train: number[]
+    readonly validation: number[]
+    readonly test: number[]
+  }
   readonly target_columns: string[]
   readonly lookback_window?: number
   readonly prediction_horizon: number[]
@@ -59,7 +66,8 @@ export interface IntentAgentResult {
 }
 
 export const INTENT_SLOT_IDS = [
-  "interaction_mode", "forecast_object", "data_source", "target_columns", "lookback_window",
+  "interaction_mode", "forecast_object", "data_source", "data_split_method", "data_split_ratios",
+  "data_split_row_ranges", "target_columns", "lookback_window",
   "prediction_horizon", "time_grain", "exogenous_variables", "future_covariate_availability",
   "business_context", "primary_metric", "secondary_metrics", "error_preferences", "latency_budget",
   "parameter_budget", "max_iterations", "max_no_improve", "interpretability", "deployment_target",
@@ -112,6 +120,21 @@ function optionalStringArray(value: unknown) {
 function numberArray(value: unknown) {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+}
+
+function splitRatios(value: unknown): number[] | undefined {
+  if (!Array.isArray(value) || value.length !== 3) return undefined
+  const ratios = value.filter((item): item is number => typeof item === "number" && Number.isFinite(item) && item > 0)
+  return ratios.length === 3 ? ratios : undefined
+}
+
+function splitRowRanges(value: unknown) {
+  const ranges = recordValue(value)
+  const train = numberArray(firstKnown(ranges.train, ranges.trainRows, ranges.train_rows))
+  const validation = numberArray(firstKnown(ranges.validation, ranges.val, ranges.validationRows, ranges.val_rows))
+  const test = numberArray(firstKnown(ranges.test, ranges.ref_test, ranges.testRows, ranges.ref_test_rows))
+  if (train.length !== 2 || validation.length !== 2 || test.length !== 2) return undefined
+  return { train, validation, test }
 }
 
 function firstString(...values: unknown[]) {
@@ -168,6 +191,7 @@ export function dialogueStrategy(mode: IntentInteractionMode): IntentDialogueStr
 export function collectedIntentSlots(task: ResearchTask) {
   const taskSpec = recordValue(task.taskSpec)
   const dataset = recordValue(taskSpec.dataset)
+  const datasetSplit = recordValue(dataset.split)
   const objective = recordValue(task.objective)
   const budget = recordValue(task.budget)
   const loopBudget = recordValue(budget.loop ?? budget.researchLoop ?? budget.autonomousLoop)
@@ -197,6 +221,8 @@ export function collectedIntentSlots(task: ResearchTask) {
     taskSpec.exogenous_variables,
   )
   const primaryMetric = firstString(objective.primaryMetric, objective.primary_metric, mergedSlots.primary_metric)
+  const splitMethodRaw = firstString(datasetSplit.method, mergedSlots.data_split_method)
+  const splitMethod = splitMethodRaw === "row_ranges" ? "row_ranges" : "ratio"
 
   return {
     interaction_mode: interactionMode,
@@ -208,6 +234,21 @@ export function collectedIntentSlots(task: ResearchTask) {
       targetColumns.length > 0 ? `${targetColumns.join(", ")} time series` : undefined,
     ),
     data_source: firstString(mergedSlots.data_source, dataset.path, dataset.source),
+    data_split_method: splitMethod,
+    data_split_ratios:
+      splitRatios(firstKnown(datasetSplit.ratios, mergedSlots.data_split_ratios)) ?? [7, 1, 2],
+    data_split_row_ranges: splitRowRanges(
+      firstKnown(
+        datasetSplit.method === "row_ranges"
+          ? {
+              train: datasetSplit.trainRows,
+              validation: datasetSplit.validationRows,
+              test: datasetSplit.testRows,
+            }
+          : undefined,
+        mergedSlots.data_split_row_ranges,
+      ),
+    ),
     target_columns: targetColumns,
     lookback_window: firstNumber(
       mergedSlots.lookback_window,
@@ -306,6 +347,34 @@ export function slotDefinitions(task: ResearchTask): IntentSlot[] {
       socraticQuestion: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
       companionQuestion: "CSV 数据集路径是什么？",
       value: slots.data_source,
+    },
+    {
+      id: "data_split_method",
+      field: "dataset.split.method",
+      label: "数据划分方式",
+      required: true,
+      socraticQuestion: "数据集按比例划分还是按显式行区间划分？默认按训练/验证/测试 7:1:2。",
+      companionQuestion: "数据划分使用比例还是显式行区间？默认 7:1:2。",
+      value: slots.data_split_method,
+    },
+    {
+      id: "data_split_ratios",
+      field: "dataset.split.ratios",
+      label: "训练/验证/测试比例",
+      required: slots.data_split_method === "ratio",
+      emptyArrayIsMissing: true,
+      socraticQuestion: "训练、验证、测试集按什么比例划分？请给出三个正数，例如 7:1:2。",
+      companionQuestion: "训练/验证/测试比例是多少？例如 7:1:2。",
+      value: slots.data_split_ratios,
+    },
+    {
+      id: "data_split_row_ranges",
+      field: "dataset.split.rowRanges",
+      label: "训练/验证/测试行区间",
+      required: slots.data_split_method === "row_ranges",
+      socraticQuestion: "请给出训练、验证、测试的连续左闭右开行区间，例如 train=[0,7000)、validation=[7000,8000)、test=[8000,10000)。",
+      companionQuestion: "训练/验证/测试的连续行区间是什么？例如 0:7000、7000:8000、8000:10000。",
+      value: slots.data_split_row_ranges,
     },
     {
       id: "target_columns",
@@ -490,6 +559,7 @@ function intentSpecFrom(task: ResearchTask, missingSlots: IntentSlot[], llmSlots
     ...slots,
     ...normalizeLLMSlots(llmSlots),
   }
+  const dataSplitMethod = merged.data_split_method === "row_ranges" ? "row_ranges" : "ratio"
   const openQuestions = missingSlots.map((slot) => questionForSlot(slot, merged.interaction_mode))
   return {
     interaction_mode: merged.interaction_mode,
@@ -497,6 +567,13 @@ function intentSpecFrom(task: ResearchTask, missingSlots: IntentSlot[], llmSlots
     domain_id: task.domainID,
     ...(merged.forecast_object === undefined ? {} : { forecast_object: merged.forecast_object }),
     ...(merged.data_source === undefined ? {} : { data_source: merged.data_source }),
+    data_split_method: dataSplitMethod,
+    ...(dataSplitMethod !== "ratio" || merged.data_split_ratios === undefined
+      ? {}
+      : { data_split_ratios: merged.data_split_ratios }),
+    ...(dataSplitMethod !== "row_ranges" || merged.data_split_row_ranges === undefined
+      ? {}
+      : { data_split_row_ranges: merged.data_split_row_ranges }),
     target_columns: merged.target_columns,
     ...(merged.lookback_window === undefined ? {} : { lookback_window: merged.lookback_window }),
     prediction_horizon: merged.prediction_horizon,
@@ -550,6 +627,9 @@ function renderIntentSpecMarkdown(input: {
     "## Forecast Definition",
     "",
     `- Forecast object: ${markdownValue(spec.forecast_object)}`,
+    `- Data split method: ${spec.data_split_method}`,
+    `- Data split ratios (train/validation/test): ${markdownValue(spec.data_split_ratios)}`,
+    `- Data split row ranges: ${markdownValue(spec.data_split_row_ranges)}`,
     `- Target columns: ${markdownList(spec.target_columns)}`,
     `- Lookback window: ${markdownValue(spec.lookback_window)}`,
     `- Prediction horizon: ${markdownList(spec.prediction_horizon)}`,
@@ -605,9 +685,19 @@ function buildResult(input: {
   const strategy = dialogueStrategy(mode)
   const slots = slotDefinitions(input.task)
   const normalizedLLMSlots = normalizeLLMSlots(input.llmSlots ?? {})
+  const effectiveSplitMethod = normalizedLLMSlots.data_split_method === "row_ranges"
+    ? "row_ranges"
+    : normalizedLLMSlots.data_split_method === "ratio"
+      ? "ratio"
+      : collectedIntentSlots(input.task).data_split_method
   const slotValues = Object.keys(normalizedLLMSlots).length === 0 ? slots : slots.map((slot) => {
-    if (!(slot.id in normalizedLLMSlots)) return slot
-    return { ...slot, value: normalizedLLMSlots[slot.id] }
+    const required = slot.id === "data_split_ratios"
+      ? effectiveSplitMethod === "ratio"
+      : slot.id === "data_split_row_ranges"
+        ? effectiveSplitMethod === "row_ranges"
+        : slot.required
+    if (!(slot.id in normalizedLLMSlots)) return { ...slot, required }
+    return { ...slot, required, value: normalizedLLMSlots[slot.id] }
   })
   const missingSlots = slotValues.filter(slotIsMissing)
   const missingFields = missingSlots.map((slot) => slot.field)
@@ -648,9 +738,13 @@ function buildResult(input: {
 function normalizeLLMSlots(value: Record<string, unknown>) {
   const exogenous = firstKnown(value.exogenous_variables, value.exogenousVariables)
   const secondary = firstKnown(value.secondary_metrics, value.secondaryMetrics)
+  const splitMethod = firstString(value.data_split_method, value.dataSplitMethod)
   const result: Partial<Record<SlotID, unknown>> = {
     forecast_object: firstString(value.forecast_object, value.forecastObject),
     data_source: firstString(value.data_source, value.dataSource),
+    data_split_method: splitMethod === "ratio" || splitMethod === "row_ranges" ? splitMethod : undefined,
+    data_split_ratios: splitRatios(firstKnown(value.data_split_ratios, value.dataSplitRatios)),
+    data_split_row_ranges: splitRowRanges(firstKnown(value.data_split_row_ranges, value.dataSplitRowRanges)),
     target_columns: optionalStringArray(firstKnown(value.target_columns, value.targetColumns)),
     lookback_window: firstNumber(value.lookback_window, value.lookbackWindow),
     prediction_horizon: Array.isArray(firstKnown(value.prediction_horizon, value.predictionHorizon))
@@ -782,6 +876,9 @@ const SLOT_KEY_ALIASES: Record<string, string> = {
   interactionMode: "interaction_mode",
   forecastObject: "forecast_object",
   dataSource: "data_source",
+  dataSplitMethod: "data_split_method",
+  dataSplitRatios: "data_split_ratios",
+  dataSplitRowRanges: "data_split_row_ranges",
   targetColumns: "target_columns",
   lookbackWindow: "lookback_window",
   predictionHorizon: "prediction_horizon",
@@ -814,6 +911,16 @@ function coerceSlotValue(value: unknown): unknown {
   if (trimmed.length === 0) return trimmed
   const num = Number(trimmed)
   if (Number.isFinite(num)) return num
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      // Keep the original text so an available LLM can still interpret it.
+    }
+  }
+  if (/^\d+(?:\.\d+)?\s*[:/]\s*\d+(?:\.\d+)?\s*[:/]\s*\d+(?:\.\d+)?$/.test(trimmed)) {
+    return trimmed.split(/[:/]/).map((item) => Number(item.trim()))
+  }
   // comma-separated numbers → number array
   if (/^\d[\d\s,]*\d$/.test(trimmed)) {
     const parts = trimmed.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n))
@@ -840,6 +947,8 @@ export async function parseSlotInputsWithLLM(input: {
       "You are a slot-value parser for a time-series forecasting intent system.",
       "Given a map of slot IDs to raw user answers, parse each value into a typed JSON value.",
       "Rules: parse bare numbers as JSON numbers; comma-separated numbers as JSON arrays of numbers;",
+      "       parse data_split_ratios such as 7:1:2 as [7,1,2];",
+      "       parse data_split_row_ranges as {train:[start,end],validation:[start,end],test:[start,end]};",
       "       lists / bracket notation as JSON arrays; everything else as a string.",
       "Return exactly one JSON object mapping slot IDs to parsed values.",
       "Only include slots that have non-empty, meaningful values.",

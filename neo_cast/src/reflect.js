@@ -54,7 +54,6 @@ function formatTaskContext(taskContext = {}) {
   const taskId = taskContext.task_id || "etth1";
   const targetColumns = Array.isArray(taskContext.target_columns) ? taskContext.target_columns : taskContext.feature_columns;
   const pastCovariates = Array.isArray(taskContext.observed_past_covariates) ? taskContext.observed_past_covariates : [];
-  const futureCovariates = Array.isArray(taskContext.known_future_covariates) ? taskContext.known_future_covariates : [];
   const featureColumns = Array.isArray(targetColumns)
     ? [...new Set([...targetColumns, ...pastCovariates, ...futureCovariates])]
     : ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"];
@@ -71,7 +70,7 @@ function formatTaskContext(taskContext = {}) {
     `- Channels: ${featureColumns.length} (${featureColumns.join(", ")})`,
     `- Prediction targets: ${(targetColumns || featureColumns).join(", ")}`,
     `- Observed-past covariates: ${pastCovariates.join(", ") || "none"}`,
-    `- Known-future covariates: ${futureCovariates.join(", ") || "none"}`,
+    "- Known-future and static covariates are unsupported; use observed-past covariates only.",
     `- Input window: ${inputLen} time steps`,
     `- Prediction horizons evaluated: ${horizons.join(", ")} (averaged)`,
     `- Train rows: [${trainRows[0]}, ${trainRows[1]})`,
@@ -101,12 +100,12 @@ ${formatTaskContext(taskContext)}
 ## Analysis protocol
 1. Examine the previous recipe: backbone, embedding, preprocessing, fusion, head.
 2. Look at per-horizon validation metrics. Is the h720/h96 gap large? Does MSE grow super-linearly with horizon? Does the model underperform on short or long horizons?
-3. If training_curves are provided:
+3. If training_curves are provided, use curves_by_fold and analyze each fold/horizon independently, in epoch order. The standard fit is a separate group. Never interpret differences between folds as oscillation or seed variance. The following patterns are hypotheses requiring evidence, not established causes:
    - Fast drop then plateau -> capacity bottleneck or LR too low
    - Oscillation -> LR too high or batch size too small
    - h720 diverges while h96 converges -> long-horizon gradient interference
    - All horizons flat from epoch 1 -> model lacks expressiveness
-4. Identify the ONE primary bottleneck: architecture capacity, temporal receptive field, normalization, channel interaction, or optimization dynamics.
+4. If the run failed, prioritize its exact error over curve interpretation; execution failures do not refute the architecture. Do not invent a root cause when error evidence is missing. Otherwise identify the ONE primary bottleneck: architecture capacity, temporal receptive field, normalization, channel interaction, or optimization dynamics.
 5. Propose a recipe that directly addresses this bottleneck. Be specific about what changed and why.
 
 ## Full supported action space
@@ -116,7 +115,7 @@ ${formatTaskContext(taskContext)}
 - { "type": "instance_norm", "affine": false, "eps": 0.00001 }
 - { "type": "series_decomposition", "method": "moving_average", "kernel_size": 25 }
 - { "type": "seasonal_differencing", "period": 24, "order": 1 }
-- { "type": "missing_mask", "mask_channel": true, "fill_policy": "mean" }
+- { "type": "missing_mask", "mask_channel": true}
 - { "type": "sample_reweighting", "scheme": "uniform"|"horizon_tail"|"outlier_robust" }
 
 ### embedding
@@ -135,37 +134,42 @@ ${formatTaskContext(taskContext)}
 - { "type": "dlinear", "kernel_size": 25, "bias": true } [requires embedding none]
 - { "type": "tcn", "hidden_dim": 16|32|64, "n_layers": 1|2|3, "kernel_size": 3|5, "activation": "gelu", "dropout": 0.0|0.1 } [requires embedding none]
 - { "type": "nbeats", "hidden_dim": 64|128|256, "n_blocks": 2|3|4, "n_layers": 2|3, "activation": "gelu", "dropout": 0.0|0.1 } [requires embedding none]
-- { "type": "timesnet", "hidden_dim": 8|16|32, "n_layers": 1|2, "top_k": 1|2, "kernel_size": 3|5, "dropout": 0.0|0.1 } [requires embedding none]
-- { "type": "ssm", "state_dim": 16|32|64, "depth": 1|2|3, "dropout": 0.0|0.1 }
+- { "type": "timesnet_lite", "hidden_dim": 8|16|32, "n_layers": 1|2, "top_k": 1|2, "kernel_size": 3|5, "dropout": 0.0|0.1 } [requires embedding none]
+- { "type": "gated_depthwise_conv", "hidden_dim": 16|32|64, "depth": 1|2|3, "dropout": 0.0|0.1 }
 - { "type": "mixer", "hidden_dim": 32|64|128, "depth": 1|2|3, "temporal_mixing": "mlp"|"conv", "channel_mixing": "mlp"|"identity", "dropout": 0.0|0.1 }
 
 ### fusion
 - { "type": "temporal", "channel_mode": "independent"|"shared" }
-- { "type": "feature" }
+- { "type": "variate_attention" }
 - { "type": "temporal_then_feature" }
 - { "type": "feature_then_temporal" }
-- { "type": "graph", "graph_type": "learned" }
+- { "type": "graph"}
 - { "type": "gated_hybrid", "gate_type": "learned"|"scalar"|"channel"|"time" }
 
 ### prediction_head
-- { "type": "linear", "output_distribution": "point", "share_across_horizons": false }
-- { "type": "direct_multi_horizon", "output_distribution": "point", "horizon_specific": true }
+- { "type": "linear", "output_distribution": "point"}
+- { "type": "direct_multi_horizon", "output_distribution": "point"}
 - { "type": "quantile", "output_distribution": "quantile", "quantiles": [0.1,0.5,0.9] }
 - { "type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.0001 }
-- { "type": "residual_correction", "output_distribution": "point", "base_head": "linear", "correction_dim": 16 }
+- { "type": "residual_correction", "output_distribution": "point" "correction_dim": 16 }
 
 ### training_strategy
-- loss.base: "mse"|"mae"|"huber"|"quantile"|"distillation"
+- loss.base: "mse"|"mae"|"huber"|"quantile"|"distillation"|"gaussian_nll"
+- Point heads require mse/mae/huber/distillation. Quantile heads require quantile loss; head and loss levels must be identical, strictly increasing and unique. Gaussian heads require gaussian_nll.
 - optimizer.type: "adam"|"adamw"|"sgd"
 - scheduler.type: "none"|"cosine"|"one_cycle"|"plateau"
-- budget: { max_epochs: 10-100, time_budget_s: <=600, batch_size: 16|32|64, patience: 3-10, seed: 42 }
+- budget: { max_epochs: 10-100, time_budget_s: <=1200, batch_size: 16|32|64, patience: 3-10, seed: 42 }
 
 ## Output format
 Return a single JSON object. No markdown, no explanation outside the JSON.
 
 Return the high-level ModelRecipe DSL shape:
-schema_version: "model_recipe.v1"
+schema_version: "model_recipe.v2"
 model_name, hypothesis, input, architecture, training, constraints
+architecture contains preprocessing, embedding, backbone (typed object), fusion, prediction_head, representation and composition.
+For the exact v3 module contract and available actions follow the current model-design schema; never emit the old flat architecture fields.
+Sequence encoders diagonal_ssm, timesblock_encoder and mamba use embedding none, explicit sequence_latent/channel_sequence layout, mean/last readout, latent_dim.
+Legacy encoders use channel_latent, readout none. Mamba backend must be torch_reference; TimesBlock is not native TimesNet. No cross-H sharing.
 
 The hypothesis field MUST follow this format, max 1200 chars:
 "Previous [backbone+embedding]: [observed metric pattern]. Diagnosis: [root cause]. Proposed change: [what changed] because [why this addresses the bottleneck]."
@@ -179,7 +183,7 @@ function _buildReflectionUserMessage(requirement, attempt, context) {
       user_requirement: requirement,
       attempt,
       reflection_context: context,
-      instruction: "Analyze the previous result and propose an improved model_recipe.v1. Return JSON only.",
+      instruction: "Analyze the previous result and propose an improved model_recipe.v2. Return JSON only.",
     },
     null,
     2,

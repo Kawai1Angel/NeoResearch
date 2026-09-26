@@ -1,12 +1,13 @@
+import { Instance } from "@/project/instance"
+import { summarizeTask } from "@/research/domain-registry"
+import { taskExecutionRoot } from "@/research/task-isolation"
 import { Effect, Schema } from "effect"
-import { readFile } from "node:fs/promises"
 import * as Tool from "./tool"
 import { resolveTaskIDBySessionID } from "@/research/hypothesis-store"
 import { Database, and, desc, eq } from "@/storage"
 import { ResearchArtifactTable, ResearchTaskTable } from "@/research/research.sql"
 import { mapTask } from "@/research/task-mapper"
 import { analyzeDataset, buildDatasetAnalysisContext } from "@/research/agents/data-analysis-agent"
-import type { JsonRecord } from "@/research/schema"
 
 const NOT_IN_RESEARCH_SESSION =
   "This tool can only be used inside a research task session — could not resolve the current research task."
@@ -66,14 +67,11 @@ export const AnalyzeDatasetTool = Tool.define(
         }
 
         try {
-          const filePath = profileArtifact.uri.startsWith("file://")
-            ? profileArtifact.uri.slice("file://".length)
-            : profileArtifact.uri
-          const raw = await readFile(filePath, "utf8")
-          const payload = JSON.parse(raw) as { fingerprint?: JsonRecord }
-          const fingerprint = (payload.fingerprint ?? {}) as JsonRecord
-
           const task = mapTask(taskRow)
+          // Revalidate the data source rather than trusting a historical cached profile.
+          const fingerprint = summarizeTask(task.domainID, task.taskSpec, {
+            taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory),
+          })
           const context = await buildDatasetAnalysisContext(task, fingerprint)
           const result = analyzeDataset({ task, fingerprint, context })
 

@@ -51,15 +51,17 @@
     },
     "known_future_covariates": {
       "type": "array",
+      "maxItems": 0,
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
     },
     "static_covariates": {
       "type": "array",
+      "maxItems": 0,
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
     },
-    "known_future_availability": { "type": "object" },
+    "known_future_availability": { "type": "object", "maxProperties": 0 },
     "experiment_scope": { "type": "string", "minLength": 1 },
     "production_comparable": { "type": "boolean" },
     "input_len": {

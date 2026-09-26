@@ -9,6 +9,8 @@ test("isolated runtime paths cannot escape into another task workspace", () => {
   expect(() => validateTaskRuntimePaths({ taskSpec: { runtime: { artifactsDir: ".neo-cast/artifacts" } } }, root)).not.toThrow()
 })
 
-test("legacy tasks keep their existing execution paths for recovery", () => {
-  expect(taskExecutionRoot({ id: "old-task", taskSpec: {} }, "/project")).toBe("/project")
+test("all sessions use distinct workspaces even without isolation metadata", () => {
+  expect(taskExecutionRoot({ id: "old-task", taskSpec: {} }, "/project")).toBe("/project/.neo-research/workspaces/old-task")
+  expect(taskExecutionRoot({ id: "other-task", taskSpec: { metadata: { executionIsolation: "legacy" } } }, "/project")).toBe("/project/.neo-research/workspaces/other-task")
+  expect(() => taskExecutionRoot({ id: "../escape", taskSpec: {} }, "/project")).toThrow("workspace ID")
 })

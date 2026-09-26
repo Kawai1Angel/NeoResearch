@@ -6,12 +6,12 @@ function describeCandidateId(payload) {
 
 function describeCandidateFamily(payload) {
   if (payload.model_family) return payload.model_family;
-  if (payload.schema_version === "model_recipe.v1") {
-    const backbone = payload.architecture?.backbone || "unknown_backbone";
+  if (["model_recipe.v1", "model_recipe.v2"].includes(payload.schema_version)) {
+    const backbone = payload.architecture?.backbone?.type || payload.architecture?.backbone || "unknown_backbone";
     const multiscale = Number(payload.architecture?.multiscale_blocks || 0) > 1 ? "+multiscale" : "";
     return `model_recipe:${backbone}${multiscale}`;
   }
-  if (payload.recipe_version === "recipe_schema_v1") {
+  if (["recipe_schema_v2", "recipe_schema_v3"].includes(payload.recipe_version)) {
     const embedding = payload.embedding?.type || "unknown_embedding";
     const backbone = payload.backbone?.type || "unknown_backbone";
     return `recipe:${embedding}+${backbone}`;

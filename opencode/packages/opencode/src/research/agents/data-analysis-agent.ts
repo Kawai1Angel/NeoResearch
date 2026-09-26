@@ -1,6 +1,6 @@
-import { existsSync } from "fs"
-import { readFile } from "fs/promises"
-import path from "path"
+import { resolveTSFProfileSource, TSFTaskSpec } from "../domains/tsf"
+import { taskExecutionRoot } from "../task-isolation"
+import { analyzeDatasetProfileForPrompt, renderCorrelationMatrixSummary } from "../prompt-context"
 import { deflateSync } from "zlib"
 import { Instance } from "@/project/instance"
 import type { JsonRecord, ResearchArtifact, ResearchArtifactID, ResearchTask } from "../schema"
@@ -101,33 +101,34 @@ function stringArray(value: unknown) {
   return value.filter((item): item is string => typeof item === "string" && item.length > 0)
 }
 
-function metricLine(label: string, value: unknown) {
-  const number = numberValue(value)
-  return `- ${label}: ${number === undefined ? "n/a" : Number(number.toFixed(6))}`
-}
-
-function markdownValue(value: unknown) {
-  if (typeof value === "number" && Number.isFinite(value)) return Number(value.toFixed(6))
-  if (typeof value === "boolean") return value ? "true" : "false"
-  if (typeof value === "string" && value.length > 0) return value
-  return "n/a"
-}
-
 function renderCorrelationMatrix(value: unknown) {
-  const matrix = recordValue(value)
-  const columns = Array.isArray(matrix.columns)
-    ? matrix.columns.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : []
-  const values = Array.isArray(matrix.values) ? matrix.values : []
-  if (columns.length === 0 || values.length === 0) return ["- Correlation matrix unavailable."]
+  return renderCorrelationMatrixSummary(value)
+}
+
+function renderDatasetProfileAnalysis(value: unknown) {
+  const analysis = analyzeDatasetProfileForPrompt(value)
+  const metrics = recordValue(analysis.metrics)
+  const labels: Record<string, string> = {
+    rowCount: "Rows",
+    targetCount: "Target columns",
+    missingRate: "Missing rate",
+    trendStrength: "Trend strength",
+    seasonalityStrength: "Seasonality strength",
+    crossVarCorrelation: "Cross-variate correlation",
+    distributionShift: "Distribution shift",
+    outlierRate: "Outlier rate",
+    acfMainPeriod: "ACF main period",
+    acfMainPeriodStrength: "ACF main period strength",
+    adfStatistic: "ADF statistic",
+    duplicateTimestampRate: "Duplicate timestamp rate",
+    irregularIntervalRatio: "Irregular interval ratio",
+  }
   return [
-    `| Target | ${columns.join(" | ")} |`,
-    `| --- | ${columns.map(() => "---:").join(" | ")} |`,
-    ...columns.map((column, index) => {
-      const row = Array.isArray(values[index]) ? values[index]! : []
-      return `| ${column} | ${columns
-        .map((_, columnIndex) => markdownValue(row[columnIndex]))
-        .join(" | ")} |`
+    "| Metric | Value | Assessment | Modeling implication |",
+    "| --- | ---: | --- | --- |",
+    ...Object.entries(metrics).map(([key, raw]) => {
+      const metric = recordValue(raw)
+      return `| ${labels[key] ?? key} | ${String(metric.value ?? "n/a")} | ${String(metric.assessment ?? "n/a")} | ${String(metric.modelingImplication ?? "n/a")} |`
     }),
   ]
 }
@@ -191,17 +192,6 @@ function datasetRoleList(dataset: Record<string, unknown>, key: string) {
     : []
 }
 
-function taskTrainDataPath(task: ResearchTask): string | undefined {
-  const taskSpec = recordValue(task.taskSpec)
-  const runtime = recordValue(taskSpec.runtime)
-  const dataset = recordValue(taskSpec.dataset)
-  const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
-  const loaderID = typeof dataset.loaderID === "string" ? dataset.loaderID.trim() : ""
-  if (!root || !loaderID) return undefined
-  const safeID = loaderID.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 64)
-  return path.join(root, ".neo-cast", "dataset", `${safeID}_train.csv`)
-}
-
 function csvCells(line: string) {
   const cells: string[] = []
   let current = ""
@@ -233,27 +223,27 @@ function datasetTargetColumns(task: ResearchTask, header: readonly string[]) {
   const targetCols = Array.isArray(dataset.targetCols)
     ? dataset.targetCols.filter((item): item is string => typeof item === "string" && header.includes(item))
     : []
-  if (targetCols.length > 0) return targetCols
+  if (Array.isArray(dataset.targetCols) && dataset.targetCols.length > 0) {
+    return targetCols.length === dataset.targetCols.length ? targetCols : []
+  }
   return header.slice(1)
 }
 
 async function loadDatasetSeriesMatrix(task: ResearchTask): Promise<DatasetSeriesMatrix | undefined> {
-  const dataset = taskDatasetSpec(task)
-  const trainPath = taskTrainDataPath(task)
-  const resolvedTrainPath = trainPath && existsSync(trainPath) ? trainPath : undefined
-  const rawPath = typeof dataset.path === "string" && dataset.path.length > 0
-    ? (path.isAbsolute(dataset.path) ? dataset.path : path.join(Instance.directory, dataset.path))
-    : undefined
-  const datasetPath = resolvedTrainPath ?? rawPath
-  if (!datasetPath || !existsSync(datasetPath)) return undefined
-  const text = await readFile(datasetPath, "utf8")
+  const spec = TSFTaskSpec.safeParse(task.taskSpec)
+  if (!spec.success) return undefined
+  const source = resolveTSFProfileSource(spec.data, {
+    taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory),
+  })
+  if (source.raw === undefined) return undefined
+  const text = source.raw
   const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0)
   if (lines.length < 3) return undefined
   const header = csvCells(lines[0]!)
   const columns = datasetTargetColumns(task, header)
   const columnIndexes = columns.map((column) => header.indexOf(column))
   if (columns.length === 0 || columnIndexes.some((index) => index < 0)) return undefined
-  const values = lines.slice(1).map((line) => {
+  const values = lines.slice(1, source.usingTrainFile ? undefined : 5001).map((line) => {
     const row = csvCells(line)
     return columnIndexes.map((columnIndex) => {
       const parsed = Number(row[columnIndex])
@@ -833,18 +823,7 @@ export function buildDatasetAnalysisReportMarkdown(input: {
     "",
     "## Dataset Profile",
     "",
-    metricLine("Rows", profile.rowCount),
-    metricLine("Target columns", profile.targetCount),
-    metricLine("Missing rate", profile.missingRate),
-    metricLine("Trend strength", profile.trendStrength),
-    metricLine("Seasonality strength", profile.seasonalityStrength),
-    metricLine("Cross-variate correlation", profile.crossVarCorrelation),
-    metricLine("Distribution shift", profile.distributionShift),
-    metricLine("Outlier rate", profile.outlierRate),
-    metricLine("ACF main period", profile.acfMainPeriod),
-    metricLine("ACF main period strength", profile.acfMainPeriodStrength),
-    metricLine("ADF statistic", profile.adfStatistic),
-    `- ADF stationarity: ${markdownValue(profile.adfStationary)}`,
+    ...renderDatasetProfileAnalysis(profile),
     "",
     "## Correlation Matrix",
     "",

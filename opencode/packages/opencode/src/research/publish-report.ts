@@ -9,6 +9,7 @@ import type {
   ResearchRun,
   ResearchTask,
 } from "./schema"
+import { compactPromptContext } from "./prompt-context"
 
 export const PUBLISH_REPORT_SCHEMA_VERSION = "neo_research_publish_report_input.v1" as const
 export const PUBLISH_REPORT_PROMPT_VERSION = "publish-report.v1"
@@ -155,7 +156,7 @@ export function buildPublishReportPrompt(snapshot: PublishReportSnapshot): strin
     "关键数字注明 run ID 或 artifact ID。只输出 Markdown 正文。必须按顺序包含以下二级章节：",
     PUBLISH_REPORT_SECTIONS.map((section) => `## ${section}`).join("\n"),
     "\n受控快照：",
-    JSON.stringify(snapshot, null, 2),
+    JSON.stringify(compactPromptContext(snapshot), null, 2),
   ].join("\n")
 }
 

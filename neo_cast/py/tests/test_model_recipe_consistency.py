@@ -82,7 +82,7 @@ class ModelRecipeConsistencyTest(unittest.TestCase):
             base = model(x.detach())
             affine = model(x.detach() * 2.5 + 7.0)
         self.assertTrue(torch.allclose(affine, base * 2.5 + 7.0, atol=2e-4, rtol=2e-4))
-        for backbone in ("linear", "mlp", "rnn", "ssm", "mixer"):
+        for backbone in ("linear", "mlp", "rnn", "gated_depthwise_conv", "mixer"):
             with self.subTest(backbone=backbone):
                 other, _ = model_for(recipe(backbone=backbone, embedding="invert"))
                 self.assertEqual(other(x.detach()).shape, (2, 8, 3))
@@ -129,7 +129,7 @@ class ModelRecipeConsistencyTest(unittest.TestCase):
             parameter_counts.append(sum(parameter.numel() for parameter in model.parameters()))
         self.assertEqual(parameter_counts, sorted(parameter_counts))
         self.assertEqual(len(set(parameter_counts)), 4)
-        for settings in ({"backbone": "timesnet", "embedding": "frequency"}, {"embedding": "frequency", "multiscale_blocks": 2}, {"heads": 6}):
+        for settings in ({"backbone": "timesnet_lite", "embedding": "frequency"}, {"embedding": "frequency", "multiscale_blocks": 2}, {"heads": 6}):
             with self.assertRaises(ValueError):
                 compile_model_recipe(recipe(**settings))
 

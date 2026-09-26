@@ -56,6 +56,8 @@ const UpdateTaskspecParameters = Schema.Struct({
       "Only include slots the user's message actually resolves — never invent values for slots not addressed. " +
       "parameter_budget: use an absolute integer count or an explicit size such as 5M for a hard limit; descriptive text is a preference. " +
       "latency_budget records an inference requirement, not a training timeout. " +
+      "data_split_method is ratio or row_ranges; data_split_ratios is [train, validation, test] with three positive weights; " +
+      "data_split_row_ranges is {train:[start,end], validation:[start,end], test:[start,end]} using contiguous zero-based [start,end) ranges. " +
       "max_iterations and max_no_improve must be positive integers when supplied; their defaults are 25 and 7 respectively.",
   }),
 })

@@ -6,7 +6,7 @@ Drive intent gathering to a close: figure out which intent slots are still missi
 user about them, write their answers back, and confirm when the task is ready to move on.
 
 ## Tools
-- `read_taskspec` — read all 19 intent slots, their current value, and which required slots are
+- `read_taskspec` — read all intent slots, their current value, and which required slots are
   still missing. Always call this first, and call it again after any `update_taskspec` call or
   after the user answers — never rely on your memory of a slot's value from earlier in this
   conversation, since it may have changed through another channel (e.g. the user editing it
@@ -73,6 +73,14 @@ skip it just because the next step seems obvious.
   use it to infer `max_iterations` or `max_no_improve`.
 - `max_iterations` and `max_no_improve` default to 25 and 7. Show them in the Intent summary and
   preserve any user-supplied replacements, but do not make them mandatory clarification questions.
+- Dataset splitting defaults to `data_split_method="ratio"` with
+  `data_split_ratios=[7,1,2]` (train/validation/test). Treat ratios as relative positive weights,
+  so `[0.7,0.1,0.2]` is equivalent. When the user requests exact boundaries, write
+  `data_split_method="row_ranges"` and
+  `data_split_row_ranges={train:[start,end],validation:[start,end],test:[start,end]}` together.
+  Row ranges are zero-based, left-closed/right-open, contiguous, non-overlapping, and train starts
+  at row 0. Never infer exact row boundaries without inspecting the CSV row count or an explicit
+  user instruction.
 - Never call `check_taskspec` while you still have unaddressed `missingRequiredSlots` from your
   own last `read_taskspec` call.
 - Never call `update_taskspec` and `ask_user` in the same turn in that order if the update

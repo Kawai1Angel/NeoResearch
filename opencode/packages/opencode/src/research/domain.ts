@@ -190,10 +190,16 @@ export const DomainRunPlan = z
   .strict()
 export type DomainRunPlan = z.infer<typeof DomainRunPlan>
 
+export interface DomainSummaryContext {
+  readonly taskID: string
+  readonly projectRoot: string
+  readonly workspaceRoot: string
+}
+
 export interface ResearchDomain {
   readonly info: DomainInfo
   readonly createTaskSpec: (input: unknown) => JsonRecord
-  readonly summarizeTask?: (taskSpec: JsonRecord) => JsonRecord
+  readonly summarizeTask?: (taskSpec: JsonRecord, context?: DomainSummaryContext) => JsonRecord
   readonly buildBaselines: (taskSpec: JsonRecord) => DomainCandidateProposal[]
   readonly rankCandidateProposals?: (input: DomainProposalContext) => DomainCandidateRanking[]
   readonly proposeCandidate?: (input: DomainProposalContext) => DomainCandidateProposal | undefined

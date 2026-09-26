@@ -1,3 +1,5 @@
+import { timedEffect } from "@/util/runtime-timing"
+import { extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure, type TrainingCurvePoint } from "./runner-evidence"
 import { supersedeIntentCheckpoints } from "./taskspec-store"
 import { taskExecutionRoot, taskSessionModel, validateTaskRuntimePaths } from "./task-isolation"
 import { readSelectedSessionModel, resolveSessionModel } from "./session-model"
@@ -112,6 +114,7 @@ import {
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
 import { apiKeyFor, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata as buildLLMMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
+import { analyzeDatasetProfileForPrompt, compactPromptContext } from "./prompt-context"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
 import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
 import {
@@ -238,6 +241,7 @@ export type AutonomousLoopStoppedReason =
   | "plateau"
   | "time_budget_exhausted"
   | "crash_streak_exceeded"
+  | "no_new_candidate"
 
 export interface AutonomousLoopResult {
   readonly iterations: AutonomousIterationResult[]
@@ -366,8 +370,12 @@ const RUNNER_IDLE_TIMEOUT_MS = 180_000
 const RUNNER_ABORT_KILL_GRACE_MS = 5_000
 const RUNNER_NAN_WATCHDOG_LIMIT = 3
 const STALE_RUN_RECONCILE_MS = 5 * 60_000
-const DEFAULT_CUSTOM_SPLIT_STRATEGY = "tsl_custom_70_10_20"
-type DatasetSplitStrategy = "tsl_custom_70_10_20" | "contiguous_60_20_20"
+
+type DatasetSplitRows = {
+  readonly train: readonly [number, number]
+  readonly validation: readonly [number, number]
+  readonly test: readonly [number, number]
+}
 
 interface RunBudgetExceeded {
   readonly limit: number
@@ -432,6 +440,7 @@ function intentCheckpointSignature(task: ResearchTask) {
   return [
     `mode=${compactIntentValue(taskInteractionMode(task) ?? (task.mode === "review" ? "companion" : "socratic"))}`,
     `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
+    `split=${JSON.stringify(dataset.split ?? null)}`,
     `targets=${compactIntentValue(dataset.targetCols)}`,
     `pastCovariates=${compactIntentValue(dataset.observedPastCovariates)}`,
     `futureCovariates=${compactIntentValue(dataset.knownFutureCovariates)}`,
@@ -466,6 +475,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Interaction mode: ${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `Task: ${task.title}`,
     `Dataset: ${compactIntentValue(slotOr(dataset.path ?? dataset.loaderID, "data_source"))}`,
+    `Data split: ${JSON.stringify(dataset.split ?? null)}`,
     `Targets: ${compactIntentValue(slotOr(dataset.targetCols, "target_columns"))}`,
     `Forecast object: ${compactIntentValue(intentSlots.forecast_object ?? spec.forecastObject)}`,
     `Context length: ${compactIntentValue(slotOr(spec.contextLength, "lookback_window"))}`,
@@ -512,49 +522,6 @@ interface RunnerProgressFields {
   readonly valLoss?: number
   readonly elapsedS?: number
   readonly foldIndex?: number
-}
-
-interface TrainingCurvePoint {
-  readonly epoch: number
-  readonly valLoss: number
-  readonly horizon?: number
-  readonly elapsedS?: number
-}
-
-async function extractTrainingCurve(filePath: string, maxPoints = 60): Promise<TrainingCurvePoint[]> {
-  let raw: string
-  try {
-    raw = await readFile(filePath, "utf8")
-  } catch {
-    return []
-  }
-  const points: TrainingCurvePoint[] = []
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line.trim()) continue
-    try {
-      const r = JSON.parse(line) as Record<string, unknown>
-      const epoch = finiteNumber(r.epoch)
-      const valLoss = finiteNumber(r.val_loss) ?? finiteNumber(r.valLoss)
-      if (epoch === undefined || valLoss === undefined) continue
-      points.push({
-        epoch,
-        valLoss,
-        ...(finiteNumber(r.horizon) !== undefined ? { horizon: finiteNumber(r.horizon)! } : {}),
-        ...(finiteNumber(r.elapsed_s) !== undefined ? { elapsedS: finiteNumber(r.elapsed_s)! } : {}),
-        ...(finiteNumber(r.elapsedS) !== undefined ? { elapsedS: finiteNumber(r.elapsedS)! } : {}),
-      })
-    } catch {
-      // skip unparseable lines
-    }
-  }
-  if (points.length <= maxPoints) return points
-  // Sample: always keep first and last; pick evenly-spaced indices in between.
-  const step = (points.length - 1) / (maxPoints - 1)
-  const sampled: TrainingCurvePoint[] = []
-  for (let i = 0; i < maxPoints; i++) {
-    sampled.push(points[Math.round(i * step)]!)
-  }
-  return sampled
 }
 
 function parseProgressLine(line: string): RunnerProgressFields {
@@ -1162,7 +1129,7 @@ function sessionLocalMetricState(input: {
   let bestMetric: number | undefined
   let noImproveStreak = 0
   const runs = input.runs
-    .filter((run) => run.stage === input.stage && run.status === "succeeded")
+    .filter((run) => run.stage === input.stage && run.status === "succeeded" && run.resourceUsage.independentEvidence !== false)
     .toSorted((left, right) =>
       (left.timeFinished ?? left.time.updated ?? left.time.created) -
       (right.timeFinished ?? right.time.updated ?? right.time.created),
@@ -2003,12 +1970,72 @@ function parseSearchPreferencesFromQualitative(text: string): string[] {
     .slice(0, 8)
 }
 
+function buildExtendedStatisticsAnalysis(context: DatasetAnalysisContext) {
+  const statistics = context.statistics
+  const decompositionShares = {
+    trend: statistics.decomposition.trendVarianceShare,
+    seasonal: statistics.decomposition.seasonalVarianceShare,
+    residual: statistics.decomposition.residualVarianceShare,
+  }
+  const dominantComponent = Object.entries(decompositionShares)
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])[0]?.[0] ?? "unknown"
+  const crossLagMagnitude = Math.abs(statistics.crossLag.correlation ?? 0)
+  return {
+    stationarity: {
+      kpssStatistic: statistics.stationarity.kpssStatistic,
+      kpssStationary: statistics.stationarity.kpssStationary,
+      analysis: statistics.stationarity.kpssStationary
+        ? "KPSS supports level stationarity under the configured rule."
+        : "KPSS suggests non-stationarity or an inconclusive result; favor normalization, differencing, or decomposition.",
+    },
+    autocorrelation: {
+      acfTopLag: statistics.acf.topLag,
+      acfTopCorrelation: statistics.acf.topCorrelation,
+      pacfTopLag: statistics.acf.pacfTopLag,
+      pacfTopCorrelation: statistics.acf.pacfTopCorrelation,
+      analysis: "Use the strongest ACF/PACF lags as evidence for seasonal periods, receptive fields, and patch scales.",
+    },
+    decomposition: {
+      period: statistics.decomposition.period,
+      ...decompositionShares,
+      dominantComponent,
+      analysis: `The ${dominantComponent} component explains the largest reported variance share; prioritize models that represent it explicitly.`,
+    },
+    frequency: {
+      dominantPeriod: statistics.frequency.dominantPeriod,
+      dominantPowerShare: statistics.frequency.dominantPowerShare,
+      spectralPeakCount: statistics.frequency.spectralPeaks.length,
+      significantPeakCount: statistics.frequency.spectralPeaks.filter((peak) => peak.significant).length,
+      analysis: "Frequency features are better supported when dominant power is concentrated and multiple peaks are statistically significant.",
+    },
+    changepoint: {
+      index: statistics.changepoint.index,
+      score: statistics.changepoint.score,
+      severity: statistics.changepoint.severity,
+      analysis: statistics.changepoint.severity === "high"
+        ? "A severe change point is a validation risk; use robust losses and split-aware evaluation."
+        : "No severe change point dominates the current deterministic analysis.",
+    },
+    crossLag: {
+      source: statistics.crossLag.source,
+      target: statistics.crossLag.target,
+      lag: statistics.crossLag.lag,
+      correlation: statistics.crossLag.correlation,
+      assessment: crossLagMagnitude >= 0.6 ? "strong" : crossLagMagnitude >= 0.4 ? "moderate" : crossLagMagnitude >= 0.2 ? "weak" : "very weak",
+      analysis: crossLagMagnitude >= 0.4
+        ? "The lead-lag signal can justify sparse directional cross-variable modeling."
+        : "The lead-lag signal alone does not justify complex cross-variable modeling.",
+    },
+  }
+}
+
 function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord, context: DatasetAnalysisContext): string {
   const profile = recordValue(recordValue(fingerprint).datasetProfile)
   const dataset = taskDatasetSpec(task)
   const covariates = datasetCovariateContext(task)
   return JSON.stringify(
-    {
+    compactPromptContext({
       task: {
         id: task.id,
         title: task.title,
@@ -2026,45 +2053,16 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
         },
       },
       taskSpec: task.taskSpec,
-      datasetProfile: {
-        rowCount: profile.rowCount,
-        targetCount: profile.targetCount,
-        missingRate: profile.missingRate,
-        trendStrength: profile.trendStrength,
-        seasonalityStrength: profile.seasonalityStrength,
-        crossVarCorrelation: profile.crossVarCorrelation,
-        distributionShift: profile.distributionShift,
-        outlierRate: profile.outlierRate,
-        acfMainPeriod: profile.acfMainPeriod,
-        adfStatistic: profile.adfStatistic,
-        adfStationary: profile.adfStationary,
-      },
-      extendedStatistics: {
-        kpssStatistic: context.statistics.stationarity.kpssStatistic,
-        kpssStationary: context.statistics.stationarity.kpssStationary,
-        acfTopLag: context.statistics.acf.topLag,
-        pacfTopLag: context.statistics.acf.pacfTopLag,
-        decompositionPeriod: context.statistics.decomposition.period,
-        trendVarianceShare: context.statistics.decomposition.trendVarianceShare,
-        seasonalVarianceShare: context.statistics.decomposition.seasonalVarianceShare,
-        dominantFrequencyPeriod: context.statistics.frequency.dominantPeriod,
-        dominantPowerShare: context.statistics.frequency.dominantPowerShare,
-        changepointIndex: context.statistics.changepoint.index,
-        changepointScore: context.statistics.changepoint.score,
-        changepointSeverity: context.statistics.changepoint.severity,
-        crossLagSource: context.statistics.crossLag.source,
-        crossLagTarget: context.statistics.crossLag.target,
-        crossLagLag: context.statistics.crossLag.lag,
-        crossLagCorrelation: context.statistics.crossLag.correlation,
-      },
+      datasetProfileAnalysis: analyzeDatasetProfileForPrompt(profile),
+      extendedStatisticsAnalysis: buildExtendedStatisticsAnalysis(context),
       instruction:
         "Call the analyze_dataset tool first to get authoritative statistics, then analyze the dataset " +
         "characteristics and provide qualitative domain insights for guiding TSF model search. " +
         "Important: targetCount describes forecast targets only. Do not conclude the task is exogenous-free " +
         "or production-infeasible when observedPastCovariates/knownFutureCovariates are listed above. " +
         "When knownFutureCovariates are present, discuss their availability and whether the scope is a production candidate " +
-        "or an oracle upper-bound. The datasetProfile/extendedStatistics below are provided only as a fallback in case the tool is unavailable.",
-    },
+        "or an oracle upper-bound. The analyzed profile/statistics below are provided only as a fallback in case the tool is unavailable.",
+    }),
     null,
     2,
   )
@@ -2126,28 +2124,32 @@ const MODEL_RECIPE_LIBRARY = {
   preferences: [
     "Prefer dlinear or linear as low-variance baselines before committing to higher-capacity backbones.",
     "Use series_decomposition or instance_norm preprocessing when seasonality or trend strength is detected.",
-    "Patch embedding works well with transformer and mlp backbones; avoid patch with dlinear/tcn/nbeats/timesnet.",
-    "Channel-mixing fusion (feature, temporal_then_feature) is only meaningful when cross-variate correlation is confirmed.",
-    "For missing data, include missing_mask in preprocessing before testing any backbone.",
+    "Patch embedding works well with transformer and mlp backbones; avoid patch with dlinear/tcn/nbeats/timesnet_lite.",
+    "Channel-mixing fusion (feature_mlp, variate_attention, temporal_then_feature) tests cross-variate dependencies.",
+    "For missing data, place missing_mask first and use cross-variable fusion so its appended channels affect forecasts.",
     "sample_reweighting is useful under distribution shift but should be validated against time-ordered splits.",
     "If a candidate's training curve is unstable (loss spikes, oscillation, or NaN), prefer hypotheses that adjust training.learning_rate (lower it) or add training.warmup_ratio (e.g. 0.1-0.3) before concluding the architecture/preprocessing choice itself is the problem.",
   ],
   backbones: {
-    linear: "Single linear projection per horizon; lowest variance, good baseline.",
+    diagonal_ssm: "Real diagonal state-space recurrence with stable ZOH discretization; explicit sequence readout.",
+    timesblock_encoder: "Sample-local FFT period selection and Inception 2D TimesBlock; not native TimesNet.",
+    mamba: "Mamba-1 selective state-space encoder with CPU torch_reference backend; CUDA not verified.",
+    linear: "Shared or per-variable linear encoder; the prediction head owns the horizon projection.",
     mlp: "Multi-layer perceptron; moderate capacity, patch-friendly.",
     transformer: "Self-attention over patch tokens; high capacity, requires sufficient data.",
     dlinear: "Decomposed linear (trend + seasonal split); strong on ETT-style benchmarks.",
     tcn: "Temporal convolutional network; effective for local temporal patterns.",
     nbeats: "Basis expansion with interpretable blocks; strong for seasonal/trend decomposition.",
-    timesnet: "2D temporal convolution via FFT reshape; good for multi-period series.",
+    timesnet_lite: "Paper-derived FFT period selection and compact 2D convolution; not a full TimesNet reproduction.",
     rnn: "Recurrent sequence model; handles irregular sampling but slower to train.",
-    ssm: "State-space model; efficient long-range modeling with linear complexity.",
+    gated_depthwise_conv: "Gated depthwise temporal convolution; no state recurrence or selective scan, not an SSM.",
     mixer: "MLP-Mixer over time and channel dimensions; fast channel-mixing alternative.",
   },
   preprocessing: {
     none: "No preprocessing; suitable for already-normalized inputs.",
+    last_value_centering: "Explicit subtract-last and restore-last transform for an NLinear-style baseline.",
     instance_norm: "Per-instance normalization; reduces distribution shift within a sequence.",
-    series_decomposition: "Trend-seasonal decomposition; feeds separated components to backbone.",
+    series_decomposition: "Independent trainable linear trend branch plus recipe residual encoder/head; not combined with DLinear.",
     seasonal_differencing: "Removes periodic trend via seasonal differencing; phase2+.",
     missing_mask: "Binary mask features for missing values; required when missingRate > 0.",
     sample_reweighting: "Reweight training samples by recency or quality; phase2+.",
@@ -2176,6 +2178,7 @@ function buildTaskDefinition(task: ResearchTask): Record<string, unknown> {
       observedPastCovariates: dataset.observedPastCovariates,
       knownFutureCovariates: dataset.knownFutureCovariates,
       staticCovariates: dataset.staticCovariates,
+      split: dataset.split,
     },
     contextLength: slotOr(spec.contextLength, "lookback_window"),
     predictionLengths: slotOr(spec.predictionLengths, "prediction_horizon"),
@@ -2270,7 +2273,7 @@ function buildHypoPlannerUserPrompt(
         })
     : undefined
   return JSON.stringify(
-    {
+    compactPromptContext({
       taskSpec: task.taskSpec,
       taskDefinition: buildTaskDefinition(task),
       dataAnalysis: dataAnalysisSummary,
@@ -2335,7 +2338,7 @@ function buildHypoPlannerUserPrompt(
         (opts?.baselineOptions && opts.baselineOptions.length > 0
           ? " After the hypothesis pool is updated, call pick_baseline exactly once to choose the single reference baseline from baselineOptions, citing specific dataAnalysis evidence."
           : ""),
-    },
+    }),
     null,
     2,
   )
@@ -2521,7 +2524,7 @@ function buildReflectionSessionUserPrompt(
     typeof objectiveRecord.description === "string" ? objectiveRecord.description : null,
   ].filter(Boolean).join(". ")
   return JSON.stringify(
-    {
+    compactPromptContext({
       taskSpec: task.taskSpec,
       taskObjective,
       maxIterations,
@@ -2542,7 +2545,7 @@ function buildReflectionSessionUserPrompt(
       instruction:
         "Follow the 4-step tool workflow in the system prompt (experiment_results → read_reflection → " +
         "read_training_curve → read_memory_lessons), then output the 7-key JSON analysis object.",
-    },
+    }),
     null,
     2,
   )
@@ -2550,7 +2553,7 @@ function buildReflectionSessionUserPrompt(
 
 function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: ReflectionLLMContext): string {
   return JSON.stringify(
-    {
+    compactPromptContext({
       taskSpec: context.taskSpec,
       taskObjective: context.taskObjective,
       maxIterations: context.maxIterations,
@@ -2595,7 +2598,7 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
       },
       decision: analysis.decision,
       decisionReason: analysis.decisionReason,
-    },
+    }),
     null,
     2,
   )
@@ -3000,8 +3003,6 @@ async function buildReproducibilitySeal(
   const preprocessPath = firstExistingFile([
     path.join(plan.command.cwd ?? workspaceRoot, ".neo-cast", "dataset_spec.json"),
     path.join(plan.command.cwd ?? workspaceRoot, ".neo-cast", "dataset", "dataset_spec.json"),
-    path.join(neoCastRoot, ".neo-cast", "dataset_spec.json"),
-    path.join(neoCastRoot, ".neo-cast", "dataset", "dataset_spec.json"),
     path.join(neoCastRoot, "py", "prepare_tsf.py"),
   ])
   const [workspaceGitSHA, datasetSHA, lockHash, preprocessSHA] = await Promise.all([
@@ -3033,6 +3034,7 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
   const runtime = recordValue(taskSpec.runtime)
   const metadata = recordValue(taskSpec.metadata)
   const availability = recordValue(metadata.knownFutureAvailability)
+  const split = recordValue(dataset.split)
   const root = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot.trim() : ""
   const source = typeof dataset.path === "string" ? dataset.path.trim() : ""
   if (!root || !source) return undefined
@@ -3053,10 +3055,26 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
     ? dataset.staticCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
     : []
   const loaderID = typeof dataset.loaderID === "string" && dataset.loaderID.length > 0 ? dataset.loaderID : "local_csv"
+  const ratios = Array.isArray(split.ratios) && split.ratios.length === 3
+    ? split.ratios.map((item) => Number(item))
+    : [7, 1, 2]
+  const rowRange = (value: unknown): [number, number] | undefined =>
+    Array.isArray(value) && value.length === 2 && value.every((item) => typeof item === "number")
+      ? [value[0], value[1]]
+      : undefined
   return {
     root: path.resolve(root),
     source: path.resolve(source),
     loaderID,
+    splitMethod: split.method === "row_ranges" ? "row_ranges" as const : "ratio" as const,
+    splitRatios: ratios as [number, number, number],
+    splitRows: split.method === "row_ranges"
+      ? {
+          train: rowRange(split.trainRows),
+          validation: rowRange(split.validationRows),
+          test: rowRange(split.testRows),
+        }
+      : undefined,
     contextLength: contextLength === undefined ? undefined : Math.floor(contextLength),
     predictionLengths: predictionLengths.map((item) => Math.floor(item)),
     targetCols,
@@ -3129,53 +3147,80 @@ function csvDataRowCount(csvPath: string): number | undefined {
   }
 }
 
-function splitIsFeasible(
-  totalRows: number,
-  inputLen: number,
-  maxHorizon: number,
-  splitStrategy: DatasetSplitStrategy,
-) {
-  if (splitStrategy === "contiguous_60_20_20") {
-    const trainEnd = Math.floor(totalRows * 0.6)
-    const valEnd = Math.floor(totalRows * 0.8)
-    return trainEnd >= inputLen + maxHorizon &&
-      valEnd - trainEnd >= maxHorizon &&
-      totalRows - valEnd >= maxHorizon
-  }
-  const trainEnd = Math.floor(totalRows * 0.7)
-  const refStart = totalRows - Math.floor(totalRows * 0.2)
-  return trainEnd >= inputLen + maxHorizon &&
-    refStart - trainEnd >= maxHorizon &&
-    totalRows - refStart >= maxHorizon
-}
-
-function minimumRowsForSplit(inputLen: number, maxHorizon: number, splitStrategy: DatasetSplitStrategy) {
-  const approximate =
-    splitStrategy === "contiguous_60_20_20"
-      ? Math.max(Math.ceil((inputLen + maxHorizon) / 0.6), Math.ceil(maxHorizon / 0.2))
-      : Math.max(Math.ceil((inputLen + maxHorizon) / 0.7), Math.ceil(maxHorizon / 0.1), Math.ceil(maxHorizon / 0.2))
-  for (let rows = Math.max(1, approximate - 8); rows <= approximate + 32; rows++) {
-    if (splitIsFeasible(rows, inputLen, maxHorizon, splitStrategy)) return rows
-  }
-  return approximate
-}
-
-function validateCustomDatasetShape(input: {
-  readonly source: string
+function validateDatasetSplitRows(input: {
+  readonly totalRows: number
   readonly inputLen?: number
   readonly predictionLengths: readonly number[]
-  readonly splitStrategy: DatasetSplitStrategy
+  readonly splitRows: DatasetSplitRows
+  readonly label: string
 }) {
+  const { train, validation, test } = input.splitRows
+  if (
+    train[0] !== 0 ||
+    train[1] !== validation[0] ||
+    validation[1] !== test[0] ||
+    train[1] <= train[0] ||
+    validation[1] <= validation[0] ||
+    test[1] <= test[0]
+  ) {
+    throw new Error(
+      `Dataset is too short for ${input.label}: computed ranges must be contiguous and non-empty ` +
+        `(train=${train.join(":")}, validation=${validation.join(":")}, test=${test.join(":")}).`,
+    )
+  }
+  if (test[1] > input.totalRows) {
+    throw new Error(`${input.label} ends at row ${test[1]}, but the dataset only has ${input.totalRows} rows`)
+  }
   if (input.inputLen === undefined || input.predictionLengths.length === 0) return
   const maxHorizon = Math.max(...input.predictionLengths)
-  const rows = csvDataRowCount(input.source)
-  if (rows === undefined) return
-  const minRows = minimumRowsForSplit(input.inputLen, maxHorizon, input.splitStrategy)
-  if (rows >= minRows) return
-  throw new Error(
-    `Dataset is too short for automatic ${input.splitStrategy} splits: rows=${rows}, minimumRows=${minRows}, ` +
-      `input_len=${input.inputLen}, max_horizon=${maxHorizon}. Lower input_len/horizons or provide explicit split rows.`,
-  )
+  if (
+    train[1] - train[0] < input.inputLen + maxHorizon ||
+    validation[1] - validation[0] < maxHorizon ||
+    test[1] - test[0] < maxHorizon
+  ) {
+    throw new Error(
+      `Dataset is too short for ${input.label}: rows=${input.totalRows}, input_len=${input.inputLen}, ` +
+        `max_horizon=${maxHorizon}, train=${train.join(":")}, validation=${validation.join(":")}, ` +
+        `test=${test.join(":")}. Lower input_len/horizons or provide larger split ranges.`,
+    )
+  }
+}
+
+function resolveDatasetSplitRows(config: NonNullable<ReturnType<typeof tsfDatasetPreparationConfig>>): DatasetSplitRows {
+  const totalRows = csvDataRowCount(config.source)
+  if (totalRows === undefined) throw new Error(`Cannot count CSV rows in ${config.source}`)
+  let splitRows: DatasetSplitRows
+  let label: string
+  if (config.splitMethod === "row_ranges") {
+    const train = config.splitRows?.train
+    const validation = config.splitRows?.validation
+    const test = config.splitRows?.test
+    if (!train || !validation || !test) throw new Error("Explicit data split requires train, validation, and test row ranges")
+    splitRows = { train, validation, test }
+    label = "explicit row-range split"
+  } else {
+    const [trainRatio, validationRatio, testRatio] = config.splitRatios
+    const totalRatio = trainRatio + validationRatio + testRatio
+    if (![trainRatio, validationRatio, testRatio, totalRatio].every((item) => Number.isFinite(item) && item > 0)) {
+      throw new Error("Data split ratios must contain three positive numbers")
+    }
+    const trainEnd = Math.floor(totalRows * trainRatio / totalRatio)
+    const validationEnd = Math.floor(totalRows * (trainRatio + validationRatio) / totalRatio)
+    splitRows = {
+      train: [0, trainEnd],
+      validation: [trainEnd, validationEnd],
+      test: [validationEnd, totalRows],
+    }
+    label = `ratio split ${trainRatio}:${validationRatio}:${testRatio}`
+  }
+  validateDatasetSplitRows({
+    totalRows,
+    inputLen: config.contextLength,
+    predictionLengths: config.predictionLengths,
+    splitRows,
+    label,
+  })
+  return splitRows
 }
 
 function datasetSourceKey(dataset: Record<string, unknown>) {
@@ -3212,16 +3257,11 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectR
   const args = [path.join(config.root, "bin", "neo-cast.js"), "prepare-data", "--source", config.source]
   const preset = datasetPresetFromLoader(config.loaderID)
   if (preset) args.push("--dataset-preset", preset)
-  else {
-    args.push("--task-id", config.loaderID)
-    args.push("--split-strategy", DEFAULT_CUSTOM_SPLIT_STRATEGY)
-    validateCustomDatasetShape({
-      source: config.source,
-      inputLen: config.contextLength,
-      predictionLengths: config.predictionLengths,
-      splitStrategy: DEFAULT_CUSTOM_SPLIT_STRATEGY,
-    })
-  }
+  else args.push("--task-id", config.loaderID)
+  const splitRows = resolveDatasetSplitRows(config)
+  args.push("--train-rows", splitRows.train.join(":"))
+  args.push("--val-rows", splitRows.validation.join(":"))
+  args.push("--ref-test-rows", splitRows.test.join(":"))
   const warnings: string[] = []
   if (config.targetCols.length > 0) {
     const csvHeaders = csvHeaderColumns(config.source)
@@ -3522,12 +3562,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const releaseEvidence = input.evidenceBinding
           ? bindTaskEvidenceToSession(child.id, input.evidenceBinding.taskID, input.evidenceBinding.artifactID)
           : () => {}
-        const promptEffect = sessionPrompt.prompt({
+        const promptEffect = timedEffect("research.session", { taskID: input.taskID, sessionID: child.id, agent: input.agent }, sessionPrompt.prompt({
           sessionID: child.id,
           agent: input.agent,
           model: yield* selectSessionModel(input.taskID, input.modelRef),
           parts: [{ type: "text", text: input.user }],
-        }).pipe(Effect.onInterrupt(() => sessionPrompt.cancel(child.id)), Effect.ensuring(Effect.sync(releaseEvidence)))
+        })).pipe(Effect.onInterrupt(() => sessionPrompt.cancel(child.id)), Effect.ensuring(Effect.sync(releaseEvidence)))
         const result = (onDelta || onPartUpdated)
           ? yield* Effect.scoped(
               Effect.gen(function* () {
@@ -3712,7 +3752,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const taskSpecMetadata = recordValue(taskSpec.metadata)
       const managed = recordValue(existing.taskSpec.metadata)
       const nextMetadata: Record<string, unknown> = { ...taskSpecMetadata,
-        executionIsolation: managed.executionIsolation ?? "legacy",
+        executionIsolation: "task",
         ...(managed.sessionModel ? { sessionModel: managed.sessionModel } : {}),
       }
       if (nextMetadata.workflow !== undefined) delete nextMetadata.workflow
@@ -5042,7 +5082,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (!run.candidateID) return
       if (task.domainID === "tsf" && (!((run.resourceUsage as any).executionContract?.status === "verified") || run.stage !== "full")) return
       const candidate = yield* getCandidateForTask(task.id, run.candidateID)
-      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
       const evaluation =
         DomainRegistry.evaluateRun(task.domainID, { task, candidate, run }) ?? fallbackRunEvaluation(task, run)
       const metricName = evaluation.primaryMetricName
@@ -5164,7 +5204,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const recordFailedRunMemory = Effect.fn("Research.recordFailedRunMemory")(function* (run: ResearchRun) {
       const task = yield* getTask(run.taskID)
-      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
       const candidate = run.candidateID === undefined ? undefined : yield* getCandidateForTask(task.id, run.candidateID)
       const failedDataset = recordValue(recordValue(task.taskSpec).dataset)
       const failedSourceCsv = datasetSourceKey(failedDataset)
@@ -5368,10 +5408,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
 
       const runnerDone = execution.records.findLast((r) => r["event"] === "done")
+      const reused = runnerDone?.reused === true
+      const duplicateRunning = runnerDone?.status === "duplicate_running"
       const runnerTrainingSucceeded = runnerDone?.["status"] === "success"
       const contractWrite = prepared.runPlan.writes.find((write) => write.content.schema_version === "research_execution_contract.v1")
       const contract = contractWrite?.content as unknown as ExecutionContract | undefined
-      const contractMismatches = contract ? verifyExecutionRecords(contract, execution.records) : []
+      const contractMismatches = contract && !duplicateRunning ? verifyExecutionRecords(contract, execution.records) : []
       const contractInvalid = contractMismatches.length > 0
       const succeeded = !contractInvalid && (execution.exitCode === 0 || runnerTrainingSucceeded)
       const task = yield* getTask(running.taskID)
@@ -5380,17 +5422,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         : undefined
       const run = yield* updateRunStatus({
         runID: running.id,
-        status: contractInvalid ? "invalid" : succeeded ? "succeeded" : "failed",
-        metrics: (contractInvalid ? {} : metrics) as ResearchRun["metrics"],
+        status: contractInvalid ? "invalid" : duplicateRunning ? "rejected" : succeeded ? "succeeded" : "failed",
+        metrics: (contractInvalid || reused || duplicateRunning ? {} : metrics) as ResearchRun["metrics"],
         resourceUsage: {
           ...running.resourceUsage,
+          independentEvidence: !reused && !duplicateRunning,
+          duplicateExperiment: reused || duplicateRunning,
+          reusedExperiment: execution.records.findLast((record) => record.event === "experiment_reused"),
           exitCode: execution.exitCode,
-          executionContract: contract ? { status: contractInvalid ? "invalid" : "verified", contractDigest: digest(contract), candidateID: contract.candidate_id, manifest: execution.records.findLast((record) => record.event === "executed_model_manifest"), verified: execution.records.findLast((record) => record.event === "execution_contract_verified") } : undefined,
+          executionContract: contract ? { status: duplicateRunning ? "not_executed" : contractInvalid ? "invalid" : "verified", contractDigest: digest(contract), candidateID: contract.candidate_id, manifest: execution.records.findLast((record) => record.event === "executed_model_manifest"), verified: execution.records.findLast((record) => record.event === "execution_contract_verified") } : undefined,
           runnerID: prepared.runPlan.runnerID,
           ...(reproducibility === undefined ? {} : { reproducibility }),
         } as ResearchRun["resourceUsage"],
         artifactRefs,
-        error: succeeded ? undefined : execution.stderr || `Runner exited with code ${execution.exitCode}`,
+        error: succeeded ? undefined : runnerFailureEvidence(execution),
       })
 
       if (contractInvalid && contract && running.candidateID) {
@@ -5798,7 +5843,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const resumeSeed = typeof resumeBlocker?.metadata.seed === "number" ? resumeBlocker.metadata.seed : undefined
       yield* ensureRunBudget(task, "queued")
       const forceExplore = input.forceExplore === true
-      const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+      const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
 
       const latestReflection = yield* Effect.promise(async () => {
         try {
@@ -6596,6 +6641,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       let bestMetric = initialMetricState.bestMetric
       let noImproveStreak = initialMetricState.noImproveStreak
       let crashStreak = cycle.crash_streak
+      let duplicateStreak = 0
       const stopClock = cycleClock(cycle.id)
       return yield* Effect.gen(function* () {
       if (maxCrashStreak !== undefined && crashStreak >= maxCrashStreak) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "crash_streak_exceeded" })
@@ -6639,6 +6685,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         )
         if (iterationResult.status === "stopped") return iterationResult.result
         iterations.push(iterationResult.iteration)
+        if (iterationResult.iteration.run.resourceUsage.duplicateExperiment === true) {
+          duplicateStreak += 1
+          if (duplicateStreak >= 3) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "no_new_candidate" })
+          continue
+        }
+        duplicateStreak = 0
         if (iterationResult.iteration.run.status === "failed") {
           crashStreak += 1
           saveCrashStreak(cycle.id, crashStreak)
@@ -7252,7 +7304,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       input: ProfileTaskInput & { readonly _onDeltaQualitative?: (delta: string) => void },
     ) {
       const task = yield* getTask(input.taskID)
-      const fingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+      const fingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
       const root = runnerPath(Instance.directory, input.outputDir ?? ".neo-research/profile")
       const directory = path.join(root, task.id)
       const outputPath = path.join(directory, "task-profile.json")
@@ -8518,7 +8570,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
 	        // Build rich NAS result with per-iteration summaries
 	        const task = yield* getTask(input.taskID)
-	        const taskFp = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+	        const taskFp = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
 	        const primaryMetricName = objectiveMetricName(task.objective)
 	        const direction = objectiveDirection(task.objective)
 	        const result = buildNASAgentResult({
@@ -8715,9 +8767,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const champion = yield* getChampion(input.taskID)
 	        const artifacts = yield* listArtifacts(input.taskID)
 	        const memories = yield* listMemory(input.taskID)
+	        const evidenceRuns = yield* Effect.promise(() => Promise.all(runs.map(async (run) => {
+	          if (run.status === "succeeded") return run
+	          const artifact = artifacts.find((a) => a.runID === run.id && a.kind === "runner_execution_log_json")
+	          if (!artifact) return run
+	          const error = await recoverRunnerFailure(artifact.uri.replace(/^file:\/\//, ""), run.error)
+	          return { ...run, error }
+	        })))
 	        const baseResult = summarizeReflectionAgent({
 	          task,
-	          runs,
+	          runs: evidenceRuns,
 	          candidates,
 	          champion,
 	          stoppedReason: input.stoppedReason,
@@ -8725,10 +8784,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        })
 
 	        // Minimal context: find latest candidate for current hypothesis (pure in-memory, no I/O).
-	        const orderedRuns = [...runs].sort((a, b) => a.time.created - b.time.created)
-	        const latestSucceededRun = [...orderedRuns].reverse().find((r) => r.status === "succeeded")
+	        const orderedRuns = [...evidenceRuns].sort((a, b) => a.time.created - b.time.created)
 	        const latestRun = orderedRuns[orderedRuns.length - 1]
-	        const latestRunForContext = latestSucceededRun ?? latestRun
+	        const latestRunForContext = latestRun
 	        const latestCandidate = latestRunForContext?.candidateID
 	          ? candidates.find((c) => c.id === latestRunForContext.candidateID)
 	          : undefined
@@ -8897,7 +8955,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          taskID: task.id,
 	          domainID: task.domainID,
 	          fingerprintSummary: {
-	            ...DomainRegistry.summarizeTask(task.domainID, task.taskSpec),
+	            ...DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) }),
 	            taskID: task.id,
 	            domainID: task.domainID,
 	            primaryMetricName: result.analysis.primaryMetricName,
@@ -9372,7 +9430,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               selectionArtifact,
             } as AutonomousIterationResult)
           }
-          const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec)
+          const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
           const loop = {
             iterations,
             stoppedReason:

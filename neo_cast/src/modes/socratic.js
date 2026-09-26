@@ -32,7 +32,7 @@ async function collectSocraticRequirement(requirement, rawFlags, io = {}) {
     const rl = readline.createInterface({ input, output });
     try {
       if (!answers.modelPreference) {
-        answers.modelPreference = (await rl.question("Model preference (transformer / dlinear / tcn / nbeats / timesnet / patch_mlp, blank to skip): ")).trim();
+        answers.modelPreference = (await rl.question("Model preference (transformer / dlinear / tcn / nbeats / timesnet_lite / patch_mlp, blank to skip): ")).trim();
       }
       if (!answers.paramsBudget) {
         answers.paramsBudget = (await rl.question("Parameter budget in millions (blank for default): ")).trim();

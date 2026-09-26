@@ -1,5 +1,5 @@
 {
-  "recipe_version": "recipe_schema_v1",
+  "recipe_version": "recipe_schema_v2",
   "recipe_id": "recipe_patch_mlp_temporal_example",
   "hypothesis": "Patch MLP can capture local temporal motifs with lower latency than attention while keeping the training budget small.",
   "preprocessing": {
@@ -28,9 +28,7 @@
   },
   "prediction_head": {
     "type": "linear",
-    "output_distribution": "point",
-    "share_across_horizons": false
-  },
+    "output_distribution": "point"},
   "post_processing": {
     "type": "auto"
   },
@@ -49,7 +47,6 @@
       "warmup_steps": 0
     },
     "regularization": {
-      "dropout": 0.1,
       "grad_clip": 1.0
     },
     "budget": {

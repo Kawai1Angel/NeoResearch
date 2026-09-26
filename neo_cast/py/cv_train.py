@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from contextlib import redirect_stdout
 import hashlib
 import json
 import math
@@ -12,9 +13,12 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from runtime_config import ACTIVE_SPEC, HORIZONS, INPUT_LEN
 
@@ -109,6 +113,56 @@ def _event(records: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
     return next((record for record in reversed(records) if record.get("event") == name), None)
 
 
+class _ForwardingRecords:
+    """Tee in-process training output live, retaining the same NDJSON evidence."""
+
+    def __init__(self, output):
+        self.output = output
+        self.records: list[dict[str, Any]] = []
+        self.pending = ""
+
+    def write(self, text: str) -> int:
+        self.output.write(text)
+        self.pending += text
+        while "\n" in self.pending:
+            line, self.pending = self.pending.split("\n", 1)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                self.records.append(record)
+        return len(text)
+
+    def flush(self) -> None:
+        self.output.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self.output, name)
+
+
+def _run_standard_train(train_cmd: list[str], artifact_root: str) -> tuple[int, list[dict[str, Any]]]:
+    # Only the standard fit reuses the CV parent. Folds keep independent processes,
+    # globals, scalers and CUDA state. Unexpected parent split overrides require a
+    # fresh process so prepare_tsf cannot retain the wrong cached split.
+    if any(name in os.environ for name in OVERRIDE_ENV):
+        env = {key: value for key, value in os.environ.items() if key not in OVERRIDE_ENV}
+        return _run_train([*train_cmd, "--artifacts-dir", artifact_root], env)
+    import train
+
+    output = _ForwardingRecords(sys.stdout)
+    with redirect_stdout(output):
+        try:
+            # Use the CLI entrypoint to preserve seed reset, normalization,
+            # execution-contract verification and deduplication behavior.
+            train.main([*train_cmd[2:], "--artifacts-dir", artifact_root])
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        else:
+            code = 0
+    return code, output.records
+
+
 def _finite_metrics(record: dict[str, Any] | None, prefix: str = "val_") -> dict[str, float]:
     if record is None:
         raise RuntimeError("Training subprocess did not emit eval_done")
@@ -153,6 +207,11 @@ def run_cv_folds_parallel(
     return [metrics_by_fold[fold.fold_index] for fold in folds]
 
 
+def default_max_parallel_folds() -> int:
+    """Avoid competing training processes on a single CUDA device."""
+    return 1 if torch.cuda.is_available() else 4
+
+
 def aggregate_cv_metrics(folds: list[TimeSeriesFold], metrics: list[dict[str, float]], *, initial_train_ratio: float) -> dict[str, Any]:
     if len(folds) != len(metrics):
         raise ValueError(f"Expected {len(folds)} completed folds, got {len(metrics)}")
@@ -177,11 +236,31 @@ def main() -> int:
     parser.add_argument("--resolved-candidate", required=True)
     parser.add_argument("--artifacts-dir", required=True)
     parser.add_argument("--num-folds", type=int, default=4)
-    parser.add_argument("--max-parallel-folds", type=int, default=4)
+    parser.add_argument(
+        "--max-parallel-folds",
+        type=int,
+        default=None,
+        help="Concurrent CV folds; defaults to 1 with CUDA and 4 on CPU",
+    )
     parser.add_argument("--initial-train-ratio", type=float, default=0.6)
     parser.add_argument("--min-train-windows", type=int, default=1)
     parser.add_argument("--min-eval-windows", type=int, default=1)
     args = parser.parse_args()
+
+    from training_identity import deduplicate_training
+    candidate = json.loads(Path(args.resolved_candidate).read_text())
+
+    @deduplicate_training
+    def execute(*, artifact_callback=None, **kwargs):
+        return _execute_cv(args, artifact_callback)
+
+    return execute(candidate=candidate, smoke=False, artifact_root=Path(args.artifacts_dir),
+                   identity_protocol={"kind": "expanding_window_ratio", "num_folds": args.num_folds,
+                                      "initial_train_ratio": args.initial_train_ratio, "min_train_windows": args.min_train_windows,
+                                      "min_eval_windows": args.min_eval_windows})
+
+
+def _execute_cv(args, artifact_callback=None):
 
     visible_rows = (ACTIVE_SPEC.train[0], ACTIVE_SPEC.val[1])
     if visible_rows[1] > ACTIVE_SPEC.ref_test[0]:
@@ -197,20 +276,31 @@ def main() -> int:
     train_cmd = [sys.executable, str(PY_ROOT / "train.py"), "--resolved-candidate", str(candidate_snapshot)]
     print(json.dumps({"event": "cv_candidate_snapshot", "candidate_id": candidate_payload.get("candidate_id"),
                       "snapshot_sha256": hashlib.sha256(candidate_snapshot.read_bytes()).hexdigest()}), flush=True)
+    max_parallel_folds = (
+        default_max_parallel_folds()
+        if args.max_parallel_folds is None
+        else args.max_parallel_folds
+    )
+    print(json.dumps({
+        "event": "cv_parallelism",
+        "max_parallel_folds": max_parallel_folds,
+        "cuda_available": torch.cuda.is_available(),
+    }), flush=True)
     fold_metrics = run_cv_folds_parallel(
-        folds, train_cmd=train_cmd, temp_root=temp_root, max_workers=args.max_parallel_folds
+        folds, train_cmd=train_cmd, temp_root=temp_root, max_workers=max_parallel_folds
     )
 
-    standard_env = os.environ.copy()
-    for name in OVERRIDE_ENV:
-        standard_env.pop(name, None)
-    exit_code, records = _run_train([*train_cmd, "--artifacts-dir", args.artifacts_dir], standard_env)
+    started = time.perf_counter()
+    exit_code, records = _run_standard_train(train_cmd, args.artifacts_dir)
+    print(json.dumps({"event": "phase_timing", "phase": "standard_fit",
+                      "duration_s": round(time.perf_counter() - started, 6)}), flush=True)
     artifact = _event(records, "artifact_ready")
     standard_metrics = _finite_metrics(_event(records, "eval_done")) if exit_code == 0 else {}
     if exit_code != 0 or artifact is None:
         raise RuntimeError(f"Standard training failed with exit code {exit_code}")
 
-    protocol = {"strategy": "expanding_window_ratio", "num_folds": args.num_folds,
+    revision = 3 if candidate_payload.get("model_config", {}).get("recipe", {}).get("recipe_version") == "recipe_schema_v3" else 2
+    protocol = {"strategy": "expanding_window_ratio", "num_folds": args.num_folds, "runtime_semantics_revision": revision,
                 "initial_train_ratio": args.initial_train_ratio,
                 "fold_val_ratio": (1.0 - args.initial_train_ratio) / args.num_folds,
                 "visible_rows": list(visible_rows), "input_len": INPUT_LEN, "horizons": list(HORIZONS),
@@ -220,6 +310,8 @@ def main() -> int:
                   **aggregate_cv_metrics(folds, fold_metrics, initial_train_ratio=args.initial_train_ratio)}
     artifact_dir = Path(str(artifact["artifact_dir"]))
     (artifact_dir / "cv_metrics.json").write_text(json.dumps(cv_metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if artifact_callback:
+        artifact_callback(artifact_dir)
     print(json.dumps({"event": "cv_eval_done", **standard_metrics,
                       **{key: value for key, value in cv_metrics.items() if key.startswith("cv_")},
                       "cv_protocol_id": protocol["protocol_id"]}), flush=True)

@@ -58,7 +58,7 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
 
             payload = json.loads((artifact_dir / "training_curves.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(payload, {"curves_by_horizon": {"96": [0.724, 0.712], "720": [1.518, 1.514]}})
+        self.assertEqual(payload["curves_by_horizon"], {"96": [0.724, 0.712], "720": [1.518, 1.514]})
 
     def test_write_training_curves_skips_invalid_epoch_losses(self) -> None:
         records = [
@@ -74,7 +74,27 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
 
             payload = json.loads((artifact_dir / "training_curves.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(payload, {"curves_by_horizon": {"96": [0.724], "720": [1.514]}})
+        self.assertEqual(payload["curves_by_horizon"], {"96": [0.724], "720": [1.514]})
+
+    def test_interleaved_cv_folds_are_separate_from_standard_fit(self) -> None:
+        records = [
+            {"event": "epoch_end", "horizon": 96, "epoch": 2, "cv_fold_index": 0, "val_loss": 1.0},
+            {"event": "epoch_end", "horizon": 96, "epoch": 1, "cv_fold_index": 1, "val_loss": 0.3},
+            {"event": "epoch_end", "horizon": 96, "epoch": 1, "cv_fold_index": 0, "val_loss": 1.2},
+            {"event": "epoch_end", "horizon": 720, "epoch": 1, "cv_fold_index": 0, "val_loss": 1.8},
+            {"event": "epoch_end", "horizon": 96, "epoch": 1, "val_loss": 0.4},
+            {"event": "epoch_end", "horizon": 96, "epoch": 2, "val_loss": float("nan")},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            runner._write_training_curves(records, Path(tmp))
+            payload = json.loads((Path(tmp) / "training_curves.json").read_text())
+        self.assertEqual(payload["schema_version"], "training_curves.v2")
+        self.assertEqual(payload["curves_by_horizon"], {"96": [0.4]})
+        self.assertEqual(payload["curves_by_fold"]["fold_0"]["96"], [
+            {"epoch": 1, "val_loss": 1.2}, {"epoch": 2, "val_loss": 1.0},
+        ])
+        self.assertEqual(payload["curves_by_fold"]["fold_1"]["96"][0]["val_loss"], 0.3)
+        self.assertEqual(payload["curves_by_fold"]["fold_0"]["720"][0]["val_loss"], 1.8)
 
     def test_smoke_validation_failure_records_current_candidate_context_without_resolved_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3,10 +3,8 @@ import type { JsonRecord } from "./schema"
 import type { OpencodeModelRef } from "./llm-proposal"
 
 export function taskExecutionRoot(task: { id: string; taskSpec: Readonly<Record<string, unknown>> }, root: string) {
-  const metadata = task.taskSpec.metadata as Record<string, unknown> | undefined
-  return metadata?.executionIsolation === "task"
-    ? path.join(root, ".neo-research", "workspaces", task.id)
-    : root
+  if (!/^[a-zA-Z0-9_-]+$/.test(task.id)) throw new Error("Invalid research task workspace ID")
+  return path.join(root, ".neo-research", "workspaces", task.id)
 }
 
 export function taskSessionModel(spec: JsonRecord): OpencodeModelRef | undefined {

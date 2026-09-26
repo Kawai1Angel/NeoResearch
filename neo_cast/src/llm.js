@@ -9,12 +9,15 @@ const { isMockLlmEnabled } = require("./mock-mode");
 
 function _modelNameForFamily(modelFamily, useMultiscale) {
   const names = {
+    diagonal_ssm: "DiagonalSSMForecaster",
+    timesblock_encoder: "TimesBlockEncoderForecaster",
+    mamba: "Mamba1Forecaster",
     tiny_transformer: useMultiscale ? "MultiScaleTinyTransformer" : "TinyTransformerForecaster",
     patch_mlp: useMultiscale ? "MultiScalePatchMLPForecaster" : "PatchMLPForecaster",
     dlinear: "DLinearTinyForecaster",
     tcn: useMultiscale ? "MultiScaleTemporalConvForecaster" : "TemporalConvForecaster",
     nbeats: "NBeatsLiteForecaster",
-    timesnet: "TimesNetLiteForecaster",
+    timesnet_lite: "TimesNetLiteForecaster",
     nlinear: "LinearTinyForecaster",
   };
   return names[modelFamily] || "TinyForecaster";
@@ -70,7 +73,7 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
     : 0;
 
   return {
-    schema_version: "model_recipe.v1",
+    schema_version: "model_recipe.v2",
     model_name: _modelNameForFamily(modelFamily, Boolean(options.useMultiscale)),
     hypothesis: recipe.hypothesis,
     input: {
@@ -80,20 +83,15 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
       covariates: recipe.fusion?.channel_mode === "shared",
     },
     architecture: {
-      backbone: _architectureBackboneForFamily(modelFamily),
-      decomposition: wantsDecomposition || modelFamily === "dlinear",
-      multiscale_blocks: multiscaleBlocks,
-      attention: modelFamily === "tiny_transformer" || text.includes("attention") ? "lightweight" : "none",
-      channel_fusion: recipe.fusion?.channel_mode || "independent",
-      hidden_dim: Number(architecture.hidden_dim || architecture.d_model || embedding.d_model || 64),
-      d_model: Number(architecture.d_model || embedding.d_model || architecture.hidden_dim || 64),
-      layers: Number(architecture.n_layers || architecture.n_blocks || architecture.depth || 1),
-      heads: Number(architecture.n_heads || 4),
-      kernel_size: Number(architecture.kernel_size || 3),
-      patch_len: Number(embedding.patch_len || 16),
-      stride: Number(embedding.stride || 8),
-      dropout: Number(architecture.dropout || 0.1),
-      output_distribution: recipe.prediction_head?.output_distribution || "point",
+      preprocessing: wantsDecomposition && modelFamily !== "dlinear"
+        ? { actions: [{ type: "series_decomposition", method: "moving_average", kernel_size: 25 }] }
+        : modelFamily === "nlinear" ? { actions: [{ type: "last_value_centering" }] } : recipe.preprocessing,
+      embedding: recipe.embedding,
+      backbone: recipe.backbone,
+      fusion: recipe.fusion?.channel_mode === "shared" ? { type: "feature_mlp" } : recipe.fusion,
+      prediction_head: recipe.prediction_head,
+      representation: recipe.representation || { layout: "channel_latent", readout: "none", latent_dim: Math.min(Number(taskContext.input_len || 512), 64) },
+      composition: { type: "single" },
     },
     training: {
       loss: strategy.loss?.base || "mse",
@@ -102,7 +100,7 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
       weight_decay: Number(optimizer.weight_decay || 0.0),
       batch_size: Number(budget.batch_size || 32),
       max_epochs: Number(budget.max_epochs || 8),
-      time_budget_s: Number(budget.time_budget_s || 600),
+      time_budget_s: Number(budget.time_budget_s || 1200),
       patience: Number(budget.patience || 4),
       seed: Number(budget.seed || 42),
       grad_clip: Number(strategy.regularization?.grad_clip || 1.0),
@@ -146,7 +144,7 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
 
   let modelFamily = "nlinear";
   if (wantsTimesNet) {
-    modelFamily = "timesnet";
+    modelFamily = "timesnet_lite";
   } else if (wantsNBeats) {
     modelFamily = "nbeats";
   } else if (wantsTCN) {
@@ -169,37 +167,48 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
     dlinear: "DLinear: decomposes trend and seasonal components with a compact linear forecast head.",
     tcn: "TCN: uses causal dilated convolutions to capture local and medium-range temporal dependencies.",
     nbeats: "N-BEATS-lite: stacks residual backcast/forecast blocks for expressive univariate temporal extrapolation.",
-    timesnet: "TimesNet-lite: uses FFT-derived period grids and compact 2D convolutions to model periodic variation.",
+    timesnet_lite: "TimesNet-lite: uses FFT-derived period grids and compact 2D convolutions to model periodic variation.",
     nlinear: "NLinear baseline: channel-independent linear mapping, strongest lightweight reference.",
   };
   const hypothesis = hypotheses[modelFamily] || hypotheses.nlinear;
 
   const budget = {
     max_epochs: fastMode ? 2 : 8,
-    time_budget_s: 600,
+    time_budget_s: 1200,
     batch_size: fastMode ? 16 : 32,
     patience: fastMode ? 2 : 4,
     seed: 42,
   };
 
   const baseRecipe = {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: `recipe_heuristic_${Date.now()}_${attempt}`,
     hypothesis,
     preprocessing: { actions: [{ type: "none" }] },
     fusion: { type: "temporal", channel_mode: channelMode },
-    prediction_head: { type: "linear", output_distribution: "point", share_across_horizons: false },
+    prediction_head: { type: "linear", output_distribution: "point"},
     post_processing: { type: "auto" },
     training_strategy: {
       loss: { base: "mse", horizon_weighting: "uniform" },
       optimizer: { type: "adam", lr: 0.001, weight_decay: 0.0 },
       scheduler: { type: "none", warmup_steps: 0 },
-      regularization: { dropout: 0.1, grad_clip: 1.0 },
+      regularization: { grad_clip: 1.0 },
       budget,
     },
     constraints: { max_params: 1_000_000, max_latency_ms: 50, latency_priority: "medium" },
     notes: `heuristic fallback for: ${requirement}`,
   };
+
+  const newEncoder = text.includes("mamba") ? "mamba" : text.includes("timesblock") ? "timesblock_encoder" : (text.includes("diagonal") || text.includes("ssm")) ? "diagonal_ssm" : null;
+  if (newEncoder) {
+    const common = { type: newEncoder, d_model: 16, depth: 1, dropout: 0.1 };
+    const backbone = newEncoder === "mamba" ? { ...common, d_state: 8, d_conv: 4, expand: 2, backend: "torch_reference" }
+      : newEncoder === "timesblock_encoder" ? { ...common, d_ff: 32, top_k: 1, num_kernels: 3 }
+        : { ...common, state_dim: 8 };
+    return _candidateRecipeToModelRecipe({ ...baseRecipe, hypothesis: `Evaluate a real ${newEncoder} with an explicit history readout.`, embedding: { type: "none" }, backbone,
+      fusion: { type: "temporal", channel_mode: "independent" }, representation: { layout: "sequence_latent", readout: "mean", latent_dim: 16 } },
+      taskContext, { modelFamily: newEncoder, requirement });
+  }
 
   if (modelFamily === "tiny_transformer") {
     const dModel = attempt >= 3 ? 128 : 64;
@@ -258,11 +267,11 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
       backbone: { type: "nbeats", hidden_dim: 128, n_blocks: 3, n_layers: 2, activation: "gelu", dropout: 0.1 },
     }, taskContext, { modelFamily, requirement, useMultiscale });
   }
-  if (modelFamily === "timesnet") {
+  if (modelFamily === "timesnet_lite") {
     return _candidateRecipeToModelRecipe({
       ...baseRecipe,
       embedding: { type: "none" },
-      backbone: { type: "timesnet", hidden_dim: 16, n_layers: 1, top_k: 1, kernel_size: 3, dropout: 0.1 },
+      backbone: { type: "timesnet_lite", hidden_dim: 16, n_layers: 1, top_k: 1, kernel_size: 3, dropout: 0.1 },
     }, taskContext, { modelFamily, requirement, useMultiscale });
   }
 
@@ -281,7 +290,6 @@ function _formatTaskContext(taskContext = {}) {
   const taskId = taskContext.task_id || "etth1";
   const targetColumns = Array.isArray(taskContext.target_columns) ? taskContext.target_columns : taskContext.feature_columns;
   const pastCovariates = Array.isArray(taskContext.observed_past_covariates) ? taskContext.observed_past_covariates : [];
-  const futureCovariates = Array.isArray(taskContext.known_future_covariates) ? taskContext.known_future_covariates : [];
   const featureColumns = Array.isArray(targetColumns)
     ? [...new Set([...targetColumns, ...pastCovariates, ...futureCovariates])]
     : ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"];
@@ -298,7 +306,7 @@ function _formatTaskContext(taskContext = {}) {
     `- Channels: ${featureColumns.length} (${featureColumns.join(", ")})`,
     `- Prediction targets: ${(targetColumns || featureColumns).join(", ")}`,
     `- Observed-past covariates: ${pastCovariates.join(", ") || "none"}`,
-    `- Known-future covariates: ${futureCovariates.join(", ") || "none"}`,
+    "- Known-future and static covariates are unsupported; use observed-past covariates only.",
     "- Model outputs, losses, and metrics must cover prediction targets only.",
     `- Input window: ${inputLen} time steps`,
     `- Prediction horizons evaluated: ${horizons.join(", ")} (averaged)`,
@@ -316,7 +324,7 @@ function _formatTaskContext(taskContext = {}) {
   return lines.join("\n");
 }
 
-function _buildSystemPrompt(taskContext = {}) {
+function _buildLegacySystemPrompt(taskContext = {}) {
   return `\
 You are a time-series forecasting model designer for the neo-cast system.
 Your job is to propose one concrete model candidate for the prepared multivariate forecasting task.
@@ -327,12 +335,15 @@ ${_formatTaskContext(taskContext)}
 ## Supported ModelRecipe DSL controlled design space
 
 You must output a high-level ModelRecipe DSL object, not natural language and not Python code.
-The runtime will compile model_recipe.v1 into the executable recipe_schema_v1 factory format.
+The runtime will compile model_recipe.v1 into the executable recipe_schema_v2 factory format.
+Runtime revision 2 rejects legacy checkpoints; retraining is required. NLinear uses explicit architecture.last_value_centering=true. TimesNet-lite is paper_derived, and gated_depthwise_conv is not an SSM.
+Use module-level dropout only. Removed fields: regularization.dropout, share_across_horizons, horizon_specific, base_head, variate_token, cross_attention, graph_type, fill_policy.
+missing_mask must be first, with mask_channel=true and cross-variable fusion; static graph requires topology_artifact with ordered channel_names and adjacency. Correlation uses only train rows.
 
-- preprocessing: none, instance_norm, series_decomposition, seasonal_differencing, missing_mask, sample_reweighting
+- preprocessing: none, last_value_centering, instance_norm, series_decomposition, seasonal_differencing, missing_mask, sample_reweighting
 - embedding: none, patch, multiscale_patch, invert, frequency, calendar
-- backbone: linear, mlp, transformer, temporal_conv, dlinear, nbeats, timesnet, rnn, ssm, mixer
-- fusion: temporal, feature, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
+- backbone: linear, mlp, transformer, temporal_conv, dlinear, nbeats, timesnet_lite, rnn, gated_depthwise_conv, mixer
+- fusion: temporal, feature_mlp, variate_attention, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
 - prediction_head: linear, direct_multi_horizon, quantile, gaussian, residual_correction
 - output_distribution: point, quantile, gaussian
 - loss: mse, mae, huber, quantile, distillation, gaussian_nll
@@ -340,7 +351,7 @@ The runtime will compile model_recipe.v1 into the executable recipe_schema_v1 fa
 - scheduler: none, cosine, one_cycle, plateau, lradj_type1, lradj_type2, lradj_type3, lradj_3, lradj_4, lradj_5, lradj_6
 
 Action parameters:
-- preprocessing.actions: one or more of [{ "type": "none" }], [{ "type": "instance_norm", "affine": false, "eps": 0.00001 }], [{ "type": "series_decomposition", "method": "moving_average", "kernel_size": 25 }], [{ "type": "seasonal_differencing", "period": 24, "order": 1 }], [{ "type": "missing_mask", "mask_channel": true, "fill_policy": "zero"|"mean"|"ffill" }], [{ "type": "sample_reweighting", "scheme": "uniform"|"horizon_tail"|"outlier_robust" }]
+- preprocessing.actions: one or more of [{ "type": "none" }], [{ "type": "instance_norm", "affine": false, "eps": 0.00001 }], [{ "type": "series_decomposition", "method": "moving_average", "kernel_size": 25 }], [{ "type": "seasonal_differencing", "period": 24, "order": 1 }], [{ "type": "missing_mask", "mask_channel": true }], [{ "type": "sample_reweighting", "scheme": "uniform"|"horizon_tail"|"outlier_robust" }]
 - embedding none: { "type": "none" }
 - embedding patch: { "type": "patch", "patch_len": 8|16|32, "stride": <= patch_len, "d_model": 32|64|128|256 }
 - embedding multiscale_patch: { "type": "multiscale_patch", "scales": [{ "patch_len": 8, "stride": 4 }, { "patch_len": 16, "stride": 8 }, { "patch_len": 32, "stride": 16 }], "d_model": 32|64|128 }
@@ -354,21 +365,21 @@ Action parameters:
 - backbone dlinear: { "type": "dlinear", "kernel_size": 25, "bias": true } and requires embedding none
 - backbone tcn: { "type": "tcn", "hidden_dim": 16|32|64, "n_layers": 1|2|3, "kernel_size": 3|5, "activation": "gelu", "dropout": 0.0|0.1|0.2 } and requires embedding none
 - backbone nbeats: { "type": "nbeats", "hidden_dim": 64|128|256, "n_blocks": 2|3|4, "n_layers": 2|3, "activation": "gelu", "dropout": 0.0|0.1|0.2 } and requires embedding none
-- backbone timesnet: { "type": "timesnet", "hidden_dim": 8|16|32, "n_layers": 1|2, "top_k": 1|2, "kernel_size": 3|5, "dropout": 0.0|0.1|0.2 } and requires embedding none
-- backbone ssm: { "type": "ssm", "state_dim": 32|64|128, "depth": 1|2|3, "kernel_size": 3|5, "dropout": 0.0|0.1|0.2 }
+- backbone timesnet_lite: { "type": "timesnet_lite", "hidden_dim": 8|16|32, "n_layers": 1|2, "top_k": 1|2, "kernel_size": 3|5, "dropout": 0.0|0.1|0.2 } and requires embedding none
+- backbone gated_depthwise_conv: { "type": "gated_depthwise_conv", "hidden_dim": 32|64|128, "depth": 1|2|3, "kernel_size": 3|5, "dropout": 0.0|0.1|0.2 }
 - backbone mixer: { "type": "mixer", "hidden_dim": 64|128|256, "depth": 1|2|3, "temporal_mixing": "mlp"|"conv", "channel_mixing": "mlp"|"identity", "dropout": 0.0|0.1|0.2 }
 - fusion temporal: { "type": "temporal", "channel_mode": "independent" | "shared" }
-- fusion feature: { "type": "feature", "variate_token": true, "cross_attention": false }
+- fusion variate_attention or feature_mlp: { "type": "variate_attention"|"feature_mlp" }
 - fusion temporal_then_feature or feature_then_temporal: { "type": "temporal_then_feature"|"feature_then_temporal", "gate": true, "residual": true }
-- fusion graph: { "type": "graph", "graph_type": "learned", "adjacency_source": "learned"|"static"|"correlation", "sparsity": 0.1 }
-- fusion gated_hybrid: { "type": "gated_hybrid", "gate_type": "learned"|"scalar"|"channel"|"time", "residual": true }
-- prediction_head linear: { "type": "linear", "output_distribution": "point", "share_across_horizons": false }
-- prediction_head direct_multi_horizon: { "type": "direct_multi_horizon", "output_distribution": "point", "horizon_specific": true }
+- fusion graph: { "type": "graph", "adjacency_source": "learned"|"static"|"correlation", "sparsity": 0.1 }
+- fusion gated_hybrid: { "type": "gated_hybrid", "gate_type": "learned"|"scalar"|"channel"|"time" }
+- prediction_head linear: { "type": "linear", "output_distribution": "point"}
+- prediction_head direct_multi_horizon: { "type": "direct_multi_horizon", "output_distribution": "point"}
 - prediction_head quantile: { "type": "quantile", "output_distribution": "quantile", "quantiles": [0.1, 0.5, 0.9] }
 - prediction_head gaussian: { "type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.000001 }
-- prediction_head residual_correction: { "type": "residual_correction", "output_distribution": "point", "base_head": "linear", "correction_dim": 32|64|128 }
+- prediction_head residual_correction: { "type": "residual_correction", "output_distribution": "point", "correction_dim": 32|64|128 }
 - training_strategy.loss.base: "mse" | "mae" | "huber" | "quantile" | "distillation" | "gaussian_nll"
-- quantile loss should include quantiles: [0.1, 0.5, 0.9]
+- quantile loss levels must match the quantile head exactly and be strictly increasing and unique, e.g. [0.1, 0.5, 0.9]. Never pair point heads with quantile loss.
 - distillation loss should include supervised_weight, teacher_weight, and teacher: { "type": "last_value"|"moving_average", "window": 24 }
 - training_strategy.optimizer.type: "adam" | "adamw" | "sgd"
 - training_strategy.scheduler.type: "none" | "cosine" | "one_cycle" | "plateau" | "lradj_type1" | "lradj_type2" | "lradj_type3" | "lradj_3" | "lradj_4" | "lradj_5" | "lradj_6"
@@ -403,12 +414,39 @@ calendar embedding requires actual history timestamps; invert feeds variable tok
 - Try channel_mode="shared" only when cross-channel correlation may matter; it adds a residual channel mixer before the temporal backbone
 - Prefer multiscale_patch when the requirement mentions multi-scale, mixed periodicity, or both short and long local motifs
 - Prefer invert/calendar/frequency embeddings when requirements mention variate-token modeling, calendar features, or spectral patterns
-- Prefer dlinear for trend/seasonality baseline checks; prefer tcn for local temporal motifs; prefer nbeats for residual extrapolation; prefer timesnet for explicit periodic or FFT-style requirements
+- Prefer dlinear for trend/seasonality baseline checks; prefer tcn for local temporal motifs; prefer nbeats for residual extrapolation; prefer timesnet_lite for explicit periodic or FFT-style requirements
 - dlinear backbone already includes decomposition; do not combine it with preprocessing series_decomposition
-- Prefer rnn for sequential memory, ssm for long-range stateful dynamics, and mixer for simple token/channel mixing
+- Prefer rnn for sequential memory, gated_depthwise_conv for long-range stateful dynamics, and mixer for simple token/channel mixing
 - Prefer graph or gated_hybrid fusion when cross-channel structure is central to the requirement
 - Use quantile or gaussian heads only when probabilistic forecasts or uncertainty estimates are requested
 - For attempt > 1, diversify: try a different backbone or substantially different hyperparameters`;
+}
+
+function _buildSystemPrompt(taskContext = {}) {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const schema = JSON.parse(fs.readFileSync(path.join(__dirname, "../py/schemas/model_recipe_v2_schema.json"), "utf8"));
+  const actions = ["preprocessing", "embedding", "backbone", "fusion", "prediction_head"];
+  const definitions = ["preprocessingAction", "embeddingAction", "backboneAction", "fusionAction", "predictionHead"];
+  return `You are a time-series forecasting model designer. Return one ModelRecipe DSL JSON object only.
+${_formatTaskContext(taskContext)}
+schema_version: "model_recipe.v2"; model_name, hypothesis, input, architecture, training and constraints are required.
+The runtime compiles this into recipe_schema_v3. Each H is independently trained; no cross-H sharing.
+${actions.map((name, i) => `- ${name}: ${schema.$defs[definitions[i]].oneOf.map((b) => b.properties.type.const).join(", ")}`).join("\n")}
+- output_distribution: point, quantile, gaussian
+- loss: mse, mae, huber, quantile, distillation, gaussian_nll
+- scheduler: none, cosine, one_cycle, plateau, lradj_type1, lradj_type2, lradj_type3, lradj_3, lradj_4, lradj_5, lradj_6
+Use only fields applicable to the selected backbone. Never repeat a recipe by changing its name.
+diagonal_ssm and mamba are real state-space encoders. mamba uses Mamba-1 torch_reference; CUDA is not verified.
+timesblock_encoder is sample-local TimesBlock, not native TimesNet. gated_depthwise_conv and timesnet_lite remain distinct lightweight baselines.
+Sequence encoders require embedding none, representation layout sequence_latent or channel_sequence, explicit mean/last readout and latent_dim.
+Legacy encoders use channel_latent/readout none. Prefer temporal/independent fusion with joint sequence_latent.
+Use feature_mlp instead of the equivalent temporal/shared alias. Missing masks require a cross-variable path.
+Composition is single, parallel_two_branch or decomposition_two_branch; no nesting. Forecast-space merges only support point output.
+dlinear backbone already includes decomposition; do not combine it with preprocessing series_decomposition.
+Quantile head requires quantile loss and matching ordered levels; Gaussian requires gaussian_nll.
+Constraints include max_params and latency_sensitive. Do not supply future/static covariates.
+Follow this strict schema (including all definitions):\n${JSON.stringify(schema)}`;
 }
 
 function _buildUserMessage(requirement, history, attempt, taskContext = {}) {
@@ -426,7 +464,7 @@ function _buildUserMessage(requirement, history, attempt, taskContext = {}) {
     attempt,
     task_context: taskContext,
     recent_experiment_history: recentHistory,
-    instruction: "Propose the next model_recipe.v1 candidate. Return JSON only.",
+    instruction: "Propose the next model_recipe.v2 candidate. Return JSON only.",
   }, null, 2);
 }
 
@@ -454,6 +492,7 @@ function _looksLikeModelRecipe(candidate) {
 }
 
 function _ensureCandidateDefaults(candidate, prefix, attempt) {
+  if (candidate.schema_version === "model_recipe.v2") return candidate;
   if (_looksLikeModelRecipe(candidate) && !candidate.recipe_version) {
     if (!candidate.schema_version) candidate.schema_version = "model_recipe.v1";
     if (!candidate.model_name) candidate.model_name = `TinyForecaster${attempt}`;
@@ -477,7 +516,7 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
         learning_rate: 0.001,
         batch_size: 32,
         max_epochs: 50,
-        time_budget_s: 600,
+        time_budget_s: 1200,
         patience: 5,
         seed: 42,
       };
@@ -487,7 +526,7 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
     if (candidate.training.learning_rate === undefined) candidate.training.learning_rate = 0.001;
     if (candidate.training.batch_size === undefined) candidate.training.batch_size = 32;
     if (candidate.training.max_epochs === undefined) candidate.training.max_epochs = 50;
-    if (candidate.training.time_budget_s === undefined) candidate.training.time_budget_s = 600;
+    if (candidate.training.time_budget_s === undefined) candidate.training.time_budget_s = 1200;
     if (candidate.training.patience === undefined) candidate.training.patience = 5;
     if (candidate.training.seed === undefined) candidate.training.seed = 42;
     if (!candidate.constraints) {
@@ -507,7 +546,7 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
     return candidate;
   }
 
-  if (!candidate.recipe_version) candidate.recipe_version = "recipe_schema_v1";
+  if (!candidate.recipe_version) candidate.recipe_version = "recipe_schema_v2";
   if (!candidate.recipe_id) candidate.recipe_id = `recipe_${prefix}_${Date.now()}_${attempt}`;
   if (!candidate.post_processing) candidate.post_processing = { type: "auto" };
   if (!candidate.constraints) {
@@ -518,15 +557,15 @@ function _ensureCandidateDefaults(candidate, prefix, attempt) {
       loss: { base: "mse", horizon_weighting: "uniform" },
       optimizer: { type: "adam", lr: 0.001, weight_decay: 0.0 },
       scheduler: { type: "none", warmup_steps: 0 },
-      regularization: { dropout: 0.1, grad_clip: 1.0 },
-      budget: { max_epochs: 50, time_budget_s: 600, batch_size: 32, patience: 5, seed: 42 },
+      regularization: { grad_clip: 1.0 },
+      budget: { max_epochs: 50, time_budget_s: 1200, batch_size: 32, patience: 5, seed: 42 },
     };
   }
   if (!candidate.training_strategy.budget) {
-    candidate.training_strategy.budget = { max_epochs: 50, time_budget_s: 600, batch_size: 32, patience: 5, seed: 42 };
+    candidate.training_strategy.budget = { max_epochs: 50, time_budget_s: 1200, batch_size: 32, patience: 5, seed: 42 };
   }
   if (candidate.training_strategy.budget.seed === undefined) candidate.training_strategy.budget.seed = 42;
-  if (candidate.training_strategy.budget.time_budget_s === undefined) candidate.training_strategy.budget.time_budget_s = 600;
+  if (candidate.training_strategy.budget.time_budget_s === undefined) candidate.training_strategy.budget.time_budget_s = 1200;
 
   if (candidate.embedding?.type === "frequency") {
     if (candidate.embedding.n_freq === undefined) candidate.embedding.n_freq = 16;

@@ -24,7 +24,7 @@ afterEach(resetDatabase)
 const hypothesis = {
   id: "H1",
   statement: "TimesNet",
-  suggestedBackbones: ["timesnet"],
+  suggestedBackbones: ["timesnet_lite"],
   suggestedPreprocessing: [],
   motivation: [],
   expectedOutcome: "improve",
@@ -58,12 +58,12 @@ test("Gate B fails closed for missing or stale manifests", () => {
     candidate_id: "candidate",
     hypothesis_id: "H1",
     candidate_spec_sha256: "sha",
-    expected: { backbone: "timesnet" },
+    expected: { backbone: "timesnet_lite" },
   } as ExecutionContract
   expect(verifyExecutionRecords(contract, [])).toHaveLength(2)
   const record = { candidate_id: "candidate", candidate_spec_sha256: "sha", contract_digest: digest(contract) }
   const records = [
-    { ...record, event: "executed_model_manifest", actual: { backbone: "timesnet" } },
+    { ...record, event: "executed_model_manifest", actual: { backbone: "timesnet_lite" } },
     { ...record, event: "execution_contract_verified", status: "verified" },
   ]
   expect(verifyExecutionRecords(contract, records)).toEqual([])
@@ -118,7 +118,7 @@ async function setup(root: string) {
   const spec = {
     ...baseline,
     embedding: { type: "none" },
-    backbone: { type: "timesnet", hiddenDim: 8, nLayers: 1, topK: 2, kernelSize: 3, dropout: 0 },
+    backbone: { type: "timesnet_lite", hiddenDim: 8, nLayers: 1, topK: 2, kernelSize: 3, dropout: 0 },
   }
   await addHypothesisToPool(task.id, hypothesis)
   const candidate = await run((svc) =>
@@ -268,7 +268,7 @@ test("Gate A preserves selected preprocessing order and task covariate declarati
   const candidate = {
     hypothesisID: "H1",
     candidateSpec: {
-      backbone: { type: "timesnet" },
+      backbone: { type: "timesnet_lite" },
       preprocessing: { actions: [{ type: "none" }, { type: "instance_norm" }] },
       input: { knownFutureCovariates: ["missing"] },
     },

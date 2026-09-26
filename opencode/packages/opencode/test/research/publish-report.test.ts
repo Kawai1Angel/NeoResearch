@@ -55,6 +55,29 @@ describe("PublishAgent final report", () => {
     for (const section of PUBLISH_REPORT_SECTIONS) expect(prompt).toContain(`## ${section}`)
   })
 
+  test("compacts matrix-bearing memories and long metric arrays before prompting", () => {
+    const value = snapshot() as any
+    value.memories = [{
+      fingerprintSummary: {
+        datasetProfile: {
+          correlationMatrix: {
+            columns: ["a", "b", "c"],
+            values: [[1, 0.9, 0.1], [0.9, 1, 0.2], [0.1, 0.2, 1]],
+          },
+        },
+      },
+    }]
+    value.runs[0].metrics.perTargetMSE = Array.from({ length: 256 }, (_, index) => index / 256)
+
+    const prompt = buildPublishReportPrompt(value)
+    expect(prompt).not.toContain('"correlationMatrix":')
+    expect(prompt).toContain('"correlationStructure"')
+    expect(prompt).toContain('"kind": "numeric_array_analysis"')
+    expect(prompt).toContain('"count": 256')
+    expect(prompt).toContain('"standardDeviation"')
+    expect(prompt).toContain('"analysis"')
+  })
+
   test("renders a valid deterministic fallback with traceable metrics", () => {
     const value = snapshot()
     const report = renderDeterministicFinalReport(value)

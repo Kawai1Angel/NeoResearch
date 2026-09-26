@@ -98,8 +98,8 @@ def _ensure_training_defaults(recipe: dict[str, Any]) -> None:
     strategy.setdefault("loss", {"base": "mse", "horizon_weighting": "uniform"})
     strategy.setdefault("optimizer", {"type": "adam", "lr": 0.001, "weight_decay": 0.0})
     strategy.setdefault("scheduler", {"type": "none", "warmup_steps": 0})
-    strategy.setdefault("regularization", {"dropout": 0.1, "grad_clip": 1.0})
-    strategy.setdefault("budget", {"max_epochs": 50, "time_budget_s": 600, "batch_size": 32, "patience": 5, "seed": 42})
+    strategy.setdefault("regularization", {"grad_clip": 1.0})
+    strategy.setdefault("budget", {"max_epochs": 50, "time_budget_s": 1200, "batch_size": 32, "patience": 5, "seed": 42})
 
 
 def _to_multiscale_patch(recipe: dict[str, Any]) -> str | None:
@@ -116,10 +116,9 @@ def _to_multiscale_patch(recipe: dict[str, Any]) -> str | None:
 
 def _enable_shared_channel(recipe: dict[str, Any]) -> str | None:
     fusion = recipe.setdefault("fusion", {"type": "temporal", "channel_mode": "independent"})
-    if fusion.get("channel_mode") == "shared":
+    if fusion.get("type") == "temporal" and fusion.get("channel_mode") == "shared":
         return None
-    fusion["type"] = "temporal"
-    fusion["channel_mode"] = "shared"
+    recipe["fusion"] = {"type": "temporal", "channel_mode": "shared"}
     return "enable_shared_channel"
 
 
@@ -163,8 +162,10 @@ def _reduce_transformer_cost(recipe: dict[str, Any]) -> str | None:
         backbone["d_model"] = max(int(backbone["d_model"]) // 2, 32)
         changed = True
         embedding = recipe.get("embedding", {})
-        if embedding.get("type") in {"patch", "multiscale_patch"}:
+        if embedding.get("type") in {"patch", "multiscale_patch", "invert", "frequency"}:
             embedding["d_model"] = backbone["d_model"]
+        elif embedding.get("type") == "calendar":
+            embedding["embed_dim"] = backbone["d_model"]
     n_heads = int(backbone.get("n_heads", 1))
     d_model = int(backbone.get("d_model", 32))
     while n_heads > 1 and d_model % n_heads != 0:
@@ -210,7 +211,7 @@ def _switch_to_nbeats(recipe: dict[str, Any]) -> str | None:
 def _switch_to_timesnet(recipe: dict[str, Any]) -> str | None:
     return _switch_to_raw_backbone(
         recipe,
-        {"type": "timesnet", "hidden_dim": 16, "n_layers": 1, "top_k": 1, "kernel_size": 3, "dropout": 0.1},
+        {"type": "timesnet_lite", "hidden_dim": 16, "n_layers": 1, "top_k": 1, "kernel_size": 3, "dropout": 0.1},
         "switch_to_timesnet",
     )
 
@@ -224,7 +225,7 @@ def _explore_alternate_raw_backbone(recipe: dict[str, Any]) -> str | None:
         "dlinear": (_switch_to_tcn, _switch_to_nbeats, _switch_to_timesnet),
         "tcn": (_switch_to_nbeats, _switch_to_timesnet, _switch_to_dlinear),
         "nbeats": (_switch_to_timesnet, _switch_to_tcn, _switch_to_dlinear),
-        "timesnet": (_switch_to_tcn, _switch_to_nbeats, _switch_to_dlinear),
+        "timesnet_lite": (_switch_to_tcn, _switch_to_nbeats, _switch_to_dlinear),
     }
     for switch in switches_by_current.get(str(recipe.get("backbone", {}).get("type")), ()):
         note = switch(recipe)
@@ -265,12 +266,12 @@ def _bias_mutation(recipe: dict[str, Any], search_biases: list[str]) -> str | No
         preprocessing = recipe.setdefault("preprocessing", {"actions": [{"type": "none"}]})
         actions = preprocessing.get("actions", [{"type": "none"}])
         if not any(a.get("type") == "series_decomposition" for a in actions):
-            preprocessing["actions"] = [{"type": "series_decomposition", "mode": "additive"}]
+            preprocessing["actions"] = [{"type": "series_decomposition", "method": "moving_average", "kernel_size": 25}]
             return "bias_seasonal_decomposition"
     if "cross_var_correlated" in biases or "cross_var" in biases:
         fusion = recipe.setdefault("fusion", {})
-        if fusion.get("type") not in {"gated_hybrid", "feature"}:
-            recipe["fusion"] = {"type": "gated_hybrid", "channel_mode": "shared"}
+        if fusion.get("type") not in {"gated_hybrid", "variate_attention"}:
+            recipe["fusion"] = {"type": "gated_hybrid", "gate_type": "channel"}
             return "bias_crossvar_gated_fusion"
     if "distribution_shift" in biases:
         preprocessing = recipe.setdefault("preprocessing", {"actions": [{"type": "none"}]})
@@ -283,7 +284,9 @@ def _bias_mutation(recipe: dict[str, Any], search_biases: list[str]) -> str | No
         preprocessing = recipe.setdefault("preprocessing", {"actions": [{"type": "none"}]})
         actions = preprocessing.get("actions", [{"type": "none"}])
         if not any(a.get("type") == "missing_mask" for a in actions):
-            preprocessing["actions"] = [{"type": "missing_mask"}]
+            preprocessing["actions"] = [{"type": "missing_mask", "mask_channel": True}]
+            if recipe.get("fusion", {}).get("type") == "temporal" and recipe["fusion"].get("channel_mode", "independent") == "independent":
+                recipe["fusion"] = {"type": "feature_mlp"}
             return "bias_missing_mask"
     return None
 
@@ -374,8 +377,8 @@ def mutate_recipe(
 ) -> dict[str, Any]:
     if is_model_recipe_payload(recipe):
         recipe = compile_model_recipe(recipe)
-    if recipe.get("recipe_version") != "recipe_schema_v1":
-        raise ValueError("mutate_recipe expects recipe_version='recipe_schema_v1'")
+    if recipe.get("recipe_version") not in {"recipe_schema_v2", "recipe_schema_v3"}:
+        raise ValueError("mutate_recipe expects recipe_version='recipe_schema_v2'")
 
     policy = policy or _policy_from_state_path(state_path) or MutationPolicy()
     metrics = metrics or {}
@@ -383,7 +386,18 @@ def mutate_recipe(
     mutated = copy.deepcopy(recipe)
     _ensure_training_defaults(mutated)
 
-    notes = _mutation_steps(mutated, metrics, policy, index=index, search_biases=search_biases)
+    if mutated["recipe_version"] == "recipe_schema_v3":
+        # Typed mutations never invent generic fields for unrelated encoders.
+        backbone = mutated["backbone"]
+        if index % 2 and backbone["type"] in {"diagonal_ssm", "timesblock_encoder", "mamba"}:
+            backbone["depth"] = backbone["depth"] % min(policy.max_depth, 8) + 1
+            notes = ["sequence_depth"]
+        else:
+            optimizer = mutated["training_strategy"]["optimizer"]
+            optimizer["lr"] = max(policy.min_lr, min(policy.max_lr, optimizer["lr"] * 0.8))
+            notes = ["learning_rate"]
+    else:
+        notes = _mutation_steps(mutated, metrics, policy, index=index, search_biases=search_biases)
     mutation_note = "+".join(note for note in notes if note)
     _set_recipe_id(mutated, parent_id, mutation_note or "noop", index)
     mutated["hypothesis"] = (
@@ -391,11 +405,16 @@ def mutate_recipe(
         "tests a bounded next-step recipe based on the previous validation result."
     )
     _append_note(mutated, mutation_note or "noop")
+    from validate import validate_recipe_object
+
+    errors = validate_recipe_object(mutated)
+    if errors:
+        raise ValueError("Invalid mutated recipe: " + "; ".join(errors))
     return mutated
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Mutate a recipe_schema_v1 candidate into a bounded next recipe.")
+    parser = argparse.ArgumentParser(description="Mutate a recipe_schema_v2 candidate into a bounded next recipe.")
     parser.add_argument("--recipe", required=True, help="Input recipe JSON path.")
     parser.add_argument("--metrics", default=None, help="Optional metrics JSON path, e.g. val_metrics.json.")
     parser.add_argument("--output", required=True, help="Output mutated recipe JSON path.")

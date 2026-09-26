@@ -152,6 +152,9 @@ function runDoctor(options = {}) {
       : checkAnthropicApiKey(options.env || process.env),
     checkConfig(options),
     checkRuntime(projectRoot),
+    { name: "mamba-backend", ok: true, level: "warn",
+      message: "Mamba-1 torch_reference uses the PyTorch runtime; CUDA optimized backend is not verified or enabled.",
+      details: "No model substitution is performed. Explicit cuda_optimized requests fail with UNSUPPORTED_BACKEND." },
   ];
 
   return {

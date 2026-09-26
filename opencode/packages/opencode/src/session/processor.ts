@@ -1,4 +1,5 @@
-import { Cause, Deferred, Effect, Layer, Context, Scope } from "effect"
+import { timedEffect, startTiming } from "@/util/runtime-timing"
+import { Cause, Deferred, Effect, Exit, Layer, Context, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Bus } from "@/bus"
@@ -109,7 +110,8 @@ export const layer: Layer.Layer<
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
       // may execute tools internally before emitting start-step events,
       // so capturing inside the event handler can be too late.
-      const initialSnapshot = yield* snapshot.track()
+      const timing = { sessionID: input.sessionID, messageID: input.assistantMessage.id, agent: input.assistantMessage.agent }
+      const initialSnapshot = yield* timedEffect("session.snapshot.initial", timing, snapshot.track())
       const ctx: ProcessorContext = {
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
@@ -344,7 +346,7 @@ export const layer: Layer.Layer<
             throw value.error
 
           case "start-step":
-            if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
+            if (!ctx.snapshot) ctx.snapshot = yield* timedEffect("session.snapshot.step_start", timing, snapshot.track())
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -366,7 +368,7 @@ export const layer: Layer.Layer<
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.finishReason,
-              snapshot: yield* snapshot.track(),
+              snapshot: yield* timedEffect("session.snapshot.step_finish", timing, snapshot.track()),
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.assistantMessage.sessionID,
               type: "step-finish",
@@ -375,7 +377,7 @@ export const layer: Layer.Layer<
             })
             yield* session.updateMessage(ctx.assistantMessage)
             if (ctx.snapshot) {
-              const patch = yield* snapshot.patch(ctx.snapshot)
+              const patch = yield* timedEffect("session.snapshot.patch", timing, snapshot.patch(ctx.snapshot))
               if (patch.files.length) {
                 yield* session.updatePart({
                   id: PartID.ascending(),
@@ -462,7 +464,7 @@ export const layer: Layer.Layer<
 
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
         if (ctx.snapshot) {
-          const patch = yield* snapshot.patch(ctx.snapshot)
+          const patch = yield* timedEffect("session.snapshot.patch", timing, snapshot.patch(ctx.snapshot))
           if (patch.files.length) {
             yield* session.updatePart({
               id: PartID.ascending(),
@@ -546,12 +548,25 @@ export const layer: Layer.Layer<
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             const stream = llm.stream(streamInput)
-
-            yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+            const firstEvent = startTiming("session.stream.first_event", timing)
+            let lastOutputAt: number | undefined
+            yield* timedEffect("session.stream.consume", timing, stream.pipe(
+              Stream.tap((event) => {
+                firstEvent("completed")
+                if (event.type === "text-end" || event.type === "reasoning-end" || event.type === "tool-result") {
+                  lastOutputAt = performance.now()
+                }
+                if (event.type === "finish-step") return timedEffect("session.finish_step", {
+                  ...timing,
+                  sinceLastOutputMs: lastOutputAt === undefined ? undefined : Math.round(performance.now() - lastOutputAt),
+                }, handleEvent(event))
+                return handleEvent(event)
+              }),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
-            )
+            )).pipe(Effect.onExit((exit) => Effect.sync(() => firstEvent(
+              Exit.isSuccess(exit) ? "completed" : Cause.hasInterruptsOnly(exit.cause) ? "canceled" : "failed",
+            ))))
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
@@ -578,7 +593,7 @@ export const layer: Layer.Layer<
               }),
             ),
             Effect.catch(halt),
-            Effect.ensuring(cleanup()),
+            Effect.ensuring(timedEffect("session.cleanup", timing, cleanup())),
           )
 
           if (ctx.needsCompaction) return "compact"

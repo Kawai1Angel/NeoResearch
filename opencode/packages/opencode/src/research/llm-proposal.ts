@@ -1,9 +1,11 @@
 import { readFile } from "fs/promises"
 import { createHash } from "crypto"
+import { TSFCandidateRecipe } from "./domains/tsf"
 import os from "os"
 import path from "path"
 import type { DomainCandidateProposal, DomainProposalContext } from "./domain"
 import type { JsonRecord, ResearchTask } from "./schema"
+import { analyzeDatasetProfileForPrompt, compactMarkdownForPrompt, compactPromptContext } from "./prompt-context"
 import PROMPT_RESEARCH_MODEL_DESIGNER from "../agent/prompt/research-model-designer.txt"
 
 type LLMProvider = "anthropic" | "openai-compatible"
@@ -67,6 +69,12 @@ const keyMap: Record<string, string> = {
   recipe_version: "recipeVersion",
   recipe_id: "recipeID",
   d_model: "dModel",
+  state_dim: "stateDim",
+  d_state: "dState",
+  d_conv: "dConv",
+  d_ff: "dFf",
+  num_kernels: "numKernels",
+  latent_dim: "latentDim",
   patch_len: "patchLen",
   n_freq: "nFreq",
   complex_mode: "complexMode",
@@ -77,7 +85,9 @@ const keyMap: Record<string, string> = {
   ffn_mult: "ffnMult",
   num_layers: "numLayers",
   kernel_size: "kernelSize",
-  state_dim: "stateDim",
+  num_blocks: "numBlocks",
+  mask_channel: "maskChannel",
+  topology_artifact: "topologyArtifact",
   temporal_mixing: "temporalMixing",
   channel_mixing: "channelMixing",
   n_blocks: "nBlocks",
@@ -208,20 +218,24 @@ export function camelizeKnown(value: unknown): unknown {
 const RECIPE_ALLOWED_KEYS = new Set([
   "recipeVersion", "recipeID", "hypothesis", "preprocessing",
   "embedding", "backbone", "fusion", "predictionHead", "trainingStrategy", "notes",
+  "representation", "composition",
 ])
 
 // Allowed camelCase keys per backbone type (schema is .strict()).
 const BACKBONE_ALLOWED_KEYS: Record<string, readonly string[]> = {
+  diagonal_ssm: ["type", "dModel", "stateDim", "depth", "dropout"],
+  timesblock_encoder: ["type", "dModel", "dFf", "depth", "topK", "numKernels", "dropout"],
+  mamba: ["type", "dModel", "dState", "dConv", "expand", "depth", "dropout", "backend"],
   linear: ["type", "shared", "bias"],
   mlp: ["type", "depth", "hiddenDim", "activation", "dropout"],
   transformer: ["type", "dModel", "nHeads", "nLayers", "dropout", "ffnMult"],
   dlinear: ["type", "kernelSize", "bias", "individual"],
   tcn: ["type", "hiddenDim", "nLayers", "kernelSize", "activation", "dropout"],
   nbeats: ["type", "hiddenDim", "nBlocks", "nLayers", "activation", "dropout"],
-  timesnet: ["type", "hiddenDim", "nLayers", "topK", "kernelSize", "dropout"],
+  timesnet_lite: ["type", "hiddenDim", "nLayers", "topK", "kernelSize", "dropout"],
   rnn: ["type", "cell", "hiddenDim", "numLayers", "dropout"],
-  ssm: ["type", "stateDim", "depth", "dropout"],
-  mixer: ["type", "hiddenDim", "depth", "temporalMixing", "channelMixing", "dropout"],
+  gated_depthwise_conv: ["type", "hiddenDim", "depth", "kernelSize", "dropout"],
+  mixer: ["type", "hiddenDim", "depth", "temporalMixing", "channelMixing", "dropout", "activation"],
 }
 
 // Safe defaults for required integer fields that LLMs frequently omit.
@@ -231,9 +245,9 @@ const BACKBONE_REQUIRED_DEFAULTS: Record<string, Record<string, number>> = {
   dlinear: { kernelSize: 25 },
   tcn: { hiddenDim: 128, nLayers: 3, kernelSize: 5 },
   nbeats: { hiddenDim: 128, nBlocks: 4, nLayers: 3 },
-  timesnet: { hiddenDim: 128, nLayers: 3, topK: 5, kernelSize: 5 },
+  timesnet_lite: { hiddenDim: 128, nLayers: 3, topK: 5, kernelSize: 5 },
   rnn: { hiddenDim: 128, numLayers: 2 },
-  ssm: { stateDim: 64, depth: 2 },
+  gated_depthwise_conv: { hiddenDim: 64, depth: 2 },
   mixer: { hiddenDim: 128, depth: 2 },
 }
 
@@ -243,7 +257,7 @@ const EMBEDDING_ALLOWED_KEYS: Record<string, readonly string[]> = {
   invert: ["type", "dModel"],
   frequency: ["type", "nFreq", "complexMode", "dModel"],
   calendar: ["type", "fields", "embedDim"],
-  multiscale_patch: ["type", "scales", "dModel"],
+  multiscale_patch: ["type", "scales", "dModel", "numBlocks"],
 }
 
 const EMBEDDING_REQUIRED_DEFAULTS: Record<string, Record<string, number>> = {
@@ -254,14 +268,15 @@ const EMBEDDING_REQUIRED_DEFAULTS: Record<string, Record<string, number>> = {
 }
 
 // Backbones that only support embedding.type='none' (domain constraint in tsf.ts).
-const BACKBONE_REQUIRES_NONE_EMBEDDING = new Set(["timesnet", "dlinear", "rnn", "ssm", "nbeats"])
+const BACKBONE_REQUIRES_NONE_EMBEDDING = new Set(["timesnet_lite", "dlinear", "tcn", "nbeats"])
 
 const FUSION_ALLOWED_KEYS: Record<string, readonly string[]> = {
   temporal: ["type", "channelMode"],
-  feature: ["type", "variateToken", "crossAttention"],
+  variate_attention: ["type"],
+  feature_mlp: ["type"],
   temporal_then_feature: ["type", "gate", "residual"],
   feature_then_temporal: ["type", "gate", "residual"],
-  graph: ["type", "adjacencySource", "sparsity"],
+  graph: ["type", "adjacencySource", "sparsity", "topologyArtifact"],
   gated_hybrid: ["type", "gateType"],
 }
 
@@ -287,6 +302,18 @@ function normalizeNumber(obj: Record<string, unknown>, key: string, fallback: nu
 export function pruneCandidateSpec(value: unknown): JsonRecord {
   // Strip top-level keys not in the schema (TSFCandidateRecipe is .strict()).
   const raw = isRecord(value) ? value : {}
+  const retired = new Set(["shareAcrossHorizons", "horizonSpecific", "baseHead", "variateToken", "crossAttention", "fillPolicy", "graphType"])
+  function rejectRetired(obj: unknown) {
+    if (Array.isArray(obj)) return obj.forEach(rejectRetired)
+    if (!isRecord(obj)) return
+    for (const [key, val] of Object.entries(obj)) {
+      if (retired.has(key)) throw new Error(`Removed recipe v2 field: ${key}`)
+      rejectRetired(val)
+    }
+  }
+  rejectRetired(raw)
+  // V3 is a typed contract: do not silently prune incompatible module fields.
+  if (raw.recipeVersion === "recipe_schema_v3") return TSFCandidateRecipe.parse(raw) as unknown as JsonRecord
   const spec: Record<string, unknown> = {}
   for (const key of RECIPE_ALLOWED_KEYS) {
     if (key in raw) spec[key] = raw[key]
@@ -300,7 +327,6 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
     preprocessing.actions = preprocessing.actions.map((action) => {
       if (!isRecord(action)) return action
       const next = { ...action }
-      if (next.type === "series_decomposition") delete next.method
       return next
     })
   }
@@ -311,7 +337,7 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
   if (isRecord(spec.backbone)) {
     spec.backbone = applyAllowedAndDefaults(
       spec.backbone,
-      backboneType !== undefined ? BACKBONE_ALLOWED_KEYS[backboneType] : undefined,
+      backboneType !== undefined && BACKBONE_ALLOWED_KEYS[backboneType] ? [...BACKBONE_ALLOWED_KEYS[backboneType], "attention"] : undefined,
       backboneType !== undefined ? (BACKBONE_REQUIRED_DEFAULTS[backboneType] ?? {}) : {},
     )
   }
@@ -343,10 +369,9 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
     }
   }
 
-  // Normalize predictionHead: strip shareAcrossHorizons; fill required quantiles default.
+  // Normalize predictionHead: fill required quantiles default.
   if (isRecord(spec.predictionHead)) {
     const ph = spec.predictionHead
-    if (ph.type === "linear") delete ph.shareAcrossHorizons
     if (ph.type === "quantile" && !Array.isArray(ph.quantiles)) {
       ph.quantiles = [0.1, 0.5, 0.9]
     }
@@ -361,7 +386,7 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
     if (isRecord(ts.optimizer)) normalizeNumber(ts.optimizer, "lr", 0.001)
     if (isRecord(ts.budget)) {
       normalizeNumber(ts.budget, "maxEpochs", 30)
-      normalizeNumber(ts.budget, "timeBudgetS", 600)
+      normalizeNumber(ts.budget, "timeBudgetS", 1200)
       normalizeNumber(ts.budget, "batchSize", 32)
       normalizeNumber(ts.budget, "patience", 5)
     }
@@ -398,7 +423,7 @@ function profileDerivedSearchDirectives(taskFingerprint: unknown) {
     const period = numberFromRecord(profile, "acfMainPeriod")
     directives.push(
       [
-        "seasonal: prefer frequency embedding, series_decomposition, seasonal_differencing, or dlinear/timesnet-style seasonal structure.",
+        "seasonal: prefer frequency embedding, series_decomposition, seasonal_differencing, or dlinear/timesnet_lite-style seasonal structure.",
         period === undefined ? undefined : `acfMainPeriod=${period} can guide decomposition kernel, seasonal period, or n_freq.`,
       ]
         .filter((item): item is string => Boolean(item))
@@ -406,7 +431,7 @@ function profileDerivedSearchDirectives(taskFingerprint: unknown) {
     )
   }
   if ((numberFromRecord(profile, "crossVarCorrelation") ?? 0) >= 0.5 || biases.has("cross_var_correlated")) {
-    directives.push("cross_var_correlated: prefer invert/calendar embeddings with feature, gated_hybrid, or graph fusion.")
+    directives.push("cross_var_correlated: prefer invert/calendar embeddings with variate_attention, feature_mlp, gated_hybrid, or graph fusion.")
   }
   if ((numberFromRecord(profile, "missingRate") ?? 0) > 0 || biases.has("missing_values")) {
     directives.push("missing_values: include missing_mask preprocessing and avoid recipes that assume dense targets.")
@@ -470,8 +495,48 @@ function memoryWeight(item: DomainProposalContext["memory"][number], now: number
 }
 
 function memoryPromptRecord(item: DomainProposalContext["memory"][number], now: number) {
+  const fingerprint = isRecord(item.fingerprintSummary) ? item.fingerprintSummary : {}
+  const profileAnalysis = analyzeDatasetProfileForPrompt(profileRecord(fingerprint))
+  const profileMetrics = isRecord(profileAnalysis.metrics) ? profileAnalysis.metrics : {}
+  const candidateSummary = isRecord(item.candidateSummary) ? item.candidateSummary : {}
+  const candidateKeys = [
+    "candidateID",
+    "runID",
+    "stage",
+    "status",
+    "recipeID",
+    "primaryMetric",
+    "bestMetric",
+    "candidateActions",
+    "role",
+    "decision",
+    "decisionReason",
+    "plateauStreak",
+    "failureCategories",
+    "championUpdated",
+  ]
+  const compactCandidateSummary = Object.fromEntries(
+    candidateKeys
+      .filter((key) => candidateSummary[key] !== undefined)
+      .map((key) => [key, candidateSummary[key]]),
+  )
   return {
-    ...item,
+    scope: item.scope,
+    outcome: item.outcome,
+    lesson: item.lesson,
+    fingerprintAnalysis: item.scope === "task"
+      ? { relationship: "same_task" }
+      : {
+          relationship: "same_domain",
+          ...(typeof fingerprint.sourceCsv === "string" ? { sourceCsv: fingerprint.sourceCsv } : {}),
+          comparableProfileMetrics: Object.fromEntries(
+            ["targetCount", "trendStrength", "seasonalityStrength", "crossVarCorrelation", "distributionShift"]
+              .filter((key) => profileMetrics[key] !== undefined)
+              .map((key) => [key, profileMetrics[key]]),
+          ),
+        },
+    candidateSummary: compactCandidateSummary,
+    time: item.time,
     memoryWeight: Number(memoryWeight(item, now).toFixed(4)),
   }
 }
@@ -544,8 +609,7 @@ export function buildUserPrompt(input: {
   const searchBiases = isRecord(input.proposalContext.taskFingerprint)
     ? stringList(input.proposalContext.taskFingerprint.searchBiases)
     : []
-  return JSON.stringify(
-    {
+  const prompt = {
       task: {
         id: input.task.id,
         title: input.task.title,
@@ -555,10 +619,11 @@ export function buildUserPrompt(input: {
         taskSpec: input.task.taskSpec,
       },
       taskFingerprint: input.proposalContext.taskFingerprint,
-      datasetProfileSummary: profile,
       searchBiases,
       profileDerivedSearchDirectives: profileDerivedSearchDirectives(input.proposalContext.taskFingerprint),
-      ...(input.dataAnalysisMarkdown ? { dataAnalysisReport: input.dataAnalysisMarkdown } : {}),
+      ...(input.dataAnalysisMarkdown
+        ? { dataAnalysisReport: compactMarkdownForPrompt(input.dataAnalysisMarkdown, profile.correlationMatrix) }
+        : {}),
       ...(input.hypoPlanMarkdown ? { hypothesisPlan: input.hypoPlanMarkdown } : {}),
       ...(input.previousReflectionMarkdown ? { previousSessionReflection: input.previousReflectionMarkdown } : {}),
       existingCandidates: representativeCandidates(input.proposalContext),
@@ -577,7 +642,9 @@ export function buildUserPrompt(input: {
         : {}),
       instruction:
         "Propose a new candidate that is different from existing candidates and suitable for the task; do not repeat forbidden_signatures. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
-    },
+    }
+  return JSON.stringify(
+    compactPromptContext(prompt),
     null,
     2,
   )

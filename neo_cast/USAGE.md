@@ -1,5 +1,7 @@
 # neo-cast 使用指南
 
+当前默认生成 `model_recipe.v2`，执行为 `recipe_schema_v3`。新增 diagonal SSM、TimesBlock encoder、Mamba-1 及受限双分支组合；旧版输入继续兼容。版本、去重和 CPU/CUDA 边界请参见 [v3 实施说明](docs/recipe_runtime_v3_contract.md)。下文旧版示例仍可执行，但不代表新版本全部能力。
+
 > **neo-cast** 是一个 CLI 工具：你描述对时序预测模型的需求，它自动设计、训练候选模型，输出可部署的模型制品（权重 + MCP 工具 + 推理代码 + 评估报告）。
 
 ---
@@ -144,7 +146,7 @@ neo-cast doctor
 会追加记录关键研究决策的依据、预期效果和验证计划。
 
 ModelDesigner 会生成 `model_recipe.v1` 高层模型配方，包含 `model_name / input / architecture / training / constraints`。
-Runtime 会把它编译成可执行的 `recipe_schema_v1`，再进入 smoke、训练、评估和导出流程。
+Runtime 会把它编译成可执行的 `recipe_schema_v2`，再进入 smoke、训练、评估和导出流程。旧 recipe/checkpoint 需要迁移并重训；运行时语义版本为 2，详见 [v2 合同](docs/recipe_runtime_v2_contract.md)。
 
 需要把模型方案确认变成 Runtime gate 时，可以启用 human checkpoint：
 

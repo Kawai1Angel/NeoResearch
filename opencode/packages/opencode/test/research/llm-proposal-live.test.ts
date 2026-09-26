@@ -215,7 +215,7 @@ test(
     }
 
     const searchBiasVariants = [
-      ["seasonal", "prefer_backbone:timesnet"],
+      ["seasonal", "prefer_backbone:timesnet_lite"],
       ["trend", "prefer_backbone:transformer"],
       ["cross_var_correlated", "prefer_backbone:mlp"],
       ["distribution_shift", "prefer_backbone:dlinear"],

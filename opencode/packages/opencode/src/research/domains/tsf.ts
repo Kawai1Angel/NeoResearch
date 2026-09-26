@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto"
 import z from "zod"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
 
 import {
   DomainRunStage,
+  type DomainSummaryContext,
   issue,
   type DomainArtifactContext,
   type DomainArtifactRender,
@@ -22,6 +24,7 @@ import { createNeoCastRunnerCommand, getNeoCastRunnerManifestForTask } from "../
 
 const ACTION_REGISTRY = {
   preprocessing: {
+    last_value_centering: { phaseMin: "phase0b", bridgeSupported: true },
     none: { phaseMin: "phase0b", bridgeSupported: true },
     instance_norm: { phaseMin: "phase1", bridgeSupported: true },
     series_decomposition: { phaseMin: "phase1", bridgeSupported: true },
@@ -38,20 +41,24 @@ const ACTION_REGISTRY = {
     multiscale_patch: { phaseMin: "phase2", bridgeSupported: true },
   },
   backbone: {
+    diagonal_ssm: { phaseMin: "phase2", bridgeSupported: true },
+    timesblock_encoder: { phaseMin: "phase2", bridgeSupported: true },
+    mamba: { phaseMin: "phase2", bridgeSupported: true },
     linear: { phaseMin: "phase0b", bridgeSupported: true },
     mlp: { phaseMin: "phase0b", bridgeSupported: true },
     transformer: { phaseMin: "phase0b", bridgeSupported: true },
     rnn: { phaseMin: "phase2", bridgeSupported: true },
     dlinear: { phaseMin: "phase2", bridgeSupported: true },
     tcn: { phaseMin: "phase2", bridgeSupported: true },
-    ssm: { phaseMin: "phase2", bridgeSupported: true },
+    gated_depthwise_conv: { phaseMin: "phase2", bridgeSupported: true },
     mixer: { phaseMin: "phase2", bridgeSupported: true },
     nbeats: { phaseMin: "phase2", bridgeSupported: true },
-    timesnet: { phaseMin: "phase2", bridgeSupported: true },
+    timesnet_lite: { phaseMin: "phase2", bridgeSupported: true },
   },
   fusion: {
+    feature_mlp: { phaseMin: "phase2", bridgeSupported: true },
     temporal: { phaseMin: "phase0b", bridgeSupported: true },
-    feature: { phaseMin: "phase2", bridgeSupported: true },
+    variate_attention: { phaseMin: "phase2", bridgeSupported: true },
     temporal_then_feature: { phaseMin: "phase2", bridgeSupported: true },
     feature_then_temporal: { phaseMin: "phase2", bridgeSupported: true },
     graph: { phaseMin: "phase2", bridgeSupported: true },
@@ -66,6 +73,7 @@ const ACTION_REGISTRY = {
   },
   loss: {
     mse: { phaseMin: "phase0b", bridgeSupported: true },
+    gaussian_nll: { phaseMin: "phase2", bridgeSupported: true },
     mae: { phaseMin: "phase1", bridgeSupported: true },
     huber: { phaseMin: "phase1", bridgeSupported: true },
     quantile: { phaseMin: "phase2", bridgeSupported: true },
@@ -117,6 +125,53 @@ const ReferenceMetric = z.enum([
   "ref_test_avg_crps_approx",
 ])
 
+const DatasetSplitRatios = z.tuple([
+  z.number().positive(),
+  z.number().positive(),
+  z.number().positive(),
+])
+const DatasetRowRange = z.tuple([z.number().int().min(0), z.number().int().positive()])
+const DatasetSplit = z
+  .discriminatedUnion("method", [
+    z
+      .object({
+        method: z.literal("ratio"),
+        ratios: DatasetSplitRatios.default([7, 1, 2]),
+      })
+      .strict(),
+    z
+      .object({
+        method: z.literal("row_ranges"),
+        trainRows: DatasetRowRange,
+        validationRows: DatasetRowRange,
+        testRows: DatasetRowRange,
+      })
+      .strict(),
+  ])
+  .superRefine((split, ctx) => {
+    if (split.method !== "row_ranges") return
+    if (split.trainRows[0] !== 0) {
+      ctx.addIssue({ code: "custom", path: ["trainRows"], message: "trainRows must start at row 0" })
+    }
+    if (split.trainRows[1] !== split.validationRows[0] || split.validationRows[1] !== split.testRows[0]) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["validationRows"],
+        message: "train, validation, and test row ranges must be contiguous and non-overlapping",
+      })
+    }
+    for (const [name, range] of [
+      ["trainRows", split.trainRows],
+      ["validationRows", split.validationRows],
+      ["testRows", split.testRows],
+    ] as const) {
+      if (range[1] <= range[0]) {
+        ctx.addIssue({ code: "custom", path: [name], message: `${name} must be a non-empty [start, end) range` })
+      }
+    }
+  })
+  .default({ method: "ratio", ratios: [7, 1, 2] })
+
 export const TSFTaskSpec = z
   .object({
     taskType: z.literal("forecasting").default("forecasting"),
@@ -129,9 +184,10 @@ export const TSFTaskSpec = z
         loaderID: z.string().min(1),
         path: z.string().optional(),
         targetCols: z.array(z.string().min(1)).default([]),
-        knownFutureCovariates: z.array(z.string()).default([]),
+        knownFutureCovariates: z.array(z.string()).max(0, "UNSUPPORTED_COVARIATE: knownFutureCovariates is unavailable").default([]),
         observedPastCovariates: z.array(z.string()).default([]),
-        staticCovariates: z.array(z.string()).default([]),
+        staticCovariates: z.array(z.string()).max(0, "UNSUPPORTED_COVARIATE: staticCovariates is unavailable").default([]),
+        split: DatasetSplit,
       })
       .superRefine((dataset, ctx) => {
         for (const [name, columns] of Object.entries({
@@ -202,6 +258,7 @@ export const TSFTaskSpec = z
 export type TSFTaskSpec = z.infer<typeof TSFTaskSpec>
 
 const PreprocessingAction = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("last_value_centering") }).strict(),
   z.object({ type: z.literal("none") }).strict(),
   z
     .object({
@@ -213,6 +270,7 @@ const PreprocessingAction = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("series_decomposition"),
+      method: z.literal("moving_average").optional(),
       kernelSize: z.number().int().min(3).max(255).default(25),
     })
     .strict(),
@@ -226,8 +284,7 @@ const PreprocessingAction = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("missing_mask"),
-      maskChannel: z.boolean().default(true),
-      fillPolicy: z.enum(["zero", "ffill", "mean"]).default("zero"),
+      maskChannel: z.literal(true).default(true),
     })
     .strict(),
   z
@@ -272,6 +329,7 @@ const Embedding = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("multiscale_patch"),
+      numBlocks: PositiveInt.max(4).optional(),
       scales: z
         .array(z.object({ patchLen: PositiveInt.max(512), stride: PositiveInt.max(512) }).strict())
         .min(2)
@@ -282,10 +340,13 @@ const Embedding = z.discriminatedUnion("type", [
 ])
 
 const Backbone = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("linear"), shared: z.boolean().default(false), bias: z.boolean().default(true) }).strict(),
+  z.object({ type: z.literal("diagonal_ssm"), dModel: PositiveInt.max(512), stateDim: PositiveInt.max(512), depth: PositiveInt.max(8), dropout: z.number().min(0).lt(1) }).strict(),
+  z.object({ type: z.literal("timesblock_encoder"), dModel: PositiveInt.max(512), dFf: PositiveInt.max(2048), depth: PositiveInt.max(8), topK: PositiveInt.max(16), numKernels: PositiveInt.max(8), dropout: z.number().min(0).lt(1) }).strict(),
+  z.object({ type: z.literal("mamba"), dModel: PositiveInt.max(512), dState: PositiveInt.max(512), dConv: PositiveInt.max(32), expand: PositiveInt.max(4), depth: PositiveInt.max(8), dropout: z.number().min(0).lt(1), backend: z.enum(["torch_reference", "cuda_optimized"]) }).strict(),
+  z.object({ type: z.literal("linear"), attention: z.enum(["none", "lightweight", "full"]).optional(), shared: z.boolean().default(false), bias: z.boolean().default(true) }).strict(),
   z
     .object({
-      type: z.literal("mlp"),
+      type: z.literal("mlp"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       depth: PositiveInt.max(24),
       hiddenDim: PositiveInt.max(4096),
       activation: z.enum(["gelu", "relu", "silu"]).default("gelu"),
@@ -294,7 +355,7 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("transformer"),
+      type: z.literal("transformer"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       dModel: PositiveInt.max(1024),
       nHeads: PositiveInt.max(32),
       nLayers: PositiveInt.max(24),
@@ -304,7 +365,7 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("rnn"),
+      type: z.literal("rnn"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       cell: z.enum(["gru", "lstm", "rnn"]),
       hiddenDim: PositiveInt.max(4096),
       numLayers: PositiveInt.max(24),
@@ -313,7 +374,7 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("dlinear"),
+      type: z.literal("dlinear"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       kernelSize: z.number().int().min(3).max(255),
       bias: z.boolean().default(true),
       individual: z.boolean().default(false),
@@ -321,7 +382,7 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("tcn"),
+      type: z.literal("tcn"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       hiddenDim: PositiveInt.max(4096),
       nLayers: PositiveInt.max(24),
       kernelSize: z.number().int().min(2).max(255),
@@ -331,15 +392,17 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("ssm"),
-      stateDim: PositiveInt.max(4096),
+      type: z.literal("gated_depthwise_conv"), attention: z.enum(["none", "lightweight", "full"]).optional(),
+      kernelSize: z.number().int().min(2).max(255).optional(),
+      hiddenDim: PositiveInt.max(4096),
       depth: PositiveInt.max(24),
       dropout: z.number().min(0).max(0.9).default(0.1),
     })
     .strict(),
   z
     .object({
-      type: z.literal("mixer"),
+      type: z.literal("mixer"), attention: z.enum(["none", "lightweight", "full"]).optional(),
+      activation: z.enum(["gelu", "relu", "silu"]).optional(),
       hiddenDim: PositiveInt.max(4096),
       depth: PositiveInt.max(24),
       temporalMixing: z.enum(["mlp", "conv"]).default("mlp"),
@@ -349,7 +412,7 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("nbeats"),
+      type: z.literal("nbeats"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       hiddenDim: PositiveInt.max(4096),
       nBlocks: PositiveInt.max(64),
       nLayers: PositiveInt.max(24),
@@ -359,7 +422,7 @@ const Backbone = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("timesnet"),
+      type: z.literal("timesnet_lite"), attention: z.enum(["none", "lightweight", "full"]).optional(),
       hiddenDim: PositiveInt.max(4096),
       nLayers: PositiveInt.max(24),
       topK: PositiveInt.max(16),
@@ -370,6 +433,7 @@ const Backbone = z.discriminatedUnion("type", [
 ])
 
 const Fusion = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("feature_mlp") }).strict(),
   z
     .object({
       type: z.literal("temporal"),
@@ -378,9 +442,7 @@ const Fusion = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("feature"),
-      variateToken: z.boolean().default(true),
-      crossAttention: z.boolean().default(false),
+      type: z.literal("variate_attention"),
     })
     .strict(),
   z
@@ -401,13 +463,14 @@ const Fusion = z.discriminatedUnion("type", [
     .object({
       type: z.literal("graph"),
       adjacencySource: z.enum(["learned", "static", "correlation"]),
+      topologyArtifact: z.string().min(1).optional(),
       sparsity: z.number().min(0).max(1).default(0.1),
     })
     .strict(),
   z
     .object({
       type: z.literal("gated_hybrid"),
-      gateType: z.enum(["scalar", "channel", "time"]).default("channel"),
+      gateType: z.enum(["scalar", "channel", "time", "learned"]).default("channel"),
     })
     .strict(),
 ])
@@ -423,7 +486,6 @@ const PredictionHead = z.discriminatedUnion("type", [
     .object({
       type: z.literal("direct_multi_horizon"),
       outputDistribution: z.literal("point").default("point"),
-      horizonSpecific: z.boolean().default(true),
     })
     .strict(),
   z
@@ -444,15 +506,27 @@ const PredictionHead = z.discriminatedUnion("type", [
     .object({
       type: z.literal("residual_correction"),
       outputDistribution: z.literal("point").default("point"),
-      baseHead: z.enum(["linear", "direct_multi_horizon"]).default("linear"),
       correctionDim: PositiveInt.max(4096),
     })
     .strict(),
 ])
 
+const Representation = z.object({
+  layout: z.enum(["channel_latent", "sequence_latent", "channel_sequence"]),
+  readout: z.enum(["mean", "last", "none"]), latentDim: PositiveInt.max(512),
+}).strict()
+const SecondaryBranch = z.object({ backbone: Backbone, embedding: Embedding, representation: Representation }).strict()
+const Composition = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("single") }).strict(),
+  z.object({ type: z.literal("parallel_two_branch"), secondary: SecondaryBranch, merge: z.enum(["latent_gate", "history_time_gate", "forecast_step_gate"]) }).strict(),
+  z.object({ type: z.literal("decomposition_two_branch"), secondary: SecondaryBranch, kernelSize: PositiveInt.min(3).max(255) }).strict(),
+])
+
 export const TSFCandidateRecipe = z
   .object({
-    recipeVersion: z.literal("recipe_schema_v1"),
+    recipeVersion: z.enum(["recipe_schema_v2", "recipe_schema_v3"]),
+    representation: Representation.optional(),
+    composition: Composition.optional(),
     recipeID: z
       .string()
       .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{2,63}$/)
@@ -467,7 +541,7 @@ export const TSFCandidateRecipe = z
       .object({
         loss: z
           .object({
-            base: z.enum(["mse", "mae", "huber", "quantile", "distillation"]),
+            base: z.enum(["mse", "mae", "huber", "quantile", "distillation", "gaussian_nll"]),
             horizonWeighting: z.enum(["uniform", "front_heavy", "tail_heavy", "learned_static"]).default("uniform"),
             delta: z.number().positive().optional(),
             quantiles: z.array(z.number().gt(0).lt(1)).min(1).max(21).optional(),
@@ -509,9 +583,9 @@ export const TSFCandidateRecipe = z
           })
           .strict(),
         regularization: z
-          .object({ dropout: z.number().min(0).max(0.9).default(0.1), gradClip: z.number().positive().optional() })
+          .object({ gradClip: z.number().positive().optional() })
           .strict()
-          .default({ dropout: 0.1 }),
+          .default({}),
         budget: z
           .object({
             maxEpochs: PositiveInt.max(1000),
@@ -526,6 +600,68 @@ export const TSFCandidateRecipe = z
     notes: z.string().max(16000).optional(),
   })
   .strict()
+  .superRefine((recipe, ctx) => {
+    const sequence = ["diagonal_ssm", "timesblock_encoder", "mamba"].includes(recipe.backbone.type)
+    if (recipe.recipeVersion === "recipe_schema_v2" && (sequence || recipe.representation || recipe.composition)) {
+      ctx.addIssue({ code: "custom", path: ["recipeVersion"], message: "Typed encoders and composition require recipe_schema_v3" })
+    }
+    if (recipe.recipeVersion === "recipe_schema_v3") {
+      const repr = recipe.representation
+      if (!repr || (sequence ? repr.layout === "channel_latent" || repr.readout === "none" : repr.layout !== "channel_latent" || repr.readout !== "none")) {
+        ctx.addIssue({ code: "custom", path: ["representation"], message: "Declare a compatible explicit layout, readout and latentDim" })
+      }
+      if (sequence && recipe.embedding.type !== "none") ctx.addIssue({ code: "custom", path: ["embedding"], message: "Sequence encoders require none embedding" })
+      const comp = recipe.composition
+      if (comp && comp.type !== "single") {
+        if (recipe.fusion.type !== "temporal" || recipe.fusion.channelMode !== "independent") ctx.addIssue({ code: "custom", path: ["fusion"], message: "Composition requires temporal/independent" })
+        if (comp.type === "decomposition_two_branch" || comp.merge === "forecast_step_gate") {
+          if (recipe.predictionHead.outputDistribution !== "point") ctx.addIssue({ code: "custom", path: ["composition"], message: "Forecast composition only supports point heads" })
+        }
+        if (comp.type === "decomposition_two_branch" && comp.kernelSize % 2 === 0) ctx.addIssue({ code: "custom", path: ["composition", "kernelSize"], message: "Kernel must be odd" })
+        if (comp.type === "parallel_two_branch" && comp.merge !== "forecast_step_gate" && repr?.latentDim !== comp.secondary.representation.latentDim) ctx.addIssue({ code: "custom", path: ["composition"], message: "Adapter output widths must match" })
+      }
+    }
+    const types = recipe.preprocessing.actions.map((action) => action.type)
+    if (new Set(types).size !== types.length || (types.includes("none") && types.length > 1)) {
+      ctx.addIssue({ code: "custom", path: ["preprocessing", "actions"], message: "Duplicate actions and none combined with transformations are invalid" })
+    }
+    if (types.includes("missing_mask") && types[0] !== "missing_mask") {
+      ctx.addIssue({ code: "custom", path: ["preprocessing", "actions"], message: "missing_mask must be first" })
+    }
+    if (types.includes("missing_mask") && recipe.fusion.type === "temporal" && recipe.fusion.channelMode === "independent" && !(sequence && recipe.representation?.layout === "sequence_latent")) {
+      ctx.addIssue({ code: "custom", path: ["fusion"], message: "missing_mask requires cross-variable fusion" })
+    }
+    if (recipe.backbone.type === "dlinear" && types.includes("series_decomposition")) {
+      ctx.addIssue({ code: "custom", path: ["preprocessing", "actions"], message: "DLinear already owns decomposition" })
+    }
+    if (recipe.fusion.type === "graph" && ((recipe.fusion.adjacencySource === "static") !== Boolean(recipe.fusion.topologyArtifact))) {
+      ctx.addIssue({ code: "custom", path: ["fusion", "topologyArtifact"], message: "Only static graph requires topologyArtifact" })
+    }
+    if (recipe.predictionHead.type === "gaussian" && types.includes("seasonal_differencing")) {
+      ctx.addIssue({ code: "custom", path: ["preprocessing", "actions"], message: "Gaussian inverse seasonal covariance is unsupported" })
+    }
+    const head = recipe.predictionHead
+    const loss = recipe.trainingStrategy.loss
+    const allowed = head.type === "quantile" ? ["quantile"] : head.type === "gaussian" ? ["gaussian_nll"] : ["mse", "mae", "huber", "distillation"]
+    if (!allowed.includes(loss.base)) {
+      ctx.addIssue({ code: "custom", path: ["trainingStrategy", "loss", "base"], message: `${head.type} requires loss in ${allowed.join(", ")}` })
+    }
+    if (head.type === "quantile") {
+      for (const [values, issuePath] of [
+        [head.quantiles, ["predictionHead", "quantiles"]],
+        [loss.quantiles ?? head.quantiles, ["trainingStrategy", "loss", "quantiles"]],
+      ] as const) {
+        if (values.some((value, index) => index > 0 && value <= values[index - 1])) {
+          ctx.addIssue({ code: "custom", path: [...issuePath], message: "Quantiles must be strictly increasing and unique" })
+        }
+      }
+      if (loss.quantiles && JSON.stringify(loss.quantiles) !== JSON.stringify(head.quantiles)) {
+        ctx.addIssue({ code: "custom", path: ["trainingStrategy", "loss", "quantiles"], message: "Loss quantiles must match head quantiles" })
+      }
+    } else if (loss.quantiles) {
+      ctx.addIssue({ code: "custom", path: ["trainingStrategy", "loss", "quantiles"], message: "Quantiles require a quantile head and loss" })
+    }
+  })
 export type TSFCandidateRecipe = z.infer<typeof TSFCandidateRecipe>
 type TSFPreprocessingAction = TSFCandidateRecipe["preprocessing"]["actions"][number]
 type TSFEmbedding = TSFCandidateRecipe["embedding"]
@@ -535,9 +671,15 @@ type TSFPredictionHead = TSFCandidateRecipe["predictionHead"]
 type DatasetProfile = {
   source: "dataset.path"
   path: string
+  sourceFingerprint?: string
+  profileFingerprint?: string
+  taskID?: string
+  workspaceRoot?: string
   rowCount: number
   targetCount: number
   numericColumnCount: number
+  profiledRowCount?: number
+  profiledColumnCount?: number
   missingRate: number
   trendStrength: number
   seasonalityStrength: number
@@ -560,7 +702,7 @@ type DatasetProfile = {
 type DatasetProfileWarning = {
   source: "dataset.path"
   path: string
-  code: "dataset_read_failed" | "dataset_empty" | "no_numeric_columns"
+  code: "dataset_read_failed" | "dataset_empty" | "no_numeric_columns" | "missing_target_columns" | "unverified_training_data"
   message: string
 }
 type DatasetProfileResult = {
@@ -673,7 +815,7 @@ export function validateTSFCandidate(taskSpec: unknown, candidateSpec: unknown):
     }
   }
 
-  if (["dlinear", "tcn", "nbeats", "timesnet"].includes(recipe.backbone.type) && recipe.embedding.type !== "none") {
+  if (["dlinear", "tcn", "nbeats", "timesnet_lite"].includes(recipe.backbone.type) && recipe.embedding.type !== "none") {
     issues.push(issue("embedding.type", `backbone.type='${recipe.backbone.type}' requires embedding.type='none'`))
   }
 
@@ -695,13 +837,13 @@ export function validateTSFCandidate(taskSpec: unknown, candidateSpec: unknown):
 
 function snakePreprocessingAction(action: TSFPreprocessingAction) {
   if (action.type === "series_decomposition") {
-    return { type: action.type, kernel_size: action.kernelSize }
+    return { type: action.type, kernel_size: action.kernelSize, ...(action.method ? { method: action.method } : {}) }
   }
   if (action.type === "seasonal_differencing") {
     return { type: action.type, period: action.period, order: action.order }
   }
   if (action.type === "missing_mask") {
-    return { type: action.type, mask_channel: action.maskChannel, fill_policy: action.fillPolicy }
+    return { type: action.type, mask_channel: action.maskChannel }
   }
   return action
 }
@@ -717,6 +859,7 @@ function snakeEmbedding(embedding: TSFEmbedding) {
   }
   if (embedding.type === "multiscale_patch") {
     return {
+      ...(embedding.numBlocks === undefined ? {} : { num_blocks: embedding.numBlocks }),
       type: embedding.type,
       scales: embedding.scales.map((scale) => ({
         patch_len: scale.patchLen,
@@ -738,6 +881,9 @@ function snakeEmbedding(embedding: TSFEmbedding) {
 }
 
 function snakeBackbone(backbone: TSFBackbone) {
+  if (backbone.type === "diagonal_ssm") return { type: backbone.type, d_model: backbone.dModel, state_dim: backbone.stateDim, depth: backbone.depth, dropout: backbone.dropout }
+  if (backbone.type === "timesblock_encoder") return { type: backbone.type, d_model: backbone.dModel, d_ff: backbone.dFf, depth: backbone.depth, top_k: backbone.topK, num_kernels: backbone.numKernels, dropout: backbone.dropout }
+  if (backbone.type === "mamba") return { type: backbone.type, d_model: backbone.dModel, d_state: backbone.dState, d_conv: backbone.dConv, expand: backbone.expand, depth: backbone.depth, dropout: backbone.dropout, backend: backbone.backend }
   if (backbone.type === "linear") {
     return { type: backbone.type, shared: backbone.shared, bias: backbone.bias }
   }
@@ -782,16 +928,18 @@ function snakeBackbone(backbone: TSFBackbone) {
       dropout: backbone.dropout,
     }
   }
-  if (backbone.type === "ssm") {
+  if (backbone.type === "gated_depthwise_conv") {
     return {
+      ...(backbone.kernelSize === undefined ? {} : { kernel_size: backbone.kernelSize }),
       type: backbone.type,
-      state_dim: backbone.stateDim,
+      hidden_dim: backbone.hiddenDim,
       depth: backbone.depth,
       dropout: backbone.dropout,
     }
   }
   if (backbone.type === "mixer") {
     return {
+      ...(backbone.activation === undefined ? {} : { activation: backbone.activation }),
       type: backbone.type,
       hidden_dim: backbone.hiddenDim,
       depth: backbone.depth,
@@ -824,14 +972,14 @@ function snakeFusion(fusion: TSFFusion) {
   if (fusion.type === "temporal") {
     return { type: fusion.type, channel_mode: fusion.channelMode }
   }
-  if (fusion.type === "feature") {
-    return { type: fusion.type, variate_token: fusion.variateToken, cross_attention: fusion.crossAttention }
+  if (fusion.type === "variate_attention" || fusion.type === "feature_mlp") {
+    return { type: fusion.type }
   }
   if (fusion.type === "temporal_then_feature" || fusion.type === "feature_then_temporal") {
     return { type: fusion.type, gate: fusion.gate, residual: fusion.residual }
   }
   if (fusion.type === "graph") {
-    return { type: fusion.type, adjacency_source: fusion.adjacencySource, sparsity: fusion.sparsity }
+    return { type: fusion.type, adjacency_source: fusion.adjacencySource, sparsity: fusion.sparsity, ...(fusion.topologyArtifact ? { topology_artifact: fusion.topologyArtifact } : {}) }
   }
   return { type: fusion.type, gate_type: fusion.gateType }
 }
@@ -844,7 +992,6 @@ function snakePredictionHead(head: TSFPredictionHead) {
     return {
       type: head.type,
       output_distribution: head.outputDistribution,
-      horizon_specific: head.horizonSpecific,
     }
   }
   if (head.type === "quantile") {
@@ -856,7 +1003,6 @@ function snakePredictionHead(head: TSFPredictionHead) {
   return {
     type: head.type,
     output_distribution: head.outputDistribution,
-    base_head: head.baseHead,
     correction_dim: head.correctionDim,
   }
 }
@@ -890,7 +1036,6 @@ function snakeTrainingStrategy(recipe: TSFCandidateRecipe) {
       warmup_steps: strategy.scheduler.warmupSteps,
     },
     regularization: {
-      dropout: strategy.regularization.dropout,
       ...(strategy.regularization.gradClip === undefined ? {} : { grad_clip: strategy.regularization.gradClip }),
     },
     budget: {
@@ -915,7 +1060,14 @@ export function toNeoCastRecipePayload(task: TSFTaskSpec, recipe: TSFCandidateRe
       actions: recipe.preprocessing.actions.map(snakePreprocessingAction),
     },
     embedding: snakeEmbedding(recipe.embedding),
-    backbone: snakeBackbone(recipe.backbone),
+    backbone: { ...snakeBackbone(recipe.backbone), ...(!("attention" in recipe.backbone) || recipe.backbone.attention === undefined ? {} : { attention: recipe.backbone.attention }) },
+    ...(recipe.representation ? { representation: { layout: recipe.representation.layout, readout: recipe.representation.readout, latent_dim: recipe.representation.latentDim } } : {}),
+    ...(recipe.composition ? { composition: recipe.composition.type === "single" ? { type: "single" } : {
+      type: recipe.composition.type,
+      ...(recipe.composition.type === "parallel_two_branch" ? { merge: recipe.composition.merge } : { kernel_size: recipe.composition.kernelSize }),
+      secondary: { backbone: snakeBackbone(recipe.composition.secondary.backbone), embedding: snakeEmbedding(recipe.composition.secondary.embedding),
+        representation: { layout: recipe.composition.secondary.representation.layout, readout: recipe.composition.secondary.representation.readout, latent_dim: recipe.composition.secondary.representation.latentDim } },
+    } } : {}),
     fusion: snakeFusion(recipe.fusion),
     prediction_head: snakePredictionHead(recipe.predictionHead),
     training_strategy: snakeTrainingStrategy(recipe),
@@ -1013,7 +1165,7 @@ export function createTSFRunPlan(input: {
 function trainingBudget(task: TSFTaskSpec) {
   return {
     maxEpochs: Math.min(50, task.constraints.maxTrials ?? 50),
-    timeBudgetS: task.constraints.maxTrainingSeconds ?? 600,
+    timeBudgetS: task.constraints.maxTrainingSeconds ?? 1200,
     batchSize: 32,
     patience: 5,
     seed: task.evaluation.seeds[0] ?? 42,
@@ -1046,6 +1198,37 @@ function splitCSVLine(line: string) {
   return cells
 }
 
+function selectCSVCells(line: string, indexes: number[]) {
+  const positions = new Map(indexes.map((index, position) => [index, position]))
+  const cells = Array<string>(indexes.length).fill("")
+  let columnIndex = 0
+  let current = ""
+  let quoted = false
+  let position = positions.get(columnIndex)
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index]
+    if (char === '"' && line[index + 1] === '"') {
+      if (position !== undefined) current += '"'
+      index += 1
+      continue
+    }
+    if (char === '"') {
+      quoted = !quoted
+      continue
+    }
+    if (char === "," && !quoted) {
+      if (position !== undefined) cells[position] = current
+      columnIndex += 1
+      position = positions.get(columnIndex)
+      current = ""
+      continue
+    }
+    if (position !== undefined) current += char
+  }
+  if (position !== undefined) cells[position] = current
+  return cells
+}
+
 function parseNumberCell(value: string) {
   const trimmed = value.trim()
   if (!trimmed) return Number.NaN
@@ -1054,25 +1237,26 @@ function parseNumberCell(value: string) {
 }
 
 function pearson(xs: number[], ys: number[]) {
-  const pairs: Array<[number, number]> = []
-  for (let index = 0; index < Math.min(xs.length, ys.length); index++) {
-    const x = xs[index]
-    const y = ys[index]
-    if (Number.isFinite(x) && Number.isFinite(y)) pairs.push([x, y])
-  }
-  if (pairs.length < 3) return 0
-  const xMean = pairs.reduce((sum, [x]) => sum + x, 0) / pairs.length
-  const yMean = pairs.reduce((sum, [, y]) => sum + y, 0) / pairs.length
+  let count = 0
+  let xMean = 0
+  let yMean = 0
   let covariance = 0
   let xVariance = 0
   let yVariance = 0
-  for (const [x, y] of pairs) {
-    const dx = x - xMean
-    const dy = y - yMean
-    covariance += dx * dy
-    xVariance += dx * dx
-    yVariance += dy * dy
+  for (let index = 0; index < Math.min(xs.length, ys.length); index++) {
+    const x = xs[index]
+    const y = ys[index]
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+    count += 1
+    const dx = x! - xMean
+    xMean += dx / count
+    const dy = y! - yMean
+    yMean += dy / count
+    covariance += dx * (y! - yMean)
+    xVariance += dx * (x! - xMean)
+    yVariance += dy * (y! - yMean)
   }
+  if (count < 3) return 0
   const denom = Math.sqrt(xVariance * yVariance)
   return denom === 0 ? 0 : covariance / denom
 }
@@ -1246,18 +1430,30 @@ function profileCrossCorrelation(matrix: number[][]) {
 function profileCorrelationMatrix(matrix: number[][], columns: string[]) {
   const width = matrix[0]?.length ?? 0
   if (width === 0) return undefined
-  const values: number[][] = []
+  const series = Array.from({ length: width }, (_, index) => column(matrix, index))
+  const values = Array.from({ length: width }, () => Array<number>(width).fill(0))
   for (let left = 0; left < width; left++) {
-    const row: number[] = []
-    for (let right = 0; right < width; right++) {
-      row.push(left === right ? 1 : roundProfileValue(pearson(column(matrix, left), column(matrix, right))))
+    values[left]![left] = 1
+    for (let right = left + 1; right < width; right++) {
+      const correlation = roundProfileValue(pearson(series[left]!, series[right]!))
+      values[left]![right] = correlation
+      values[right]![left] = correlation
     }
-    values.push(row)
   }
   return {
     columns,
     values,
   }
+}
+
+function crossCorrelationFromMatrix(matrix: NonNullable<DatasetProfile["correlationMatrix"]>) {
+  const correlations: number[] = []
+  for (let left = 0; left < matrix.values.length; left++) {
+    for (let right = left + 1; right < matrix.values.length; right++) {
+      correlations.push(Math.abs(matrix.values[left]?.[right] ?? 0))
+    }
+  }
+  return meanFinite(correlations)
 }
 
 function profileDistributionShift(matrix: number[][]) {
@@ -1335,63 +1531,128 @@ function safeTaskId(taskId: string): string {
   return taskId.trim().replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 64)
 }
 
-function trainDataPath(task: TSFTaskSpec): string | undefined {
-  const root = task.runtime?.neoCastProjectRoot
-  if (typeof root !== "string" || root.length === 0) return undefined
-  return path.join(root, ".neo-cast", "dataset", `${safeTaskId(task.dataset.loaderID)}_train.csv`)
+function firstNonEmptyLines(raw: string, limit: number) {
+  const lines: string[] = []
+  let start = 0
+  while (start <= raw.length && lines.length < limit) {
+    const newline = raw.indexOf("\n", start)
+    const end = newline === -1 ? raw.length : newline
+    const line = raw.slice(start, end).replace(/\r$/, "")
+    if (line.trim().length > 0) lines.push(line)
+    if (newline === -1) break
+    start = newline + 1
+  }
+  return lines
 }
 
-function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
-  const trainPath = trainDataPath(task)
-  const usingTrainFile = Boolean(trainPath && existsSync(trainPath))
-  const datasetPath = usingTrainFile ? trainPath! : task.dataset.path
-  if (!datasetPath) return {}
-  let raw: string
+function countNonEmptyLines(raw: string) {
+  let count = 0
+  let content = false
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw.charCodeAt(index)
+    if (char === 10) {
+      if (content) count += 1
+      content = false
+      continue
+    }
+    if (char !== 13 && char !== 32 && char !== 9) content = true
+  }
+  if (content) count += 1
+  return count
+}
+
+function sampleEvenly(values: number[], limit: number) {
+  if (values.length <= limit) return values
+  return Array.from({ length: limit }, (_, index) =>
+    values[Math.round((index * (values.length - 1)) / (limit - 1))]!,
+  )
+}
+
+export function resolveTSFProfileSource(task: Pick<TSFTaskSpec, "dataset">, context?: DomainSummaryContext): {
+  raw?: string
+  sourceRaw?: string
+  sourceFingerprint?: string
+  datasetPath?: string
+  usingTrainFile?: boolean
+  warning?: DatasetProfileWarning
+} {
+  if (!task.dataset.path) return {}
+  const sourcePath = path.resolve(context?.projectRoot ?? process.cwd(), task.dataset.path)
+  const hash = (raw: string) => createHash("sha256").update(raw).digest("hex")
+  let sourceRaw: string
   try {
-    raw = readFileSync(datasetPath, "utf8")
+    sourceRaw = readFileSync(sourcePath, "utf8")
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    return {
-      warning: datasetProfileWarning(datasetPath, "dataset_read_failed", message),
+    return { warning: datasetProfileWarning(sourcePath, "dataset_read_failed", String(error)) }
+  }
+  const sourceFingerprint = hash(sourceRaw)
+  let raw = sourceRaw
+  let datasetPath = sourcePath
+  let usingTrainFile = false
+  let warning: DatasetProfileWarning | undefined
+  // The runner package root is code, never a source of task data.
+  if (context) {
+    const dataRoot = path.join(context.workspaceRoot, ".neo-cast", "dataset")
+    const trainPath = path.join(dataRoot, `${safeTaskId(task.dataset.loaderID)}_train.csv`)
+    if (existsSync(trainPath)) {
+      try {
+        const specRaw = readFileSync(path.join(dataRoot, "dataset_spec.json"), "utf8")
+        const spec = JSON.parse(specRaw)
+        const provenance = JSON.parse(readFileSync(path.join(dataRoot, "profile_provenance.json"), "utf8"))
+        const trainRaw = readFileSync(trainPath, "utf8")
+        if (path.resolve(spec.source_csv) !== sourcePath ||
+            provenance.source_sha256 !== sourceFingerprint ||
+            provenance.train_sha256 !== hash(trainRaw) ||
+            provenance.spec_sha256 !== hash(specRaw) ||
+            JSON.stringify(spec.target_columns) !== JSON.stringify(task.dataset.targetCols)) {
+          throw new Error("Prepared data source, content fingerprint, or target columns do not match this task")
+        }
+        raw = trainRaw
+        datasetPath = trainPath
+        usingTrainFile = true
+      } catch (error) {
+        warning = datasetProfileWarning(trainPath, "unverified_training_data", `${String(error)}; profiling the task source prefix instead`)
+      }
     }
   }
-  const rows = raw
-    .split(/\r?\n/)
-    .filter((line) => line.trim().length > 0)
-    .map(splitCSVLine)
-  const header = rows[0]
-  if (!header || rows.length < 2) {
+  return { raw, sourceRaw, sourceFingerprint, datasetPath, usingTrainFile, warning }
+}
+
+function profileTSFDataset(task: TSFTaskSpec, context?: DomainSummaryContext): DatasetProfileResult {
+  const input = resolveTSFProfileSource(task, context)
+  const { raw, sourceRaw, sourceFingerprint, datasetPath, warning } = input
+  if (raw === undefined || sourceRaw === undefined || sourceFingerprint === undefined || !datasetPath) return { warning }
+  const MAX_PROFILE_COLS = 20
+  const MAX_PROFILE_ROWS = 5000
+  const lines = firstNonEmptyLines(raw, MAX_PROFILE_ROWS + 1)
+  const header = lines[0] ? splitCSVLine(lines[0]) : undefined
+  if (!header || lines.length < 2) {
     return {
       warning: datasetProfileWarning(datasetPath, "dataset_empty", "Dataset profile requires a header and data rows."),
     }
   }
-  const MAX_PROFILE_COLS = 20
-  const MAX_PROFILE_ROWS_FALLBACK = 5000
-  const dataRows = usingTrainFile ? rows.slice(1) : rows.slice(1, MAX_PROFILE_ROWS_FALLBACK + 1)
-  let totalRowCount = dataRows.length
-  if (usingTrainFile && task.dataset.path) {
-    try {
-      const sourceRaw = readFileSync(task.dataset.path, "utf8")
-      totalRowCount = sourceRaw.split(/\r?\n/).filter((line) => line.trim().length > 0).length - 1
-    } catch {
-      // fallback to train row count
-    }
+  const dataLines = lines.slice(1)
+  const totalRowCount = Math.max(0, countNonEmptyLines(sourceRaw) - 1)
+  const missingTargets = task.dataset.targetCols.filter((target) => !header.includes(target))
+  if (missingTargets.length > 0) {
+    return { warning: datasetProfileWarning(datasetPath, "missing_target_columns", `Missing target columns: ${missingTargets.join(", ")}`) }
   }
   const targetIndexes = task.dataset.targetCols
     .map((target) => header.indexOf(target))
     .filter((index) => index >= 0)
-  const numericIndexes =
+  let fallbackRows: string[][] | undefined
+  const allNumericIndexes =
     targetIndexes.length > 0
       ? targetIndexes
       : header
           .map((_, index) => index)
           .filter((index) => {
-            const parsed = dataRows.map((row) => parseNumberCell(row[index] ?? ""))
+            fallbackRows ??= dataLines.map(splitCSVLine)
+            const parsed = fallbackRows.map((row) => parseNumberCell(row[index] ?? ""))
             const valid = parsed.filter(Number.isFinite).length
-            return valid > 0 && valid / dataRows.length >= 0.5
+            return valid > 0 && valid / fallbackRows.length >= 0.5
           })
-          .slice(0, MAX_PROFILE_COLS)
-  if (numericIndexes.length === 0) {
+  if (allNumericIndexes.length === 0) {
     return {
       warning: datasetProfileWarning(
         datasetPath,
@@ -1400,32 +1661,54 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
       ),
     }
   }
+  const numericIndexes = sampleEvenly(allNumericIndexes, MAX_PROFILE_COLS)
+  const timestampIndex = header.findIndex((item) => ["date", "time", "timestamp", "datetime"].includes(item.toLowerCase()))
+  const profileIndexes = [...new Set([timestampIndex >= 0 ? timestampIndex : 0, ...numericIndexes])].sort((left, right) => left - right)
+  const profileHeader = profileIndexes.map((index) => header[index] ?? `col_${index}`)
+  const profilePositions = new Map(profileIndexes.map((index, position) => [index, position]))
+  const profileNumericIndexes = numericIndexes.map((index) => profilePositions.get(index)!)
+  const dataRows = dataLines.map((line) => selectCSVCells(line, profileIndexes))
 
   let missing = 0
 	  const matrix = dataRows.map((row) =>
-	    numericIndexes.map((index) => {
+	    profileNumericIndexes.map((index) => {
 	      const value = parseNumberCell(row[index] ?? "")
 	      if (!Number.isFinite(value)) missing += 1
 	      return value
 	    }),
 	  )
-	  const timeAxis = profileTimeAxis(header, dataRows)
+	  const timeAxis = profileTimeAxis(profileHeader, dataRows)
 	  const numericColumns = numericIndexes.map((index) => header[index] ?? `col_${index}`)
 	  const acf = profileACFMainPeriod(matrix)
 	  const adf = profileADF(matrix)
 	  const correlationMatrix = profileCorrelationMatrix(matrix, numericColumns)
 	  const totalCells = Math.max(dataRows.length * numericIndexes.length, 1)
+	  const profileFingerprint = createHash("sha256")
+	    .update(sourceFingerprint)
+	    .update("\0")
+	    .update(raw)
+	    .update("\0")
+	    .update(JSON.stringify(task.dataset.targetCols))
+	    .digest("hex")
 	  return {
+	    ...(warning ? { warning } : {}),
 	    profile: {
 	      source: "dataset.path",
       path: datasetPath,
+      sourceFingerprint,
+      profileFingerprint,
+      ...(context ? { taskID: context.taskID, workspaceRoot: context.workspaceRoot } : {}),
       rowCount: totalRowCount,
-      targetCount: numericIndexes.length,
-      numericColumnCount: numericIndexes.length,
+      targetCount: targetIndexes.length,
+      numericColumnCount: allNumericIndexes.length,
+      profiledRowCount: dataRows.length,
+      profiledColumnCount: numericIndexes.length,
       missingRate: roundProfileValue(missing / totalCells),
       trendStrength: roundProfileValue(profileTrend(matrix, timeAxis)),
       seasonalityStrength: roundProfileValue(profileSeasonality(matrix)),
-	      crossVarCorrelation: roundProfileValue(profileCrossCorrelation(matrix)),
+	      crossVarCorrelation: roundProfileValue(
+	        correlationMatrix ? crossCorrelationFromMatrix(correlationMatrix) : profileCrossCorrelation(matrix),
+	      ),
 	      distributionShift: roundProfileValue(profileDistributionShift(matrix)),
 	      outlierRate: roundProfileValue(profileOutlierRate(matrix)),
 	      ...(acf === undefined
@@ -1441,7 +1724,7 @@ function profileTSFDataset(task: TSFTaskSpec): DatasetProfileResult {
 	            adfStationary: adf.stationary,
 	          }),
 	      ...(correlationMatrix === undefined ? {} : { correlationMatrix }),
-	      ...profileTimestampQuality(header, dataRows),
+	      ...profileTimestampQuality(profileHeader, dataRows),
 	    },
 	  }
 	}
@@ -1462,18 +1745,17 @@ function baseStrategy(task: TSFTaskSpec) {
     loss: { base: "mse", horizonWeighting: "uniform" },
     optimizer: { type: "adam", lr: 0.001, weightDecay: 0 },
     scheduler: { type: "none", warmupSteps: 0 },
-    regularization: { dropout: 0.1, gradClip: 1 },
+    regularization: { gradClip: 1 },
     budget: trainingBudget(task),
   } satisfies TSFCandidateRecipe["trainingStrategy"]
 }
 
-export function summarizeTSFTask(taskSpec: unknown): JsonRecord {
+export function summarizeTSFTask(taskSpec: unknown, context?: DomainSummaryContext): JsonRecord {
   const task = TSFTaskSpec.parse(taskSpec)
   const maxPredictionLength = Math.max(...task.predictionLengths)
   const horizonContextRatio = Number((maxPredictionLength / task.contextLength).toFixed(6))
-  const datasetProfileResult = profileTSFDataset(task)
-  const metadataProfile = datasetProfileFromFingerprint(task.metadata as JsonRecord)
-  const datasetProfile = datasetProfileResult.profile ?? metadataProfile
+  const datasetProfileResult = profileTSFDataset(task, context)
+  const datasetProfile = datasetProfileResult.profile
   const metadataBiases = searchBiasList(task.metadata as JsonRecord)
   const effectiveSeriesType =
     task.dataset.targetCols.length === 1 ? "univariate" : task.seriesType
@@ -1491,6 +1773,7 @@ export function summarizeTSFTask(taskSpec: unknown): JsonRecord {
     forecastMode: task.forecastMode,
     seriesType: effectiveSeriesType,
     loaderID: task.dataset.loaderID,
+    dataSplit: task.dataset.split,
     targetCount: task.dataset.targetCols.length,
     contextLength: task.contextLength,
     predictionLengths: task.predictionLengths,
@@ -1517,9 +1800,12 @@ function recipe(
   },
 ): TSFCandidateRecipe {
   return {
-    recipeVersion: "recipe_schema_v1",
+    recipeVersion: "recipe_schema_v3",
+    representation: { layout: "channel_latent", readout: "none", latentDim: Math.min(task.contextLength, 64) },
+    composition: { type: "single" },
     trainingStrategy: baseStrategy(task),
     ...input,
+    fusion: input.fusion.type === "temporal" && input.fusion.channelMode === "shared" ? { type: "feature_mlp" } : input.fusion,
   }
 }
 
@@ -1583,7 +1869,7 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
         ...baseStrategy(task),
         optimizer: { type: "adam", lr: 0.0001, weightDecay: 0 },
         scheduler: { type: "lradj_type3", warmupSteps: 0 },
-        regularization: { dropout: 0.05, gradClip: 1 },
+        regularization: { gradClip: 1 },
         budget: {
           ...trainingBudget(task),
           maxEpochs: 100,
@@ -1622,8 +1908,8 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
       preprocessing: { actions: [{ type: "instance_norm", affine: true, eps: 1e-5 }] },
       embedding: { type: "invert", dModel: 512 },
       backbone: { type: "transformer", dModel: 512, nHeads: 8, nLayers: 2, dropout: 0.1, ffnMult: 4 },
-      fusion: { type: "feature", variateToken: true, crossAttention: true },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true },
+      fusion: { type: "variate_attention" },
+      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
       trainingStrategy: {
         ...baseStrategy(task),
         optimizer: { type: "adam", lr: 0.0001, weightDecay: 0 },
@@ -1887,7 +2173,7 @@ function candidateActionVector(candidate: TSFCandidateRecipe, historyContext?: R
 function rankedPreprocessingActions(profile: DatasetProfile | undefined, biases: Set<string>): TSFPreprocessingAction[] {
   const actions: TSFPreprocessingAction[] = []
   if ((profile?.missingRate ?? 0) > 0 || biases.has("missing_values")) {
-    actions.push({ type: "missing_mask", maskChannel: true, fillPolicy: "mean" })
+    actions.push({ type: "missing_mask", maskChannel: true })
   }
   if ((profile?.distributionShift ?? 0) >= 0.5 || biases.has("distribution_shift")) {
     actions.push({ type: "sample_reweighting", scheme: "outlier_robust" })
@@ -1927,7 +2213,6 @@ function profiledStrategy(
     },
     regularization: {
       ...base.regularization,
-      dropout: 0.1,
       gradClip: 1,
       ...overrides.regularization,
     },
@@ -1945,7 +2230,7 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
   const probabilistic = task.forecastMode === "probabilistic"
   const predictionHead: TSFPredictionHead = probabilistic
     ? { type: "quantile", outputDistribution: "quantile", quantiles: [0.1, 0.5, 0.9] }
-    : { type: "direct_multi_horizon", outputDistribution: "point", horizonSpecific: true }
+    : { type: "direct_multi_horizon", outputDistribution: "point" }
   const trainingStrategy = profiledStrategy(task, profile, biases, {
     ...(probabilistic
       ? {
@@ -1960,7 +2245,7 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
 
   return [
     {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "tsf_ranked_frequency_mixer_profiled",
       hypothesis:
         "Profile-ranked frequency embedding plus a mixer backbone targets seasonal structure, missing values, and distribution shift.",
@@ -1980,30 +2265,30 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
       notes: "Ranked native TimeRecipe candidate: seasonal/frequency-first exploration.",
     },
     {
-      recipeVersion: "recipe_schema_v1",
+      recipeVersion: "recipe_schema_v2",
       recipeID: "tsf_ranked_invert_rnn_feature_profiled",
       hypothesis:
         "Profile-ranked inverted embedding with feature fusion tests whether cross-variate dependence improves forecasts.",
       preprocessing: { actions: rankedPreprocessingActions(profile, biases) },
       embedding: { type: "invert", dModel: 64 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
-      fusion: { type: "feature", variateToken: true, crossAttention: (profile?.crossVarCorrelation ?? 0) >= 0.5 },
+      fusion: { type: "variate_attention" },
       predictionHead,
       trainingStrategy: profiledStrategy(task, profile, biases),
       notes: "Ranked native TimeRecipe candidate: cross-variate recurrent exploration.",
     },
     {
-      recipeVersion: "recipe_schema_v1",
-      recipeID: "tsf_ranked_ssm_graph_profiled",
+      recipeVersion: "recipe_schema_v2",
+      recipeID: "tsf_ranked_gated_depthwise_conv_graph_profiled",
       hypothesis:
-        "Profile-ranked SSM with correlation graph fusion tests long-range temporal state and multivariate structure.",
+        "Profile-ranked gated depthwise convolution with train-only correlation graph tests local temporal and multivariate structure.",
       preprocessing: { actions: rankedPreprocessingActions(profile, biases) },
       embedding: { type: "none" },
-      backbone: { type: "ssm", stateDim: 64, depth: 2, dropout: 0.1 },
+      backbone: { type: "gated_depthwise_conv", hiddenDim: 64, depth: 2, dropout: 0.1 },
       fusion: { type: "graph", adjacencySource: "correlation", sparsity: 0.2 },
       predictionHead,
       trainingStrategy: profiledStrategy(task, profile, biases),
-      notes: "Ranked native TimeRecipe candidate: state-space and correlation-graph exploration.",
+      notes: "Native gated convolution and correlation graph exploration; not a state-space model.",
     },
   ]
 }
@@ -2560,14 +2845,14 @@ function profileMutationSequence(task: TSFTaskSpec, taskFingerprint: JsonRecord)
     factories.push((base, recipeID) => {
       const alreadyHasMask = base.preprocessing.actions.some((a) => a.type === "missing_mask")
       if (alreadyHasMask) return undefined
-      const newActions = [...base.preprocessing.actions.filter((a) => a.type !== "none"), { type: "missing_mask" as const, maskChannel: true, fillPolicy: "zero" as const }]
+      const newActions = [{ type: "missing_mask" as const, maskChannel: true as const }, ...base.preprocessing.actions.filter((a) => a.type !== "none")]
       return recipe(task, {
         recipeID,
         hypothesis: `Profile-guided mutation: missing values (rate=${missingRate}), adding missing mask preprocessing.`,
         preprocessing: { actions: newActions },
         embedding: base.embedding,
         backbone: base.backbone,
-        fusion: base.fusion,
+        fusion: base.fusion.type === "temporal" && base.fusion.channelMode === "independent" ? { type: "feature_mlp" } : base.fusion,
         predictionHead: base.predictionHead,
         notes: `Profile-directed missing values mutation from ${base.recipeID ?? "candidate"}.`,
       })
@@ -2988,14 +3273,14 @@ export const TSFDomain: ResearchDomain = {
     displayName: "Time Series Forecasting",
     version: "0.1.0",
     taskSpecSchemaID: "neo-research.tsf.task_spec.v1",
-    candidateSpecSchemaID: "neo-cast.recipe_schema_v1",
+    candidateSpecSchemaID: "neo-cast.recipe_schema_v2",
     actionRegistry: ACTION_REGISTRY,
   },
   createTaskSpec(input) {
     return TSFTaskSpec.parse(input) as unknown as JsonRecord
   },
-  summarizeTask(taskSpec) {
-    return summarizeTSFTask(taskSpec)
+  summarizeTask(taskSpec, context) {
+    return summarizeTSFTask(taskSpec, context)
   },
   buildBaselines(taskSpec) {
     return buildTSFBaselines(taskSpec)

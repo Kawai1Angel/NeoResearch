@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import types
 import io
 import json
 from contextlib import redirect_stdout
@@ -13,11 +15,42 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 if str(PY_ROOT) not in sys.path:
     sys.path.insert(0, str(PY_ROOT))
 
-from cv_train import _run_train, aggregate_cv_metrics, build_ratio_folds, run_cv_folds_parallel, validate_folds
+from cv_train import _run_standard_train, _run_train, aggregate_cv_metrics, build_ratio_folds, default_max_parallel_folds, run_cv_folds_parallel, validate_folds
 from prepare_tsf import _split_bounds_with_cv_override
 
 
 class CvTrainTest(unittest.TestCase):
+    @patch("cv_train.torch.cuda.is_available", return_value=True)
+    def test_default_parallelism_serializes_cuda_folds(self, _cuda) -> None:
+        self.assertEqual(default_max_parallel_folds(), 1)
+
+    @patch("cv_train.torch.cuda.is_available", return_value=False)
+    def test_default_parallelism_keeps_cpu_folds_parallel(self, _cuda) -> None:
+        self.assertEqual(default_max_parallel_folds(), 4)
+
+    def test_standard_fit_reuses_parent_and_keeps_live_evidence(self) -> None:
+        def entry(argv):
+            self.assertEqual(argv, ["--resolved-candidate", "snapshot.json", "--artifacts-dir", "artifacts"])
+            print('{"event":"experiment_reused","independent_evidence":false}')
+            print('{"event":"eval_done","val_avg_mse":0.5}')
+            print('{"event":"artifact_ready","run_id":"fixture","artifact_dir":"artifacts/run_fixture"}')
+            raise SystemExit(0)
+        with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {"train": types.SimpleNamespace(main=entry)}), \
+             patch("cv_train.subprocess.Popen", side_effect=AssertionError("unexpected subprocess")), redirect_stdout(io.StringIO()) as out:
+            code, records = _run_standard_train([sys.executable, "train.py", "--resolved-candidate", "snapshot.json"], "artifacts")
+        self.assertEqual(code, 0)
+        self.assertEqual(records, [json.loads(line) for line in out.getvalue().splitlines()])
+        self.assertEqual(records[-1]["run_id"], "fixture")
+        self.assertNotIn("cv_fold_index", records[-1])
+
+    def test_standard_fit_with_parent_overrides_uses_clean_subprocess(self) -> None:
+        with patch.dict(os.environ, {"NEO_CAST_TRAIN_ROWS": "0:600", "NEO_CAST_VAL_ROWS": "600:700", "NEO_CAST_CV_FOLD_INDEX": "1"}), \
+             patch("cv_train._run_train", return_value=(5, [{"event": "execution_contract_violation"}])) as run:
+            code, records = _run_standard_train([sys.executable, "train.py"], "artifacts")
+        self.assertEqual(code, 5)
+        self.assertEqual(records[0]["event"], "execution_contract_violation")
+        self.assertFalse(any(key in run.call_args.args[1] for key in ("NEO_CAST_TRAIN_ROWS", "NEO_CAST_VAL_ROWS", "NEO_CAST_CV_FOLD_INDEX")))
+
     def test_fold_output_marks_temporary_artifacts_without_mutating_metrics(self) -> None:
         process = Mock(stdout=io.StringIO('{"event":"done","artifact_dir":"/tmp/fold","val_avg_mse":1.0}\n'))
         process.wait.return_value = 0

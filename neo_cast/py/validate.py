@@ -55,16 +55,48 @@ def load_validator(schema_path: str | Path) -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
+def _schema_errors(validator: Draft202012Validator, payload: Any) -> list[str]:
+    def relevant(error):
+        # Report the selected discriminator branch, including the offending path.
+        if error.validator == "oneOf" and isinstance(error.instance, dict):
+            branches = error.schema.get("oneOf", [])
+            selected = next((i for i, branch in enumerate(branches)
+                             if branch.get("properties", {}).get("type", {}).get("const") == error.instance.get("type")), None)
+            if selected is not None:
+                children = [child for child in error.context if child.schema_path[0] == selected]
+                if children:
+                    return [item for child in children for item in relevant(child)]
+        path = ".".join(str(part) for part in error.absolute_path) or "<root>"
+        return [f"{path}: {error.message}"]
+
+    return [message for error in validator.iter_errors(payload) for message in relevant(error)]
+
+
+def validate_recipe_object(payload: dict[str, Any], *, input_len: int | None = None) -> list[str]:
+    from registry.action_specs import validate_recipe_against_registry
+
+    schema_path = SCHEMA_DIR / "recipe_schema_v3.json" if payload.get("recipe_version") == "recipe_schema_v3" else DEFAULT_SCHEMAS["recipe"]
+    errors = _schema_errors(load_validator(schema_path), payload)
+    return errors or validate_recipe_against_registry(payload, input_len=input_len)
+
+
 def validate_payload(kind: str, payload_path: str | Path, schema_path: str | Path | None = None) -> list[str]:
     selected_schema = Path(schema_path).expanduser() if schema_path is not None else DEFAULT_SCHEMAS[kind]
-    validator = load_validator(selected_schema)
     payload = load_json(payload_path)
+    if schema_path is None and isinstance(payload, dict):
+        if kind == "recipe" and payload.get("recipe_version") == "recipe_schema_v3":
+            selected_schema = SCHEMA_DIR / "recipe_schema_v3.json"
+        elif kind == "model-recipe" and payload.get("schema_version") == "model_recipe.v2":
+            selected_schema = SCHEMA_DIR / "model_recipe_v2_schema.json"
+    validator = load_validator(selected_schema)
 
-    errors: list[str] = []
-    for error in sorted(validator.iter_errors(payload), key=lambda exc: list(exc.absolute_path)):
-        path = ".".join(str(part) for part in error.absolute_path)
-        location = path if path else "<root>"
-        errors.append(f"{location}: {error.message}")
+    errors = _schema_errors(validator, payload)
+    if kind == "dataset" and isinstance(payload, dict):
+        from dataset_contract import reject_unsupported_covariates
+        try:
+            reject_unsupported_covariates(payload)
+        except ValueError as exc:
+            errors.append(str(exc))
     if kind == "recipe" and not errors:
         from registry.action_specs import validate_recipe_against_registry
 
@@ -72,14 +104,13 @@ def validate_payload(kind: str, payload_path: str | Path, schema_path: str | Pat
             errors.extend(validate_recipe_against_registry(payload))
     if kind == "model-recipe" and not errors:
         from model_recipe import compile_model_recipe
-        from registry.action_specs import validate_recipe_against_registry
 
         if isinstance(payload, dict):
             try:
                 compiled = compile_model_recipe(payload)
                 errors.extend(
                     f"compiled_recipe.{item}"
-                    for item in validate_recipe_against_registry(
+                    for item in validate_recipe_object(
                         compiled,
                         input_len=int(payload.get("input", {}).get("history_window", 0)) or None,
                     )
@@ -93,12 +124,12 @@ def detect_payload_kind(payload_path: str | Path) -> str:
     payload = load_json(payload_path)
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {payload_path}")
-    if payload.get("recipe_version") == "recipe_schema_v1":
+    if payload.get("recipe_version") in {"recipe_schema_v2", "recipe_schema_v3"}:
         return "recipe"
-    if payload.get("schema_version") == "model_recipe.v1":
+    if payload.get("schema_version") in {"model_recipe.v1", "model_recipe.v2"}:
         return "model-recipe"
     raise ValueError(
-        "Unknown payload kind. Expected recipe_version='recipe_schema_v1' or schema_version='model_recipe.v1'."
+        "Unknown payload kind. Expected recipe_version='recipe_schema_v2' or schema_version='model_recipe.v1'."
     )
 
 

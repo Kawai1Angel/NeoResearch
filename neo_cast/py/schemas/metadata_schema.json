@@ -29,7 +29,10 @@
     },
     "dataset_schema_version": {
       "type": "string",
-      "enum": ["dataset.v1", "dataset.v2"]
+      "enum": [
+        "dataset.v1",
+        "dataset.v2"
+      ]
     },
     "run_id": {
       "type": "string",
@@ -103,21 +106,54 @@
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "used_observed_past_covariates": {
-      "type": "array", "uniqueItems": true, "items": { "type": "string" }
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
     },
     "used_known_future_covariates": {
-      "type": "array", "uniqueItems": true, "items": { "type": "string" }
+      "type": "array",
+      "maxItems": 0,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
     },
-    "target_channels": { "type": "integer", "minimum": 1 },
-    "past_exogenous_channels": { "type": "integer", "minimum": 0 },
-    "future_exogenous_channels": { "type": "integer", "minimum": 0 },
-    "model_input_channels": { "type": "integer", "minimum": 1 },
-    "model_output_channels": { "type": "integer", "minimum": 1 },
-    "experiment_scope": { "type": "string", "minLength": 1 },
-    "production_comparable": { "type": "boolean" },
+    "target_channels": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "past_exogenous_channels": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "future_exogenous_channels": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 0
+    },
+    "model_input_channels": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "model_output_channels": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "experiment_scope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "production_comparable": {
+      "type": "boolean"
+    },
     "preprocess_entry": {
       "type": "string",
       "minLength": 1
@@ -135,21 +171,30 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "export_spec": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["model_impl_entry", "state_dict_layout"],
+          "properties": {
+            "model_impl_entry": {"type": "string", "minLength": 1},
+            "state_dict_layout": {"type": "string", "minLength": 1}
+          }
+        },
         "training_seconds": {
           "type": "number",
-          "minimum": 0.0
+          "minimum": 0
         },
         "total_seconds": {
           "type": "number",
-          "minimum": 0.0
+          "minimum": 0
         },
         "peak_vram_mb": {
           "type": "number",
-          "minimum": 0.0
+          "minimum": 0
         },
         "num_params_M": {
           "type": "number",
-          "minimum": 0.0
+          "minimum": 0
         },
         "preprocessing_actions": {
           "type": "array",
@@ -171,11 +216,19 @@
         },
         "output_distribution": {
           "type": "string",
-          "enum": ["point", "quantile", "gaussian"]
+          "enum": [
+            "point",
+            "quantile",
+            "gaussian"
+          ]
         },
         "training_prediction": {
           "type": "string",
-          "enum": ["point_forecast", "quantile_distribution", "gaussian_distribution"]
+          "enum": [
+            "point_forecast",
+            "quantile_distribution",
+            "gaussian_distribution"
+          ]
         },
         "loss": {
           "type": "string"
@@ -188,25 +241,96 @@
             "exclusiveMaximum": 1
           }
         },
-        "target_columns": { "type": "array", "items": { "type": "string" } },
-        "used_observed_past_covariates": { "type": "array", "items": { "type": "string" } },
-        "used_known_future_covariates": { "type": "array", "items": { "type": "string" } },
-        "target_channels": { "type": "integer", "minimum": 1 },
-        "past_exogenous_channels": { "type": "integer", "minimum": 0 },
-        "future_exogenous_channels": { "type": "integer", "minimum": 0 },
-        "model_input_channels": { "type": "integer", "minimum": 1 },
-        "model_output_channels": { "type": "integer", "minimum": 1 },
-        "future_covariate_mode": { "type": "string", "enum": ["none", "concat_head"] },
+        "target_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "used_observed_past_covariates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "used_known_future_covariates": {
+          "type": "array",
+          "maxItems": 0,
+          "items": {
+            "type": "string"
+          }
+        },
+        "target_channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "past_exogenous_channels": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "future_exogenous_channels": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 0
+        },
+        "model_input_channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "model_output_channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "future_covariate_mode": {
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
         "first_batch_shapes": {
           "type": "object",
           "additionalProperties": {
             "type": "array",
-            "items": { "type": "integer", "minimum": 0 }
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         },
         "latency_ms_by_horizon": {
           "type": "object",
-          "additionalProperties": {"type": "number", "minimum": 0}
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "runtime_semantics_revision": {
+          "enum": [
+            2,
+            3
+          ]
+        },
+        "model_manifests": {
+          "type": "object"
+        },
+        "model_manifest_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "implementation_status": {
+          "enum": [
+            "native",
+            "paper_derived"
+          ]
+        },
+        "architecture_id": {
+          "type": "string"
+        },
+        "experiment_id": {
+          "type": "string"
+        },
+        "normalization_revision": {
+          "type": "integer"
         }
       }
     },
@@ -261,6 +385,12 @@
     "created_at": {
       "type": "string",
       "format": "date-time"
+    },
+    "runtime_semantics_revision": {
+      "enum": [
+        2,
+        3
+      ]
     }
   },
   "$defs": {
@@ -268,48 +398,169 @@
       "type": "object",
       "additionalProperties": false,
       "patternProperties": {
-        "^cv_h[0-9]+_[a-z0-9_]+$": { "type": "number" },
-        "^cv_avg_[a-z0-9_]+$": { "type": "number" }
+        "^cv_h[0-9]+_[a-z0-9_]+$": {
+          "type": "number"
+        },
+        "^cv_avg_[a-z0-9_]+$": {
+          "type": "number"
+        }
       },
-      "required": ["schema_version", "protocol", "cv_avg_mse", "cv_std_mse", "folds"],
+      "required": [
+        "schema_version",
+        "protocol",
+        "cv_avg_mse",
+        "cv_std_mse",
+        "folds"
+      ],
       "properties": {
-        "schema_version": { "const": "cv_metrics.v1" },
+        "schema_version": {
+          "const": "cv_metrics.v1"
+        },
         "protocol": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["strategy", "protocol_id", "num_folds", "initial_train_ratio", "visible_rows", "input_len", "horizons"],
+          "required": [
+            "strategy",
+            "protocol_id",
+            "num_folds",
+            "initial_train_ratio",
+            "visible_rows",
+            "input_len",
+            "horizons"
+          ],
           "properties": {
-            "strategy": { "const": "expanding_window_ratio" },
-            "protocol_id": { "type": "string", "minLength": 1 },
-            "num_folds": { "type": "integer", "minimum": 2 },
-            "initial_train_ratio": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
-            "fold_val_ratio": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
-            "visible_rows": { "type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "minItems": 2, "maxItems": 2 },
-            "input_len": { "type": "integer", "minimum": 1 },
-            "horizons": { "type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1} },
-            "min_train_windows": { "type": "integer", "minimum": 1 },
-            "min_eval_windows": { "type": "integer", "minimum": 1 }
+            "runtime_semantics_revision": {
+              "enum": [
+                2,
+                3
+              ]
+            },
+            "strategy": {
+              "const": "expanding_window_ratio"
+            },
+            "protocol_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "num_folds": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "initial_train_ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 1
+            },
+            "fold_val_ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 1
+            },
+            "visible_rows": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "integer"
+                }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "input_len": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "horizons": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "min_train_windows": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "min_eval_windows": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         },
-        "cv_avg_mse": { "type": "number" },
-        "cv_std_mse": { "type": "number", "minimum": 0 },
-        "cv_avg_mae": { "type": "number" },
-        "folds": { "type": "array", "minItems": 2, "items": {
-          "type": "object",
-          "additionalProperties": false,
-          "patternProperties": {
-            "^val_h[0-9]+_[a-z0-9_]+$": { "type": "number" },
-            "^val_avg_[a-z0-9_]+$": { "type": "number" }
-          },
-          "required": ["fold_index", "train_rows", "val_rows", "val_avg_mse"],
-          "properties": {
-            "fold_index": { "type": "integer", "minimum": 0 },
-            "train_rows": { "type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "minItems": 2, "maxItems": 2 },
-            "val_rows": { "type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "minItems": 2, "maxItems": 2 },
-            "val_avg_mse": { "type": "number" },
-            "val_avg_mae": { "type": "number" }
+        "cv_avg_mse": {
+          "type": "number"
+        },
+        "cv_std_mse": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cv_avg_mae": {
+          "type": "number"
+        },
+        "folds": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "patternProperties": {
+              "^val_h[0-9]+_[a-z0-9_]+$": {
+                "type": "number"
+              },
+              "^val_avg_[a-z0-9_]+$": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "fold_index",
+              "train_rows",
+              "val_rows",
+              "val_avg_mse"
+            ],
+            "properties": {
+              "fold_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "train_rows": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "val_rows": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "val_avg_mse": {
+                "type": "number"
+              },
+              "val_avg_mae": {
+                "type": "number"
+              }
+            }
           }
-        } }
+        }
       }
     },
     "valMetricsBlock": {

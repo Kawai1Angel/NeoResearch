@@ -7,7 +7,7 @@ describe("research domain registry", () => {
 
     expect(info.capability).toEqual({
       taskSpecKind: "neo-research.tsf.task_spec.v1",
-      candidateSpecKind: "neo-cast.recipe_schema_v1",
+      candidateSpecKind: "neo-cast.recipe_schema_v2",
       evaluatorKind: "domain-run-evaluator",
       artifactExporterKind: "domain-artifact-exporter",
       supportsAutonomous: true,

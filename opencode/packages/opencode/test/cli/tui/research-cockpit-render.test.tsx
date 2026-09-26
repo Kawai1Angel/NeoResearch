@@ -4796,8 +4796,13 @@ describe("ResearchCockpit render", () => {
     const events = createCockpitEventSource()
     const changingRunID = "run_refresh_progress"
     let runStatus: "running" | "succeeded" = "running"
+    let fingerprintFetches = 0
     const progressFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/fingerprint`) {
+        fingerprintFetches += 1
+        return Promise.resolve(response({}))
+      }
       if (path === `/research/tasks/${taskID}/runs`) {
         return Promise.resolve(
           response([
@@ -4825,6 +4830,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, `smoke running`)
+      const fingerprintFetchesBeforeProgress = fingerprintFetches
       runStatus = "succeeded"
       events.emit({
         type: "research.runner.progress.line",
@@ -4838,6 +4844,7 @@ describe("ResearchCockpit render", () => {
 
       const frame = await waitForFrame(app, `smoke succeeded`)
       expect(frame).toContain("val_avg_mse 0.101")
+      expect(fingerprintFetches).toBe(fingerprintFetchesBeforeProgress)
     } finally {
       app.renderer.destroy()
     }
@@ -6028,3 +6035,33 @@ for (const mode of ["autonomous", "companion", "socratic"] as const) {
     } finally { app.renderer.destroy() }
   })
 }
+
+test("agent streaming renders locally without refetching state or LLM configuration", async () => {
+  const counts = new Map<string, number>()
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = requestURL(input)
+    if ((requestMethod(input, init) ?? "GET") === "GET") counts.set(url.pathname, (counts.get(url.pathname) ?? 0) + 1)
+    return researchFetch(input, init)
+  }) as typeof globalThis.fetch
+  const events = createCockpitEventSource()
+  const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} events={events.source} />, { width: 160, height: 48 })
+  try {
+    await waitForFrame(app, "smoke succeeded")
+    await Bun.sleep(1100)
+    const tasksBefore = counts.get("/research/tasks") ?? 0
+    const llmBefore = counts.get("/research/llm") ?? 0
+    for (const agent of ["hypoPlanner", "reflection"]) {
+      events.emit({ type: `research.agent.${agent}.started`, properties: { taskID } })
+      events.emit({ type: `research.agent.${agent}.part.updated`, properties: { taskID, partID: `${agent}-text`, kind: "text", text: "" } })
+      for (let i = 0; i < 100; i++) events.emit({ type: `research.agent.${agent}.stream.delta`, properties: { taskID, delta: "." } })
+      events.emit({ type: `research.agent.${agent}.stream.delta`, properties: { taskID, delta: ` ${agent} visible-stream-marker` } })
+      await waitForFrame(app, `${agent} visible-stream-marker`)
+    }
+    expect(counts.get("/research/tasks") ?? 0).toBe(tasksBefore)
+    expect(counts.get("/research/llm") ?? 0).toBe(llmBefore)
+    events.emit({ type: "research.agent.reflection.completed", properties: { taskID } })
+    await Bun.sleep(1100)
+    expect(counts.get("/research/tasks") ?? 0).toBe(tasksBefore + 1)
+    expect(counts.get("/research/llm") ?? 0).toBe(llmBefore)
+  } finally { app.renderer.destroy() }
+})

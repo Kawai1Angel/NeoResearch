@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import urllib.error
@@ -315,6 +316,7 @@ def _apply_missing_strategy(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, o
         }
 
     cleaned = df.copy()
+    train_means = df.iloc[BORDER_TRAIN[0]:BORDER_TRAIN[1]][feature_columns].mean().fillna(0.0)
     if strategy == "reject":
         raise ValueError(
             f"full source CSV contains missing feature values: {before['feature_missing']}. "
@@ -323,16 +325,13 @@ def _apply_missing_strategy(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, o
     if strategy == "drop":
         cleaned = cleaned.dropna(subset=feature_columns).reset_index(drop=True)
     elif strategy == "forward_fill":
-        cleaned[feature_columns] = cleaned[feature_columns].ffill(limit=limit).bfill()
+        cleaned[feature_columns] = cleaned[feature_columns].ffill(limit=limit).fillna(train_means)
     elif strategy == "mean_fill":
-        cleaned[feature_columns] = cleaned[feature_columns].fillna(cleaned[feature_columns].mean(numeric_only=True))
+        cleaned[feature_columns] = cleaned[feature_columns].fillna(train_means)
     elif strategy == "linear_interpolate":
-        cleaned[feature_columns] = (
-            cleaned[feature_columns]
-            .interpolate(method="linear", limit=limit, limit_direction="both")
-            .ffill()
-            .bfill()
-        )
+        boundaries = sorted({0, len(df), *(max(0, min(len(df), value)) for rows in (BORDER_TRAIN, BORDER_VAL, BORDER_TEST) for value in rows)})
+        for start, end in zip(boundaries, boundaries[1:]):
+            cleaned.loc[cleaned.index[start:end], feature_columns] = cleaned.iloc[start:end][feature_columns].interpolate(method="linear", limit=limit).ffill().fillna(train_means)
     else:
         raise ValueError(f"Unsupported missing strategy: {strategy}")
 
@@ -419,6 +418,14 @@ def _build_materialize_spec(
     allow_irregular: bool | None = None,
     irregular_ratio_warn: float | None = None,
 ) -> DatasetSpec:
+    from dataset_contract import reject_unsupported_covariates
+
+    reject_unsupported_covariates({
+        "known_future_covariates": known_future_covariates,
+        "static_covariates": static_covariates,
+        "known_future_source": known_future_source,
+        "known_future_available": known_future_available,
+    })
     default_payload = dataset_preset_payload(dataset_preset)
     use_preset_policy = dataset_preset is not None
     default_spec = DatasetSpec.from_payload(
@@ -443,7 +450,7 @@ def _build_materialize_spec(
         raise ValueError("--feature-cols cannot be combined with dataset.v2 role columns")
     selected_target_columns = target_columns or selected_feature_columns
     selected_observed = observed_past_covariates or []
-    selected_known_future: list[str] = []
+    selected_known_future = known_future_covariates or []
     selected_static = static_covariates or []
 
     preset_split_strategy = default_payload.get("split_strategy") if use_preset_policy else None
@@ -587,6 +594,8 @@ def materialize_visible_splits(
     df = df[_expected_columns()].copy()
     raw_profile = _build_dataset_profile(df)
     _enforce_time_policy(raw_profile)
+    for column in FEATURE_COLUMNS:
+        df[f"__neo_missing__{column}"] = df[column].isna().astype(np.uint8)
     df, missing_action = _apply_missing_strategy(df)
     _validate_frame(df, expected_rows=None, min_rows=BORDER_TEST[1], context="cleaned source CSV")
     prepared_profile = _build_dataset_profile(df)
@@ -617,6 +626,15 @@ def materialize_visible_splits(
     train_df.to_csv(TRAIN_DATA_PATH, index=False)
     visible_df.to_csv(VISIBLE_DATA_PATH, index=False)
     ref_test_df.to_csv(REF_TEST_DATA_PATH, index=False)
+    # Bind profiling inputs to the exact source, materialized training split and contract.
+    provenance = {
+        "source_sha256": hashlib.sha256(source_path.expanduser().resolve().read_bytes()).hexdigest(),
+        "train_sha256": hashlib.sha256(TRAIN_DATA_PATH.read_bytes()).hexdigest(),
+        "spec_sha256": hashlib.sha256(dataset_spec_path(DATA_ROOT).read_bytes()).hexdigest(),
+    }
+    (DATA_ROOT / "profile_provenance.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+    )
 
     global _VISIBLE_BUNDLE
     _VISIBLE_BUNDLE = None
@@ -645,6 +663,13 @@ def _load_visible_bundle() -> VisibleDataBundle:
 
     df = pd.read_csv(VISIBLE_DATA_PATH)
     _validate_frame(df, expected_rows=VISIBLE_DATA_ROWS[1], context="visible dataset")
+
+    # A CV fold must not inherit imputation fitted on a larger materialized train
+    # interval. Restore original holes and refit using this process's train rows.
+    if all(f"__neo_missing__{column}" in df for column in FEATURE_COLUMNS):
+        for column in FEATURE_COLUMNS:
+            df.loc[df[f"__neo_missing__{column}"] == 1, column] = np.nan
+        df, _ = _apply_missing_strategy(df)
 
     feature_values = df[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
     target_raw = df[list(TARGET_COLUMNS)].to_numpy(dtype=np.float32)
@@ -697,14 +722,25 @@ def calendar_values(timestamps) -> np.ndarray:
     return np.stack([dates.hour, dates.dayofweek, dates.day, dates.month], axis=-1).astype(np.float32)
 
 
+def original_missing_mask(frame: pd.DataFrame) -> np.ndarray:
+    columns = [f"__neo_missing__{name}" for name in (*TARGET_COLUMNS, *PAST_COVARIATE_COLUMNS)]
+    if any(name not in frame for name in columns):
+        raise ValueError("missing_mask requires original mask columns; rematerialize the dataset with prepare-data")
+    values = frame[columns].to_numpy(dtype=np.float32)
+    if not np.isin(values, [0, 1]).all():
+        raise ValueError("Persisted missing mask must be binary")
+    return values
+
+
 class WindowDataset(Dataset):
-    def __init__(self, split: str, horizon: int, include_calendar: bool = False) -> None:
+    def __init__(self, split: str, horizon: int, include_calendar: bool = False, include_missing_mask: bool = False) -> None:
         if split not in {"train", "val"}:
             raise ValueError(f"Unsupported split: {split}. Agent-visible splits are only 'train' and 'val'.")
         if horizon not in HORIZONS:
             raise ValueError(f"Unsupported horizon: {horizon}. Supported horizons: {HORIZONS}")
 
         bundle = _load_visible_bundle()
+        self.missing_mask = original_missing_mask(bundle.frame) if include_missing_mask else None
         self.calendar = calendar_values(bundle.frame[TIMESTAMP_COL]) if include_calendar else None
         self.values = bundle.scaled_values
         self.target_values = bundle.target_values
@@ -736,11 +772,12 @@ class WindowDataset(Dataset):
         end = start + INPUT_LEN
         target_end = end + self.horizon
 
-        if ACTIVE_SPEC.schema_version == "dataset.v1" and self.calendar is None:
+        if ACTIVE_SPEC.schema_version == "dataset.v1" and self.calendar is None and self.missing_mask is None:
             x = self.values[start:end]
             y = self.values[end:target_end]
             return torch.from_numpy(x), torch.from_numpy(y)
         return {
+            **({"missing_mask": torch.from_numpy(self.missing_mask[start:end])} if self.missing_mask is not None else {}),
             "target_history": torch.from_numpy(self.target_values[start:end]),
             "exogenous_past": torch.from_numpy(self.past_covariate_values[start:end]),
             "exogenous_future": torch.from_numpy(self.future_covariate_values[end:target_end]),
@@ -749,8 +786,8 @@ class WindowDataset(Dataset):
         }
 
 
-def make_dataloader(split: str, horizon: int, batch_size: int, shuffle: bool | None = None, include_calendar: bool = False) -> DataLoader:
-    dataset = WindowDataset(split=split, horizon=horizon, include_calendar=include_calendar)
+def make_dataloader(split: str, horizon: int, batch_size: int, shuffle: bool | None = None, include_calendar: bool = False, include_missing_mask: bool = False) -> DataLoader:
+    dataset = WindowDataset(split=split, horizon=horizon, include_calendar=include_calendar, include_missing_mask=include_missing_mask)
     if shuffle is None:
         shuffle = split == "train"
     return DataLoader(
@@ -788,6 +825,7 @@ def _model_inputs(x):
     if isinstance(x, dict):
         return {
             "target_history": x["target_history"],
+            **({"missing_mask": x["missing_mask"]} if "missing_mask" in x else {}),
             "exogenous_past": x["exogenous_past"],
             "exogenous_future": x["exogenous_future"],
             **({"calendar_features": x["calendar_features"]} if "calendar_features" in x else {}),
@@ -921,6 +959,8 @@ def evaluate_val_tsf(model_or_models, device: torch.device, horizons: Iterable[i
         model.eval()
 
         calendar = {"include_calendar": True} if getattr(model, "embedding_type", None) == "calendar" else {}
+        if getattr(model, "uses_missing_mask", False):
+            calendar["include_missing_mask"] = True
         loader = make_dataloader("val", horizon, batch_size=EVAL_BATCH_SIZE, shuffle=False, **calendar)
         total_sq_error = 0.0
         total_abs_error = 0.0
@@ -995,6 +1035,8 @@ def build_preprocess_spec() -> dict[str, object]:
             "ref_test": list(BORDER_TEST),
         },
         "missing": dict(ACTIVE_SPEC.missing),
+        "missing_mask_contract": {"version": 1, "one_means": "originally_missing", "channel_order": list(TARGET_COLUMNS) + list(PAST_COVARIATE_COLUMNS)},
+        "scaler_fit_values": "imputed_train_only",
         "time": dict(ACTIVE_SPEC.time),
         "dataset_profile": bundle.profile,
         "input_space": "raw",
@@ -1067,6 +1109,7 @@ def _iter_scaled_windows(
     horizon: int,
     batch_size: int,
     include_calendar: bool = False,
+    include_missing_mask: bool = False,
 ) -> Iterable[tuple[torch.Tensor, torch.Tensor]]:
     context_start = BORDER_TEST[0] - INPUT_LEN
     split_end = BORDER_TEST[1]
@@ -1081,6 +1124,8 @@ def _iter_scaled_windows(
     target_values, past_values, future_values = values
     calendar = calendar_values(pd.concat([_load_visible_bundle().frame[TIMESTAMP_COL], _load_ref_test_frame()[TIMESTAMP_COL]], ignore_index=True)) if include_calendar else None
     batch_calendar: list[np.ndarray] = []
+    masks = original_missing_mask(pd.concat([_load_visible_bundle().frame, _load_ref_test_frame()], ignore_index=True)) if include_missing_mask else None
+    batch_masks: list[np.ndarray] = []
     batch_x: list[np.ndarray] = []
     batch_y: list[np.ndarray] = []
     batch_past: list[np.ndarray] = []
@@ -1094,12 +1139,15 @@ def _iter_scaled_windows(
         batch_future.append(future_values[end:target_end])
         if calendar is not None:
             batch_calendar.append(calendar[start:end])
+        if masks is not None:
+            batch_masks.append(masks[start:end])
 
         if len(batch_x) == batch_size:
-            if ACTIVE_SPEC.schema_version == "dataset.v1" and calendar is None:
+            if ACTIVE_SPEC.schema_version == "dataset.v1" and calendar is None and masks is None:
                 yield (torch.from_numpy(np.stack(batch_x)), torch.from_numpy(np.stack(batch_y)))
             else:
                 yield {
+                    **({"missing_mask": torch.from_numpy(np.stack(batch_masks))} if masks is not None else {}),
                     "target_history": torch.from_numpy(np.stack(batch_x)),
                     "exogenous_past": torch.from_numpy(np.stack(batch_past)),
                     "exogenous_future": torch.from_numpy(np.stack(batch_future)),
@@ -1111,12 +1159,14 @@ def _iter_scaled_windows(
             batch_past.clear()
             batch_future.clear()
             batch_calendar.clear()
+            batch_masks.clear()
 
     if batch_x:
-        if ACTIVE_SPEC.schema_version == "dataset.v1" and calendar is None:
+        if ACTIVE_SPEC.schema_version == "dataset.v1" and calendar is None and masks is None:
             yield (torch.from_numpy(np.stack(batch_x)), torch.from_numpy(np.stack(batch_y)))
         else:
             yield {
+                **({"missing_mask": torch.from_numpy(np.stack(batch_masks))} if masks is not None else {}),
                 "target_history": torch.from_numpy(np.stack(batch_x)),
                 "exogenous_past": torch.from_numpy(np.stack(batch_past)),
                 "exogenous_future": torch.from_numpy(np.stack(batch_future)),
@@ -1147,7 +1197,7 @@ def evaluate_ref_test_tsf(model_or_models, device: torch.device, horizons: Itera
         probabilistic_state = _empty_probabilistic_state()
 
         with torch.no_grad():
-            for batch in _iter_scaled_windows(scaled_values, horizon=horizon, batch_size=EVAL_BATCH_SIZE, include_calendar=getattr(model, "embedding_type", None) == "calendar"):
+            for batch in _iter_scaled_windows(scaled_values, horizon=horizon, batch_size=EVAL_BATCH_SIZE, include_calendar=getattr(model, "embedding_type", None) == "calendar", include_missing_mask=getattr(model, "uses_missing_mask", False)):
                 x, y = _move_batch(batch, device)
 
                 _update_probabilistic_state(
@@ -1218,6 +1268,8 @@ def query_ref_test(artifact_uri: str, task_id: str, promotion_token: str) -> dic
         raise FileNotFoundError(f"Artifact checkpoint not found: {model_path}")
 
     checkpoint = torch.load(model_path, map_location="cpu")
+    if checkpoint.get("runtime_semantics_revision") not in (2, 3):
+        raise ValueError("Incompatible legacy runtime semantics; retrain with recipe_schema_v2")
     metadata_path = artifact_dir / "metadata.json"
     metadata: dict[str, object] = {}
     if metadata_path.exists():

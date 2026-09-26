@@ -25,18 +25,18 @@ Current capabilities:
 
 Current Model Recipe DSL and native factory action space:
 
-- ModelDesigner emits `model_recipe.v1`, a high-level DSL with `model_name`, `input`, `architecture`, `training`, and `constraints`.
-- The runtime compiles `model_recipe.v1` into executable `recipe_schema_v1` before validation, smoke testing, training, mutation, and export.
+- ModelDesigner now emits `model_recipe.v2`, compiled into typed `recipe_schema_v3`. Explicit legacy `model_recipe.v1` / `recipe_schema_v2` inputs remain supported with their original semantics.
+- V3 adds real `diagonal_ssm`, `timesblock_encoder`, and CPU-reference Mamba-1, explicit sequence readout, bounded two-branch composition, and content-addressed experiment reuse. Each horizon remains independently trained. See the [v3 contract and limitations](docs/recipe_runtime_v3_contract.md).
 
 - Preprocessing: `none`, `instance_norm`, `series_decomposition`.
 - Embedding: `none`, `patch`, `multiscale_patch`.
-- Backbone: `linear`, `mlp`, `transformer`, `temporal_conv` (compiled to TCN), `dlinear`, `nbeats`, `timesnet`.
+- Backbone: `linear`, `mlp`, `transformer`, `temporal_conv` (compiled to TCN), `dlinear`, `nbeats`, `timesnet_lite`, `rnn`, `gated_depthwise_conv`, `mixer`.
 - Fusion/head: temporal fusion with `independent` or residual `shared` channel mixing, plus linear point forecast head.
 - Training: `mse` / `mae` / `huber`, `adam` / `adamw` / `sgd`, optional cosine scheduler.
 
-The new raw-sequence backbones (`dlinear`, `tcn`, `nbeats`, `timesnet`) currently require `embedding.type="none"`. Patch and multiscale patch embeddings remain paired with `mlp` or `transformer`.
+The raw-sequence backbones (`dlinear`, `tcn`, `nbeats`, `timesnet_lite`) require `embedding.type="none"`. `timesnet_lite` is paper-derived, not a full TimesNet reproduction; `gated_depthwise_conv` is not an SSM. Historical proxy results must not be attributed to the full paper architectures.
 
-Legacy `recipe_schema_v1` is still accepted as the executable factory format. New design proposals should prefer `model_recipe.v1`.
+Legacy `recipe_schema_v1` recipes and checkpoints are rejected: migrate recipes and retrain under runtime semantics revision 2. New design proposals should prefer `model_recipe.v1`. See [runtime v2 contract](docs/recipe_runtime_v2_contract.md) for latent/head boundaries, explicit centering, original missing masks, train-only graphs and removed fields.
 
 The main optimization signal is `cv_avg_mse`, computed by four expanding-window folds over the original train+val visible range. `cv_std_mse` reports temporal stability, while `val_avg_mse` remains the final checkpoint's original validation-split diagnostic. `ref_test` is reserved for final reporting and never participates in folds or candidate selection.
 
@@ -339,13 +339,10 @@ Use `dataset.v2` whenever targets and exogenous variables have different roles:
 node ./bin/neo-cast.js prepare-data \
   --source /path/to/wind.csv \
   --target-cols real_power \
-  --observed-past-covariates wind_speed,temperature \
-  --known-future-covariates wind_speed,temperature \
-  --known-future-source weather_forecast \
-  --known-future-available true
+  --observed-past-covariates wind_speed,temperature
 ```
 
-The same column may be both observed-past and known-future. It appears once in historical inputs, while forecasts, losses, metrics, and inverse transforms remain target-only. `--feature-cols` remains available for `dataset.v1` compatibility and cannot be combined with `--target-cols`.
+Only targets and observed-past covariates are supported. Nonempty known-future or static covariate configurations fail with `UNSUPPORTED_COVARIATE` before materialization or training. Existing artifacts with these capabilities require retraining. Forecasts, losses, metrics, and inverse transforms remain target-only. `--feature-cols` remains available for `dataset.v1` compatibility and cannot be combined with `--target-cols`.
 
 Missing values and timestamps:
 

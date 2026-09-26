@@ -37,7 +37,7 @@ test("appendModelDesignRecord writes ordered JSONL and markdown summaries", () =
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-design-log-"));
 
   const first = appendModelDesignRecord(projectRoot, {
-    recipe_version: "recipe_schema_v1",
+    recipe_version: "recipe_schema_v2",
     recipe_id: "recipe_dlinear",
     hypothesis: "baseline linear model",
     embedding: { type: "none" },

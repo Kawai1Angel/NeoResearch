@@ -31,13 +31,14 @@ test("LLM system prompt exposes recipe schema action spaces", () => {
   const schema = recipeSchema();
   const defs = schema.$defs;
   const prompt = _buildSystemPrompt();
+  const actionTypes = (definition) => definition.oneOf.map((branch) => branch.properties.type.const);
   const expected = {
-    preprocessing: defs.preprocessingAction.properties.type.enum,
-    embedding: defs.embeddingAction.properties.type.enum,
-    backbone: defs.backboneAction.properties.type.enum,
-    fusion: defs.fusionAction.properties.type.enum,
-    prediction_head: defs.predictionHead.properties.type.enum,
-    output_distribution: defs.predictionHead.properties.output_distribution.enum,
+    preprocessing: actionTypes(defs.preprocessingAction),
+    embedding: actionTypes(defs.embeddingAction),
+    backbone: actionTypes(defs.backboneAction),
+    fusion: actionTypes(defs.fusionAction),
+    prediction_head: actionTypes(defs.predictionHead),
+    output_distribution: [...new Set(defs.predictionHead.oneOf.map((branch) => branch.properties.output_distribution.const))],
     loss: defs.trainingStrategy.properties.loss.properties.base.enum,
     scheduler: defs.trainingStrategy.properties.scheduler.properties.type.enum,
   };
@@ -50,31 +51,35 @@ test("LLM system prompt exposes recipe schema action spaces", () => {
 test("LLM system prompt lists the full factory backbone action space", () => {
   const prompt = _buildSystemPrompt();
 
-  assert.deepEqual(promptActionList(prompt, "backbone"), [
+  assert.deepEqual(promptActionList(prompt, "backbone").sort(), [
     "linear",
     "mlp",
     "transformer",
-    "temporal_conv",
+    "tcn",
     "dlinear",
     "nbeats",
-    "timesnet",
+    "timesnet_lite",
     "rnn",
-    "ssm",
+    "gated_depthwise_conv",
     "mixer",
-  ]);
+    "diagonal_ssm",
+    "timesblock_encoder",
+    "mamba",
+  ].sort());
 });
 
 test("LLM system prompt exposes advanced fusion and probabilistic heads", () => {
   const prompt = _buildSystemPrompt();
 
-  assert.deepEqual(promptActionList(prompt, "fusion"), [
+  assert.deepEqual(promptActionList(prompt, "fusion").sort(), [
+    "feature_mlp",
     "temporal",
-    "feature",
+    "variate_attention",
     "temporal_then_feature",
     "feature_then_temporal",
     "graph",
     "gated_hybrid",
-  ]);
+  ].sort());
   assert.deepEqual(promptActionList(prompt, "prediction_head"), [
     "linear",
     "direct_multi_horizon",
@@ -89,11 +94,11 @@ test("LLM system prompt exposes advanced fusion and probabilistic heads", () => 
   ]);
 });
 
-test("LLM system prompt requires the high-level model_recipe.v1 DSL", () => {
+test("LLM system prompt requires the high-level model_recipe.v2 DSL", () => {
   const prompt = _buildSystemPrompt({ input_len: 96, horizons: [24] });
 
   assert.match(prompt, /ModelRecipe DSL/);
-  assert.match(prompt, /schema_version: "model_recipe\.v1"/);
+  assert.match(prompt, /schema_version: "model_recipe\.v2"/);
   assert.match(prompt, /model_name/);
   assert.match(prompt, /input/);
   assert.match(prompt, /architecture/);
@@ -137,11 +142,11 @@ test("heuristic mock candidate emits a high-level model recipe", () => {
     { input_len: 96, horizons: [24] },
   );
 
-  assert.equal(candidate.schema_version, "model_recipe.v1");
+  assert.equal(candidate.schema_version, "model_recipe.v2");
   assert.equal(candidate.input.history_window, 96);
   assert.equal(candidate.input.prediction_horizon, 24);
-  assert.equal(candidate.architecture.backbone, "temporal_conv");
-  assert.equal(candidate.architecture.multiscale_blocks, 0);
+  assert.equal(candidate.architecture.backbone.type, "tcn");
+  assert.equal(candidate.architecture.embedding.type, "none");
   assert.equal(candidate.constraints.latency_sensitive, true);
 });
 
@@ -164,7 +169,7 @@ test("heuristic mock candidate preserves the full task horizon objective", () =>
     { input_len: 512, horizons: [96, 192, 336, 720] },
   );
 
-  assert.equal(candidate.schema_version, "model_recipe.v1");
+  assert.equal(candidate.schema_version, "model_recipe.v2");
   assert.equal(candidate.input.prediction_horizon, 96);
   assert.deepEqual(candidate.input.prediction_horizons, [96, 192, 336, 720]);
 });

@@ -5,7 +5,7 @@ from typing import Any
 
 
 MODEL_RECIPE_VERSION = "model_recipe.v1"
-RECIPE_VERSION = "recipe_schema_v1"
+RECIPE_VERSION = "recipe_schema_v2"
 
 DEFAULT_SCALES = [
     {"patch_len": 8, "stride": 4},
@@ -21,17 +21,17 @@ BACKBONE_MAP = {
     "temporal_conv": "tcn",
     "dlinear": "dlinear",
     "nbeats": "nbeats",
-    "timesnet": "timesnet",
+    "timesnet_lite": "timesnet_lite",
     "rnn": "rnn",
-    "ssm": "ssm",
+    "gated_depthwise_conv": "gated_depthwise_conv",
     "mixer": "mixer",
 }
 
-RAW_BACKBONES = {"dlinear", "tcn", "nbeats", "timesnet"}
+RAW_BACKBONES = {"dlinear", "tcn", "nbeats", "timesnet_lite"}
 
 
 def is_model_recipe_payload(payload: dict[str, Any]) -> bool:
-    return payload.get("schema_version") == MODEL_RECIPE_VERSION
+    return payload.get("schema_version") in {MODEL_RECIPE_VERSION, "model_recipe.v2"}
 
 
 def parse_max_params(value: Any) -> int:
@@ -107,6 +107,10 @@ def prediction_horizons_from_input(model_input: dict[str, Any]) -> list[int]:
 
 
 def _compile_preprocessing(architecture: dict[str, Any]) -> dict[str, Any]:
+    if architecture.get("last_value_centering"):
+        if architecture.get("decomposition"):
+            raise ValueError("Choose last_value_centering or decomposition, not both")
+        return {"actions": [{"type": "last_value_centering"}]}
     if architecture.get("decomposition") and architecture["backbone"] != "dlinear":
         return {
             "actions": [
@@ -203,9 +207,9 @@ def _compile_backbone(architecture: dict[str, Any], low_backbone: str) -> dict[s
             "activation": "gelu",
             "dropout": dropout,
         }
-    if low_backbone == "timesnet":
+    if low_backbone == "timesnet_lite":
         return {
-            "type": "timesnet",
+            "type": "timesnet_lite",
             "hidden_dim": hidden_dim,
             "n_layers": layers,
             "top_k": 1,
@@ -214,8 +218,8 @@ def _compile_backbone(architecture: dict[str, Any], low_backbone: str) -> dict[s
         }
     if low_backbone == "rnn":
         return {"type": "rnn", "cell": "gru", "hidden_dim": hidden_dim, "num_layers": layers, "dropout": dropout}
-    if low_backbone == "ssm":
-        return {"type": "ssm", "state_dim": hidden_dim, "depth": layers, "kernel_size": kernel_size, "dropout": dropout}
+    if low_backbone == "gated_depthwise_conv":
+        return {"type": "gated_depthwise_conv", "hidden_dim": hidden_dim, "depth": layers, "kernel_size": kernel_size, "dropout": dropout}
     if low_backbone == "mixer":
         return {
             "type": "mixer",
@@ -230,10 +234,10 @@ def _compile_backbone(architecture: dict[str, Any], low_backbone: str) -> dict[s
 
 def _compile_fusion(model_input: dict[str, Any], architecture: dict[str, Any]) -> dict[str, Any]:
     requested = architecture.get("channel_fusion")
-    if requested == "feature":
-        return {"type": "feature", "variate_token": True, "cross_attention": False}
+    if requested == "variate_attention":
+        return {"type": "variate_attention",}
     if requested == "gated_hybrid":
-        return {"type": "gated_hybrid", "gate_type": "learned", "residual": True}
+        return {"type": "gated_hybrid", "gate_type": "learned"}
     return {
         "type": "temporal",
         "channel_mode": requested if requested in {"shared", "independent"} else ("shared" if model_input.get("covariates") else "independent"),
@@ -246,7 +250,7 @@ def _compile_prediction_head(architecture: dict[str, Any]) -> dict[str, Any]:
         return {"type": "quantile", "output_distribution": "quantile", "quantiles": [0.1, 0.5, 0.9]}
     if distribution == "gaussian":
         return {"type": "gaussian", "output_distribution": "gaussian", "variance_floor": 1e-6}
-    return {"type": "linear", "output_distribution": "point", "share_across_horizons": False}
+    return {"type": "linear", "output_distribution": "point"}
 
 
 def _compile_training(training: dict[str, Any]) -> dict[str, Any]:
@@ -256,7 +260,11 @@ def _compile_training(training: dict[str, Any]) -> dict[str, Any]:
     warmup_steps = max(0, min(warmup_steps, max_epochs - 1))
 
     return {
-        "loss": {"base": training["loss"], "horizon_weighting": "uniform"},
+        "loss": {
+            "base": training["loss"],
+            "horizon_weighting": "uniform",
+            **({"quantiles": [0.1, 0.5, 0.9]} if training["loss"] == "quantile" else {}),
+        },
         "optimizer": {
             "type": training["optimizer"],
             "lr": float(training["learning_rate"]),
@@ -264,12 +272,11 @@ def _compile_training(training: dict[str, Any]) -> dict[str, Any]:
         },
         "scheduler": {"type": "none", "warmup_steps": warmup_steps},
         "regularization": {
-            "dropout": 0.1,
             "grad_clip": float(training.get("grad_clip", 1.0)),
         },
         "budget": {
             "max_epochs": max_epochs,
-            "time_budget_s": _positive_int(training.get("time_budget_s"), 600),
+            "time_budget_s": _positive_int(training.get("time_budget_s"), 1200),
             "batch_size": _positive_int(training.get("batch_size"), 32),
             "patience": _positive_int(training.get("patience"), 5),
             "seed": int(training.get("seed", 42)),
@@ -289,6 +296,25 @@ def _compile_constraints(constraints: dict[str, Any]) -> dict[str, Any]:
 def compile_model_recipe(model_recipe: dict[str, Any]) -> dict[str, Any]:
     if not is_model_recipe_payload(model_recipe):
         raise ValueError("compile_model_recipe expects schema_version='model_recipe.v1'")
+    if model_recipe.get("schema_version") == "model_recipe.v2":
+        import copy
+        from validate import load_validator, SCHEMA_DIR, validate_recipe_object
+        load_validator(SCHEMA_DIR / "model_recipe_v2_schema.json").validate(model_recipe)
+        if model_recipe["input"].get("known_future_covariates"):
+            raise ValueError("UNSUPPORTED_COVARIATE: known_future_covariates")
+        prediction_horizons_from_input(model_recipe["input"])
+        result = {
+            "recipe_version": "recipe_schema_v3",
+            "recipe_id": f"recipe_{_safe_model_slug(model_recipe['model_name'])}",
+            "hypothesis": model_recipe["hypothesis"],
+            **copy.deepcopy(model_recipe["architecture"]),
+            "training_strategy": _compile_training(model_recipe["training"]),
+            "constraints": _compile_constraints(model_recipe["constraints"]),
+        }
+        errors = validate_recipe_object(result, input_len=model_recipe["input"]["history_window"])
+        if errors:
+            raise ValueError("; ".join(errors))
+        return result
 
     model_input = model_recipe["input"]
     prediction_horizons = prediction_horizons_from_input(model_input)

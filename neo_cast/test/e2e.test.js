@@ -9,6 +9,7 @@ const { spawnSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const BIN = path.join(REPO_ROOT, "bin", "neo-cast.js");
+let testedRunId;
 
 function runNode(args, options = {}) {
   const result = spawnSync("node", [BIN, ...args], {
@@ -18,6 +19,15 @@ function runNode(args, options = {}) {
   });
   return result;
 }
+
+test("prepare-data rejects unsupported covariates before accessing the source", () => {
+  for (const flag of ["known-future-covariates", "static-covariates", "known-future-source", "known-future-available"]) {
+    const result = runNode(["prepare-data", "--source", "/nonexistent.csv", `--${flag}`, "requested"]);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /UNSUPPORTED_COVARIATE/);
+    assert.match(result.stderr, new RegExp(flag));
+  }
+});
 
 test("prepare-data materializes visible and ref-test splits", () => {
   const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-data-"));
@@ -82,6 +92,7 @@ test("design mock mode runs one candidate and updates results", () => {
   assert.notEqual(after, before);
   assert.match(result.stdout, /design_best_run_id=/);
   const runId = /runner_run_id=([^\s]+)/.exec(result.stdout)?.[1];
+  testedRunId = runId;
   assert.ok(runId, "design output should expose current runner run id");
   const artifactDir = path.join(REPO_ROOT, ".neo-cast", "artifacts", `run_${runId}`);
   const tracePath = path.join(artifactDir, "research_trace.json");
@@ -134,7 +145,7 @@ test("mutation policy writes a schema-valid next recipe", () => {
   assert.equal(validate.status, 0, validate.stderr || validate.stdout);
 });
 
-test("runner ref-test evaluates the best artifact and updates metadata", () => {
+test("runner ref-test evaluates the newly trained v2 artifact and updates metadata", () => {
   const statePath = path.join(REPO_ROOT, ".neo-cast", "runner_state.json");
   assert.ok(fs.existsSync(statePath), "runner state must exist before ref-test");
 
@@ -142,14 +153,14 @@ test("runner ref-test evaluates the best artifact and updates metadata", () => {
   assert.ok(state.best_run_id, "best_run_id must be available before ref-test");
 
   const result = runNode(
-    ["runner", "ref-test", "--run-id", state.best_run_id],
+    ["runner", "ref-test", "--run-id", testedRunId],
     { cwd: REPO_ROOT }
   );
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /ref_test_done/);
 
-  const artifactDir = path.join(REPO_ROOT, ".neo-cast", "artifacts", `run_${state.best_run_id}`);
+  const artifactDir = path.join(REPO_ROOT, ".neo-cast", "artifacts", `run_${testedRunId}`);
   const metricsPath = path.join(artifactDir, "ref_test_metrics.json");
   const metadataPath = path.join(artifactDir, "metadata.json");
 

@@ -9,7 +9,8 @@ The full taskSpec is the authoritative task contract. Always read its dataset ro
 (`targetCols`, `observedPastCovariates`, `knownFutureCovariates`, `staticCovariates`) and metadata
 before describing whether the task is univariate/multivariate or whether exogenous variables are
 available. `targetCount` only counts forecast targets; a single target column can still have valid
-observed-past or known-future exogenous covariates.
+observed-past exogenous covariates. Known-future and static covariates are currently unsupported:
+if legacy task metadata contains them, report the unsupported configuration instead of recommending their use.
 Language policy: 用中文写领域解读、业务机制、风险分析、建模建议；保留英文的技术术语、指标名和模块名。
 Task: Interpret the dataset statistics from a domain and business perspective.
 Output format: Return exactly three markdown sections as plain text (no code blocks, no JSON):

@@ -1,5 +1,5 @@
 {
-  "recipe_version": "recipe_schema_v1",
+  "recipe_version": "recipe_schema_v2",
   "recipe_id": "recipe_shared_channel_patch_mlp_example",
   "hypothesis": "A residual channel mixer can expose cross-sensor correlations before the temporal patch MLP while keeping the search space bounded.",
   "preprocessing": {
@@ -30,9 +30,7 @@
   },
   "prediction_head": {
     "type": "linear",
-    "output_distribution": "point",
-    "share_across_horizons": false
-  },
+    "output_distribution": "point"},
   "post_processing": {
     "type": "auto"
   },
@@ -51,7 +49,6 @@
       "warmup_steps": 0
     },
     "regularization": {
-      "dropout": 0.1,
       "grad_clip": 1.0
     },
     "budget": {

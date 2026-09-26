@@ -1,0 +1,79 @@
+import { readFile } from "node:fs/promises"
+
+export interface TrainingCurvePoint {
+  readonly epoch: number
+  readonly valLoss: number
+  readonly horizon?: number
+  readonly foldIndex?: number
+  readonly phase: "cv" | "standard"
+  readonly elapsedS?: number
+}
+
+function finite(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+// Keep each fold/horizon independent, including during downsampling. The limit is per series.
+export async function extractTrainingCurve(filePath: string, maxPoints = 60): Promise<TrainingCurvePoint[]> {
+  const raw = await readFile(filePath, "utf8").catch(() => "")
+  const groups = new Map<string, TrainingCurvePoint[]>()
+  for (const line of raw.split(/\r?\n/)) {
+    try {
+      let r = JSON.parse(line)
+      if (typeof r.line === "string") r = JSON.parse(r.line)
+      if (r.event && r.event !== "epoch_end") continue
+      const epoch = finite(r.epoch)
+      const valLoss = finite(r.val_loss) ?? finite(r.valLoss)
+      if (epoch === undefined || valLoss === undefined) continue
+      const foldIndex = finite(r.cv_fold_index) ?? finite(r.foldIndex)
+      const horizon = finite(r.horizon)
+      const point: TrainingCurvePoint = {
+        epoch, valLoss, horizon, foldIndex,
+        phase: foldIndex === undefined ? "standard" : "cv",
+        elapsedS: finite(r.elapsed_s) ?? finite(r.elapsedS),
+      }
+      const key = `${point.phase}:${foldIndex ?? "standard"}:${horizon ?? "unknown"}`
+      const group = groups.get(key) ?? []
+      group.push(point)
+      groups.set(key, group)
+    } catch { /* Ignore non-JSON output; failure evidence is reported separately. */ }
+  }
+  const limit = Number.isFinite(maxPoints) ? Math.max(1, Math.floor(maxPoints)) : 60
+  return [...groups.values()].flatMap((group) => {
+    group.sort((a, b) => a.epoch - b.epoch)
+    if (group.length <= limit) return group
+    if (limit === 1) return [group[group.length - 1]!]
+    return Array.from({ length: limit }, (_, i) => group[Math.round(i * (group.length - 1) / (limit - 1))]!)
+  })
+}
+
+export function runnerFailureEvidence(execution: {
+  records: readonly Record<string, unknown>[]
+  stdout: string
+  stderr: string
+  exitCode: number | null
+}): string {
+  const errors = execution.records
+    .filter((r) => ["error", "runner_error", "execution_contract_violation"].includes(String(r.event)))
+    .map((r) => JSON.stringify(r))
+  // Some validators print plain errors to stdout before any JSON records exist.
+  const plain = execution.stdout.split(/\r?\n/).filter((line) => /^(error:|traceback|\w*(?:error|exception):)/i.test(line.trim()))
+  return [
+    ...new Set(errors),
+    ...plain,
+    execution.stderr.trim() ? `stderr:\n${execution.stderr.trim()}` : "",
+  ].filter(Boolean).join("\n") || `Runner exited with code ${execution.exitCode}`
+}
+
+export async function recoverRunnerFailure(filePath: string, fallback?: string): Promise<string | undefined> {
+  try {
+    const execution = JSON.parse(await readFile(filePath, "utf8"))
+    if (!Array.isArray(execution.records) || typeof execution.stdout !== "string" || typeof execution.stderr !== "string") return fallback
+    if (execution.exitCode === 0 && fallback &&
+        !execution.records.some((r: Record<string, unknown>) => ["error", "runner_error", "execution_contract_violation"].includes(String(r.event)))) return fallback
+    const error = runnerFailureEvidence(execution)
+    return error.startsWith("Runner exited with code") ? fallback ?? error : error
+  } catch {
+    return fallback
+  }
+}

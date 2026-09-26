@@ -14,6 +14,22 @@ DATA_SPEC_FILENAME = "dataset_spec.json"
 
 ETT_FEATURE_COLUMNS = ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"]
 
+
+def reject_unsupported_covariates(payload: dict[str, Any]) -> None:
+    """Accept empty legacy fields, but never silently discard requested inputs."""
+    fields = (
+        "known_future_covariates", "known_future_source", "known_future_available",
+        "known_future_availability", "num_future_covariate_channels",
+        "future_exogenous_channels", "used_known_future_covariates", "static_covariates",
+    )
+    for field in fields:
+        if payload.get(field):
+            raise ValueError(f"UNSUPPORTED_COVARIATE: {field} is not supported; use targets and observed-past covariates only")
+    if payload.get("future_covariate_mode") not in (None, "", "none"):
+        raise ValueError("UNSUPPORTED_COVARIATE: future_covariate_mode is not supported; retrain without future conditioning")
+    if payload.get("covariate_fusion"):
+        raise ValueError("UNSUPPORTED_COVARIATE: legacy covariate_fusion wrapper is unsupported; retrain with native observed-past inputs")
+
 DEFAULT_ETTH1_SPEC: dict[str, Any] = {
     "schema_version": "dataset.v1",
     "task_id": "etth1",
@@ -303,6 +319,7 @@ class DatasetSpec:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "DatasetSpec":
+        reject_unsupported_covariates(payload)
         schema_version = str(payload.get("schema_version", ""))
         if schema_version not in {"dataset.v1", "dataset.v2"}:
             raise ValueError("dataset spec schema_version must be dataset.v1 or dataset.v2")

@@ -1,5 +1,5 @@
 {
-  "recipe_version": "recipe_schema_v1",
+  "recipe_version": "recipe_schema_v2",
   "recipe_id": "recipe_native_patch_transformer_example",
   "hypothesis": "Instance-normalized patch Transformer can test a larger native recipe action space while staying inside the smoke budget.",
   "preprocessing": {
@@ -31,9 +31,7 @@
   },
   "prediction_head": {
     "type": "linear",
-    "output_distribution": "point",
-    "share_across_horizons": false
-  },
+    "output_distribution": "point"},
   "post_processing": {
     "type": "auto"
   },
@@ -52,7 +50,6 @@
       "warmup_steps": 0
     },
     "regularization": {
-      "dropout": 0.1,
       "grad_clip": 1.0
     },
     "budget": {

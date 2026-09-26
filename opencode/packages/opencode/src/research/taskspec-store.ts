@@ -71,6 +71,48 @@ function stringArray(value: unknown): string[] {
   return []
 }
 
+function normalizeSplitRatios(value: unknown): [number, number, number] {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 3 ||
+    !value.every((item) => typeof item === "number" && Number.isFinite(item) && item > 0)
+  ) {
+    throw new TaskSpecUpdateError("data_split_ratios must contain three positive numbers: train, validation, test")
+  }
+  return [value[0], value[1], value[2]] as [number, number, number]
+}
+
+function normalizeRowRange(value: unknown, name: string): [number, number] {
+  const raw = typeof value === "string" ? value.split(":").map((item) => Number(item.trim())) : value
+  if (
+    !Array.isArray(raw) ||
+    raw.length !== 2 ||
+    !raw.every((item) => typeof item === "number" && Number.isSafeInteger(item) && item >= 0) ||
+    raw[1] <= raw[0]
+  ) {
+    throw new TaskSpecUpdateError(`${name} must be a non-empty [start, end) integer range`)
+  }
+  return [raw[0], raw[1]] as [number, number]
+}
+
+function normalizeSplitRowRanges(value: unknown) {
+  const ranges = recordValue(value)
+  const train = normalizeRowRange(ranges.train ?? ranges.trainRows ?? ranges.train_rows, "data_split_row_ranges.train")
+  const validation = normalizeRowRange(
+    ranges.validation ?? ranges.val ?? ranges.validationRows ?? ranges.val_rows,
+    "data_split_row_ranges.validation",
+  )
+  const test = normalizeRowRange(
+    ranges.test ?? ranges.ref_test ?? ranges.testRows ?? ranges.ref_test_rows,
+    "data_split_row_ranges.test",
+  )
+  if (train[0] !== 0) throw new TaskSpecUpdateError("data_split_row_ranges.train must start at row 0")
+  if (train[1] !== validation[0] || validation[1] !== test[0]) {
+    throw new TaskSpecUpdateError("data_split_row_ranges must be contiguous and non-overlapping")
+  }
+  return { train, validation, test }
+}
+
 function explicitParameterLimit(value: unknown): number | undefined {
   const match = typeof value === "string" ? value.trim().match(/^([+-]?\d+(?:\.\d+)?)\s*([kmb])?(?:\s*(?:parameters?|params|参数))?$/i) : undefined
   const count = typeof value === "number" ? value : match
@@ -196,6 +238,26 @@ export async function applySlotUpdates(
   for (const slot of ["forecast_object", "data_source", "time_grain", "future_covariate_availability", "business_context", "primary_metric", "error_preferences", "interpretability", "deployment_target"] as const) {
     if (slot in normalizedUpdates && typeof normalizedUpdates[slot] !== "string") throw new TaskSpecUpdateError(`${slot} must be a string`)
   }
+  if (
+    "data_split_method" in normalizedUpdates &&
+    normalizedUpdates.data_split_method !== "ratio" &&
+    normalizedUpdates.data_split_method !== "row_ranges"
+  ) {
+    throw new TaskSpecUpdateError("data_split_method must be ratio or row_ranges")
+  }
+  if ("data_split_ratios" in normalizedUpdates) {
+    normalizedUpdates.data_split_ratios = normalizeSplitRatios(normalizedUpdates.data_split_ratios)
+  }
+  if ("data_split_row_ranges" in normalizedUpdates) {
+    normalizedUpdates.data_split_row_ranges = normalizeSplitRowRanges(normalizedUpdates.data_split_row_ranges)
+  }
+  if (
+    "data_split_ratios" in normalizedUpdates &&
+    "data_split_row_ranges" in normalizedUpdates &&
+    !("data_split_method" in normalizedUpdates)
+  ) {
+    throw new TaskSpecUpdateError("data_split_method is required when ratios and row ranges are updated together")
+  }
   for (const slot of ["target_columns", "exogenous_variables", "secondary_metrics"] as const) {
     if (!(slot in normalizedUpdates)) continue
     const value = normalizedUpdates[slot]
@@ -243,6 +305,53 @@ export async function applySlotUpdates(
     if (slotID in normalizedUpdates) datasetPatch[field] = normalizedUpdates[slotID as SlotID]
   }
   const existingDataset = recordValue(task.taskSpec.dataset)
+  const splitTouched = ["data_split_method", "data_split_ratios", "data_split_row_ranges"].some(
+    (slot) => slot in normalizedUpdates,
+  )
+  if (splitTouched) {
+    const existingSplit = recordValue(existingDataset.split)
+    const inferredMethod = "data_split_row_ranges" in normalizedUpdates
+      ? "row_ranges"
+      : "data_split_ratios" in normalizedUpdates
+        ? "ratio"
+        : existingSplit.method === "row_ranges"
+          ? "row_ranges"
+          : "ratio"
+    const method = normalizedUpdates.data_split_method ?? inferredMethod
+    if (method === "ratio") {
+      if ("data_split_row_ranges" in normalizedUpdates) {
+        throw new TaskSpecUpdateError("data_split_row_ranges cannot be used with data_split_method=ratio")
+      }
+      const ratios = normalizeSplitRatios(
+        normalizedUpdates.data_split_ratios ?? existingSplit.ratios ?? [7, 1, 2],
+      )
+      datasetPatch.split = { method: "ratio", ratios }
+      nextSlots.data_split_method = "ratio"
+      nextSlots.data_split_ratios = ratios
+      delete nextSlots.data_split_row_ranges
+    } else {
+      if ("data_split_ratios" in normalizedUpdates) {
+        throw new TaskSpecUpdateError("data_split_ratios cannot be used with data_split_method=row_ranges")
+      }
+      const existingRanges = existingSplit.method === "row_ranges"
+        ? {
+            train: existingSplit.trainRows,
+            validation: existingSplit.validationRows,
+            test: existingSplit.testRows,
+          }
+        : undefined
+      const ranges = normalizeSplitRowRanges(normalizedUpdates.data_split_row_ranges ?? existingRanges)
+      datasetPatch.split = {
+        method: "row_ranges",
+        trainRows: ranges.train,
+        validationRows: ranges.validation,
+        testRows: ranges.test,
+      }
+      nextSlots.data_split_method = "row_ranges"
+      nextSlots.data_split_row_ranges = ranges
+      delete nextSlots.data_split_ratios
+    }
+  }
   const resolved = resolveCovariates({ ...task, taskSpec: {
     ...task.taskSpec, dataset: { ...existingDataset, ...datasetPatch } as JsonRecord,
   } }, nextSlots)
@@ -252,9 +361,12 @@ export async function applySlotUpdates(
   const oracle = availability !== undefined && /oracle|上界|离线真值/i.test(availability)
   const unavailable = availability !== undefined && /not available|unavailable|不可用|不能|无法|否/i.test(availability)
   const availableAtPredictionTime = availability === undefined ? undefined : !oracle && !unavailable
+  if (task.domainID === "tsf" && ((availability !== undefined && !unavailable) || (Array.isArray(existingDataset.knownFutureCovariates) && existingDataset.knownFutureCovariates.length > 0))) {
+    throw new TaskSpecUpdateError("UNSUPPORTED_COVARIATE: known-future conditioning is unavailable; use observed-past covariates only")
+  }
   if ("exogenous_variables" in nextSlots) {
     datasetPatch.observedPastCovariates = resolved.columns
-    datasetPatch.knownFutureCovariates = unavailable ? [] : resolved.columns
+    datasetPatch.knownFutureCovariates = []
   }
 
   const nextObjective = { ...task.objective }
@@ -471,6 +583,7 @@ function intentCheckpointSignature(task: ResearchTask) {
   return [
     `mode=${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `dataset=${compactIntentValue(dataset.path ?? dataset.loaderID)}`,
+    `split=${JSON.stringify(dataset.split ?? null)}`,
     `targets=${compactIntentValue(dataset.targetCols)}`,
     `pastCovariates=${compactIntentValue(dataset.observedPastCovariates)}`,
     `futureCovariates=${compactIntentValue(dataset.knownFutureCovariates)}`,
@@ -503,6 +616,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Interaction mode: ${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `Task: ${task.title}`,
     `Dataset: ${compactIntentValue(slotOr(dataset.path ?? dataset.loaderID, "data_source"))}`,
+    `Data split: ${JSON.stringify(dataset.split ?? null)}`,
     `Targets: ${compactIntentValue(slotOr(dataset.targetCols, "target_columns"))}`,
     `Forecast object: ${compactIntentValue(intentSlots.forecast_object ?? spec.forecastObject)}`,
     `Context length: ${compactIntentValue(slotOr(spec.contextLength, "lookback_window"))}`,
@@ -513,7 +627,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Known future covariates: ${compactIntentValue(dataset.knownFutureCovariates)}`,
     `Covariate count: ${Array.isArray(dataset.knownFutureCovariates) ? dataset.knownFutureCovariates.length : 0}`,
     `Future availability: ${compactIntentValue(metadata.futureCovariateAvailability)}`,
-    "Risk notice: known-future values may only be used when they are available at prediction time; offline realized values make this an oracle upper-bound experiment.",
+    "Runtime capability: only targets and observed-past covariates are supported; known-future and static conditioning are unavailable.",
     `Primary metric: ${compactIntentValue(slotOr(objective.primaryMetric, "primary_metric"))}`,
     `Error preferences: ${compactIntentValue(intentSlots.error_preferences ?? objective.errorPreferences)}`,
     `Latency budget: ${compactIntentValue(intentSlots.latency_budget ?? budget.latencyBudget)}`,

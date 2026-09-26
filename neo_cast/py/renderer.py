@@ -37,6 +37,14 @@ def load_json(path: str | Path) -> dict[str, Any]:
 
 
 def resolve_recipe(recipe: dict[str, Any], *, model_recipe: dict[str, Any] | None = None) -> dict[str, Any]:
+    from validate import validate_recipe_object
+
+    errors = validate_recipe_object(
+        recipe,
+        input_len=int(model_recipe["input"]["history_window"]) if model_recipe else INPUT_LEN,
+    )
+    if errors:
+        raise ValueError("Invalid recipe: " + "; ".join(errors))
     recipe_id = normalize_recipe_id(recipe)
     normalized_recipe = {
         **recipe,
@@ -98,7 +106,7 @@ def resolve_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if is_model_recipe_payload(payload):
         return resolve_recipe(compile_model_recipe(payload), model_recipe=payload)
     raise ValueError(
-        "Expected recipe_version='recipe_schema_v1' or schema_version='model_recipe.v1'. "
+        "Expected recipe_version='recipe_schema_v2' or schema_version='model_recipe.v1'. "
         "The legacy candidate.v1 format is no longer supported as pipeline input."
     )
 

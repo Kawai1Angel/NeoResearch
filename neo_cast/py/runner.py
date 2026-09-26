@@ -15,6 +15,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import secrets
 import subprocess
@@ -373,21 +374,37 @@ def _write_training_curves(records: list[dict[str, Any]], artifact_dir: Path | N
     if not epoch_records:
         return
 
-    curves: dict[str, list[float]] = {}
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for record in epoch_records:
-        horizon = str(record.get("horizon", "unknown"))
         try:
             value = float(record["val_loss"])
-        except (TypeError, ValueError):
+            epoch = int(record["epoch"])
+        except (TypeError, ValueError, KeyError, OverflowError):
             continue
-        except KeyError:
+        if not math.isfinite(value):
             continue
-        curves.setdefault(horizon, []).append(value)
+        fold = record.get("cv_fold_index")
+        fold_key = "standard" if fold is None else f"fold_{fold}"
+        horizon = str(record.get("horizon", "unknown"))
+        groups.setdefault((fold_key, horizon), []).append({"epoch": epoch, "val_loss": value})
+
+    curves: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for (fold, horizon), points in groups.items():
+        curves.setdefault(fold, {})[horizon] = sorted(points, key=lambda point: point["epoch"])
+    payload = {
+        "schema_version": "training_curves.v2",
+        "curves_by_fold": curves,
+        # Legacy readers only receive the standard fit, never interleaved CV folds.
+        "curves_by_horizon": {
+            horizon: [point["val_loss"] for point in points]
+            for horizon, points in curves.get("standard", {}).items()
+        },
+    }
 
     try:
         training_curves_path = artifact_dir / "training_curves.json"
         training_curves_path.write_text(
-            f"{json.dumps({'curves_by_horizon': curves}, indent=2)}\n",
+            f"{json.dumps(payload, indent=2)}\n",
             encoding="utf-8",
         )
     except OSError:
@@ -466,7 +483,7 @@ def _candidate_context_from_current(fallback_candidate_id: str) -> tuple[str, st
 
     candidate_id = payload.get("candidate_id") or payload.get("recipe_id") or fallback_candidate_id
     model_family = payload.get("model_family")
-    if model_family is None and payload.get("recipe_version") == "recipe_schema_v1":
+    if model_family is None and payload.get("recipe_version") in {"recipe_schema_v2", "recipe_schema_v3"}:
         backbone = payload.get("backbone")
         backbone_type = backbone.get("type") if isinstance(backbone, dict) else "unknown"
         model_family = f"recipe:{backbone_type}"
@@ -590,9 +607,17 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         "--num-folds",
         "4",
         "--max-parallel-folds",
-        "4",
+        "1",
     ]
     train_exit, train_records = _run_and_capture(train_cmd)
+    if any(record.get("event") in {"experiment_reused", "experiment_duplicate_running"} and "cv_fold_index" not in record for record in train_records):
+        # The top-level CV cache has not produced independent evidence.
+        # A standard-fit reuse inside a new CV execution still has cv_eval_done.
+        final_done = next((r for r in reversed(train_records) if r.get("event") == "done"), {})
+        if final_done.get("reused") or final_done.get("status") == "duplicate_running":
+            save_state(state)
+            print(json.dumps({"event": "candidate_duplicate", "independent_evidence": False}), flush=True)
+            return 0
     candidate_id, model_family = _candidate_context()
     run_id, artifact_dir = _parse_artifact_record(train_records)
     val_metrics = _parse_eval_metrics(train_records)
@@ -712,14 +737,22 @@ def run_ref_test(state: RunnerState, *, run_id: str | None) -> int:
         encoding="utf-8",
     )
 
-    export_exit = _export_artifact(
-        state=state,
-        run_id=target_run_id,
-        artifact_dir=artifact_dir,
-        ref_test_metrics_json=ref_test_metrics_path,
-    )
-    if export_exit != 0:
-        return export_exit
+    if (artifact_dir / "metadata.json").exists():
+        from export import update_ref_test_export
+        metadata_path, report_path = update_ref_test_export(
+            artifact_dir, run_id=target_run_id, metrics=metrics,
+        )
+        print("export_status: success")
+        print(f"artifact_dir: {artifact_dir}")
+        print(f"metadata_path: {metadata_path}")
+        print(f"eval_report_path: {report_path}")
+    else:
+        export_exit = _export_artifact(
+            state=state, run_id=target_run_id, artifact_dir=artifact_dir,
+            ref_test_metrics_json=ref_test_metrics_path,
+        )
+        if export_exit != 0:
+            return export_exit
 
     print(json.dumps({"event": "ref_test_done", "run_id": target_run_id, **metrics}, sort_keys=True))
     print(f"runner_ref_test_run_id={target_run_id}")

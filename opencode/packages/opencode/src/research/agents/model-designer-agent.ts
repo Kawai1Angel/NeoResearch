@@ -87,7 +87,7 @@ export function buildModelDesignerProposalFromHypotheses(
   const scheduler = lib.schedulers.includes("cosine") ? "cosine" : (lib.schedulers[0] ?? "none")
 
   const candidateSpec: JsonRecord = {
-    recipeVersion: "recipe_schema_v1",
+    recipeVersion: "recipe_schema_v2",
     hypothesis: `${hypothesis.id}: ${hypothesis.statement}`,
     preprocessing: { actions: [{ type: preprocessing }] },
     backbone: { type: backbone },
@@ -95,8 +95,8 @@ export function buildModelDesignerProposalFromHypotheses(
       loss: { base: loss, horizonWeighting: "uniform" },
       optimizer: { type: optimizer, lr: 0.001, weightDecay: 0 },
       scheduler: { type: scheduler, warmupSteps: 0 },
-      regularization: { dropout: 0.1 },
-      budget: { maxEpochs: 30, timeBudgetS: 600, batchSize: 64, patience: 5, seed: 42 },
+      regularization: {},
+      budget: { maxEpochs: 30, timeBudgetS: 1200, batchSize: 64, patience: 5, seed: 42 },
     },
   } as JsonRecord
 
