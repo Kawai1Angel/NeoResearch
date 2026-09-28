@@ -26,7 +26,7 @@ The explicit `build-principles` command runs the paper-level v2 pipeline:
 
 ```bash
 bun run src/research/literature/dev-cli.ts build-principles \
-  --neo-cast-root ../../../../neo_cast --paper-id <paper-id> \
+  --neo-cast-root ../../../neo_cast --paper-id <paper-id> \
   --output-root /absolute/separate-audit-root --max-calls 80
 ```
 
@@ -60,6 +60,10 @@ source chunks and adverse materials, plus results/ablation/setup/limitations chu
 even when collection did not cite them. Final review failure cannot reuse an
 initial approval. Consolidation returns ID groups, not a repeated copy of every
 card; each necessary merge gets a separate bounded request and final review.
+Merging may drop unused source inventory entries from earlier drafts; every
+source cited by the final assertions, experiments and boundaries must still
+resolve to the same paper, and the merged candidate receives a fresh review
+against original text and counterevidence.
 Missing assertion links or mis-typed scope references can receive a targeted
 binding repair. It can link existing evidence and add explicitly sourced scope
 assertions; it cannot invent evidence IDs or modify experimental values, evidence

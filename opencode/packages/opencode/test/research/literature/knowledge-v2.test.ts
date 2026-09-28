@@ -84,7 +84,7 @@ test("paper analysis allows no contributions; materials are not candidate cards"
 test("formal construction requires integrity, semantic review and version provenance", () => {
   const input = {
     candidate: candidate(), review: review(), context,
-    provenance: { documentSha256: digest, analysisHash: digest, extractionRunID: "run", extractorModel: "fixture", verifierModel: "fixture", synthesisVersion: "paper_principle_v7", verifierVersion: "principle_verifier_v10", createdAt: "2026-09-28T00:00:00.000Z" },
+    provenance: { documentSha256: digest, analysisHash: digest, extractionRunID: "run", extractorModel: "fixture", verifierModel: "fixture", synthesisVersion: "paper_principle_v8", verifierVersion: "principle_verifier_v10", createdAt: "2026-09-28T00:00:00.000Z" },
   }
   const card = finalizeKnowledgeCandidate(input)
   expect(card.knowledgeID).toMatch(/^kn_[a-f0-9]{24}$/)

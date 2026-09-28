@@ -252,6 +252,33 @@ test("merged candidate is verified after changes, with a fresh hash", async () =
   expect(result.cards[0].unknowns).toContain("Additional scope qualification")
   expect(requests.at(-1)?.payload.candidateHash).not.toBe(review().candidateHash)
 })
+test("merge may omit an unused original source while final assertions remain source-bound and reviewed", async () => {
+  const longText = `${chunk.text}\n${"Unrelated appendix context. ".repeat(55)}`
+  const longDigest = createHash("sha256").update(longText).digest("hex")
+  const longChunk = { ...chunk, text: longText, textSha256: longDigest }
+  const longDocument = { ...document, sourceSha256: longDigest, pages: [{ pageNumber: 1, text: longText, blocks: [] }] }
+  let unusedSourceID = ""
+  const { model, requests } = fixtureModel((stage, payload, value) => {
+    if (stage === "synthesize") {
+      unusedSourceID = ((payload.analysis as any).sources as Array<{ sourceID: string }>)[1]!.sourceID
+      const c = candidate()
+      c.sources.push({ ...c.sources[0]!, sourceID: unusedSourceID })
+      return { candidates: [c], unformed: [] }
+    }
+    if (stage === "consolidate") return { groups: [{ candidateIDs: ["candidate"], action: "merge", rationale: "Remove unused source inventory" }] }
+    if (stage === "merge") {
+      const c = structuredClone((payload.originals as any[])[0])
+      c.sources = c.sources.filter((id: string) => id !== unusedSourceID)
+      return { candidate: c, reason: "The omitted span is not cited by the final principle" }
+    }
+    return value
+  })
+  const result = await extractPaperPrinciples({ document: longDocument, chunks: [longChunk], model, runID: "run" })
+  expect(result.errors).toEqual([])
+  expect(result.cards).toHaveLength(1)
+  expect(result.cards[0]!.sources.some((source) => source.sourceID === unusedSourceID)).toBe(false)
+  expect(requests.filter((request) => request.stage === "verify")).toHaveLength(2)
+})
 test("semantic revision is bounded and reviewed again after consolidation", async () => {
   const { model, requests } = fixtureModel((stage, payload, value) => {
     if (stage === "verify" && payload.phase === "initial") return { ...(value as object), verdict: "needs_revision", reasons: ["scope_overgeneralized"] }

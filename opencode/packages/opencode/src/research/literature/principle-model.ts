@@ -68,7 +68,7 @@ Use retain for a single complete independent candidate, merge for equivalent pri
 Do not repeat full cards: the program retains original cards or requests one source-backed merge per group.
 Preserve supporting and contrary sources. A merge is not semantic approval; every final candidate will be verified again against original text.
 Do not invent new sources or omit boundaries to achieve a merge.`,
-  merge: `Merge exactly the supplied group into one complete conditional principle. Use all source IDs in the originals, preserving contrary evidence and boundaries.
+  merge: `Merge exactly the supplied group into one complete conditional principle. Retain registered sources needed by the final assertions, experiments, conditions and boundaries, and preserve material contrary evidence. Unused source IDs from the originals need not be copied into the merged inventory.
 Do not merely concatenate statements. Preserve the union of contributionIndexes. Return candidate:null with a reason when merging is not scientifically justified.
 This merged candidate will receive a fresh independent source-reading review.`,
   revise: `Revise the single candidate using the independent semantic review and original sources.

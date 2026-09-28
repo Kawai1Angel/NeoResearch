@@ -3,7 +3,7 @@ import z from "zod"
 // V1 remains an audit format. Never coerce a fragment into this contract.
 export const KNOWLEDGE_V2_VERSIONS = {
   schema: "knowledge_card_v2", analysis: "paper_analysis_v1",
-  synthesis: "paper_principle_v7", verifier: "principle_verifier_v10",
+  synthesis: "paper_principle_v8", verifier: "principle_verifier_v10",
   sourceRecovery: "registered_spans_v1",
 } as const
 

@@ -32,7 +32,7 @@ const ConsolidationSchema = z.object({
 const ConsolidationWireSchema = z.object({ groups: z.array(z.object({
   candidateIDs: z.array(z.string().min(1)).min(1), action: z.enum(["retain", "merge", "reject"]), rationale: z.string().min(1),
 }).strict()) }).strict()
-const PlanSchema = z.object({ plans: z.array(z.object({ planID: z.string().min(1), contributionIndexes: z.array(z.number().int().nonnegative()).min(1), focus: z.string().min(1).max(1200) }).strict()), unformed: z.array(z.string()) }).strict()
+const PlanSchema = z.object({ plans: z.array(z.object({ planID: z.string().min(1), contributionIndexes: z.array(z.number().int().nonnegative()).min(1), focus: z.string().min(1).max(1600) }).strict()), unformed: z.array(z.string()) }).strict()
 const MaterialRepairSchema = z.object({ repairs: z.array(z.object({ itemIndex: z.number().int().nonnegative(), material: z.unknown().nullable(), reason: z.string().min(1) }).strict()) }).strict()
 const BindingRepairSchema = z.object({
   links: z.array(z.object({ evidenceID: z.string().min(1), assertionIDs: z.array(z.string().min(1)).min(1) }).strict()),
@@ -406,7 +406,6 @@ export async function extractPaperPrinciples(input: {
           if (!value.candidate) return
           checkCandidates([value.candidate])
           const candidate = value.candidate
-          if (originals.some((c) => c.sources.some((s) => !candidate.sources.some((x) => x.sourceID === s.sourceID)))) throw new Error("Consolidation dropped original evidence sources")
           const expected = [...new Set(originals.flatMap((c) => c.contributionIndexes!))].sort()
           if (JSON.stringify([...new Set(candidate.contributionIndexes!)].sort()) !== JSON.stringify(expected)) throw new Error("Merge changed contribution scope")
         }, wire(RevisionWireSchema))
