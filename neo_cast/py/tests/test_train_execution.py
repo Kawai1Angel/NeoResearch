@@ -74,7 +74,7 @@ def phase2_invert_rnn_candidate() -> dict[str, Any]:
         "backbone": {"type": "rnn", "cell": "gru", "hidden_dim": 8, "num_layers": 1, "dropout": 0.0},
         "fusion": {"type": "variate_attention",},
         "prediction_head": {
-            "type": "direct_multi_horizon",
+            "type": "linear",
             "output_distribution": "point"
         },
         "training_strategy": {
@@ -189,7 +189,7 @@ class TrainExecutionTest(unittest.TestCase):
         self.assertEqual(summary["embedding"], "invert")
         self.assertEqual(summary["backbone"], "rnn")
         self.assertEqual(summary["fusion"], "variate_attention")
-        self.assertEqual(summary["prediction_head"], "direct_multi_horizon")
+        self.assertEqual(summary["prediction_head"], "linear")
         self.assertEqual(summary["output_distribution"], "point")
         self.assertEqual(summary["training_prediction"], "point_forecast")
         self.assertEqual(summary["loss"], "mae")

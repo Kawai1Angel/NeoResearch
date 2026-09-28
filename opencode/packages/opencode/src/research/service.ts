@@ -1,3 +1,4 @@
+import { projectTaskEvidence } from "./retrieve/evidence-handoff"
 import { timedEffect } from "@/util/runtime-timing"
 import { extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure, type TrainingCurvePoint } from "./runner-evidence"
 import { supersedeIntentCheckpoints } from "./taskspec-store"
@@ -113,7 +114,7 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { apiKeyFor, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata as buildLLMMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
+import { apiKeyFor, llmProposalValidationIssues, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata as buildLLMMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
 import { analyzeDatasetProfileForPrompt, compactPromptContext } from "./prompt-context"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
 import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
@@ -350,6 +351,19 @@ export const PipelineBlockedError = NamedError.create(
     mismatches: z.array(z.object({ path: z.string(), expected: z.unknown(), actual: z.unknown() })).optional(),
   }),
 )
+
+type ContractRecoveryState = {
+  readonly taskID: ResearchTaskID
+  readonly attempt: number
+  readonly maxAttempts: number
+  readonly hypothesisID?: string
+  readonly feedback?: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
+}
+
+// Fiber-local state keeps concurrent tasks and explicit/manual runs independent.
+const ContractRecovery = Context.Reference<ContractRecoveryState | undefined>("research/ContractRecovery", {
+  defaultValue: () => undefined,
+})
 
 export const SeedBaselinesError = NamedError.create(
   "ResearchSeedBaselinesError",
@@ -2302,23 +2316,7 @@ function buildHypoPlannerUserPrompt(
         ? abandonedHypotheses.map((h) => ({ statement: h.statement }))
         : null,
       taskEvidence: taskEvidence
-        ? {
-            readiness: taskEvidence.readiness,
-            entries: taskEvidence.entries.map((entry) => ({
-              cardID: entry.cardID,
-              revision: entry.cardRevision,
-              claim: entry.claim,
-              roles: entry.roles,
-              conceptIDs: entry.linkage.conceptIDs,
-              methodConceptIDs: entry.linkage.methodConceptIDs,
-              datasetEvidencePaths: entry.linkage.datasetEvidencePaths,
-              applicability: entry.applicability,
-              limitations: entry.limitations,
-              registryMappings: entry.implementation?.registryMappings ?? [],
-            })),
-            conflicts: taskEvidence.conflicts,
-            gaps: taskEvidence.gaps,
-          }
+        ? projectTaskEvidence(taskEvidence)
         : { readiness: "ready_data_only", entries: [], conflicts: [], gaps: [] },
       ...(opts?.baselineOptions && opts.baselineOptions.length > 0
         ? { baselineOptions: opts.baselineOptions }
@@ -4670,6 +4668,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       mismatches: ContractMismatch[],
       invalidRun?: ResearchRun,
     ) {
+      const recovery = yield* ContractRecovery
+      const autoRepair = recovery?.taskID === task.id && recovery.attempt < recovery.maxAttempts
       const previous = yield* db((d) =>
         d
           .select({ id: ResearchArtifactTable.id })
@@ -4694,13 +4694,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         hypothesis_id: candidate.hypothesisID ?? null,
         candidate_id: candidate.id,
         invalid_run_id: invalidRun?.id ?? null,
-        stage: "smoke",
+        stage: invalidRun?.stage ?? "smoke",
         contract_digest: contractDigest,
         expected: contract.expected,
         actual: Object.fromEntries(mismatches.map((item) => [item.path, item.actual])),
         mismatches,
         evidence_disposition: "inconclusive",
-        recommended_owner: "pipeline_maintainer",
+        recommended_owner: autoRepair ? "ModelDesignerAgent" : "pipeline_maintainer",
+        automatic_recovery: recovery ? { attempt: recovery.attempt, max_attempts: recovery.maxAttempts, status: autoRepair ? "pending" : "exhausted" } : null,
+        runner_error: invalidRun?.error ?? null,
         resume_requirement: {
           same_hypothesis: true,
           same_candidate: true,
@@ -4725,30 +4727,36 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           blockerID,
           attempt: previous.length + 1,
           seed: typeof invalidRun?.resourceUsage.seed === "number" ? invalidRun.resourceUsage.seed : null,
+          ...(recovery ? { autoRecoveryAttempt: recovery.attempt, autoRecoveryMaxAttempts: recovery.maxAttempts } : {}),
         },
       })
-      yield* updateTaskStatus({ taskID: task.id, status: "paused" })
-      const approval = yield* createApproval({
-        taskID: task.id,
-        candidateID: candidate.id,
-        kind: "protocol",
-        reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n实验执行契约不一致，任务已暂停。\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\n实现已修复时 approve，以重新验证原 candidate；candidate 设计本身错误时 reject，以废弃该 candidate 并重新运行 ModelDesigner。`,
-      })
-      yield* db((d) =>
-        d
-          .update(ResearchArtifactTable)
-          .set({ metadata: { ...artifact.metadata, approvalID: approval.id } })
-          .where(eq(ResearchArtifactTable.id, artifact.id))
-          .run(),
-      )
+      if (!autoRepair) {
+        yield* updateTaskStatus({ taskID: task.id, status: "paused" })
+        const approval = yield* createApproval({
+          taskID: task.id,
+          candidateID: candidate.id,
+          kind: "protocol",
+          reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n${recovery ? `Agent 已尝试 ${recovery.attempt} 次自动修复，仍未通过验证。` : ""}实验执行契约不一致，任务已暂停。\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\n实现已修复时 approve，以重新验证原 candidate；candidate 设计本身错误时 reject，以废弃该 candidate 并重新运行 ModelDesigner。`,
+        })
+        yield* db((d) =>
+          d
+            .update(ResearchArtifactTable)
+            .set({ metadata: { ...artifact.metadata, approvalID: approval.id } })
+            .where(eq(ResearchArtifactTable.id, artifact.id))
+            .run(),
+        )
+      }
       yield* bus.publish(Event.ExecutionContractViolation, {
         taskID: task.id,
         agent: "ContractChecker",
-        stage: "smoke",
+        stage: invalidRun?.stage ?? "smoke",
         status: "failed",
         metadata: {
           blockerArtifactID: artifact.id,
           candidateID: candidate.id,
+          automaticRecovery: autoRepair,
+          recoveryAttempt: recovery?.attempt ?? null,
+          runnerError: invalidRun?.error ?? null,
           mismatches: mismatches as unknown as JsonRecord["mismatches"],
         },
       })
@@ -5833,10 +5841,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
     })
 
-    const runAutonomousIteration = logPhaseMethod("runAutonomousIteration", Effect.fn("Research.runAutonomousIteration")(function* (
+    const runAutonomousIterationAttempt = Effect.fn("Research.runAutonomousIterationAttempt")(function* (
       input: AutonomousIterationInput,
     ) {
       const task = yield* getTask(input.taskID)
+      const recovery = yield* ContractRecovery
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
       const resumeBlocker = yield* assertExecutionCheckpoint(task.id)
       const resumeCandidate = resumeBlocker ? yield* getCandidateForTask(task.id, String(resumeBlocker.metadata.candidateID) as ResearchCandidateID) : undefined
@@ -5873,9 +5882,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const previousReflectionNotesMarkdown = latestReflection?.reflectionNotesMarkdown
       const hypotheses = yield* listHypotheses(input.taskID)
       const hypothesisPlan = experimentPlanFromDB(task, hypotheses)
-      const selectedHypothesis = resumeCandidate ? hypotheses.find((item) => item.id === resumeCandidate.hypothesisID) : selectHypothesisForDesign(hypothesisPlan)
+      const selectedHypothesis = recovery?.hypothesisID
+        ? hypotheses.find((item) => item.id === recovery.hypothesisID)
+        : resumeCandidate ? hypotheses.find((item) => item.id === resumeCandidate.hypothesisID) : selectHypothesisForDesign(hypothesisPlan)
 
+      const designTaskEvidence = selectedHypothesis?.literatureEvidence?.length
+        ? yield* loadTaskEvidenceBundle(input.taskID)
+        : undefined
       const taskFingerprint = buildModelDesignerTaskFingerprint({
+        taskEvidence: designTaskEvidence,
         baseFingerprint,
         hypothesisPlan,
         selectedHypothesis,
@@ -5937,7 +5952,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         attemptedCandidateIDs: new Set(designerSelection.attemptedCandidateIDs),
         inconclusiveCandidateIDs: new Set(designerSelection.inconclusiveCandidateIDs),
       }
-      let candidate = resumeCandidate ?? (forceExplore ? undefined : designerSelection.candidate)
+      let candidate = recovery?.feedback ? undefined : resumeCandidate ?? (forceExplore ? undefined : designerSelection.candidate)
 
       const proposalApprovals: ResearchApproval[] = []
       let proposalCreated = false
@@ -6006,7 +6021,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: modelDesignerNeoCastRoot }),
         ))
         let proposal: DomainCandidateProposal | undefined
-        let validationFeedback: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
+        let validationFeedback = recovery?.feedback
         const maxModelDesignerAttempts = 3
         for (let attempt = 1; attempt <= maxModelDesignerAttempts; attempt++) {
           const promptInput = {
@@ -6054,7 +6069,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             if (modelDesignerSessionAttempt && attempt < maxModelDesignerAttempts) {
               validationFeedback = {
                 attempt,
-                issues: [{ path: "response", message: "Response did not contain a valid candidate JSON object" }],
+                issues: llmProposalValidationIssues(llmResult.metadata),
               }
               continue
             }
@@ -6107,7 +6122,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           // Heuristic proposals may be used only when they satisfy the selected
           // hypothesis. Never attach a generic fallback to an incompatible plan.
           proposal = selectedHypothesis && task.domainID === "tsf"
-            ? rankings.find((ranking) => validateCandidateAgainstHypothesis(
+            ? rankings.find((ranking) => DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec: ranking.candidateSpec }).ok && validateCandidateAgainstHypothesis(
                 selectedHypothesis,
                 { hypothesisID: selectedHypothesis.id, candidateSpec: ranking.candidateSpec } as ResearchCandidate,
                 ranking.candidateSpec,
@@ -6124,7 +6139,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                   task.taskSpec,
                 )
               : []
-            if (fallback && fallbackMismatches.length === 0) proposal = fallback
+            if (fallback && fallbackMismatches.length === 0 && DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec: fallback.candidateSpec }).ok) proposal = fallback
           }
         }
         if (!proposal) {
@@ -6193,13 +6208,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }
         }
       }
-      if (!candidate && forceExplore && designerSelection.candidate) {
+      if (!candidate && forceExplore && !recovery?.feedback && designerSelection.candidate) {
         candidate = designerSelection.candidate
         selectionSource = "existing_frontier"
         explorationFallback = true
         rankings = [...designerSelection.rankings]
       }
       if (!candidate) throw new Error(`No approved autonomous candidate is ready for task: ${task.id}`)
+
+      const validation = DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec: candidate.candidateSpec })
+      if (!validation.ok && task.domainID === "tsf") {
+        const plan = DomainRegistry.createRunPlan(task.domainID, { taskSpec: task.taskSpec, candidateSpec: candidate.candidateSpec, stage: "smoke" })
+        yield* blockExecutionContract(task, candidate, buildExecutionContract(task, candidate, plan.writes[0].content),
+          validation.issues.map((item) => ({ path: item.path, expected: "valid candidate configuration", actual: item.message })))
+      }
 
       const candidateHypothesis = (yield* listHypotheses(task.id)).find((item) => item.id === candidate.hypothesisID)
       if (candidateHypothesis && !resumeCandidate) {
@@ -6570,6 +6592,71 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         managerTrace,
         selectionArtifact,
       }
+    })
+
+    const runAutonomousIteration = logPhaseMethod("runAutonomousIteration", Effect.fn("Research.runAutonomousIteration")(function* (
+      input: AutonomousIterationInput,
+    ) {
+      const maxAttempts = 2
+      let feedback: ContractRecoveryState["feedback"]
+      let hypothesisID: string | undefined
+      const recoveryArtifacts: ResearchArtifact[] = []
+      const finishRecovery = (status: "recovered" | "failed", result?: AutonomousIterationResult) => Effect.gen(function* () {
+        for (const artifact of recoveryArtifacts) {
+          const resolution = { status, replacementCandidateID: result?.candidate.id ?? null, verificationRunID: result?.run.id ?? null }
+          yield* Effect.promise(async () => {
+            const file = artifact.uri.slice(7)
+            const payload = JSON.parse(await readFile(file, "utf8"))
+            await writeFile(file, JSON.stringify({ ...payload, automatic_recovery: { ...payload.automatic_recovery, ...resolution } }, null, 2) + "\n")
+          })
+          yield* db((d) => d.update(ResearchArtifactTable).set({
+            metadata: { ...artifact.metadata, autoRecoveryStatus: status, replacementCandidateID: resolution.replacementCandidateID, verificationRunID: resolution.verificationRunID },
+            time_updated: Date.now(),
+          }).where(eq(ResearchArtifactTable.id, artifact.id)).run())
+        }
+      })
+      for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+        const outcome = yield* runAutonomousIterationAttempt(input).pipe(
+          Effect.provideService(ContractRecovery, { taskID: input.taskID, attempt, maxAttempts, feedback, hypothesisID }),
+          Effect.map((result) => ({ result, cause: undefined })),
+          Effect.catchCause((cause) => Effect.succeed({ result: undefined, cause })),
+        )
+        if (outcome.result) {
+          yield* finishRecovery(outcome.result.run.status === "succeeded" ? "recovered" : "failed", outcome.result)
+          return outcome.result
+        }
+        const cause = outcome.cause!
+        const error = Cause.squash(cause)
+        if (!PipelineBlockedError.isInstance(error) || error.data.reason !== "execution_contract_violation" || attempt >= maxAttempts) {
+          yield* finishRecovery("failed")
+          return yield* Effect.failCause(cause)
+        }
+        const blocker = yield* latestExecutionBlocker(input.taskID)
+        // An existing human checkpoint must still be explicitly resolved by its owner.
+        if (!blocker || blocker.metadata.approvalID) return yield* Effect.failCause(cause)
+        const candidate = yield* getCandidateForTask(input.taskID, String(blocker.metadata.candidateID) as ResearchCandidateID)
+        const payload = yield* Effect.promise(() => readFile(blocker.uri.slice(7), "utf8").then(JSON.parse))
+        hypothesisID = candidate.hypothesisID
+        feedback = {
+          attempt: attempt + 1,
+          rejectedCandidate: candidate.candidateSpec,
+          issues: [
+            ...((payload.mismatches ?? []) as ContractMismatch[]).map((item) => ({
+              ...item, message: "Execution contract verification failed. Repair the candidate without weakening the contract or changing its hypothesis.",
+            })),
+            ...(payload.runner_error ? [{ path: "runner", message: String(payload.runner_error) }] : []),
+          ],
+        }
+        // Preserve invalid evidence, reject only the incompatible candidate and let
+        // ModelDesigner generate a replacement tied to the original hypothesis.
+        yield* supersedeExecutionContractCheckpoint(blocker)
+        recoveryArtifacts.push({ ...blocker, metadata: { ...blocker.metadata, status: "superseded", supersededReason: "candidate_rejected_for_redesign" } })
+        recordResearchEvent(Instance.directory, "research.execution_contract.repair", {
+          taskID: input.taskID, agent: "ModelDesignerAgent", candidateID: candidate.id,
+          blockerArtifactID: blocker.id, attempt: attempt + 1, maxAttempts, feedback,
+        })
+      }
+      throw new Error("Execution contract recovery exhausted")
     }))
 
     const getAutonomousLoopStopReason = Effect.fn("Research.getAutonomousLoopStopReason")(function* (

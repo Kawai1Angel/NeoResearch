@@ -458,10 +458,11 @@ LLM 生成的候选必须符合 `recipe_schema_v1`，支持以下组合：
 
 ### Prediction Head
 
+`direct_multi_horizon` 已删除；旧配置校验失败，需生成使用受支持 head 的新候选。
+
 | type | 说明 |
 |---|---|
 | `linear` | 点预测线性头 |
-| `direct_multi_horizon` | 每个 horizon 独立头 |
 | `quantile` | 分位数预测（不确定性） |
 | `gaussian` | 高斯分布输出 |
 | `residual_correction` | 残差修正头 |

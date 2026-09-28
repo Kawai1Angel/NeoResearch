@@ -77,16 +77,17 @@ test("Gate B fails closed for missing or stale manifests", () => {
 })
 
 // Deterministic subprocess fixture. Python unit tests independently check actual module introspection.
-async function fixtureRunner(root: string, mismatch: boolean) {
+async function fixtureRunner(root: string, mismatch: boolean | string) {
   await mkdir(path.join(root, "py"), { recursive: true })
   const script = `const fs = require("fs"), crypto = require("crypto")
 const canonical = v => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v)
 const c = JSON.parse(fs.readFileSync(process.env.NEO_CAST_EXECUTION_CONTRACT))
 const d = crypto.createHash("sha256").update(canonical(c)).digest("hex")
-const actual = { ...c.expected, backbone: ${mismatch ? '"mlp"' : "c.expected.backbone"} }
+const fails = ${typeof mismatch === "string" ? `c.candidate_id === ${JSON.stringify(mismatch)}` : mismatch}
+const actual = { ...c.expected, backbone: fails ? "mlp" : c.expected.backbone }
 const manifest = { event: "executed_model_manifest", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: d, actual }
 console.log(JSON.stringify(manifest))
-if (${mismatch}) { console.log(JSON.stringify({event: "execution_contract_violation", mismatches: [{path: "backbone", expected: c.expected.backbone, actual: "mlp"}]})); process.exit(5) }
+if (fails) { console.log(JSON.stringify({event: "execution_contract_violation", mismatches: [{path: "backbone", expected: c.expected.backbone, actual: "mlp"}]})); process.exit(5) }
 console.log(JSON.stringify({event: "execution_contract_verified", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: d, status: "verified", manifest}))
 console.log(JSON.stringify({event: "smoke_eval_done", val_avg_mse: 0.1}))
 console.log(JSON.stringify({event: "cv_eval_done", cv_avg_mse: 0.1, cv_std_mse: 0.01, val_avg_mse: 0.1}))
@@ -151,7 +152,7 @@ test("violation pauses, consumes no full run, preserves evidence, and approval r
       ).rejects.toThrow("No verified smoke contract")
       expect(await run((svc) => svc.listRuns(task.id))).toHaveLength(0)
       await expect(
-        run((svc) => svc.runNASAgent({ taskID: task.id, stage: "full", maxIterations: 1 })),
+        run((svc) => svc.executeRun({ taskID: task.id, candidateID: candidate.id, stage: "smoke" })),
       ).rejects.toThrow()
       const invalidRuns = await run((svc) => svc.listRuns(task.id))
       expect(invalidRuns.map((r) => r.status)).toEqual(["invalid"])
@@ -162,7 +163,8 @@ test("violation pauses, consumes no full run, preserves evidence, and approval r
       expect((await listHypothesesInPool(task.id))[0]!.status).toBe("pending")
       const analysis = analyzeReflection({ task, candidates: [candidate], runs: invalidRuns })
       expect(analysis.plateauStreak).toBe(0)
-      expect(analysis.failures).toEqual([])
+      expect(analysis.failures).toHaveLength(1)
+      expect(analysis.failedRuns).toBe(0)
       expect(analysis.effectiveChanges).toEqual([])
       expect(analysis.ineffectiveChanges).toEqual([])
       expect(candidateAttemptStateFromRuns({ runs: invalidRuns, maxFailedRetries: 0 }).attemptedCandidateIDs.size).toBe(
@@ -223,6 +225,72 @@ test("Gate A creates a blocker without starting Python smoke", async () => {
     },
   })
 })
+
+for (const exhausted of [false, true]) {
+  test(exhausted ? "autonomous contract repair requests human help only after two unsuccessful repairs" : "autonomous contract repair asks ModelDesigner for a replacement and re-verifies smoke before full", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const previousFetch = globalThis.fetch
+    const keys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"] as const
+    const previous = keys.map((key) => process.env[key])
+    const prompts: any[] = []
+    let replacement: Record<string, unknown>
+    process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+    process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
+    process.env.NEO_CAST_LLM_MODEL = "test-model"
+    process.env.NEO_CAST_LLM_API_KEY = "test-key"
+    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      prompts.push(JSON.parse(body.messages.at(-1).content))
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        ...replacement,
+        recipeID: `contract_repaired_${prompts.length}`,
+        backbone: { type: "timesnet_lite", hiddenDim: 8 + prompts.length, nLayers: 1, topK: 2, kernelSize: 3, dropout: 0 },
+      }) } }] }), { headers: { "content-type": "application/json" } })
+    }) as typeof fetch
+    try {
+      await Instance.provide({ directory: tmp.path, fn: async () => {
+        const root = path.join(tmp.path, "runner")
+        const { task, candidate } = await setup(root)
+        await run((svc) => svc.updateTaskBudget({ taskID: task.id, budget: { maxRuns: 10 } }))
+        replacement = candidate.candidateSpec
+        await fixtureRunner(root, exhausted ? true : candidate.id)
+        if (exhausted) {
+          await expect(run((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" }))).rejects.toThrow()
+          expect(prompts).toHaveLength(2)
+          const approvals = await run((svc) => svc.listApprovals({ taskID: task.id }))
+          expect(approvals).toHaveLength(1)
+          expect(approvals[0]!.reason).toContain("Agent 已尝试 2 次自动修复")
+          expect((await run((svc) => svc.getTask(task.id))).status).toBe("paused")
+          expect((await run((svc) => svc.listRuns(task.id))).map((item) => item.status)).toEqual(["invalid", "invalid", "invalid"])
+          expect(await run((svc) => svc.getChampion(task.id))).toBeUndefined()
+          expect(await run((svc) => svc.listMemory(task.id))).toEqual([])
+        } else {
+          const result = await run((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" }))
+          expect(prompts).toHaveLength(1)
+          expect(result.run.status).toBe("succeeded")
+          expect(result.run.stage).toBe("full")
+          expect(result.candidate.id).not.toBe(candidate.id)
+          expect(result.candidate.hypothesisID).toBe(candidate.hypothesisID)
+          expect(await run((svc) => svc.listApprovals({ taskID: task.id }))).toEqual([])
+          expect((await run((svc) => svc.getTask(task.id))).status).not.toBe("paused")
+          const runs = await run((svc) => svc.listRuns(task.id))
+          expect(runs.toSorted((a, b) => a.time.created - b.time.created).map((item) => [item.stage, item.status])).toEqual([["smoke", "invalid"], ["smoke", "succeeded"], ["full", "succeeded"]])
+          const incident = (await run((svc) => svc.listArtifacts(task.id))).find((item) => item.kind === "execution_contract_violation_json")!
+          expect(incident.metadata).toMatchObject({ status: "superseded", autoRecoveryStatus: "recovered", replacementCandidateID: result.candidate.id })
+        }
+        expect(prompts[0].candidateValidationFeedback.rejectedCandidate).toEqual(candidate.candidateSpec)
+        expect(prompts[0].candidateValidationFeedback.issues).toContainEqual(expect.objectContaining({ path: "backbone", actual: "mlp" }))
+        expect((await run((svc) => svc.listCandidates(task.id))).find((item) => item.id === candidate.id)?.approvalStatus).toBe("rejected")
+      } })
+    } finally {
+      globalThis.fetch = previousFetch
+      for (const [index, key] of keys.entries()) {
+        if (previous[index] === undefined) delete process.env[key]
+        else process.env[key] = previous[index]
+      }
+    }
+  })
+}
 
 test("rejecting a contract checkpoint supersedes the bad candidate and returns the task to design", async () => {
   await using tmp = await tmpdir({ git: true })

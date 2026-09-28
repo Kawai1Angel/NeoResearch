@@ -29,6 +29,7 @@ function phrases(values: readonly string[]) {
 function cardVocabulary(card: KnowledgeCard, scope: "semantic" | "task" | "domain") {
   const semantic = [
     card.claim,
+    card.problem ?? "",
     card.normalizedClaim.subject,
     card.normalizedClaim.predicate,
     card.normalizedClaim.object,
@@ -92,6 +93,7 @@ export function bindCardToIntents(input: {
       const taskType = matches(taskVocabulary, [input.taskType, ...intent.paperLanguageQuery.taskTerms])
       const domain = matches(domainVocabulary, [input.domain, ...intent.paperLanguageQuery.domainTerms])
       const compatible = roleCompatible(input.card, intent)
+      if (input.card.cardType === "evaluation_protocol" && !compatible) return []
       if (scientific.length === 0 && method.length === 0) return []
       const score =
         (scientific.length > 0 ? taskEvidenceConfig.weights.scientific : 0) +
@@ -117,4 +119,4 @@ export function bindCardToIntents(input: {
     .toSorted((left, right) => right.score - left.score || left.intentID.localeCompare(right.intentID))
 }
 
-export const TASK_EVIDENCE_MAPPING_VERSION = taskEvidenceConfig.schemaVersion
+export const TASK_EVIDENCE_MAPPING_VERSION = `${taskEvidenceConfig.schemaVersion}:binding_v4`

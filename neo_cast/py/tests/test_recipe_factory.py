@@ -220,7 +220,7 @@ class RecipeFactoryTest(unittest.TestCase):
             backbone={"type": "rnn", "cell": "gru", "hidden_dim": 16, "num_layers": 1, "dropout": 0.0},
             fusion={"type": "variate_attention"},
             prediction_head={
-                "type": "direct_multi_horizon",
+                "type": "linear",
                 "output_distribution": "point"
             },
         )
@@ -480,7 +480,7 @@ class RecipeFactoryTest(unittest.TestCase):
                 backbone={"type": "mixer", "hidden_dim": 16, "depth": 1, "dropout": 0.0},
                 fusion=fusion,
                 prediction_head={
-                    "type": "direct_multi_horizon",
+                    "type": "linear",
                     "output_distribution": "point"
                 },
             )
@@ -502,7 +502,7 @@ class RecipeFactoryTest(unittest.TestCase):
                     backbone={"type": "gated_depthwise_conv", "hidden_dim": 12, "depth": 1, "dropout": 0.0},
                     fusion=fusion,
                     prediction_head={
-                        "type": "direct_multi_horizon",
+                        "type": "linear",
                         "output_distribution": "point"
                     },
                 )

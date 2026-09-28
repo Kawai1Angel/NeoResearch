@@ -310,6 +310,9 @@ function compactPromptString(value: string) {
 }
 
 export function compactPromptContext(value: unknown, contextKey?: string): unknown {
+  // This bounded, selected evidence packet has its own schema; summarizing arrays here
+  // silently removes mechanisms, provenance and citation permissions.
+  if (contextKey === "taskEvidence") return value
   if (typeof value === "string") return compactPromptString(value)
   if (Array.isArray(value)) {
     if (contextKey === "trainingCurve") return summarizeTrainingCurve(value)

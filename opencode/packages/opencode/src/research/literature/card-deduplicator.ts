@@ -50,7 +50,10 @@ export function deduplicateCard(card: KnowledgeCard, existing: readonly Knowledg
     const sameTriple = claimKey(item) === claimKey(card)
     const sameClaim = normalizedText(item.claim) === normalizedText(card.claim)
     const sharedEvidence = item.evidence.some((a) => card.evidence.some((b) => a.chunkID === b.chunkID))
-    if (samePaper && (sameTriple || sameClaim || (sharedEvidence && tokenSimilarity(item.claim, card.claim) >= 0.9))) {
+    const sameMechanism = item.mechanism && card.mechanism &&
+      normalizedText(item.mechanism.principle) === normalizedText(card.mechanism.principle) &&
+      item.mechanism.components.map(normalizedText).sort().join("|") === card.mechanism.components.map(normalizedText).sort().join("|")
+    if (samePaper && item.cardType === card.cardType && (sameMechanism || sameTriple || sameClaim || (sharedEvidence && tokenSimilarity(item.claim, card.claim) >= 0.9))) {
       return { action: "merge", card, duplicateOf: item, relations: [relation(card, item, "duplicates", "deterministic normalized claim/evidence match", 1)] }
     }
     if (!samePaper && sameClaim) {
@@ -75,7 +78,8 @@ export function mergeCardEvidence(existing: KnowledgeCard, incoming: KnowledgeCa
   const known = new Set(evidence.map((item) => item.evidenceID))
   for (const item of incoming.evidence) if (!known.has(item.evidenceID)) evidence.push(item)
   return {
-    ...existing,
+    ...incoming,
+    cardID: existing.cardID,
     revision,
     evidence,
     confidence: {
@@ -84,6 +88,6 @@ export function mergeCardEvidence(existing: KnowledgeCard, incoming: KnowledgeCa
       evidenceDirectness: Math.max(existing.confidence.evidenceDirectness, incoming.confidence.evidenceDirectness),
       transferability: Math.max(existing.confidence.transferability, incoming.confidence.transferability),
     },
-    provenance: { ...existing.provenance, updatedAt: now, extractionRunID: incoming.provenance.extractionRunID },
+    provenance: { ...incoming.provenance, createdAt: existing.provenance.createdAt, updatedAt: now, extractionRunID: incoming.provenance.extractionRunID },
   }
 }

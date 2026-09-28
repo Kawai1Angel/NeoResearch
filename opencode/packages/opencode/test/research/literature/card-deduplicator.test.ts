@@ -19,3 +19,12 @@ test("same claim from another paper creates support instead of erasing provenanc
   expect(decision.action).toBe("insert")
   if (decision.action === "insert") expect(decision.relations[0].relationType).toBe("supports")
 })
+
+test("identical structured operations merge despite paraphrased claims but distinct operations survive", () => {
+  const mechanism = { mechanismID: "gru", name: "GRU encoder", principle: "Encode stock histories into hidden feature vectors using a GRU", components: ["GRU", "hidden features"] }
+  const original = card({ cardType: "model_mechanism", mechanism })
+  const paraphrase = card({ cardID: "kc_aaaaaaaaaaaa", cardType: "model_mechanism", mechanism, claim: "A recurrent unit maps each stock history to hidden features.", normalizedClaim: { subject: "GRU", predicate: "encodes", object: "history" } })
+  expect(deduplicateCard(paraphrase, [original]).action).toBe("merge")
+  const different = { ...paraphrase, mechanism: { ...mechanism, principle: "Decode hidden features into the future stock prices" } }
+  expect(deduplicateCard(different, [original]).action).toBe("insert")
+})

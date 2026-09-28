@@ -1,3 +1,5 @@
+import aliases from "./config/tsf-task-evidence.v1.json" with { type: "json" }
+import { includesPhrase } from "./bm25-search"
 import { createHash } from "crypto"
 import { RetrievalCandidateSchema, type RetrievalBudgets, type RetrievalCandidate, type RetrievalIntent } from "./contract"
 import type { BM25SearchResult } from "./bm25-search"
@@ -14,15 +16,29 @@ export function buildRetrievalCandidates(
   intent: RetrievalIntent,
   results: readonly BM25SearchResult[],
   maxLiteraturePapersPerIntent: number,
+  probabilistic = false,
 ): RetrievalCandidate[] {
   const phenomenon = normalized(intent.paperLanguageQuery.phenomenonTerms)
   const methods = normalized(intent.paperLanguageQuery.methodTerms)
   let selected = 0
-  return results.map((result) => {
-    const matched = normalized(result.matchedTerms)
-    const scientificOrMethodMatch = matched.some((term) => phenomenon.includes(term) || methods.includes(term))
+  const extra = Object.entries(aliases.aliases).flatMap(([key, values]) =>
+    intent.intentID.startsWith(`intent_${key}_`) || [key.replaceAll("_", " "), ...values].some((term) => phenomenon.includes(term) || methods.includes(term)) ? values : [])
+  const reviewed = results.map((result) => {
+    const scientificTerms = [...phenomenon, ...methods, ...extra]
+    const titleMatches = scientificTerms.filter((term) => includesPhrase(result.paper.title, term))
+    const source = [result.paper.fields.abstract, result.paper.fields.introduction, result.paper.fields.method].join("\n")
+    const sourceMatches = scientificTerms.filter((term) => includesPhrase(source, term))
+    const auxiliary = !probabilistic && /conformal|prediction intervals|uncertainty quantification/i.test(result.paper.title)
+    return { result, titleMatches, sourceMatches, auxiliary,
+      relevance: (titleMatches.length ? 10 : 0) + Math.min(sourceMatches.length, 5) - (auxiliary ? 20 : 0) }
+  }).toSorted((a, b) => b.relevance - a.relevance || a.result.rank - b.result.rank)
+  return reviewed.map(({ result, titleMatches, sourceMatches, auxiliary }) => {
+    const scientificOrMethodMatch = titleMatches.length > 0 || sourceMatches.length > 0
     let decision: RetrievalCandidate["decision"] = "retain_candidate"
     const decisionReasons: string[] = [`BM25 rank ${result.rank} for ${intent.intentID}`]
+    decisionReasons.push(`screening_v2: title matches [${titleMatches.join(", ")}]; source matches [${sourceMatches.join(", ")}]`)
+    if (result.paper.previewError) decisionReasons.push(`preview unavailable: ${result.paper.previewError}`)
+    if (auxiliary) decisionReasons.push("auxiliary: interval/calibration objective differs from point forecasting")
     if (!result.paper.localPDF) {
       decision = "skipped_pdf_unavailable"
       decisionReasons.push("local PDF unavailable")
@@ -30,6 +46,8 @@ export function buildRetrievalCandidates(
     } else if (!scientificOrMethodMatch) {
       decision = "domain_only"
       decisionReasons.push("no scientific or method phrase matched")
+    } else if (auxiliary) {
+      decisionReasons.push("retained as auxiliary; not consuming mechanism reading quota")
     } else if (selected < maxLiteraturePapersPerIntent) {
       selected += 1
       decision = "send_to_literature_agent"
@@ -81,7 +99,21 @@ export function selectBridgeCandidates(
       })
     }
   }
-  return [...grouped.values()]
+  const ranked = [...grouped.values()]
     .toSorted((left, right) => left.bm25Rank - right.bm25Rank || right.bm25Score - left.bm25Score || left.paperID.localeCompare(right.paperID))
-    .slice(0, budgets.maxLiteraturePapersTotal)
+  const selected: typeof ranked = []
+  const intentIDs = [...new Set(candidates.filter((item) => item.decision === "send_to_literature_agent").map((item) => item.intentID))]
+  while (selected.length < budgets.maxLiteraturePapersTotal) {
+    let added = false
+    for (const intentID of intentIDs) {
+      if (selected.length >= budgets.maxLiteraturePapersTotal) break
+      // Preserve the scientific re-ranking from buildRetrievalCandidates.
+      const next = candidates.find((item) => item.intentID === intentID && item.decision === "send_to_literature_agent" && !selected.some((paper) => paper.paperID === item.paperID))
+      if (!next) continue
+      selected.push(grouped.get(next.paperID)!)
+      added = true
+    }
+    if (!added) break
+  }
+  return selected
 }

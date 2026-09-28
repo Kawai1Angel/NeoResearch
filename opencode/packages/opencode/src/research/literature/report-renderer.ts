@@ -13,7 +13,10 @@ export function renderReview(input: {
     "",
     `- Run: \`${input.runID}\``,
     `- Accepted cards: ${input.cards.length}`,
-    `- Rejected candidates: ${input.rejected.length}`,
+    `- Quality-rejected candidates: ${input.rejected.filter((item) => item.reason !== "duplicate" && item.reason !== "verification_error" && item.reason !== "selection_budget").length}`,
+    `- Verification errors: ${input.rejected.filter((item) => item.reason === "verification_error").length}`,
+    `- Budget-omitted verified cards: ${input.rejected.filter((item) => item.reason === "selection_budget").length}`,
+    `- Duplicate merges: ${input.rejected.filter((item) => item.reason === "duplicate").length}`,
     `- Warnings: ${input.warnings.length}`,
     "",
   ]

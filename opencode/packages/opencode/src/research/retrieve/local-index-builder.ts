@@ -1,10 +1,11 @@
+import { readPDFPreviews, PDF_PREVIEW_VERSION } from "./pdf-preview"
 import { createHash } from "crypto"
 import { access, mkdir, readFile, readdir, rename, writeFile } from "fs/promises"
 import path from "path"
 import { Database } from "bun:sqlite"
 import { KnowledgeCardSchema } from "../literature/contract"
 
-export const RETRIEVAL_TOKENIZER_VERSION = "unicode_word_v1"
+export const RETRIEVAL_TOKENIZER_VERSION = "unicode_word_v2"
 export const RETRIEVAL_INDEX_SCHEMA_VERSION = "local_retrieval_index_v1"
 
 export type IndexedPaper = {
@@ -17,6 +18,7 @@ export type IndexedPaper = {
   readonly arxivID?: string
   readonly localPDF: boolean
   readonly sourceSha256?: string
+  readonly previewError?: string
   readonly fields: {
     readonly title: string
     readonly abstract: string
@@ -47,6 +49,7 @@ type MutablePaper = {
   arxivID?: string
   localPDF: boolean
   sourceSha256?: string
+  previewError?: string
   fields: { title: string; abstract: string; introduction: string; method: string; results: string; limitations: string; knowledgeCard: string }
   hasDocument: boolean
   hasPaperBackedCard: boolean
@@ -169,6 +172,7 @@ export async function collectIndexedPapers(input: {
   })()
   const sourceDigests: Record<string, string> = {}
   const papers = new Map<string, MutablePaper>()
+  const previewSources: Array<{ paperID: string; path: string }> = []
   if (await exists(catalogPath)) sourceDigests[path.relative(neoCastRoot, catalogPath)] = digestText(await readFile(catalogPath, "utf8"))
   for (const value of await readJsonl(catalogPath)) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue
@@ -178,6 +182,7 @@ export async function collectIndexedPapers(input: {
     const paper = emptyPaper(paperID)
     paper.title = typeof record.title === "string" ? record.title : paperID
     paper.fields.title = paper.title
+    paper.fields.abstract = typeof record.abstract === "string" ? record.abstract : ""
     paper.year = typeof record.year === "number" ? record.year : undefined
     paper.venue = typeof record.venue === "string" ? record.venue : undefined
     paper.publicationStatus = typeof record.publication_status === "string" ? record.publication_status : "unknown"
@@ -187,11 +192,20 @@ export async function collectIndexedPapers(input: {
     const download = record.download && typeof record.download === "object" ? record.download as Record<string, unknown> : {}
     let pdfAvailable = false
     for (const candidate of catalogPDFCandidates(neoCastRoot, catalogPath, download.path)) {
-      if (await exists(candidate)) { pdfAvailable = true; break }
+      if (await exists(candidate)) { pdfAvailable = true; previewSources.push({ paperID, path: candidate }); break }
     }
     paper.localPDF = download.status === "downloaded" && pdfAvailable
     paper.sourceSha256 = typeof download.sha256 === "string" ? download.sha256 : undefined
     papers.set(paperID, paper)
+  }
+
+  const previews = await readPDFPreviews(neoCastRoot, previewSources)
+  for (const [paperID, preview] of previews) {
+    const paper = papers.get(paperID)!
+    // First pages are preview text, not a verified abstract or card evidence.
+    appendField(paper, "introduction", preview.text)
+    paper.previewError = preview.error
+    sourceDigests[`preview:${paperID}:${PDF_PREVIEW_VERSION}`] = digestText(stableJson(preview))
   }
 
   for (const documentPath of await filesUnder(path.join(knowledgeRoot, "documents"), ".document.json")) {
@@ -218,6 +232,7 @@ export async function collectIndexedPapers(input: {
           case "method": case "experiment_setup": case "complexity": appendField(paper, "method", text); break
           case "results": case "ablation": case "conclusion": appendField(paper, "results", text); break
           case "limitations": appendField(paper, "limitations", text); break
+          case "unknown": appendField(paper, "introduction", text); break
           default: break
         }
       }
@@ -246,6 +261,7 @@ export async function collectIndexedPapers(input: {
     ...(paper.arxivID === undefined ? {} : { arxivID: paper.arxivID }),
     localPDF: paper.localPDF,
     ...(paper.sourceSha256 === undefined ? {} : { sourceSha256: paper.sourceSha256 }),
+    ...(paper.previewError ? { previewError: paper.previewError } : {}),
     fields: paper.fields,
     evidenceLevel: paper.hasPaperBackedCard ? "paper_backed" : paper.hasDocument ? "document_available" : "metadata_only",
   })))

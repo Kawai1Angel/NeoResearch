@@ -1,6 +1,7 @@
 import { readFile } from "fs/promises"
 import { createHash } from "crypto"
 import { TSFCandidateRecipe } from "./domains/tsf"
+import { z } from "zod"
 import os from "os"
 import path from "path"
 import type { DomainCandidateProposal, DomainProposalContext } from "./domain"
@@ -284,19 +285,26 @@ function applyAllowedAndDefaults(
   obj: Record<string, unknown>,
   allowed: readonly string[] | undefined,
   defaults: Record<string, number>,
+  location: string,
 ): Record<string, unknown> {
   const next: Record<string, unknown> = {}
   for (const key of allowed ?? Object.keys(obj)) {
     if (key in obj) next[key] = obj[key]
   }
   for (const [key, value] of Object.entries(defaults)) {
-    if (typeof next[key] !== "number" || !Number.isFinite(next[key] as number)) next[key] = value
+    normalizeNumber(next, key, value, location)
   }
   return next
 }
 
-function normalizeNumber(obj: Record<string, unknown>, key: string, fallback: number) {
-  if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) obj[key] = fallback
+function normalizeNumber(obj: Record<string, unknown>, key: string, fallback: number, location: string) {
+  if (!(key in obj)) {
+    obj[key] = fallback
+    return
+  }
+  if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) {
+    throw new Error(`${location}.${key} must be a finite number`)
+  }
 }
 
 export function pruneCandidateSpec(value: unknown): JsonRecord {
@@ -319,16 +327,12 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
     if (key in raw) spec[key] = raw[key]
   }
 
-  // Guarantee preprocessing.actions is a valid array.
+  // Default omitted modules only. Explicit invalid values must reach validation.
   const preprocessing = spec.preprocessing
-  if (!isRecord(preprocessing) || !Array.isArray(preprocessing.actions)) {
+  if (!("preprocessing" in spec)) {
     spec.preprocessing = { actions: [{ type: "none" }] }
-  } else {
-    preprocessing.actions = preprocessing.actions.map((action) => {
-      if (!isRecord(action)) return action
-      const next = { ...action }
-      return next
-    })
+  } else if (!isRecord(preprocessing) || !Array.isArray(preprocessing.actions)) {
+    throw new Error("preprocessing.actions must be an array")
   }
 
   // Normalize backbone: strip unknown keys, fill required number defaults.
@@ -339,13 +343,17 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
       spec.backbone,
       backboneType !== undefined && BACKBONE_ALLOWED_KEYS[backboneType] ? [...BACKBONE_ALLOWED_KEYS[backboneType], "attention"] : undefined,
       backboneType !== undefined ? (BACKBONE_REQUIRED_DEFAULTS[backboneType] ?? {}) : {},
+      "backbone",
     )
   }
 
   // Normalize embedding: strip unknown keys, fill required number defaults.
   // Certain backbones require embedding.type='none' (domain constraint).
   if (backboneType !== undefined && BACKBONE_REQUIRES_NONE_EMBEDDING.has(backboneType)) {
-    spec.embedding = { type: "none" }
+    if (!("embedding" in spec)) spec.embedding = { type: "none" }
+    else if (!isRecord(spec.embedding) || spec.embedding.type !== "none") {
+      throw new Error(`${backboneType} requires embedding.type=none`)
+    }
   } else if (isRecord(spec.embedding)) {
     const emb = spec.embedding
     const type = typeof emb.type === "string" ? emb.type : undefined
@@ -353,6 +361,7 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
       emb,
       type !== undefined ? EMBEDDING_ALLOWED_KEYS[type] : undefined,
       type !== undefined ? (EMBEDDING_REQUIRED_DEFAULTS[type] ?? {}) : {},
+      "embedding",
     )
   }
 
@@ -372,27 +381,27 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
   // Normalize predictionHead: fill required quantiles default.
   if (isRecord(spec.predictionHead)) {
     const ph = spec.predictionHead
-    if (ph.type === "quantile" && !Array.isArray(ph.quantiles)) {
+    if (ph.type === "quantile" && !("quantiles" in ph)) {
       ph.quantiles = [0.1, 0.5, 0.9]
     }
-    if (ph.type === "residual_correction" && (typeof ph.correctionDim !== "number" || !Number.isFinite(ph.correctionDim as number))) {
-      ph.correctionDim = 64
+    if (ph.type === "residual_correction") {
+      normalizeNumber(ph, "correctionDim", 64, "predictionHead")
     }
   }
 
   // Normalize trainingStrategy: fill required number fields with safe defaults.
   if (isRecord(spec.trainingStrategy)) {
     const ts = spec.trainingStrategy
-    if (isRecord(ts.optimizer)) normalizeNumber(ts.optimizer, "lr", 0.001)
+    if (isRecord(ts.optimizer)) normalizeNumber(ts.optimizer, "lr", 0.001, "trainingStrategy.optimizer")
     if (isRecord(ts.budget)) {
-      normalizeNumber(ts.budget, "maxEpochs", 30)
-      normalizeNumber(ts.budget, "timeBudgetS", 1200)
-      normalizeNumber(ts.budget, "batchSize", 32)
-      normalizeNumber(ts.budget, "patience", 5)
+      normalizeNumber(ts.budget, "maxEpochs", 30, "trainingStrategy.budget")
+      normalizeNumber(ts.budget, "timeBudgetS", 1200, "trainingStrategy.budget")
+      normalizeNumber(ts.budget, "batchSize", 32, "trainingStrategy.budget")
+      normalizeNumber(ts.budget, "patience", 5, "trainingStrategy.budget")
     }
   }
 
-  return spec as JsonRecord
+  return TSFCandidateRecipe.parse(spec) as unknown as JsonRecord
 }
 
 function buildSystemPrompt() {
@@ -981,10 +990,10 @@ export function candidateGovernance(candidateSpec: JsonRecord) {
 }
 
 /**
- * Parses an LLM-generated candidate proposal from raw response text. Returns undefined when the
- * text doesn't contain a valid candidate JSON object — callers should treat this as a failed attempt.
+ * Parses an LLM-generated candidate proposal from raw response text. Invalid candidates
+ * return validation details for a repair attempt.
  */
-export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, config: NeoCastLLMConfig): LLMProposalResult | undefined {
+export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, config: NeoCastLLMConfig): LLMProposalResult {
   try {
     const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
     const governance = candidateGovernance(candidateSpec)
@@ -1000,9 +1009,27 @@ export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, con
       },
       metadata: llmMetadata(config, "used", {}, usage),
     }
-  } catch {
-    return undefined
+  } catch (error) {
+    const issues = error instanceof z.ZodError
+      ? error.issues.map((issue) => ({ path: issue.path.join(".") || "candidateSpec", message: issue.message }))
+      : [{ path: "candidateSpec", message: error instanceof Error ? error.message : String(error) }]
+    return {
+      metadata: llmMetadata(config, "invalid", {
+        llmError: issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"),
+        llmValidationIssues: issues,
+      }, usage),
+    }
   }
+}
+
+export function llmProposalValidationIssues(metadata: JsonRecord): { path: string; message: string }[] {
+  const issues = Array.isArray(metadata.llmValidationIssues) ? metadata.llmValidationIssues.flatMap((item) =>
+    isRecord(item) && typeof item.path === "string" && typeof item.message === "string"
+      ? [{ path: item.path, message: item.message }]
+      : [],
+  ) : []
+  return issues.length ? issues : [{ path: "candidateSpec", message: typeof metadata.llmError === "string"
+    ? metadata.llmError : "Response did not contain a valid candidate JSON object" }]
 }
 
 export async function proposeLLMCandidate(input: {
@@ -1047,21 +1074,26 @@ export async function proposeLLMCandidate(input: {
   }
 
   const system = buildSystemPrompt()
-  const user = buildUserPrompt({
+  const promptInput = {
     task: input.task,
     proposalContext: input.proposalContext,
     dataAnalysisMarkdown: input.dataAnalysisMarkdown,
     hypoPlanMarkdown: input.hypoPlanMarkdown,
     previousReflectionMarkdown: input.previousReflectionMarkdown,
     validationFeedback: input.validationFeedback,
-  })
+  }
+  let user = buildUserPrompt(promptInput)
   const maxAttempts = 3
   let lastError: unknown
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const { text, usage } = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
       const result = buildLLMProposalFromText(text, usage, effectiveConfig)
-      if (!result) throw new Error("Failed to parse LLM proposal JSON")
+      if (!result?.proposal) {
+        const message = typeof result?.metadata.llmError === "string" ? result.metadata.llmError : "Failed to parse LLM proposal JSON"
+        user = buildUserPrompt({ ...promptInput, validationFeedback: { attempt, issues: llmProposalValidationIssues(result?.metadata ?? {}) } })
+        throw new Error(message)
+      }
       return result
     } catch (error) {
       lastError = error

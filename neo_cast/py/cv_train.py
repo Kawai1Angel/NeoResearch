@@ -18,8 +18,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from runtime_config import ACTIVE_SPEC, HORIZONS, INPUT_LEN
 
 
@@ -209,6 +207,8 @@ def run_cv_folds_parallel(
 
 def default_max_parallel_folds() -> int:
     """Avoid competing training processes on a single CUDA device."""
+    import torch
+
     return 1 if torch.cuda.is_available() else 4
 
 
@@ -261,6 +261,7 @@ def main() -> int:
 
 
 def _execute_cv(args, artifact_callback=None):
+    import torch
 
     visible_rows = (ACTIVE_SPEC.train[0], ACTIVE_SPEC.val[1])
     if visible_rows[1] > ACTIVE_SPEC.ref_test[0]:

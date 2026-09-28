@@ -36,14 +36,20 @@ function condition(input: { label: string; values: readonly string[]; actual: re
 
 function taskFacts(report: DatasetQuantitativeAnalysis, context: RetrieveTaskContext, conceptIDs: readonly string[]) {
   const dataScale = scale(report.profile.rowCount)
+  const temporalColumns = new Set([
+    ...report.dataset.targetColumns, ...report.dataset.observedPastCovariates,
+    ...report.dataset.knownFutureCovariates,
+  ].map((value) => value.trim()).filter(Boolean))
   return {
     taskTypes: [context.taskType],
     domains: [context.domain, report.domain],
     dataFeatures: [
       ...conceptIDs,
+      ...(temporalColumns.size > 1 ? ["multivariate"] : temporalColumns.size === 1 ? ["univariate"] : []),
       report.profile.irregularIntervalRatio < 0.05 ? "regular_sampling" : "irregular_sampling",
       report.forecast.horizonContextRatio >= 1 ? "long_horizon" : "short_horizon",
     ],
+    dimensionalityKnown: temporalColumns.size > 0,
     dataScale: [dataScale, `${dataScale}_data`],
     horizonProfile: [report.forecast.horizonContextRatio >= 1 ? "long_horizon" : "short_horizon"],
     computeProfile: context.constraints.computeProfile === "unknown"
@@ -62,9 +68,12 @@ export function matchApplicability(input: {
   const checks = [
     condition({ label: "taskType", values: input.card.applicability.taskTypes, actual: facts.taskTypes, known: true }),
     condition({ label: "domain", values: input.card.applicability.domains, actual: facts.domains, known: true }),
-    condition({ label: "dataFeature", values: input.card.applicability.dataFeatures, actual: facts.dataFeatures, known: true }),
+    ...input.card.applicability.dataFeatures.map((feature) => condition({
+      label: "dataFeature", values: [feature], actual: facts.dataFeatures,
+      known: /^(multi|uni)variate$/.test(normalized(feature)) ? facts.dimensionalityKnown : true,
+    })),
     condition({ label: "dataScale", values: input.card.applicability.dataScale, actual: facts.dataScale, known: true }),
-    condition({ label: "horizonProfile", values: input.card.applicability.horizonProfile, actual: facts.horizonProfile, known: true }),
+    condition({ label: "horizonProfile", values: input.card.applicability.horizonProfile.map((value) => value === "long" ? "long_horizon" : value === "short" ? "short_horizon" : value), actual: facts.horizonProfile, known: true }),
     condition({
       label: "computeProfile",
       values: input.card.applicability.computeProfile,

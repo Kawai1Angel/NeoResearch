@@ -1,5 +1,7 @@
 # neo-research for TSF：架构设计文档 v3.1
 
+> 2026-09-27 更新：用户已要求删除 `direct_multi_horizon`。该 action 已从当前 schema、注册表、工厂和搜索入口移除，旧方案中对其恢复/重新定义的描述不再适用。
+
 > 面向时间序列预测领域的自主研究智能体系统 — **Forecast Research Operating System**
 > 设计参照：Karpathy autoresearch（2026）、The AI Scientist（2024）、AutoML-Zero、TimeRecipe（ICLR 2026）
 > 数据加载与评估协议参照：[Time-Series-Library](https://github.com/thuml/Time-Series-Library)（thuml，2024）
@@ -368,7 +370,6 @@ Prediction head 负责把 latent 表示映射到 horizon 输出：
 | Head | 参数 | 适用场景 |
 |------|------|---------|
 | `linear` | `share_across_horizons` | point forecast 默认 head |
-| `direct_multi_horizon` | `horizon_specific` | 一次输出多个 horizon，避免递推误差 |
 | `quantile` | `quantiles` | 概率预测、P50/P90 场景 |
 | `gaussian` | `variance_floor` | 分布式预测与不确定性估计 |
 | `residual_correction` | `base_head`, `correction_dim` | 在强 baseline 上学习残差 |
@@ -1959,7 +1960,7 @@ neo-research TSF 的 `prepare_tsf.py` 在数据层**直接采用 TSL 的实现�
 - [x] embedding 接入 `none`, `patch`, `multiscale_patch`, `invert`, `frequency`, `calendar`
 - [x] backbone 接入 `linear`, `mlp`, `rnn`, `dlinear`, `tcn`, `nbeats`, `timesnet`, `ssm`, `mixer`, `transformer`
 - [x] fusion 接入 `temporal`, `feature`, `temporal_then_feature`, `feature_then_temporal`, `graph`, `gated_hybrid`
-- [x] prediction head 接入 `linear`, `direct_multi_horizon`, `quantile`, `gaussian`, `residual_correction`
+- [x] prediction head 接入 `linear`, `quantile`, `gaussian`, `residual_correction`
 - [x] Loss grammar DSL（BaseLoss + HorizonLoss + Regularization + Calibration）
 - [x] 支持 horizon weighting 策略
 - [x] 加入 distillation objective（当前实现为可执行 teacher-policy distillation：`last_value` / `moving_average` teacher 与 supervised loss 加权混合；foundation-model teacher 接入仍可作为后续 teacher provider 扩展）

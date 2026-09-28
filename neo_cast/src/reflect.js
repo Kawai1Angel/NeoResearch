@@ -148,7 +148,6 @@ ${formatTaskContext(taskContext)}
 
 ### prediction_head
 - { "type": "linear", "output_distribution": "point"}
-- { "type": "direct_multi_horizon", "output_distribution": "point"}
 - { "type": "quantile", "output_distribution": "quantile", "quantiles": [0.1,0.5,0.9] }
 - { "type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.0001 }
 - { "type": "residual_correction", "output_distribution": "point" "correction_dim": 16 }

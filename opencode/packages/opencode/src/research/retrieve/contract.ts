@@ -1,5 +1,5 @@
 import z from "zod"
-import { CARD_TYPES } from "../literature/contract"
+import { CARD_TYPES, MechanismSchema, KnowledgeCardSchema } from "../literature/contract"
 
 const FiniteNumber = z.number().finite()
 
@@ -212,6 +212,7 @@ export const TaskEvidenceRoleSchema = z.enum(TASK_EVIDENCE_ROLES)
 export type TaskEvidenceRole = z.infer<typeof TaskEvidenceRoleSchema>
 
 export const TASK_EVIDENCE_EXCLUSION_REASONS = [
+  "mechanism_incomplete", "card_validation_required",
   "card_not_found",
   "paper_mismatch",
   "status_not_eligible",
@@ -230,6 +231,19 @@ export const TaskEvidenceEntrySchema = z.object({
   cardType: z.enum(CARD_TYPES),
   cardStatus: z.enum(["paper_backed", "corroborated", "contradicted"]),
   claim: z.string().min(1),
+  paperTitle: z.string().optional(),
+  problem: z.string().optional(),
+  mechanism: MechanismSchema.optional(),
+  mergedSources: z.array(z.object({
+    cardID: z.string(), cardRevision: z.number().int().positive(),
+    claim: z.string(), problem: z.string().optional(), mechanism: MechanismSchema.optional(),
+    rationale: z.string(),
+    applicability: KnowledgeCardSchema.shape.applicability.optional(),
+    evidenceRefs: z.array(z.object({
+      evidenceID: z.string(), chunkID: z.string(), evidenceSpan: z.string(),
+      section: z.string(), pageStart: z.number(), pageEnd: z.number(),
+    }).strict()),
+  }).strict()).optional(),
   linkage: z.object({
     intentIDs: z.array(z.string()).min(1),
     candidateIDs: z.array(z.string()).min(1),
@@ -252,6 +266,7 @@ export const TaskEvidenceEntrySchema = z.object({
   }).strict(),
   evidenceRefs: z.array(z.object({
     evidenceID: z.string(),
+    evidenceSpan: z.string().optional(),
     chunkID: z.string(),
     section: z.string(),
     pageStart: z.number().int().positive(),
@@ -290,6 +305,13 @@ export const TaskEvidenceBundleSchema = z.object({
   quantitativeReportArtifactID: z.string(),
   taskContextDigest: z.string().regex(/^[a-f0-9]{64}$/),
   readiness: z.enum(["ready_with_evidence", "ready_data_only", "partial_evidence", "evidence_conflict"]),
+  mechanismRelations: z.array(z.object({
+    parentCardID: z.string(), componentCardID: z.string(), rationale: z.string(),
+  }).strict()).optional(),
+  consolidation: z.object({
+    version: z.string(), reviewedPapers: z.array(z.string()),
+    failedPapers: z.array(z.string()), unavailablePapers: z.array(z.string()),
+  }).strict().optional(),
   entries: z.array(TaskEvidenceEntrySchema),
   excluded: z.array(ExcludedTaskEvidenceSchema),
   conflicts: z.array(z.object({

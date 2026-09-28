@@ -1,5 +1,7 @@
 # LiteratureAgent Phase → HypoPlanner 任务证据桥接实施方案
 
+规则补充（2026-09-27，待实现与验收）：第 5.2、5.7 节增加知识卡类型完整性和机制角色门槛，对齐[知识卡规则](../../文档/LiteratureAgent与知识库独立实现方案.md#641-按类型强制执行的知识卡规则)。下列既有实现进度不代表本次补充已经落地。
+
 实现进度（2026-09-21）：桥接功能、持久化、恢复路径及离线验收已实现；全仓测试仍有下列既有失败。
 下文保留原设计与验收要求，不把完整训练/发布流水线标记为全绿。
 
@@ -373,6 +375,10 @@ type TaskEvidenceKnowledgeSource = {
 5. 缺失或 paper mismatch 进入 excluded，并使 readiness 至少为 `partial_evidence`；
 6. 不修改 canonical card。
 
+新增类型完整性检查：按知识卡规则执行条件校验，`model_mechanism` 必须具备非空 `problem` 和完整 `mechanism`，且有对应版本的类型、语义完整性与证据覆盖验证记录。仅有 `paper_backed` 状态或有效引用不够；不得从标签、模型名或检索词临时补出机制。缺少字段进入 excluded，原因为 `mechanism_incomplete`；缺少新版验证记录进入 excluded，原因为 `card_validation_required`；已确认类型错误记录 `card_type_mismatch`。保留 cardID、revision 和排除理由，并据剩余有效证据重算 coverage/readiness。
+
+旧卡仍可读取和审计，但不得绕过上述门槛。重新验证或抽取由 LiteratureAgent 创建新 revision，桥接层不改写 canonical card；新规则启用后重建受影响的 evidence bundle，保留旧 bundle 的版本引用以便复现。
+
 ### 5.3 eligibility gate
 
 正向支持证据必须满足：
@@ -499,6 +505,12 @@ TSF 首版派生事实：
 | status=`contradicted` 或 contradiction relation | `contradicts` |
 
 首版 role 由确定性规则产生，不由 claim 中的乐观措辞决定。
+
+上述映射仅对通过第 5.2 节及 eligibility 检查的卡片生效。`supports_mechanism` 还必须通过机制完整性与证据覆盖检查；仅描述 context length、prediction length、数据划分或评估指标的卡，即使误标为 `model_mechanism`，也不得进入该角色。
+
+`evaluation_protocol` 只能在与评估有关的任务需求中提供 `defines_evaluation`，不能计入机制问题的证据覆盖。其他类型同样按问题与角色的兼容性使用；匹配了相同 horizon 或数据集，不等于支持模型设计机制。HypoPlanner 的结构假设必须引用合格机制卡，或明确标注为待实验检验的 Agent 假设，不能把协议卡包装成论文支持。
+
+验收须包含端到端反例：只有“输入长度 96，预测长度 96/192/336/720”的卡，即使原文真实、BM25 分数高且状态为 `paper_backed`，也不能输出 `supports_mechanism` 或填补机制 intent 的覆盖；正确分类并验证后可为评估需求提供协议参考。另需验证完整机制正例正常通过、旧版缺字段卡被排除、同一输入的规则升级不会复用旧版合格缓存。
 
 ### 5.8 跨论文冲突、去重与选择预算
 

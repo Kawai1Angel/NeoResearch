@@ -43,6 +43,27 @@ test("fixture model produces deterministic auditable run artifacts", async () =>
     const repeated = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }] })
     expect(repeated.runIDs).toEqual(result.runIDs)
     expect(agent.validate().cardCount).toBe(1)
+    const originalExtract = model.extractCandidates.bind(model)
+    model.extractCandidates = async () => [
+      ...Array.from({ length: 30 }, (_, index) => candidate({ candidateID: `unsupported-${index}`, claim: "The method reduces MSE by 99% on ETTh1." })),
+      candidate({ candidateID: "late-valid" }),
+    ]
+    const budgeted = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }], options: { force: true, maxCardsPerPaper: 1 } })
+    expect(budgeted.summary.acceptedCardCount).toBe(1)
+    const budgetManifest = JSON.parse(await readFile(path.join(knowledgeRoot, "runs", budgeted.runIDs[0]!, "run_manifest.json"), "utf8"))
+    expect(budgetManifest.counters.candidateCount).toBe(31)
+    expect(budgetManifest.counters.qualityRejectedCount).toBe(30)
+    expect(await readFile(path.join(knowledgeRoot, "runs", budgeted.runIDs[0]!, "card_validation.jsonl"), "utf8")).toContain("evidence_validation_v3")
+    model.extractCandidates = originalExtract
+    model.verifyEvidence = async () => { throw new Error("fixture verifier format error") }
+    const failed = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }], options: { force: true } })
+    expect(failed.processed[0]!.status).toBe("partial")
+    const failedRoot = path.join(knowledgeRoot, "runs", failed.runIDs[0]!)
+    const rejected = JSON.parse((await readFile(path.join(failedRoot, "rejected_candidates.jsonl"), "utf8")).trim())
+    expect(rejected.reason).toBe("verification_error")
+    expect(await readFile(path.join(failedRoot, "review.md"), "utf8")).toContain("Quality-rejected candidates: 0")
+    const manifest = JSON.parse(await readFile(path.join(failedRoot, "run_manifest.json"), "utf8"))
+    expect(manifest.counters.verificationErrorCount).toBe(1)
   } finally {
     agent.close()
   }

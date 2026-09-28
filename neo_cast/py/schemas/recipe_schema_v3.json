@@ -1342,22 +1342,6 @@
           ],
           "properties": {
             "type": {
-              "const": "direct_multi_horizon"
-            },
-            "output_distribution": {
-              "const": "point"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "type",
-            "output_distribution"
-          ],
-          "properties": {
-            "type": {
               "const": "quantile"
             },
             "output_distribution": {

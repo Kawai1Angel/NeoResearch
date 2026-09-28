@@ -55,9 +55,19 @@ export const SourceLocationSchema = z.object({
   page: z.number().int().positive(), section: z.string().min(1), evidenceSpan: z.string().min(1).max(1500),
 }).strict()
 
+export const MechanismSchema = z.object({
+  mechanismID: z.string().trim().min(1), name: z.string().trim().min(1),
+  principle: z.string().trim().min(12), components: z.array(z.string().trim().min(1)).min(1),
+}).strict()
+
+export function hasCompleteMechanism(value: { problem?: string; mechanism?: unknown }) {
+  return !!value.problem?.trim() && MechanismSchema.safeParse(value.mechanism).success
+}
+
 export const CandidateClaimSchema = z.object({
   candidateID: z.string().min(1), paperID: z.string().min(1), cardType: z.enum(CARD_TYPES),
   claim: z.string().min(8).max(2000), subject: z.string().min(1), predicate: z.string().min(1), object: z.string().min(1),
+  problem: z.string().trim().min(1).optional(), mechanism: MechanismSchema.optional(),
   evidenceType: z.enum(EVIDENCE_TYPES), supportingChunkIDs: z.array(z.string()).min(1),
   sourceLocations: z.array(SourceLocationSchema).min(1), extractorConfidence: z.number().min(0).max(1),
 }).strict()
@@ -65,6 +75,10 @@ export type CandidateClaim = z.infer<typeof CandidateClaimSchema>
 
 export const EvidenceVerificationSchema = z.object({
   verdict: z.enum(["supported", "partially_supported", "unsupported", "overstated"]),
+  cardTypeVerdict: z.enum(["correct", "mismatch", "uncertain"]).optional(),
+  mechanismVerdict: z.enum(["supported", "incomplete", "unsupported", "not_applicable"]).optional(),
+  contributionVerdict: z.enum(["own_method", "background", "uncertain", "not_applicable"]).optional(),
+  qualityReasons: z.array(z.string()).optional(),
   supportedScope: z.string(), unsupportedParts: z.array(z.string()), correctedClaim: z.string().optional(),
   evidenceDirectness: z.enum(["direct", "indirect", "inferred"]), confidence: z.number().min(0).max(1),
 }).strict()
@@ -126,7 +140,8 @@ export const CardRelationSchema = z.object({
 export type CardRelation = z.infer<typeof CardRelationSchema>
 
 export type RejectionReason =
-  | "no_locatable_evidence" | "claim_too_broad" | "duplicate" | "references_only" | "schema_invalid"
+  | "mechanism_incomplete" | "card_quality_failed" | "selection_budget"
+  | "verification_error" | "no_locatable_evidence" | "claim_too_broad" | "duplicate" | "references_only" | "schema_invalid"
   | "evidence_does_not_support_claim" | "prompt_injection_detected" | "numeric_evidence_missing"
 
 export type RejectedCandidate = { readonly candidate: unknown; readonly reason: RejectionReason; readonly detail: string }

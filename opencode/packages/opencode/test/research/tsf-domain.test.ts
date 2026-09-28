@@ -30,6 +30,53 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 describe("TSF research domain", () => {
+  test("validates secondary encoders for both composition types before creating a run", () => {
+    const task = Research.DomainRegistry.createTaskSpec("tsf", { ...taskSpec, runtime: { bridgeOnly: false } })
+    const primary = {
+      ...validTransformerCandidate(),
+      recipeVersion: "recipe_schema_v3",
+      representation: { layout: "channel_latent", readout: "none", latentDim: 64 },
+    }
+    const embedding = { type: "multiscale_patch", dModel: 64, scales: [{ patchLen: 24, stride: 12 }, { patchLen: 48, stride: 24 }] }
+    const compositions: Research.JsonRecord[] = [
+      { type: "parallel_two_branch", merge: "forecast_step_gate" },
+      { type: "decomposition_two_branch", kernelSize: 25 },
+    ]
+    const backbones: Research.JsonRecord[] = [
+        { type: "tcn", hiddenDim: 64, nLayers: 3, kernelSize: 3 },
+        { type: "nbeats", hiddenDim: 64, nBlocks: 2, nLayers: 2 },
+        { type: "dlinear", kernelSize: 25 },
+        { type: "timesnet_lite", hiddenDim: 64, nLayers: 2, topK: 2, kernelSize: 3 },
+    ]
+    for (const composition of compositions) {
+      for (const backbone of backbones) {
+        const candidateSpec = {
+          ...primary,
+          composition: { ...composition, secondary: { backbone, embedding, representation: primary.representation } },
+        }
+        const invalid = Research.DomainRegistry.validateCandidate("tsf", { taskSpec: task, candidateSpec })
+        expect(invalid.ok).toBe(false)
+        expect(invalid.issues).toContainEqual(expect.objectContaining({
+          path: "composition.secondary.embedding.type",
+          message: `backbone.type='${backbone.type}' requires embedding.type='none'`,
+        }))
+        expect(Research.DomainRegistry.validateCandidate("tsf", {
+          taskSpec: task,
+          candidateSpec: { ...candidateSpec, composition: { ...candidateSpec.composition, secondary: { ...candidateSpec.composition.secondary, embedding: { type: "none" } } } },
+        }).ok).toBe(true)
+      }
+      const result = Research.DomainRegistry.validateCandidate("tsf", {
+        taskSpec: task,
+        candidateSpec: {
+          ...primary,
+          composition: { ...composition, secondary: { backbone: { type: "linear" }, embedding: { ...embedding, scales: [{ patchLen: 192, stride: 12 }, { patchLen: 48, stride: 24 }] }, representation: primary.representation } },
+        },
+      })
+      expect(result.ok).toBe(false)
+      expect(result.issues.some((item) => item.path.startsWith("composition.secondary.embedding.scales"))).toBe(true)
+    }
+  })
+
   test("defaults dataset splitting to 7:1:2 and validates explicit row ranges", () => {
     const normalized = TSFTaskSpec.parse(taskSpec)
     expect(normalized.dataset.split).toEqual({ method: "ratio", ratios: [7, 1, 2] })
@@ -99,7 +146,7 @@ describe("TSF research domain", () => {
     expect(info.actionRegistry.backbone.dlinear.bridgeSupported).toBe(true)
     expect(info.actionRegistry.embedding.invert.bridgeSupported).toBe(true)
     expect(info.actionRegistry.fusion.variate_attention.bridgeSupported).toBe(true)
-    expect(info.actionRegistry.head.direct_multi_horizon.bridgeSupported).toBe(true)
+    expect(info.actionRegistry.head).not.toHaveProperty("direct_multi_horizon")
     expect(info.actionRegistry.scheduler.none.bridgeSupported).toBe(true)
     expect(info.actionRegistry.scheduler.cosine.bridgeSupported).toBe(false)
     expect(info.actionRegistry.scheduler.one_cycle.bridgeSupported).toBe(false)
@@ -691,7 +738,7 @@ describe("TSF research domain", () => {
       embedding: { type: "invert", dModel: 128 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 128, numLayers: 2, dropout: 0.1 },
       fusion: { type: "variate_attention" },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
       trainingStrategy: {
         loss: { base: "mae", horizonWeighting: "tail_heavy" },
         optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
@@ -726,7 +773,7 @@ describe("TSF research domain", () => {
     expect(payload.backbone).toMatchObject({ type: "rnn", cell: "gru", hidden_dim: 128, num_layers: 2 })
     expect(payload.fusion).toMatchObject({ type: "variate_attention",})
     expect(payload.prediction_head).toMatchObject({
-      type: "direct_multi_horizon",
+      type: "linear",
       output_distribution: "point"
     })
     expect(payload.training_strategy).toMatchObject({
@@ -1122,7 +1169,7 @@ describe("TSF research domain", () => {
       embedding: { type: "frequency", nFreq: 8, complexMode: "magnitude", dModel: 32 },
       backbone: { type: "mixer", hiddenDim: 64, depth: 2, temporalMixing: "mlp", channelMixing: "mlp", dropout: 0.1 },
       fusion: { type: "gated_hybrid", gateType: "channel" },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
       trainingStrategy: priorTraining,
     }
     const acceptedInvert = {
@@ -1133,7 +1180,7 @@ describe("TSF research domain", () => {
       embedding: { type: "invert", dModel: 64 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
       fusion: { type: "variate_attention" },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
       trainingStrategy: priorTraining,
     }
 
@@ -1228,7 +1275,7 @@ describe("TSF research domain", () => {
       embedding: { type: "invert", dModel: 64 },
       backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
       fusion: { type: "variate_attention" },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
       trainingStrategy: priorTraining,
     }
     const taskFingerprint = {

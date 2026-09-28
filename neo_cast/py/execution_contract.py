@@ -179,8 +179,7 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
         factory.ResidualCorrectionHead: "residual_correction",
         factory.QuantilePointHead: "quantile",
         factory.GaussianPointHead: "gaussian",
-        LinearHead: "linear",
-        DirectMultiHorizonHead: "direct_multi_horizon",
+        factory.LinearHead: "linear",
     }.get(type(model.prediction_head), "unknown")
     ordered = latent if isinstance(latent, factory.OrderedChannelMixer) else mixer
     return {
@@ -217,9 +216,6 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
         "output_channels": model.num_output_channels,
         "num_parameters": sum(p.numel() for p in model.parameters()),
     }
-
-
-from factory.build_model import LinearHead, DirectMultiHorizonHead
 
 
 def compare(contract: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:

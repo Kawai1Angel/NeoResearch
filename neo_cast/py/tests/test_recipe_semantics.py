@@ -38,7 +38,7 @@ class RecipeSemanticsTest(unittest.TestCase):
                 self.assertTrue(any(field in error and unexpected in error for error in errors), errors)
 
     def test_complete_head_distribution_loss_matrix(self) -> None:
-        for head in ("linear", "direct_multi_horizon", "residual_correction", "quantile", "gaussian"):
+        for head in ("linear", "residual_correction", "quantile", "gaussian"):
             expected = head if head in {"quantile", "gaussian"} else "point"
             for distribution in ("point", "quantile", "gaussian"):
                 for loss in ("mse", "mae", "huber", "distillation", "quantile", "gaussian_nll"):

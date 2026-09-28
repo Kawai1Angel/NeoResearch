@@ -1,3 +1,5 @@
+import { projectCitedTaskEvidence } from "../retrieve/evidence-handoff"
+import type { TaskEvidenceBundle } from "../retrieve/contract"
 import type { DomainCandidateProposal, DomainCandidateRanking } from "../domain"
 import type {
   JsonRecord,
@@ -269,6 +271,7 @@ export function selectHypothesisForDesign(plan: ExperimentPlan | undefined): Hyp
 }
 
 export function buildModelDesignerTaskFingerprint(input: {
+  readonly taskEvidence?: TaskEvidenceBundle
   readonly baseFingerprint: JsonRecord
   readonly hypothesisPlan?: ExperimentPlan
   readonly selectedHypothesis?: HypothesisObject
@@ -289,6 +292,9 @@ export function buildModelDesignerTaskFingerprint(input: {
         ]
   return {
     ...input.baseFingerprint,
+    ...(input.selectedHypothesis?.literatureEvidence?.length ? {
+      taskEvidence: projectCitedTaskEvidence(input.taskEvidence, input.selectedHypothesis.literatureEvidence),
+    } : {}),
     searchBiases: unique([
       ...baseBiases,
       ...planBiases,

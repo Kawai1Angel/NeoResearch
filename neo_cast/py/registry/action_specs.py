@@ -44,7 +44,6 @@ ACTION_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     },
     "head": {
         "linear": {"phase_min": "phase0b", "bridge_supported": True},
-        "direct_multi_horizon": {"phase_min": "phase2", "bridge_supported": False},
         "quantile": {"phase_min": "phase2", "bridge_supported": False},
         "gaussian": {"phase_min": "phase2", "bridge_supported": False},
         "residual_correction": {"phase_min": "phase2", "bridge_supported": False},
@@ -238,7 +237,6 @@ def validate_recipe_against_registry(
             errors.append("fusion.topology_artifact is only supported for static adjacency")
     allowed_distribution = {
         "linear": {"point"},
-        "direct_multi_horizon": {"point"},
         "residual_correction": {"point"},
         "quantile": {"quantile"},
         "gaussian": {"gaussian"},

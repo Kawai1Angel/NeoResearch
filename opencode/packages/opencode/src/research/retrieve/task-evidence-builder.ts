@@ -1,3 +1,4 @@
+import { hasCompleteMechanism } from "../literature/contract"
 import { createHash } from "crypto"
 import taskEvidenceConfig from "./config/tsf-task-evidence.v1.json" with { type: "json" }
 import type { CardRelation, KnowledgeCard } from "../literature/contract"
@@ -117,6 +118,11 @@ function addRole(entry: TaskEvidenceEntry, role: TaskEvidenceRole): TaskEvidence
   return TaskEvidenceEntrySchema.parse({ ...entry, roles: unique([...entry.roles, role]) })
 }
 
+function coversIntent(entry: TaskEvidenceEntry, intent: RetrievalIntent) {
+  return entry.linkage.intentIDs.includes(intent.intentID) &&
+    (!/how|mechanism|address/i.test(intent.question) || entry.roles.includes("supports_mechanism"))
+}
+
 function selectEntries(input: {
   readonly entries: readonly TaskEvidenceEntry[]
   readonly intents: readonly RetrievalIntent[]
@@ -141,10 +147,10 @@ function selectEntries(input: {
     return entryQualityRank(left, right) ||
       rightDiversity - leftDiversity || entryRank(left, right)
   })
-  const orderedIntents = [...input.intents].toSorted((a, b) => b.priority - a.priority || a.intentID.localeCompare(b.intentID))
-  for (const intent of orderedIntents.filter((item) => item.mustCover)) {
-    if (selected.some((entry) => entry.linkage.intentIDs.includes(intent.intentID))) continue
-    for (const candidate of rankRemaining().filter((entry) => entry.linkage.intentIDs.includes(intent.intentID))) {
+  const orderedIntents = [...input.intents].toSorted((a, b) => Number(b.mustCover) - Number(a.mustCover) || b.priority - a.priority || a.intentID.localeCompare(b.intentID))
+  for (const intent of orderedIntents) {
+    if (selected.some((entry) => coversIntent(entry, intent))) continue
+    for (const candidate of rankRemaining().filter((entry) => coversIntent(entry, intent))) {
       if (add(candidate)) break
     }
   }
@@ -190,6 +196,10 @@ function gapReason(input: {
 }
 
 export function buildTaskEvidence(input: {
+  readonly componentRelations?: TaskEvidenceBundle["mechanismRelations"]
+  readonly consolidation?: TaskEvidenceBundle["consolidation"]
+  readonly paperTitles?: Readonly<Record<string, string>>
+  readonly semanticGroups?: readonly { cardIDs: readonly string[]; rationale: string }[]
   readonly retrieveRunID: string
   readonly quantitativeReportArtifactID: string
   readonly report: DatasetQuantitativeAnalysis
@@ -243,9 +253,17 @@ export function buildTaskEvidence(input: {
         excluded.push(exclude(cardID, card.paperID, "no_direct_exact_evidence", "No direct exact-span paper evidence was available."))
         continue
       }
+      if (card.cardType === "model_mechanism" && !hasCompleteMechanism(card)) {
+        excluded.push(exclude(cardID, card.paperID, "mechanism_incomplete", "Legacy/incomplete mechanism requires source-based re-extraction."))
+        continue
+      }
+      if (card.cardType === "model_mechanism" && !["evidence_verifier_v3", "evidence_verifier_v4"].includes(card.provenance.verifierPromptVersion ?? "")) {
+        excluded.push(exclude(cardID, card.paperID, "card_validation_required", "Mechanism has not passed the current typed verification rule."))
+        continue
+      }
       const bindings = bindCardToIntents({
         card,
-        intentIDs: literature.intentIDs,
+        intentIDs: unique(input.candidates.filter((candidate) => candidate.paperID === card.paperID).map((candidate) => candidate.intentID)),
         intents: input.intents,
         transformations: input.transformations,
         taskType: input.taskContext.taskType,
@@ -286,6 +304,9 @@ export function buildTaskEvidence(input: {
         cardType: card.cardType,
         cardStatus: card.status,
         claim: card.claim,
+        paperTitle: input.paperTitles?.[card.paperID],
+        problem: card.problem,
+        mechanism: card.mechanism,
         linkage: {
           intentIDs,
           candidateIDs,
@@ -305,6 +326,7 @@ export function buildTaskEvidence(input: {
           .filter((item) => item.evidenceType !== "agent_inference")
           .map((item) => ({
             evidenceID: item.evidenceID,
+            evidenceSpan: item.evidenceSpan,
             chunkID: item.chunkID,
             section: item.section,
             pageStart: item.pageStart,
@@ -328,12 +350,6 @@ export function buildTaskEvidence(input: {
   const relations = input.knowledgeSource.listRelations()
     .filter((relation) => entryByCard.has(relation.sourceCardID) && entryByCard.has(relation.targetCardID))
     .toSorted((left, right) => left.relationID.localeCompare(right.relationID))
-  for (const relation of relations.filter((item) => item.relationType === "duplicates")) {
-    const source = entryByCard.get(relation.sourceCardID)!
-    const target = entryByCard.get(relation.targetCardID)!
-    const winner = betterDuplicate(source, target)
-    duplicateLosers.add(winner.cardID === source.cardID ? target.cardID : source.cardID)
-  }
   for (const relation of relations.filter((item) => item.relationType === "contradicts")) {
     const source = entryByCard.get(relation.sourceCardID)
     const target = entryByCard.get(relation.targetCardID)
@@ -350,9 +366,55 @@ export function buildTaskEvidence(input: {
       ]) },
     })
   }
+  // Merge equivalent operations before quota selection, never parent/component relations.
+  // Preserve canonical cards and their revision-specific source evidence in the handoff.
+  const groups = [...(input.semanticGroups ?? []), ...relations
+    .filter((item) => item.relationType === "duplicates")
+    .map((item) => ({ cardIDs: [item.sourceCardID, item.targetCardID], rationale: item.rationale }))]
+  const canonical = new Map<string, string>()
+  const resolve = (id: string): string => canonical.has(id) ? resolve(canonical.get(id)!) : id
+  for (const group of groups) {
+    const members = unique(group.cardIDs.map(resolve)).map((id) => entryByCard.get(id))
+      .filter((entry): entry is TaskEvidenceEntry => !!entry && !duplicateLosers.has(entry.cardID))
+    if (members.length < 2) continue
+    const winner = members.reduce(betterDuplicate)
+    for (const member of members) {
+      if (member.cardID === winner.cardID || member.paperID !== winner.paperID || member.cardType !== winner.cardType) continue
+      const a = input.knowledgeSource.getCard(member.cardID)!
+      const b = input.knowledgeSource.getCard(winner.cardID)!
+      // Different applicability or contradictory claims are not interchangeable evidence.
+      const safeTaskScope = [member, winner].every((entry) =>
+        entry.applicability.violatedConditions.length === 0 && entry.applicability.uncertainConditions.length === 0)
+      if ((!safeTaskScope && stableJson(a.applicability) !== stableJson(b.applicability)) ||
+          stableJson(a.notApplicableWhen) !== stableJson(b.notApplicableWhen) ||
+          relations.some((relation) => relation.relationType === "contradicts" &&
+            [member.cardID, winner.cardID].includes(relation.sourceCardID) &&
+            [member.cardID, winner.cardID].includes(relation.targetCardID))) continue
+      winner.mergedSources = [...(winner.mergedSources ?? []), {
+        cardID: member.cardID, cardRevision: member.cardRevision,
+        claim: member.claim, problem: member.problem, mechanism: member.mechanism,
+        rationale: group.rationale,
+        applicability: a.applicability,
+        evidenceRefs: a.evidence.filter((item) => item.directness === "direct" && item.verification === "exact_span")
+          .map(({ evidenceID, chunkID, evidenceSpan, section, pageStart, pageEnd }) => ({ evidenceID, chunkID, evidenceSpan, section, pageStart, pageEnd })),
+      }, ...(member.mergedSources ?? [])]
+      winner.limitations = unique([...winner.limitations, ...member.limitations])
+      for (const key of Object.keys(winner.linkage) as Array<keyof TaskEvidenceEntry["linkage"]>) {
+        winner.linkage[key] = unique([...winner.linkage[key], ...member.linkage[key]])
+      }
+      winner.roles = [...new Set([...winner.roles, ...member.roles])]
+      winner.relevance = {
+        score: Math.max(winner.relevance.score, member.relevance.score),
+        matchedTerms: unique([...winner.relevance.matchedTerms, ...member.relevance.matchedTerms]),
+        reasons: unique([...winner.relevance.reasons, ...member.relevance.reasons]),
+      }
+      canonical.set(member.cardID, winner.cardID)
+      duplicateLosers.add(member.cardID)
+    }
+  }
   for (const cardID of duplicateLosers) {
     const entry = entryByCard.get(cardID)!
-    excluded.push(exclude(cardID, entry.paperID, "duplicate_claim", "A stronger duplicate KnowledgeCard was retained."))
+    excluded.push(exclude(cardID, entry.paperID, "duplicate_claim", `Equivalent mechanism retained with source trace in ${[...entryByCard.values()].find((value) => value.mergedSources?.some((source) => source.cardID === cardID))?.cardID ?? "representative"}.`))
   }
   const deduplicated = [...entryByCard.values()].filter((entry) => !duplicateLosers.has(entry.cardID))
   const selection = selectEntries({ entries: deduplicated, intents: input.intents, budgets: input.budgets })
@@ -379,7 +441,7 @@ export function buildTaskEvidence(input: {
       confidence: relation.confidence,
     }))
   const gaps = [...input.intents].toSorted((a, b) => a.intentID.localeCompare(b.intentID)).flatMap((intent) => {
-    if (selection.entries.some((entry) => entry.linkage.intentIDs.includes(intent.intentID))) return []
+    if (selection.entries.some((entry) => coversIntent(entry, intent))) return []
     const transformation = transformationByID.get(intent.transformationID)
     if (!transformation) throw new Error(`Retrieval intent references an unknown transformation: ${intent.intentID}`)
     const reason = gapReason({
@@ -398,7 +460,7 @@ export function buildTaskEvidence(input: {
     }]
   })
   const coveredIntentCount = input.intents.filter((intent) =>
-    selection.entries.some((entry) => entry.linkage.intentIDs.includes(intent.intentID)),
+    selection.entries.some((entry) => coversIntent(entry, intent)),
   ).length
   const uncoveredMustCoverIntentCount = gaps.filter((gap) => gap.mustCover).length
   const highConfidenceCriticalConflict = conflicts.some((conflict) =>
@@ -419,6 +481,16 @@ export function buildTaskEvidence(input: {
         : "ready_with_evidence"
   return TaskEvidenceBundleSchema.parse({
     schemaVersion: "task_evidence_bundle_v1",
+    consolidation: input.consolidation,
+    mechanismRelations: (input.componentRelations ?? []).flatMap((relation) => {
+      const representative = (id: string) => selection.entries.find((entry) => entry.cardID === id ||
+        entry.mergedSources?.some((source) => source.cardID === id))?.cardID
+      const parentCardID = representative(relation.parentCardID)
+      const componentCardID = representative(relation.componentCardID)
+      return parentCardID && componentCardID && parentCardID !== componentCardID
+        ? [{ ...relation, parentCardID, componentCardID }] : []
+    }).filter((relation, index, all) => all.findIndex((item) => item.parentCardID === relation.parentCardID &&
+      item.componentCardID === relation.componentCardID) === index),
     retrieveRunID: input.retrieveRunID,
     taskID: input.report.taskID,
     quantitativeReportArtifactID: input.quantitativeReportArtifactID,

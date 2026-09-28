@@ -344,7 +344,7 @@ missing_mask must be first, with mask_channel=true and cross-variable fusion; st
 - embedding: none, patch, multiscale_patch, invert, frequency, calendar
 - backbone: linear, mlp, transformer, temporal_conv, dlinear, nbeats, timesnet_lite, rnn, gated_depthwise_conv, mixer
 - fusion: temporal, feature_mlp, variate_attention, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
-- prediction_head: linear, direct_multi_horizon, quantile, gaussian, residual_correction
+- prediction_head: linear, quantile, gaussian, residual_correction
 - output_distribution: point, quantile, gaussian
 - loss: mse, mae, huber, quantile, distillation, gaussian_nll
 - optimizer: adam, adamw, or sgd
@@ -374,7 +374,6 @@ Action parameters:
 - fusion graph: { "type": "graph", "adjacency_source": "learned"|"static"|"correlation", "sparsity": 0.1 }
 - fusion gated_hybrid: { "type": "gated_hybrid", "gate_type": "learned"|"scalar"|"channel"|"time" }
 - prediction_head linear: { "type": "linear", "output_distribution": "point"}
-- prediction_head direct_multi_horizon: { "type": "direct_multi_horizon", "output_distribution": "point"}
 - prediction_head quantile: { "type": "quantile", "output_distribution": "quantile", "quantiles": [0.1, 0.5, 0.9] }
 - prediction_head gaussian: { "type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.000001 }
 - prediction_head residual_correction: { "type": "residual_correction", "output_distribution": "point", "correction_dim": 32|64|128 }

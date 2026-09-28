@@ -1,5 +1,7 @@
 # ModelRecipe v3 实施说明
 
+
+> 2026-09-27 更新：删除 `direct_multi_horizon`（schema、registry、工厂及搜索入口）；旧配置明确拒绝，不转换为其他 head。`gated_depthwise_conv` / `timesnet_lite` 保留请求的偶数卷积核，以非对称 padding 保持长度。候选仅对缺失字段补默认值，显式非法值和不兼容 embedding 返回校验错误供 agent 修正。旧偶数核 checkpoint 不自动转换，需重训。
 日期：2026-09-23。高层版本为 `model_recipe.v2`，执行版本为 `recipe_schema_v3`，运行时 revision 为 3。旧 v1/v2 输入和旧 revision 2 checkpoint 不作静默升级。
 
 ## 模型与组合

@@ -1,6 +1,10 @@
 import type { LiteratureProgress } from "../literature-phase-executor"
 import { createHash } from "crypto"
 import path from "path"
+import { mkdir, writeFile } from "node:fs/promises"
+import { consolidateMechanisms, SEMANTIC_CONSOLIDATION_VERSION } from "../literature/semantic-consolidator"
+import type { KnowledgeCard } from "../literature/contract"
+import { EVIDENCE_VALIDATION_VERSION } from "../literature/evidence-verifier"
 import { LiteratureAgent } from "../literature/literature-agent"
 import type { LiteratureExtractionModel } from "../literature/extraction-model"
 import { KnowledgeStore } from "../literature/knowledge-store"
@@ -155,10 +159,13 @@ export class RetrieveAgent {
           }
         : this.config.literatureAgent ? "external_bridge" : "disabled",
       versions: {
+        evidenceValidation: EVIDENCE_VALIDATION_VERSION,
         scientific: SCIENTIFIC_CONCEPT_MAPPING_VERSION,
         method: METHOD_CONCEPT_MAPPING_VERSION,
         paperLanguage: PAPER_LANGUAGE_MAPPING_VERSION,
         taskEvidence: TASK_EVIDENCE_MAPPING_VERSION,
+        semanticConsolidation: SEMANTIC_CONSOLIDATION_VERSION,
+        semanticReviewer: this.config.literatureModel?.reviewMechanisms ? this.config.literatureModel.modelIdentifier : "unavailable",
       },
     })
     const retrieveRunID = `retrieve_${runDigest.slice(0, 16)}`
@@ -170,6 +177,7 @@ export class RetrieveAgent {
       intent,
       searchBM25(index, intent, budgets.maxCandidatesPerIntent),
       budgets.maxLiteraturePapersPerIntent,
+      normalizedTaskContext.context.objective.probabilistic,
     ))
     const selectedCandidates = selectBridgeCandidates(candidates, budgets)
     return { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
@@ -203,7 +211,23 @@ export class RetrieveAgent {
     const literatureResults = [...bridge.papers, ...skippedPapers(candidates)]
       .toSorted((left, right) => left.paperID.localeCompare(right.paperID))
     await this.config.onProgress?.({ step: "assemble_evidence", status: "running" })
+    const cards = [...new Set(literatureResults.flatMap((paper) => paper.acceptedCardIDs))]
+      .map((id) => this.knowledgeSource.getCard(id)).filter((card): card is KnowledgeCard => !!card)
+    const semanticReview = await consolidateMechanisms(cards,
+      this.config.literatureModel?.reviewMechanisms?.bind(this.config.literatureModel))
+    const reviewDirectory = path.join(this.retrievalRoot, "runs", retrieveRunID)
+    await mkdir(reviewDirectory, { recursive: true })
+    await writeFile(path.join(reviewDirectory, "semantic_consolidation.json"), JSON.stringify(semanticReview, null, 2))
     const taskEvidence = buildTaskEvidence({
+      semanticGroups: semanticReview.groups,
+      componentRelations: semanticReview.papers.flatMap((paper) => paper.review?.componentRelations ?? []),
+      consolidation: {
+        version: semanticReview.version,
+        reviewedPapers: semanticReview.papers.filter((paper) => paper.status === "reviewed").map((paper) => paper.paperID),
+        failedPapers: semanticReview.papers.filter((paper) => paper.status === "failed").map((paper) => paper.paperID),
+        unavailablePapers: semanticReview.papers.filter((paper) => paper.status === "unavailable").map((paper) => paper.paperID),
+      },
+      paperTitles: Object.fromEntries(index.documents.map((document) => [document.paperID, document.title])),
       retrieveRunID,
       quantitativeReportArtifactID,
       report,
@@ -251,6 +275,8 @@ export class RetrieveAgent {
           method: METHOD_CONCEPT_MAPPING_VERSION,
           paperLanguage: PAPER_LANGUAGE_MAPPING_VERSION,
           taskEvidence: TASK_EVIDENCE_MAPPING_VERSION,
+        semanticConsolidation: SEMANTIC_CONSOLIDATION_VERSION,
+        semanticReviewer: this.config.literatureModel?.reviewMechanisms ? this.config.literatureModel.modelIdentifier : "unavailable",
         },
         taskContext: normalizedTaskContext.context,
         taskContextDigest: contextDigest,

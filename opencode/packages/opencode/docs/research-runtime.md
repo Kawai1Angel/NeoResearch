@@ -18,6 +18,14 @@ The `src/research/runtime.ts` module provides the contract and local filesystem 
 
 The immediate path remains useful for local development and deterministic integration tests. The worker path separates scheduling, execution, worker heartbeats, retry/dead-letter handling, and DB synchronization enough to exercise the Research OS loop on one machine.
 
+## Autonomous execution contract recovery
+
+TSF candidate validation checks both the primary encoder and the secondary encoder before starting a subprocess. Secondary branches follow the same backbone, embedding, patch scale, and representation rules as standalone encoders. Invalid ModelDesigner output is returned to the agent through validation feedback, with up to three design attempts. Missing v2 fields may receive defaults, but explicit invalid numeric values, malformed modules, and incompatible embeddings are rejected. Both session and direct LLM transports preserve field paths and reasons in repair feedback. The removed `direct_multi_horizon` head is rejected in both recipe versions, without conversion to another head.
+
+During an autonomous iteration, an execution contract violation first triggers ModelDesigner recovery instead of a human approval. The invalid run remains invalid and contributes no metrics. The agent receives the rejected candidate, contract differences, and runner error; it produces a replacement under the original hypothesis. The replacement must pass normal candidate validation and a fresh verified smoke run before full training. Recovery is limited to two replacement attempts within the iteration, and artifacts record the outcome and replacement identity. Agent recovery does not change runtime verification rules or the evaluation protocol.
+
+If the replacement attempts still violate the contract, the task pauses and creates a protocol checkpoint with the errors and attempt count. If the agent cannot produce a valid design after its design retries, the model-design checkpoint requests human help. Explicit single-run execution and existing human checkpoints retain their approval and re-verification behavior.
+
 ## Runtime Contracts
 
 `runtime.ts` defines production-facing interfaces that can be implemented later without changing domain planning:

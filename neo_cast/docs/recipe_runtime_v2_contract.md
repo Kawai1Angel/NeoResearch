@@ -1,5 +1,7 @@
 # Recipe runtime v2 合同
 
+
+> 2026-09-27 更新：删除 `direct_multi_horizon`（schema、registry、工厂及搜索入口）；旧配置明确拒绝，不转换为其他 head。`gated_depthwise_conv` / `timesnet_lite` 保留请求的偶数卷积核，以非对称 padding 保持长度。候选仅对缺失字段补默认值，显式非法值和不兼容 embedding 返回校验错误供 agent 修正。旧偶数核 checkpoint 不自动转换，需重训。
 本文冻结 semantic correction plan 批次三的设计检查点。
 
 - Proposal 使用 `recipe_schema_v2`；ModelRecipe DSL 仍为 `model_recipe.v1`，编译到 v2。checkpoint 必须带 `runtime_semantics_revision=2`，缺失或不匹配时要求重训。

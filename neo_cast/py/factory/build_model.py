@@ -216,10 +216,6 @@ ACTION_FIELDS = {
             "type",
             "output_distribution"
         ],
-        "direct_multi_horizon": [
-            "type",
-            "output_distribution"
-        ],
         "quantile": [
             "type",
             "output_distribution",
@@ -854,11 +850,10 @@ class NBeatsCore(nn.Module):
 class TimesBlockLite(nn.Module):
     def __init__(self, *, hidden_dim: int, top_k: int, kernel_size: int, dropout: float) -> None:
         super().__init__()
-        if kernel_size % 2 == 0:
-            kernel_size += 1
+        self.kernel_size = kernel_size
         self.top_k = top_k
         self.conv = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, padding=kernel_size // 2),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, padding=kernel_size // 2 if kernel_size % 2 else 0),
             nn.GELU(),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
         )
@@ -889,6 +884,10 @@ class TimesBlockLite(nn.Module):
         pad_len = target_len - length
         padded = F.pad(x, (0, 0, 0, pad_len)) if pad_len else x
         grid = padded.reshape(batch_size, target_len // period, period, hidden_dim).permute(0, 3, 1, 2)
+        if self.kernel_size % 2 == 0:
+            left = (self.kernel_size - 1) // 2
+            right = self.kernel_size - 1 - left
+            grid = F.pad(grid, (left, right, left, right))
         y = self.conv(grid).permute(0, 2, 3, 1).reshape(batch_size, target_len, hidden_dim)
         return y[:, :length, :]
 
@@ -935,14 +934,13 @@ class TimesNetLiteCore(nn.Module):
 class GatedDepthwiseConvBlock(nn.Module):
     def __init__(self, *, hidden_dim: int, kernel_size: int, dropout: float) -> None:
         super().__init__()
-        if kernel_size % 2 == 0:
-            kernel_size += 1
+        self.kernel_size = kernel_size
         self.norm = nn.LayerNorm(hidden_dim)
         self.depthwise = nn.Conv1d(
             hidden_dim,
             hidden_dim,
             kernel_size=kernel_size,
-            padding=kernel_size // 2,
+            padding=kernel_size // 2 if kernel_size % 2 else 0,
             groups=hidden_dim,
         )
         self.gate = nn.Linear(hidden_dim, hidden_dim)
@@ -952,7 +950,11 @@ class GatedDepthwiseConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         y = self.norm(x)
-        y = self.depthwise(y.transpose(1, 2)).transpose(1, 2)
+        y = y.transpose(1, 2)
+        if self.kernel_size % 2 == 0:
+            left = (self.kernel_size - 1) // 2
+            y = F.pad(y, (left, self.kernel_size - 1 - left))
+        y = self.depthwise(y).transpose(1, 2)
         y = torch.tanh(y) * torch.sigmoid(self.gate(y))
         return residual + self.dropout(self.out(y))
 
@@ -1010,16 +1012,6 @@ class TokenMixerBlock(nn.Module):
 
 class LinearHead(nn.Linear):
     """The sole latent-to-horizon projection for a point forecast."""
-
-
-class DirectMultiHorizonHead(nn.Module):
-    def __init__(self, latent_dim: int, horizon: int) -> None:
-        super().__init__()
-        width = max(8, min(latent_dim, 32))
-        self.towers = nn.ModuleList([nn.Sequential(nn.Linear(latent_dim, width), nn.GELU(), nn.Linear(width, 1)) for _ in range(horizon)])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([tower(x) for tower in self.towers], dim=-1)
 
 
 class ChannelLinear(nn.Module):
@@ -1605,8 +1597,8 @@ class RecipeModel(nn.Module):
 
     def _build_prediction_head(self) -> nn.Module:
         head_type = self.head_cfg["type"]
-        if head_type in {"linear", "direct_multi_horizon"}:
-            return LinearHead(self.latent_dim, self.horizon) if head_type == "linear" else DirectMultiHorizonHead(self.latent_dim, self.horizon)
+        if head_type == "linear":
+            return LinearHead(self.latent_dim, self.horizon)
         if head_type == "residual_correction":
             return ResidualCorrectionHead(
                 latent_dim=self.latent_dim,

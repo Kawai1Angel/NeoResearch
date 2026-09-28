@@ -4,6 +4,21 @@ import type { CardRelation } from "../../../src/research/literature/contract"
 import { TaskEvidenceBundleSchema } from "../../../src/research/retrieve/contract"
 import { validateHypothesisEvidence, type HypothesisObject } from "../../../src/research/agents/hypo-planner-agent"
 
+test("legacy long horizon labels are equivalent only in horizon applicability", () => {
+  const source = frequencyCard()
+  const bundle = fixture({ cards: [frequencyCard({ applicability: { ...source.applicability, horizonProfile: ["long"] } })] }).build()
+  expect(bundle.entries[0]!.applicability.violatedConditions).not.toContain("horizonProfile:long")
+  expect(bundle.entries[0]!.applicability.matchedConditions).toContain("horizonProfile:long_horizon")
+})
+
+test("protocol cards cannot satisfy mechanism questions even when scientific terms match", () => {
+  const value = fixture({ cards: [frequencyCard({ cardType: "evaluation_protocol" })] })
+  for (const intent of value.intents) intent.question = "How does the mechanism address this data phenomenon?"
+  expect(value.build().entries).toHaveLength(0)
+  for (const intent of value.intents) intent.question = "Which evaluation metrics are appropriate?"
+  expect(value.build().entries[0]!.roles).toEqual(["defines_evaluation"])
+})
+
 test("eligibility states and direct exact evidence cannot be bypassed", () => {
   for (const status of ["extracted", "inconclusive", "deprecated"] as const) {
     const value = fixture({ cards: [frequencyCard({ status })] }).build()
@@ -69,7 +84,7 @@ test("equal-quality evidence favors another paper under a tight budget", () => {
 })
 
 test("must-cover intents are covered before spending the budget on redundant evidence", () => {
-  const alpha = frequencyCard({ cardID: "kc_aaaaaaaaaaaa", claim: "Alpha mechanism", normalizedClaim: { subject: "alpha", predicate: "uses", object: "alpha" }, mechanism: undefined, tags: ["alpha"] })
+  const alpha = frequencyCard({ cardID: "kc_aaaaaaaaaaaa", claim: "Alpha mechanism", normalizedClaim: { subject: "alpha", predicate: "uses", object: "alpha" }, mechanism: { mechanismID: "alpha", name: "alpha", principle: "Apply alpha to the input sequence", components: ["alpha"] }, tags: ["alpha"] })
   const duplicate = { ...alpha, cardID: "kc_bbbbbbbbbbbb" }
   const beta = { ...alpha, cardID: "kc_cccccccccccc", claim: "Beta mechanism", normalizedClaim: { subject: "beta", predicate: "uses", object: "beta" }, tags: ["beta"] }
   const value = fixture({ cards: [alpha, duplicate, beta], budgets: { maxTaskEvidenceEntries: 2 } })
@@ -150,6 +165,8 @@ test("binds an eligible card to semantic intents and expands exact provenance", 
 
 test("does not let domain-only or high BM25 matches bypass the evidence gate", () => {
   const domainOnly = frequencyCard({
+    cardType: "empirical_finding",
+    problem: undefined,
     claim: "Electricity load benchmark results are reported for a utility dataset.",
     normalizedClaim: { subject: "electricity_load", predicate: "reports", object: "benchmark" },
     mechanism: undefined,
@@ -251,4 +268,29 @@ test("keeps support and refinement provenance and prefers the refined card under
   const supported = fixture({ cards: [general, specific], relations: [{ ...relation, relationType: "supports" }] }).build()
   expect(supported.entries).toHaveLength(2)
   expect(supported.entries.some((entry) => entry.relevance.reasons.some((reason) => reason.includes("supports:")))).toBe(true)
+})
+
+test("legacy mechanism cards require complete fields and current validation", () => {
+  const incomplete = fixture({ cards: [frequencyCard({ mechanism: undefined })] }).build()
+  expect(incomplete.excluded[0]!.reasons).toContain("mechanism_incomplete")
+  const old = frequencyCard()
+  old.provenance.verifierPromptVersion = "evidence_verifier_v2"
+  expect(fixture({ cards: [old] }).build().excluded[0]!.reasons).toContain("card_validation_required")
+})
+
+test("warnings alone do not cover a mechanism question", () => {
+  const result = fixture({ cards: [frequencyCard({ cardType: "limitation" })] }).build()
+  expect(result.entries.length).toBeGreaterThan(0)
+  expect(result.summary.coveredIntentCount).toBe(0)
+  expect(result.gaps.length).toBeGreaterThan(0)
+})
+
+test("reading under another intent does not hide eligible cards with existing recall provenance", () => {
+  const value = fixture()
+  const expected = value.build().entries[0]!.linkage.intentIDs
+  const other = value.intents.find((intent) => !expected.includes(intent.intentID))!
+  value.literatureResults[0]!.intentIDs = [other.intentID]
+  const actual = value.build().entries[0]!
+  expect(actual.linkage.intentIDs).toEqual(expected)
+  expect(actual.linkage.candidateIDs.every((id) => value.candidates.some((candidate) => candidate.candidateID === id))).toBe(true)
 })

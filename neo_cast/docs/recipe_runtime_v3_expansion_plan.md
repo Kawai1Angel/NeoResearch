@@ -27,7 +27,7 @@
 - 用 probe 相似度证明任意两个模型数学等价。
 - 将现有 `gated_depthwise_conv`、`timesnet_lite` 改名冒充新增模型。
 
-`direct_multi_horizon` 仍表示一个固定 H 内多个预测步的输出结构，不表示跨 H 共享。
+2026-09-27 更正：`direct_multi_horizon` 已按用户要求删除，旧候选不迁移为其他 head。此前关于它的描述不再是当前可用能力。
 
 ## 2. 当前实现基线与需要改变的位置
 

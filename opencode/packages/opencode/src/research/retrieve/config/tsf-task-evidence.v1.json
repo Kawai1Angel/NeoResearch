@@ -20,24 +20,98 @@
     "data"
   ],
   "aliases": {
-    "forecasting": ["forecast", "prediction", "predictive"],
-    "seasonality": ["seasonal", "periodic", "periodicity"],
-    "multiple_seasonalities": ["multi periodic", "multiple periods", "multi scale frequency"],
-    "trend_dynamics": ["trend", "detrending", "long term evolution"],
-    "non_stationarity": ["nonstationary", "non stationary", "distribution shift"],
-    "potential_structural_break": ["change point", "changepoint", "regime transition"],
-    "covariate_conditioning": ["exogenous", "known future covariate", "covariate fusion"],
-    "cross_series_dependency": ["cross variable", "channel mixing", "inter series"],
-    "lead_lag_relationship": ["lead lag", "lag aware", "lagged covariate"],
-    "contaminated_observations": ["outlier", "robust", "heavy tailed"],
-    "incomplete_observations": ["missing", "masked", "incomplete"],
-    "irregular_sampling": ["irregular", "continuous time", "time gap"],
-    "long_horizon_dependency": ["long horizon", "long range", "multi horizon"],
-    "frequency_multiscale": ["frequency domain", "multi scale", "spectral"],
-    "seasonal_decomposition": ["decomposition", "trend seasonal"],
-    "adaptive_normalization": ["adaptive normalization", "shift aware"],
-    "cross_variable_modeling": ["cross attention", "channel mixing"],
-    "continuous_time_modeling": ["continuous time", "time gap encoding"]
+    "forecasting": [
+      "forecast",
+      "prediction",
+      "predictive"
+    ],
+    "seasonality": [
+      "seasonal",
+      "periodic",
+      "periodicity"
+    ],
+    "multiple_seasonalities": [
+      "multi periodic",
+      "multiple periods",
+      "multi scale frequency"
+    ],
+    "trend_dynamics": [
+      "trend",
+      "detrending",
+      "long term evolution"
+    ],
+    "non_stationarity": [
+      "nonstationary",
+      "non stationary",
+      "distribution shift"
+    ],
+    "potential_structural_break": [
+      "change point",
+      "changepoint",
+      "regime transition",
+      "regime shifting",
+      "regime change",
+      "regime switching",
+      "structural breaks"
+    ],
+    "covariate_conditioning": [
+      "exogenous",
+      "known future covariate",
+      "covariate fusion"
+    ],
+    "cross_series_dependency": [
+      "cross variable",
+      "channel mixing",
+      "inter series"
+    ],
+    "lead_lag_relationship": [
+      "lead lag",
+      "lag aware",
+      "lagged covariate",
+      "lagged correlation",
+      "lagged cross correlation"
+    ],
+    "contaminated_observations": [
+      "outlier",
+      "robust",
+      "heavy tailed"
+    ],
+    "incomplete_observations": [
+      "missing",
+      "masked",
+      "incomplete"
+    ],
+    "irregular_sampling": [
+      "irregular",
+      "continuous time",
+      "time gap"
+    ],
+    "long_horizon_dependency": [
+      "long horizon",
+      "long range",
+      "multi horizon"
+    ],
+    "frequency_multiscale": [
+      "frequency domain",
+      "multi scale",
+      "spectral"
+    ],
+    "seasonal_decomposition": [
+      "decomposition",
+      "trend seasonal"
+    ],
+    "adaptive_normalization": [
+      "adaptive normalization",
+      "shift aware"
+    ],
+    "cross_variable_modeling": [
+      "cross attention",
+      "channel mixing"
+    ],
+    "continuous_time_modeling": [
+      "continuous time",
+      "time gap encoding"
+    ]
   },
   "dataScale": {
     "smallMaxRows": 4999,

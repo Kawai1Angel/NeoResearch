@@ -113,7 +113,7 @@ function benchmarkInvertTsfCandidateSpec() {
     embedding: { type: "invert", dModel: 64 },
     backbone: { type: "rnn", cell: "gru", hiddenDim: 96, numLayers: 2, dropout: 0.1 },
     fusion: { type: "variate_attention" },
-    predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
+    predictionHead: { type: "linear", outputDistribution: "point" },
     trainingStrategy: {
       loss: { base: "huber", horizonWeighting: "tail_heavy", delta: 1 },
       optimizer: { type: "adamw", lr: 0.0005, weightDecay: 0.01 },
@@ -4762,7 +4762,7 @@ describe("Research service", () => {
           embedding: "frequency",
           backbone: "mixer",
           fusion: "gated_hybrid",
-          predictionHead: "direct_multi_horizon",
+          predictionHead: "linear",
           outputDistribution: "point",
           loss: "huber",
           optimizer: "adamw",

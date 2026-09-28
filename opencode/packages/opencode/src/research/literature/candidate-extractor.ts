@@ -1,5 +1,5 @@
 import {
-  CARD_TYPES, CandidateClaimSchema, type CandidateClaim, type DocumentChunk,
+  CARD_TYPES, hasCompleteMechanism, CandidateClaimSchema, type CandidateClaim, type DocumentChunk,
 } from "./contract"
 import type { LiteratureExtractionModel } from "./extraction-model"
 
@@ -15,7 +15,7 @@ const SECTION_CARD_TYPES: Readonly<Record<DocumentChunk["sectionKind"], readonly
   limitations: ["limitation", "applicability_rule"],
   conclusion: ["limitation", "applicability_rule", "model_mechanism"],
   references: [],
-  unknown: ["model_mechanism", "limitation"],
+  unknown: CARD_TYPES,
 }
 
 export function extractionPlan(
@@ -39,32 +39,51 @@ export async function extractCandidates(input: {
   readonly includeAgentInference: boolean
 }) {
   const accepted: CandidateClaim[] = []
+  const attempts: Array<{ chunkID: string; attempt: number; values?: unknown[]; error?: string }> = []
   const malformed: Array<{ value: unknown; error: string }> = []
   const failedChunks: Array<{ chunkID: string; error: string }> = []
   for (const item of extractionPlan(input.chunks, input.cardTypes)) {
     try {
       const request = { ...item, paper: input.paper }
-      const values = await input.model.extractCandidates(request).catch(() => input.model.extractCandidates(request))
-      for (const value of values) {
-        const parsed = CandidateClaimSchema.safeParse(value)
-        if (!parsed.success) {
-          malformed.push({ value, error: parsed.error.message })
+      let pending: Array<{ value: unknown; error: string }> = []
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let values: unknown[]
+        try {
+          values = await input.model.extractCandidates({ ...request,
+            ...(attempt ? { repair: { rejected: pending.map((item) => item.value), errors: pending.map((item) => item.error) } } : {}),
+          })
+          attempts.push({ chunkID: item.chunk.chunkID, attempt, values })
+        } catch (error) {
+          attempts.push({ chunkID: item.chunk.chunkID, attempt, error: String(error) })
+          if (attempt === 1) { malformed.push(...pending); throw error }
+          pending = [{ value: null, error: String(error) }]
           continue
         }
-        if (!item.allowedCardTypes.includes(parsed.data.cardType)) {
-          malformed.push({ value, error: `cardType ${parsed.data.cardType} is not allowed in ${item.chunk.sectionKind}` })
-          continue
+        if (attempt && values.length === 0) malformed.push(...pending)
+        pending = []
+        for (const value of values) {
+          const parsed = CandidateClaimSchema.safeParse(value)
+          const error = !parsed.success ? parsed.error.message
+            : !item.allowedCardTypes.includes(parsed.data.cardType) ? `cardType ${parsed.data.cardType} is not allowed in ${item.chunk.sectionKind}`
+            : parsed.data.paperID !== item.chunk.paperID ? "paperID does not match source"
+            : !parsed.data.supportingChunkIDs.includes(item.chunk.chunkID) ||
+              !parsed.data.sourceLocations.some((location) => item.chunk.text.replace(/\s+/g, " ").includes(location.evidenceSpan.replace(/\s+/g, " "))) ? "current chunk must supply a quoted span, not just context"
+            : parsed.data.cardType === "model_mechanism" && !hasCompleteMechanism(parsed.data) ? "mechanism requires problem, principle and components"
+            : undefined
+          if (error || !parsed.success) {
+            pending.push({ value, error: error! })
+            continue
+          }
+          if (!input.includeAgentInference && parsed.data.evidenceType === "agent_inference") continue
+          accepted.push(parsed.data)
         }
-        if (parsed.data.paperID !== item.chunk.paperID) {
-          malformed.push({ value, error: `paperID ${parsed.data.paperID} does not match source ${item.chunk.paperID}` })
-          continue
-        }
-        if (!input.includeAgentInference && parsed.data.evidenceType === "agent_inference") continue
-        accepted.push(parsed.data)
+        if (!pending.length) break
       }
+      malformed.push(...pending)
+
     } catch (error) {
       failedChunks.push({ chunkID: item.chunk.chunkID, error: String(error) })
     }
   }
-  return { candidates: accepted, malformed, failedChunks }
+  return { candidates: accepted, malformed, failedChunks, attempts }
 }

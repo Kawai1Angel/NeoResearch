@@ -1240,8 +1240,6 @@ function formatHeadDetail(head: Record<string, unknown>): string {
   if (type === "quantile") {
     const q = Array.isArray(head.quantiles) ? `q=[${head.quantiles.join(",")}]` : undefined
     if (q) params.push(q)
-  } else if (type === "direct_multi_horizon") {
-    if (head.horizonSpecific ?? head.horizon_specific) params.push("horizon_specific")
   } else if (type === "residual_correction") {
     params.push(fmt("base", head.baseHead ?? head.base_head))
     params.push(fmt("corrDim", head.correctionDim ?? head.correction_dim))

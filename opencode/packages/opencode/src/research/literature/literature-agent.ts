@@ -1,3 +1,4 @@
+import { selectCardBudget } from "./card-budget"
 import type { LiteratureProgress } from "../literature-phase-executor"
 import { createHash } from "crypto"
 import { access, mkdir, readFile, rename, writeFile } from "fs/promises"
@@ -8,7 +9,7 @@ import {
   type LiteratureAgentResult, type RejectedCandidate,
 } from "./contract"
 import { extractCandidates } from "./candidate-extractor"
-import { verifyCandidate } from "./evidence-verifier"
+import { EVIDENCE_VALIDATION_VERSION, verifyCandidate } from "./evidence-verifier"
 import { normalizeCandidate } from "./card-normalizer"
 import { deduplicateCard, mergeCardEvidence } from "./card-deduplicator"
 import type { LiteratureExtractionModel } from "./extraction-model"
@@ -138,7 +139,7 @@ export class LiteratureAgent {
     const taxonomyPath = path.join(this.config.neoCastRoot, "literature_knowledge", "taxonomy.v1.json")
     const taxonomy = await loadTaxonomy(taxonomyPath)
     const versions = {
-      parser: document.parser.version, chunker: "paragraph_chunker_v1", taxonomy: taxonomy.schemaVersion,
+      evidenceValidation: EVIDENCE_VALIDATION_VERSION, parser: document.parser.version, chunker: "paragraph_chunker_v1", taxonomy: taxonomy.schemaVersion,
       candidatePrompt: model.candidatePromptVersion, verifierPrompt: model.verifierPromptVersion,
       model: model.modelIdentifier, knowledgeCardSchema: "knowledge_card_v1",
     }
@@ -201,17 +202,18 @@ export class LiteratureAgent {
     const extracted = await extractCandidates({
       model, chunks, paper, cardTypes: options.cardTypes, includeAgentInference: options.includeAgentInference,
     })
-    const candidates = extracted.candidates.slice(0, options.maxCardsPerPaper)
+    await writeJsonl(path.join(runDir, "extraction_attempts.jsonl"), extracted.attempts)
+    const candidates = extracted.candidates
     const rejected: RejectedCandidate[] = extracted.malformed.map((item) => ({ candidate: item.value, reason: "schema_invalid", detail: item.error }))
     const normalizedCards: KnowledgeCard[] = []
     const verifications: unknown[] = []
     const taxonomySuggestions: string[] = []
     for (const candidate of candidates) {
       await this.config.onProgress?.({ step: "verify", paperID: document.paperID, status: "running" })
-      const verified = await verifyCandidate({ model, candidate, chunks, requireExactEvidenceSpan: options.requireExactEvidenceSpan })
-        .catch((error) => ({ ok: false as const, rejection: { candidate, reason: "evidence_does_not_support_claim" as const, detail: `verifier error: ${String(error)}` } }))
+      const verified = await verifyCandidate({ model, candidate, chunks, sections: document.sections, requireExactEvidenceSpan: options.requireExactEvidenceSpan })
+        .catch((error) => ({ ok: false as const, rejection: { candidate, reason: "verification_error" as const, detail: `verifier error: ${String(error)}` } }))
       if (!verified.ok) { rejected.push(verified.rejection); continue }
-      verifications.push({ candidateID: candidate.candidateID, ...verified.verification })
+      verifications.push({ candidateID: candidate.candidateID, ...verified.verification, canonicalSourceLocations: verified.candidate.sourceLocations, evidenceValidationVersion: EVIDENCE_VALIDATION_VERSION })
       const normalized = normalizeCandidate({
         candidate: verified.candidate, evidence: verified.evidence, verification: verified.verification,
         taxonomy, documentID: document.documentID, documentSha256: document.sourceSha256,
@@ -221,6 +223,7 @@ export class LiteratureAgent {
         verifierPromptVersion: model.verifierPromptVersion, runID, now: new Date().toISOString(),
       })
       normalizedCards.push(KnowledgeCardSchema.parse(normalized.card))
+      Object.assign(verifications[verifications.length - 1] as object, { normalizedCardID: normalized.card.cardID })
       taxonomySuggestions.push(...normalized.taxonomySuggestions)
     }
 
@@ -244,17 +247,26 @@ export class LiteratureAgent {
       }
     }
 
+    const uniqueCards = new Map<string, KnowledgeCard>()
+    for (const card of cardsToSave) {
+      const prior = uniqueCards.get(card.cardID)
+      uniqueCards.set(card.cardID, prior ? mergeCardEvidence(prior, card, prior.revision, card.provenance.updatedAt) : card)
+    }
+    const budget = selectCardBudget([...uniqueCards.values()], options.maxCardsPerPaper)
+    for (const card of budget.omitted) rejected.push({ candidate: card, reason: "selection_budget", detail: "Verified unique card omitted by per-paper storage budget" })
     const savedCards: KnowledgeCard[] = []
     const counters = {
       candidateCount: candidates.length + extracted.malformed.length,
-      acceptedCount: cardsToSave.length, rejectedCount: rejected.length,
-      duplicateCount, warningCount: document.parseWarnings.length + extracted.failedChunks.length,
+      acceptedCount: budget.selected.length, verifiedCount: normalizedCards.length, budgetOmittedCount: budget.omitted.length, rejectedCount: rejected.length,
+      duplicateCount, verificationErrorCount: rejected.filter((item) => item.reason === "verification_error").length,
+      qualityRejectedCount: rejected.filter((item) => item.reason !== "duplicate" && item.reason !== "verification_error" && item.reason !== "selection_budget").length,
+      warningCount: document.parseWarnings.length + extracted.failedChunks.length + rejected.filter((item) => item.reason === "verification_error").length,
     }
-    const status = extracted.failedChunks.length ? "partial" as const : "completed" as const
+    const status = extracted.failedChunks.length || counters.verificationErrorCount ? "partial" as const : "completed" as const
     this.store.transaction(() => {
       for (const item of rejected) this.store.saveRejected(runID, item)
-      for (const card of cardsToSave) savedCards.push(this.store.saveCard(card))
-      for (const relation of relations) this.store.saveRelation(relation)
+      for (const card of budget.selected) savedCards.push(this.store.saveCard(card))
+      for (const relation of relations.filter((item) => this.store.getCard(item.sourceCardID) && this.store.getCard(item.targetCardID))) this.store.saveRelation(relation)
       this.store.finishRun(runID, status, counters, extracted.failedChunks.length ? { failedChunks: extracted.failedChunks } : undefined)
     })
     await this.writeRunArtifacts({
@@ -262,6 +274,12 @@ export class LiteratureAgent {
       cards: savedCards, rejected, taxonomySuggestions: [...new Set(taxonomySuggestions)], counters, reviewPath,
       callRecords: model.drainCallRecords?.() ?? [], failedChunks: extracted.failedChunks,
     })
+    await writeJsonl(path.join(runDir, "card_validation.jsonl"), savedCards.map((card) => ({
+      cardID: card.cardID, revision: card.revision, ruleVersion: EVIDENCE_VALIDATION_VERSION,
+      extractionRunID: runID, verifierPromptVersion: model.verifierPromptVersion,
+      disposition: "accepted", cardType: card.cardType,
+      verificationArtifact: "verification_results.jsonl",
+    })))
     await this.exportCurrentCards()
     return {
       runID, cards: savedCards, duplicateCount,

@@ -31,7 +31,7 @@ class ExecutionContractTests(unittest.TestCase):
             "kernel_size": 3,
             "dropout": 0.0,
         }
-        self.recipe["prediction_head"]["type"] = "direct_multi_horizon"
+        self.recipe["prediction_head"]["type"] = "linear"
         self.config = {
             "recipe": self.recipe,
             "num_channels": 7,

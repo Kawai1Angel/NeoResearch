@@ -20,11 +20,11 @@ from prepare_tsf import _split_bounds_with_cv_override
 
 
 class CvTrainTest(unittest.TestCase):
-    @patch("cv_train.torch.cuda.is_available", return_value=True)
+    @patch("torch.cuda.is_available", return_value=True)
     def test_default_parallelism_serializes_cuda_folds(self, _cuda) -> None:
         self.assertEqual(default_max_parallel_folds(), 1)
 
-    @patch("cv_train.torch.cuda.is_available", return_value=False)
+    @patch("torch.cuda.is_available", return_value=False)
     def test_default_parallelism_keeps_cpu_folds_parallel(self, _cuda) -> None:
         self.assertEqual(default_max_parallel_folds(), 4)
 

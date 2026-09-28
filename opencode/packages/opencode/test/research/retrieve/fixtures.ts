@@ -63,6 +63,8 @@ export function frequencyCard(overrides: Partial<KnowledgeCard> = {}) {
     cardType: "model_mechanism",
     claim: "Frequency-domain modeling captures multiple seasonalities in time series forecasting.",
     normalizedClaim: { subject: "multiple_seasonalities", predicate: "uses", object: "frequency_domain_modeling" },
+    problem: "Multiple seasonal periods coexist in the input series.",
+    provenance: { ...card().provenance, verifierPromptVersion: "evidence_verifier_v3" },
     mechanism: {
       mechanismID: "mechanism_frequency",
       name: "frequency multi-scale modeling",
@@ -84,6 +86,7 @@ export function frequencyCard(overrides: Partial<KnowledgeCard> = {}) {
 }
 
 export function fixture(input?: {
+  semanticGroups?: { cardIDs: string[]; rationale: string }[]
   cards?: KnowledgeCard[]
   acceptedCardIDs?: string[]
   relations?: CardRelation[]
@@ -130,6 +133,8 @@ export function fixture(input?: {
     literatureResults,
     taskContext,
     build: () => buildTaskEvidence({
+      semanticGroups: input?.semanticGroups,
+      paperTitles: { "paper-frequency": "Frequency Study" },
       retrieveRunID: "retrieve_fixture",
       quantitativeReportArtifactID: "researchArtifact_quantitative",
       report: quantitative,

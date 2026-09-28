@@ -40,3 +40,17 @@ test("v3 rejects stale fields and cannot downgrade typed encoders into v2", () =
   expect(TSFCandidateRecipe.safeParse({ ...spec, recipeVersion: "recipe_schema_v2" }).success).toBe(false)
   expect(TSFCandidateRecipe.safeParse({ ...spec, representation: { ...spec.representation, readout: "none" } }).success).toBe(false)
 })
+
+
+test("a valid v3 candidate rejects the removed direct head", () => {
+  const source = JSON.parse(readFileSync(path.join(root, "py/schemas/recipe_mamba.example.json"), "utf8"))
+  delete source.constraints
+  delete source.post_processing
+  const spec = camelizeKnown(source) as any
+  expect(TSFCandidateRecipe.safeParse(spec).success).toBe(true)
+  spec.predictionHead = { type: "direct_multi_horizon", outputDistribution: "point" }
+  const result = TSFCandidateRecipe.safeParse(spec)
+  expect(result.success).toBe(false)
+  if (!result.success) expect(result.error.issues.some((issue) => issue.path[0] === "predictionHead")).toBe(true)
+  expect(() => pruneCandidateSpec(spec)).toThrow()
+})

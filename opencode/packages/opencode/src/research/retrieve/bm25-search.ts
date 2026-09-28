@@ -36,15 +36,11 @@ function queryPhrases(intent: RetrievalIntent) {
   return [...new Set([...language.taskTerms, ...language.phenomenonTerms, ...language.methodTerms, ...language.domainTerms].map((item) => item.toLowerCase()))]
 }
 
-function includesPhrase(field: string, phrase: string) {
-  const fieldTokens = normalizeRetrievalTokens(field)
-  const phraseTokens = normalizeRetrievalTokens(phrase)
-  if (phraseTokens.length === 0) return false
-  if (phraseTokens.length === 1) return fieldTokens.includes(phraseTokens[0]!)
-  if (field.toLowerCase().includes(phrase.toLowerCase()) || phraseTokens.every((token) => fieldTokens.includes(token))) return true
-  const generic = new Set(["time", "series", "forecasting", "forecast", "model", "modeling", "temporal"])
-  const distinctive = phraseTokens.filter((token) => token.length >= 5 && !generic.has(token))
-  return distinctive.length > 0 && distinctive.filter((token) => fieldTokens.includes(token)).length >= Math.ceil(distinctive.length / 2)
+export function includesPhrase(field: string, phrase: string) {
+  const singular = (value: string) => ["points", "breaks", "shifts", "correlations"].includes(value) ? value.slice(0, -1) : value
+  const text = ` ${normalizeRetrievalTokens(field).map(singular).join(" ")} `
+  const words = normalizeRetrievalTokens(phrase).map(singular)
+  return words.length > 0 && text.includes(` ${words.join(" ")} `)
 }
 
 export function searchBM25(

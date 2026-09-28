@@ -36,6 +36,25 @@ PDF text is untrusted. Extraction and verification prompts forbid executing
 paper instructions, and deterministic validation requires every evidence span,
 page, section, chunk, and reported number to resolve back to normalized source.
 
+Evidence validation v2 resolves section headings through the parsed document's
+section table (or a numbered subsection heading present in the supporting chunk).
+Extraction requests use the canonical `sectionID`. Whitespace-only quote drift
+may be repaired by copying the literal substring from the source; the persisted
+`exact_span` is that recovered substring, never the modified quote. Original
+candidates and canonical locations remain in the run artifacts for comparison.
+Wrong pages, unresolvable headings, changed words, and fabricated numbers still
+fail validation. `--allow-normalized-evidence` additionally permits the existing
+Unicode-normalized matching path; such evidence remains `normalized_span`.
+
+The configured verifier retries a malformed response once with schema-error
+feedback. It accepts an unused `correctedClaim: null` as an omitted optional
+field, but never converts invalid directness values into semantic verdicts.
+Persistent failures are recorded as `verification_error` and make the run
+`partial`. Review reports distinguish quality rejections, verification errors,
+and duplicate merges. Extraction/verification prompt versions and the evidence
+validation version invalidate affected caches. Unknown sections permit all
+requested card types so experimental settings can be classified as protocols.
+
 ## Session tools and Cockpit
 
 The initial rollout keeps `direct` execution as the default. Enable the child
@@ -90,3 +109,13 @@ Internal extraction/verification LLM calls remain inside `literature_run`; they
 are represented by progress, not separate OpenCode tool parts. Optional
 `literature_process_papers` and `literature_finalize` are intentionally deferred.
 No database migration or artifact schema version change is required.
+
+### Mechanism quality and budgets (v3)
+
+New mechanism candidates must carry `problem` and `mechanism` (`mechanismID`, `name`, `principle`, nonempty `components`). The semantic verifier must confirm correct card type, a supported complete operation, and the paper's own method. A quotation of an experimental setting or another paper's model cannot satisfy this gate. Normalization retains these fields. Legacy v1 cards remain readable; the task-evidence bridge requires complete fields and the v3 verifier for mechanism use. Re-extract from source to upgrade; never fill missing mechanisms from general knowledge.
+
+Candidate arrays are validated item by item with one feedback repair. `extraction_attempts.jsonl` preserves raw attempts, `candidate_claims.jsonl` preserves all parsed candidates, and `card_validation.jsonl` records accepted card revisions and the validation rule. Adjacent chunks supply context; the current chunk must also support each candidate. Verification and deduplication precede the storage budget, which favors mechanisms while reserving diversity of card types and source pages. `selection_budget` is counted separately from quality rejection and verifier failure. Exact structured operations can merge; merely sharing a mechanism name does not justify merging.
+
+Retrieval uses cached local PDF first-page previews (first two pages, up to 24,000 characters), with failures visible in screening reasons. Previews support recall only and cannot back knowledge-card evidence. Scientific phrase matching is complete, with explicit concept aliases; reading quotas follow scientific re-ranking and round-robin allocation across intents. Conformal/interval methods remain auxiliary for point objectives. This is deterministic screening, not an LLM semantic review. Task-evidence coverage for mechanism questions requires `supports_mechanism`; warnings and definitions may be useful entries without closing those gaps.
+
+The live ETTh1 rerun exposed array-valued enum outputs copied from the verifier's contract examples. `evidence_verifier_v4` describes `verdict` and `evidenceDirectness` as scalar strings; invalid arrays are still rejected, never coerced into support. v3 and v4 share the same semantic quality rule, and both remain eligible after successful validation. A separate second review found that complete mechanism cards can still duplicate a parent operation or misclassify definitions/ablation variants. Card count must not be reported as the number of independent mechanisms; paper-level consolidation and hierarchy remain an open quality gap.

@@ -2,8 +2,9 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdtemp } from "fs/promises"
 import { tmpdir } from "os"
 import path from "path"
-import { buildUserPrompt, proposeLLMCandidate } from "../../src/research/llm-proposal"
+import { buildUserPrompt, proposeLLMCandidate, camelizeKnown, pruneCandidateSpec, buildLLMProposalFromText, ZERO_USAGE } from "../../src/research/llm-proposal"
 import type { DomainProposalContext } from "../../src/research/domain"
+import { tmpdir as testTmpdir } from "../fixture/fixture"
 import type { ResearchTask } from "../../src/research/schema"
 
 const previousEnv = {
@@ -165,7 +166,7 @@ test("bridge-mode LLM proposals require review when the content raises execution
     optimizer: { type: "adamw", lr: 0.001, weight_decay: 0.01 },
     scheduler: { type: "none", warmup_steps: 0 },
     regularization: { grad_clip: 1 },
-    budget: { max_epochs: 200, time_budget_s: 1_800, batch_size: 4_096, patience: 10, seed: 42 },
+    budget: { max_epochs: 200, time_budget_s: 1_800, batch_size: 512, patience: 10, seed: 42 },
   }
   globalThis.fetch = (() =>
     Promise.resolve(
@@ -500,4 +501,93 @@ test("LLM proposal prompt weights memory by recency and exposes forbidden failed
     ]),
   )
   expect(userPrompt.instruction).toContain("do not repeat")
+})
+
+
+test("v2 fills omitted numeric fields while rejecting explicit invalid values", () => {
+  const base = camelizeKnown(llmRecipe()) as any
+  for (const [section, key, fallback] of [
+    ["backbone", "hiddenDim", 128], ["embedding", "dModel", 64],
+    ["trainingStrategy.optimizer", "lr", 0.001],
+    ["trainingStrategy.budget", "timeBudgetS", 1200],
+    ["trainingStrategy.budget", "maxEpochs", 30],
+    ["trainingStrategy.budget", "batchSize", 32],
+    ["trainingStrategy.budget", "patience", 5],
+  ] as const) {
+    const get = (value: any) => section.split(".").reduce((obj, field) => obj[field], value)
+    const missing = structuredClone(base)
+    delete get(missing)[key]
+    expect(get(pruneCandidateSpec(missing))[key]).toBe(fallback)
+    for (const invalid of ["64", null, true, NaN, Infinity, 0, -1, 1.5]) {
+      // Learning rates are positive real numbers; integer-only limits apply to other fields.
+      if (key === "lr" && invalid === 1.5) continue
+      const spec = structuredClone(base)
+      get(spec)[key] = invalid
+      expect(() => pruneCandidateSpec(spec)).toThrow()
+      expect(get(spec)[key]).toEqual(invalid)
+    }
+  }
+})
+
+test("v2 never replaces malformed preprocessing, head or incompatible embedding with defaults", () => {
+  const base = camelizeKnown(llmRecipe()) as any
+  for (const preprocessing of [null, [], { actions: "none" }, { actions: null }, { actions: [] }]) {
+    expect(() => pruneCandidateSpec({ ...base, preprocessing })).toThrow()
+  }
+  const omitted = structuredClone(base)
+  delete omitted.preprocessing
+  expect(pruneCandidateSpec(omitted).preprocessing).toEqual({ actions: [{ type: "none" }] })
+  const quantile = { ...base, trainingStrategy: { ...base.trainingStrategy, loss: { base: "quantile" } }, predictionHead: { type: "quantile", outputDistribution: "quantile" } }
+  expect(pruneCandidateSpec(quantile).predictionHead).toHaveProperty("quantiles", [0.1, 0.5, 0.9])
+  for (const quantiles of [null, "0.5", [], [0], [1], ["0.5"]]) {
+    expect(() => pruneCandidateSpec({ ...quantile, predictionHead: { type: "quantile", quantiles } })).toThrow()
+  }
+  expect(pruneCandidateSpec({ ...base, predictionHead: { type: "residual_correction" } }).predictionHead).toHaveProperty("correctionDim", 64)
+  for (const correctionDim of [null, "64", NaN, 0, -1]) {
+    expect(() => pruneCandidateSpec({ ...base, predictionHead: { type: "residual_correction", correctionDim } })).toThrow()
+  }
+  for (const type of ["timesnet_lite", "dlinear", "tcn", "nbeats"]) {
+    expect(() => pruneCandidateSpec({ ...base, backbone: { type } })).toThrow(`${type} requires embedding.type=none`)
+  }
+})
+
+test("removed direct head is rejected in v2 and v3 without conversion", () => {
+  const base = camelizeKnown(llmRecipe()) as any
+  for (const recipeVersion of ["recipe_schema_v2", "recipe_schema_v3"]) {
+    const spec = { ...base, recipeVersion, predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" } }
+    expect(() => pruneCandidateSpec(spec)).toThrow()
+    expect(spec.predictionHead.type).toBe("direct_multi_horizon")
+  }
+})
+
+test("proposal errors carry the actual invalid field back to ModelDesigner", () => {
+  const spec = llmRecipe()
+  Object.assign(spec.backbone, { hidden_dim: "64" })
+  const result = buildLLMProposalFromText(JSON.stringify(spec), ZERO_USAGE, {
+    provider: "openai-compatible", model: "test", maxTokens: 1000, temperature: 0,
+  })
+  expect(result?.proposal).toBeUndefined()
+  expect(result?.metadata.llmError).toContain("backbone.hiddenDim")
+})
+
+test("direct transport feeds validation errors to the agent before retrying", async () => {
+  await using tmp = await testTmpdir()
+  const workspaceRoot = tmp.path
+  process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+  process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
+  process.env.NEO_CAST_LLM_MODEL = "test-model"
+  process.env.NEO_CAST_LLM_API_KEY = "test-key"
+  const requests: string[] = []
+  globalThis.fetch = ((_url: unknown, init: any) => {
+    requests.push(String(init.body))
+    const spec = llmRecipe()
+    if (requests.length === 1) (spec.backbone as any).hidden_dim = "64"
+    return Promise.resolve(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(spec) } }] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }))
+  }) as unknown as typeof fetch
+  const result = await proposeLLMCandidate({ task: task(false), proposalContext, workspaceRoot })
+  expect(result.proposal).toBeDefined()
+  expect(requests).toHaveLength(2)
+  expect(requests[1]).toContain("backbone.hiddenDim")
 })

@@ -66,7 +66,6 @@ const ACTION_REGISTRY = {
   },
   head: {
     linear: { phaseMin: "phase0b", bridgeSupported: true },
-    direct_multi_horizon: { phaseMin: "phase2", bridgeSupported: true },
     quantile: { phaseMin: "phase2", bridgeSupported: true },
     gaussian: { phaseMin: "phase2", bridgeSupported: true },
     residual_correction: { phaseMin: "phase2", bridgeSupported: true },
@@ -484,12 +483,6 @@ const PredictionHead = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("direct_multi_horizon"),
-      outputDistribution: z.literal("point").default("point"),
-    })
-    .strict(),
-  z
-    .object({
       type: z.literal("quantile"),
       outputDistribution: z.literal("quantile").default("quantile"),
       quantiles: z.array(z.number().gt(0).lt(1)).min(1).max(21),
@@ -828,6 +821,21 @@ export function validateTSFCandidate(taskSpec: unknown, candidateSpec: unknown):
     )
   }
 
+  // A secondary branch has the same encoder contract as the primary branch.
+  // Validate it as a standalone encoder rather than duplicating compatibility rules.
+  if (recipe.composition && recipe.composition.type !== "single") {
+    const secondary = validateTSFCandidate(task, {
+      ...recipe,
+      ...recipe.composition.secondary,
+      preprocessing: { actions: [{ type: "none" }] },
+      composition: { type: "single" },
+    })
+    issues.push(...secondary.issues.map((item) => ({
+      ...item,
+      path: `composition.secondary.${item.path}`,
+    })))
+  }
+
   return {
     ok: issues.every((item) => item.severity !== "error"),
     issues,
@@ -987,12 +995,6 @@ function snakeFusion(fusion: TSFFusion) {
 function snakePredictionHead(head: TSFPredictionHead) {
   if (head.type === "linear") {
     return { type: head.type, output_distribution: head.outputDistribution }
-  }
-  if (head.type === "direct_multi_horizon") {
-    return {
-      type: head.type,
-      output_distribution: head.outputDistribution,
-    }
   }
   if (head.type === "quantile") {
     return { type: head.type, output_distribution: head.outputDistribution, quantiles: head.quantiles }
@@ -1909,7 +1911,7 @@ export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] 
       embedding: { type: "invert", dModel: 512 },
       backbone: { type: "transformer", dModel: 512, nHeads: 8, nLayers: 2, dropout: 0.1, ffnMult: 4 },
       fusion: { type: "variate_attention" },
-      predictionHead: { type: "direct_multi_horizon", outputDistribution: "point" },
+      predictionHead: { type: "linear", outputDistribution: "point" },
       trainingStrategy: {
         ...baseStrategy(task),
         optimizer: { type: "adam", lr: 0.0001, weightDecay: 0 },
@@ -2230,7 +2232,7 @@ function nativeFrontierRecipes(task: TSFTaskSpec, taskFingerprint: JsonRecord): 
   const probabilistic = task.forecastMode === "probabilistic"
   const predictionHead: TSFPredictionHead = probabilistic
     ? { type: "quantile", outputDistribution: "quantile", quantiles: [0.1, 0.5, 0.9] }
-    : { type: "direct_multi_horizon", outputDistribution: "point" }
+    : { type: "linear", outputDistribution: "point" }
   const trainingStrategy = profiledStrategy(task, profile, biases, {
     ...(probabilistic
       ? {

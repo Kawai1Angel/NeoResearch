@@ -301,7 +301,7 @@ class ActionSensitivityTest(unittest.TestCase):
             metadata = {"runtime_semantics_revision": 2, "dataset_schema_version": "dataset.v1", "input_len": 16, "num_channels": 3, "horizons": [4]}
             (root / "metadata.json").write_text(json.dumps(metadata))
             (root / "preprocess.json").write_text("{}")
-            for head in ("linear", "direct_multi_horizon", "quantile", "gaussian", "residual_correction"):
+            for head in ("linear", "quantile", "gaussian", "residual_correction"):
                 recipe = make_recipe(prediction_head={"type": head, "output_distribution": head if head in {"quantile", "gaussian"} else "point", **({"quantiles": [0.1, 0.5, 0.9]} if head == "quantile" else {}), **({"correction_dim": 8} if head == "residual_correction" else {})})
                 model = self.model(recipe).eval()
                 checkpoint = {"runtime_semantics_revision": 2, "candidate": {"model_config": {"recipe": recipe, "num_channels": 3}}, "state_dicts": {"4": model.state_dict()}, "model_manifests": {"4": {"parameter_graph_digest": parameter_graph_digest(model)}}}

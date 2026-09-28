@@ -1,5 +1,7 @@
 # ModelRecipe / CandidateRecipe 体系说明
 
+> 2026-09-27 更新：用户已要求删除 `direct_multi_horizon`。该 action 已从当前 schema、注册表、工厂和搜索入口移除，旧方案中对其恢复/重新定义的描述不再适用。
+
 > 本文档总结 NeoResearch（neo_cast + opencode）当前的「模型配方」数据结构与流转路径，作为后续开发与 LLM Prompt 设计的参考。
 
 ## 1. 总览：两级配方结构
@@ -193,7 +195,6 @@ interface TSFCandidateRecipe {
 | type | 关键参数 | phase_min | bridge | 输出分布 |
 |---|---|---|---|---|
 | linear | output_distribution | phase0b | ✓ | point |
-| direct_multi_horizon | horizon_specific | phase2 | ✗ | point |
 | quantile | quantiles[] | phase2 | ✗ | quantile |
 | gaussian | variance_floor | phase2 | ✗ | gaussian |
 | residual_correction | base_head, correction_dim | phase2 | ✗ | point |
