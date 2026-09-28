@@ -89,16 +89,20 @@ export async function createLiteraturePhase(input: {
       signal?.throwIfAborted()
       if (progress.cached) cached = true
       await input.onProgress?.(progress)
+      signal?.throwIfAborted()
     } })
     const result = await (async () => {
       snapshot = await runner.prepare({ ...input.run, quantitativeReport: snapshot.report })
+      signal?.throwIfAborted()
       return runner.run({ ...input.run, quantitativeReport: snapshot.report }, snapshot)
     })().finally(() => runner.close())
+    signal?.throwIfAborted()
     const receipt = LiteratureReceiptSchema.parse({ schemaVersion: "literature_tool_receipt_v1", taskID: input.taskID,
       quantitativeReportArtifactID: snapshot.quantitativeReportArtifactID, retrieveRunID: result.retrieveRunID,
       resultDigest: literatureDigest(result), cached, summary: result.summary, readiness: result.taskEvidence.readiness,
       selectedEntryCount: result.taskEvidence.summary.selectedEntryCount, gapCount: result.taskEvidence.gaps.length })
     await validate(receipt)
+    signal?.throwIfAborted()
     return receipt
   })
   return {

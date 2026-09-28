@@ -16,7 +16,9 @@ import type { LiteratureExtractionModel } from "./extraction-model"
 import { DisabledExtractionModel } from "./extraction-model"
 import { KnowledgeStore } from "./knowledge-store"
 import { loadTaxonomy } from "./taxonomy"
-import { renderCardExport, renderReview } from "./report-renderer"
+import { renderCardExport, renderReview, renderPrincipleReview } from "./report-renderer"
+import { extractPaperPrinciples } from "./paper-principle-extractor"
+import type { PrincipleModel } from "./principle-model"
 
 const DEFAULT_CARD_TYPES: CandidateClaim["cardType"][] = [
   "model_mechanism", "empirical_finding", "applicability_rule", "limitation", "evaluation_protocol", "implementation_hint",
@@ -79,6 +81,34 @@ export class LiteratureAgent {
 
   async parseOnly(source: LiteratureAgentInput["sources"][number]) {
     return this.config.documentParser?.(source) ?? this.parseSource(source)
+  }
+
+  // Explicit rollout entry point. V2 artifacts do not enter the legacy database,
+  // export index or task handoff until all downstream consumers support v2.
+  async runPrinciples(input: {
+    source: LiteratureAgentInput["sources"][number]
+    model: PrincipleModel
+    verifier?: PrincipleModel
+    signal?: AbortSignal
+    options?: { maxCalls?: number; batchCharacters?: number; maxContextCharacters?: number }
+  }) {
+    input.signal?.throwIfAborted()
+    const parsed = await this.parseOnly(input.source)
+    const document = NormalizedDocumentSchema.parse(JSON.parse(await readFile(parsed.documentPath, "utf8")))
+    const chunks = parseJsonl(await readFile(parsed.chunksPath, "utf8"), DocumentChunkSchema)
+    const runID = `principles_${crypto.randomUUID()}`
+    const result = await extractPaperPrinciples({ ...input, document, chunks, runID })
+    const runPath = path.join(this.knowledgeRoot, "principle-runs", runID)
+    await writeJson(path.join(runPath, "result.json"), result)
+    await writeJsonl(path.join(runPath, "knowledge_cards_v2.jsonl"), result.cards)
+    await atomicWrite(path.join(runPath, "review.md"), renderPrincipleReview(result))
+    await writeJson(path.join(runPath, "manifest.json"), {
+      schemaVersion: "principle_run_manifest_v1", runID, status: result.status, cacheKey: result.cacheKey,
+      documentSha256: document.sourceSha256, resultHash: digest(result),
+      acceptedCount: result.cards.length, rejectedCount: result.rejected.length,
+      publication: "audit_only", completedAt: new Date().toISOString(),
+    })
+    return { ...result, runPath }
   }
 
   async run(input: LiteratureAgentInput): Promise<LiteratureAgentResult> {

@@ -1,5 +1,134 @@
 # LiteratureAgent
 
+## Transferable knowledge v2 rollout
+
+`knowledge-v2-contract.ts` defines separate paper analysis, conditional principle
+candidates, source-bound experiments and `knowledge_card_v2` records. The v1
+contracts below remain the current runtime path until paper-level synthesis,
+storage, downstream consumers and frozen-source replay have been upgraded.
+There is no automatic v1-to-v2 conversion.
+
+`knowledge-v2-validator.ts` checks source identity and exact quotes, assertion
+references, experiment binding and complete semantic-review coverage. Construct
+new records through `finalizeKnowledgeCandidate`, not a schema parse alone.
+Reviews bind to the entire candidate hash; any edit or evidence merge needs a
+fresh independent semantic review. Citation existence does not establish semantic
+support. The validator cannot detect fabricated causal interpretations by string
+matching; the source-reading verifier must assess that explicitly.
+
+Protocols, settings, observations and limitations belong to the principle's
+evidence/context. They have no standalone v2 card type. Mechanisms attributed only
+to extractor inference cannot pass. Performance effects require a comparison
+experiment, while computational or representation claims need not pretend to
+have accuracy evidence. Missing experimental fields remain explicitly unreported.
+
+The explicit `build-principles` command runs the paper-level v2 pipeline:
+
+```bash
+bun run src/research/literature/dev-cli.ts build-principles \
+  --neo-cast-root ../../../../neo_cast --paper-id <paper-id> \
+  --output-root /absolute/separate-audit-root --max-calls 80
+```
+
+It uses the existing configured provider. No configured model is an explicit
+error; use `parse` for parse-only work. `--max-context-characters` limits the whole
+serialized request (default 180000 characters, not tokens); individual collection
+batches default to 24000 characters. Existing provider output-token limits still
+apply. Oversized chunks or requests are recorded as incomplete instead of silently
+truncated. Output-schema repair gets at most one retry per call, counted against
+the call budget. Transport failures stop the paper run except during a targeted
+material repair, where the affected item is staged with its failure reason.
+
+`source-registry.ts` assigns immutable IDs, hashes, page ranges and character
+offsets to contiguous raw source spans. Models select IDs instead of copying
+provenance or rewriting quotations. Assertions can cite several independently
+locatable spans across column/footer interruptions. The wire candidate contains
+source ID strings; hydration restores exact program-owned source objects.
+The source inventory is automatically collected from every explicit sourceIDs
+binding. The main principle text is derived from its primary assertion instead
+of requiring two separately generated copies. Conditions, observed scope and
+boundaries already have direct source bindings; these do not need duplicate
+support rows, but every assertion still receives independent semantic review.
+
+`paper-principle-extractor.ts` builds an outline, collects source-linked materials
+in bounded batches, plans complete principles across the paper, then generates
+one complete principle per request (zero is allowed). This controls response size
+without turning chunks or components into cards. It independently reviews candidates,
+allows one source-based semantic revision, consolidates with explicit lineage,
+then independently verifies every final candidate again. The verifier sees raw
+source chunks and adverse materials, plus results/ablation/setup/limitations chunks
+even when collection did not cite them. Final review failure cannot reuse an
+initial approval. Consolidation returns ID groups, not a repeated copy of every
+card; each necessary merge gets a separate bounded request and final review.
+Missing assertion links or mis-typed scope references can receive a targeted
+binding repair. It can link existing evidence and add explicitly sourced scope
+assertions; it cannot invent evidence IDs or modify experimental values, evidence
+relations or existing claims. The full integrity checks run again, followed by
+independent semantic verification. Invalid drafts are isolated per planned
+principle instead of erasing other candidates.
+
+Review and revision requests carry original text once, with source IDs resolving
+through chunk offsets. Related candidate versions are stored once by content hash;
+original/sibling references reuse those hashes, preserving revised versions and
+all counterevidence without truncation. Audit calls include `inputCharacters`.
+Experimental binding repairs may select existing experiments and their sources,
+but cannot create experiments, change evidence kinds, or alter reported values.
+Missing citation edges can select immutable registered source spans; the program
+assigns new edge IDs and scope assertion IDs. These edges are not new observations
+and still require source-reading verification. A composite principle may be
+supported jointly by multiple evidence units. The same integrity repair applies
+after semantic revision; an invalid revision is isolated to its candidate, while
+transport, budget and cancellation failures retain their existing fatal behavior.
+Experiment source inventories include citations already present in each reported
+field, so separate setup and result spans remain connected without changing values
+or importing sources from a different experiment. Model inputs explicitly label
+zero-based contribution indices; unresolved invalid indices still block acceptance.
+Semantic revision targets disputed assertion text and its dependent descriptions;
+adding a caveat elsewhere does not repair an unchanged overclaim. Review diagnostics
+distinguish missing assertion reviews from assertions reviewed as unsupported.
+Incomplete assertion review coverage or a contradictory verdict receives the same bounded
+response-repair opportunity as malformed JSON. A valid scientific rejection is
+never retried for acceptance, and a persistent protocol failure cannot publish cards.
+
+Verifier v9 separates source fidelity from evidence strength. An `accepted` review
+may contain `qualified` assertions when its typed qualification confirms both
+`sourceFaithful` and `limitationDisclosed`. Limited experiments, author hypotheses,
+unisolated components, missing uncertainty estimates, shared protocols and limited
+scope do not by themselves reject a complete source-backed relationship. These
+qualifications remain in the stored review and report for hypothesis generation.
+Missing mechanisms, fabricated results, wrong experimental bindings, hidden
+counterevidence and unsupported generalization still block acceptance. Historical
+untyped `qualified` verdicts are not automatically promoted; they need a fresh review.
+
+Verifier v10 also permits partial source review. `reviewedSourceIDs` records the
+nonempty subset actually inspected; no complete-source or percentage threshold is
+required. Additional IDs from the same paper’s program-registered analysis sources
+are allowed, including counterevidence not attached to the candidate. Unreviewed source IDs are reported as non-blocking audit metadata, never
+silently marked reviewed. Unknown source IDs still require output repair, and actual
+unsupported claims or omitted counterevidence still fail semantic review. Candidate
+citations remain program-validated against the document regardless of review coverage.
+Changing the verifier version invalidates extraction caches; historical v9 results
+are not relabeled or automatically published under v10.
+
+Malformed materials are individually repaired once or staged. Valid siblings
+survive. `materialGaps` records affected contribution indexes; candidates tied to
+those contributions cannot pass. Unknown gap scope blocks all candidates.
+Independent verified principles can remain in a partial run's **audit output**,
+but that does not authorize active publication. Budget or later fatal execution
+failure still clears the paper's publishable card list.
+
+`LiteratureAgent.runPrinciples` saves `result.json`, `review.md`,
+`knowledge_cards_v2.jsonl` and a completion manifest under `principle-runs/<runID>`.
+The result contains analysis, staged materials, plans, initial/final candidates, dispositions, reviews,
+rejections and model call audit records (response, hashes, usage when available,
+duration and repair errors). These are **audit-only** artifacts: no writes to
+legacy card tables or automatic downstream handoff. Runs have independent IDs;
+cache keys are recorded but cache reuse and active v2 publication are not enabled.
+
+Tests include synthetic pipeline cases and frozen source excerpts from VCformer,
+SparseTSF and RSAP-DFM for line wraps, footers and column interleaving. They do not
+by themselves establish extraction quality on ETTh1's twelve papers.
+
 The Research service runs this module inside the single `literature` phase between
 DataAnalysis and HypoPlanner. Retrieve(pre), Literature(core), and Retrieve(post)
 share the existing validation rules and persisted evidence bundle. The standalone

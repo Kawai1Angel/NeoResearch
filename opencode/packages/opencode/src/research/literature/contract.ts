@@ -1,5 +1,12 @@
 import z from "zod"
 
+// Explicit names keep v1 audit consumers separate from the new principle contract.
+export {
+  KnowledgeCandidateSchema, KnowledgeCardV2Schema, PaperAnalysisSchema, PrincipleReviewSchema,
+  KNOWLEDGE_V2_VERSIONS, KNOWLEDGE_REJECTION_REASONS,
+  type KnowledgeCandidateV2, type KnowledgeCardV2, type PaperAnalysis, type PrincipleReview,
+} from "./knowledge-v2-contract"
+
 export const CARD_TYPES = [
   "model_mechanism", "empirical_finding", "applicability_rule", "limitation",
   "evaluation_protocol", "domain_prior", "implementation_hint",

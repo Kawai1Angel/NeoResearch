@@ -1,0 +1,71 @@
+[
+  {
+    "case": "line_wrap",
+    "document": {
+      "documentID": "doc_23cb18b9d9187a49",
+      "paperID": "tsf-2024-029206a66b16",
+      "sourceSha256": "8a8274f36c0373d3a1d5cb258fb71c1d0be582a4e53132717d2b42884f7095b8"
+    },
+    "chunk": {
+      "chunkID": "chunk_c7760c13ff5ed6eac7d0",
+      "documentID": "doc_23cb18b9d9187a49",
+      "nextChunkID": "chunk_0b07c1bff90821933e77",
+      "ordinal": 0,
+      "pageEnd": 1,
+      "pageStart": 1,
+      "paperID": "tsf-2024-029206a66b16",
+      "previousChunkID": "chunk_7ec796e9dd6ba43bbba4",
+      "schemaVersion": "document_chunk_v1",
+      "sectionID": "section_ae35cb11ddff",
+      "sectionKind": "abstract",
+      "text": "Abstract\n\nThe achievement of Transformer [Vaswani et al., 2017] in\nnatural language processing [Brown et al., 2020] has led to the\nemergence of numerous Transformer variants for time series\nprediction tasks.\n\nThese models have developed various sophisticated atten-\ntion mechanisms and enhancements to the Transformer archi-\ntecture [Zhou et al., 2022a; Wu et al., 2021; Li et al., 2019a;\nZhou et al., 2022b], which demonstrate a remarkable mod-\nelling ability for temporal dependencies in time series data\n[Wen et al., 2023].\n\nHowever, there is an ongoing academic discourse regard-\ning their ability to effectively capture temporal dependen-\ncies [Zeng et al., 2023] which typically embed each time\nstep into a mix-channel token and apply attention mecha-\nnism on every token. Considering that these methods may\noverlook the valuable multivariate relationships, which is\ncrucial for MTS forecasting, researchers have begun to fo-\ncus on ensuring the channel independence and incorporating\nmutual information to explicitly model multivariate correla-\ntions. [Zhang and Yan, 2023; Nie et al., 2023; Yu et al., 2023;\nLiu et al., 2023a].\n\nMultivariate time series (MTS) forecasting has\nbeen extensively applied across diverse domains,\nsuch as weather prediction and energy consump-\ntion.\nHowever, current studies still rely on the\nvanilla point-wise self-attention mechanism to cap-\nture cross-variable dependencies, which is inade-\nquate in extracting the intricate cross-correlation\nimplied between variables. To fill this gap, we pro-\npose Variable Correlation Transformer (VCformer),\nwhich utilizes Variable Correlation Attention (VCA)\nmodule to mine the correlations among variables.\nSpecifically, based on the stochastic process theory,\nVCA calculates and integrates the cross-correlation\nscores corresponding to different lags between\nqueries and keys, thereby enhancing its ability\nto uncover multivariate relationships.\nAddition-\nally, inspired by Koopman dynamics theory, we\nalso develop Koopman Temporal Detector (KTD)\nto better address the non-stationarity in time se-\nries. The two key components enable VCformer\nto extract both multivariate correlations and tem-\nporal dependencies.\nOur extensive experiments\non eight real-world datasets demonstrate the ef-\nfectiveness of VCformer, achieving top-tier per-\nformance compared to other state-of-the-art base-\nline models. Code is available at this repository:\nhttps://github.com/CSyyn/VCformer.",
+      "textSha256": "5fd5cc00dace11a2ff4008631c1516c41183793453b6f99c358d865467956fe8"
+    }
+  },
+  {
+    "case": "interrupted_by_footer",
+    "document": {
+      "documentID": "doc_5524622be9fb9d4e",
+      "paperID": "tsf-2024-3ec5677ab0f7",
+      "sourceSha256": "8c5b74d79711da12c272391e7b39868f213cfda708fb81b51b8ed3332764926c"
+    },
+    "chunk": {
+      "chunkID": "chunk_1345aa87bb3070b8cb37",
+      "documentID": "doc_5524622be9fb9d4e",
+      "nextChunkID": "chunk_15bcb8b292f114cd38bd",
+      "ordinal": 0,
+      "pageEnd": 2,
+      "pageStart": 1,
+      "paperID": "tsf-2024-3ec5677ab0f7",
+      "previousChunkID": "chunk_5f73540643b655bfdf20",
+      "schemaVersion": "document_chunk_v1",
+      "sectionID": "section_5eec914597e5",
+      "sectionKind": "unknown",
+      "text": "1. Introduction\n\narXiv:2405.00946v2 [cs.LG] 3 Jun 2024\n\nTime series forecasting holds significant value in domains\nsuch as traffic flow, product sales, and energy consump-\ntion, as accurate predictions enable decision-makers to\nplan proactively. Achieving precise forecasts typically re-\nlies on powerful yet complex deep learning models, such\nas RNNs (Zhang et al., 2023), TCNs (Bai et al., 2018;\nFranceschi et al., 2019), and Transformers (Wen et al., 2022).\nIn recent years, there has been a growing interest in Long-\nterm Time Series Forecasting (LTSF), which demands mod-\n\n1School of Computer Science and Engineering, South China\nUniversity of Technology, Guangzhou 510006, China 2Peng Cheng\nLaboratory, Shenzhen 518066, China 3College of Information\nScience and Technology, Jinan University, Guangzhou 510632,\nChina. Correspondence to: Weiwei Lin <linww@scut.edu.cn>.\n\nIn this paper, we pioneer the exploration of how to utilize\nthis inherent periodicity and decomposition in data to con-\nstruct specialized lightweight time series forecasting mod-\nels. Specifically, we introduce SparseTSF, an extremely\nlightweight LTSF model. Technically, we propose the Cross-\nPeriod Sparse Forecasting technique (hereinafter referred\nto as Sparse technique). It first downsamples the original\nsequences with constant periodicity into subsequences, then\nperforms predictions on each downsampled subsequence,\nsimplifying the original time series forecasting task into a\ncross-period trend prediction task. This approach yields\ntwo benefits: (i) effective decoupling of data periodicity\nand trend, enabling the model to stably identify and ex-\ntract periodic features while focusing on predicting trend\nchanges, and (ii) extreme compression of the model’s pa-\nrameter size, significantly reducing the demand for computa-\ntional resources. As shown in Figure 1, SparseTSF achieves\nnear state-of-the-art prediction performance with less than\n\nProceedings of the 41 st International Conference on Machine\nLearning, Vienna, Austria. PMLR 235, 2024. Copyright 2024 by\nthe author(s).\n\n1k trainable parameters, which makes it 1∼4 orders of mag-\nnitude smaller than its counterparts.\n\n\u0002\n\u0001\n\u0006\n\u0002\n\n\u0002\n\u0001\n\u0005\n\u0007\n\n\u0002\n\u0001\n\u0005\n\u0002\n\nI n f o r m\ne r ( 2 0 2 1 )\nA u t o f o r m\ne r ( 2 0 2 1 )\nF E D f o r m\ne r ( 2 0 2 2 )\nF i L M\n( 2 0 2 2 )\nP a t c h T S T ( 2 0 2 3 )\nD L i n e a r ( 2 0 2 3 )\nF I T S ( 2 0 2 4 )\n\nS p a r s e T S F ( O u r s )\n\n\u0002\n\u0001\n\u0004\n\u0007\n\n\u0002\n\u0001\n\u0004\n\u0002\n\nMe a n S q u a r e d E r r o r ( M\nS E )\n\npatch strategy, a technique that is prevalently employed in\nthe realm of computer vision (Dosovitskiy et al., 2020; He\net al., 2022). Besides Transformer architectures, Convo-\nlutional Neural Networks (CNNs) and Multilayer Percep-\ntrons (MLPs) are also mainstream approaches, including\nSCINet (Liu et al., 2022a), TimesNet (Wu et al., 2023),\nMICN (Wang et al., 2022), TiDE (Das et al., 2023), and HD-\nMixer (Huang et al., 2024a). Recent studies have shown that\ntransferring pretrained Large Language Models (LLMs) to\nthe time series domain can also yield commendable results\n(Chang et al., 2024; Jin et al., 2023; Xue & Salim, 2023).\nMoreover, recent works have revealed that RNN and GNN\nnetworks can also perform well in LTSF tasks, as exempli-\nfied by SegRNN (Lin et al., 2023b) and CrossGNN (Huang\net al., 2024b).\n\n\u0003\n\u0002\n\u0001\n\u0003\n\u0002\n\u0002\n\u0003\n\u0002\n\u0003\n\u0003\n\u0002\n\u0004\n\u0003\n\u0002\n\u0005\n\u0003\n\u0002\n\u0006\n\u0003\n\u0002\n\u0007\n\u0002\n\u0001\n\u0003\n\u0007\n\nP a r a m\ne t e r s\n\nFigure 1: Comparison of MSE and parameters between\nSparseTSF and other mainstream models on the Electricity\ndataset with a forecast horizon of 720.\n\nIn summary, our contributions in this paper are as follows:\n\n• We propose a novel Cross-Period Sparse Forecasting\ntechnique, which downsamples the original sequences\nto focus on cross-period trend prediction, effectively ex-\ntracting periodic features while minimizing the model’s\ncomplexity and parameter count.",
+      "textSha256": "e42665793910acb8ca519bb8b5b8ee4302e5bcdd05469ba0fcfe9ff9aae6d9f1"
+    }
+  },
+  {
+    "case": "interleaved_columns",
+    "document": {
+      "documentID": "doc_76bef1d55aefa471",
+      "paperID": "tsf-2024-37108a149a78",
+      "sourceSha256": "6164e6129321498c0c9e706fdba5a4627259c6fb1c04ce3d25aab47a2fbb172d"
+    },
+    "chunk": {
+      "chunkID": "chunk_f2f6638a135510ff5e01",
+      "documentID": "doc_76bef1d55aefa471",
+      "nextChunkID": "chunk_2974736a278c3daa82df",
+      "ordinal": 0,
+      "pageEnd": 2,
+      "pageStart": 1,
+      "paperID": "tsf-2024-37108a149a78",
+      "previousChunkID": "chunk_0fa1d60e0e1814cc6c22",
+      "schemaVersion": "document_chunk_v1",
+      "sectionID": "section_0bbd507c0208",
+      "sectionKind": "introduction",
+      "text": "1\nIntroduction\n\nHowever, we believe that two unresolved issues remain.\nFirstly, in the current complex and volatile economic envi-\nronment, the key to the success of the investment model is\nwhether it can judge the macroeconomic state in time and\nintegrate it into the investment decision. Existing machine\nlearning and dynamic factor models struggle to encapsulate\nthis characteristic effectively. [Wei et al., 2023] introduces\nan innovative concept of hierarchical market states, yet the\napproach of broadly categorizing economic features into dis-\ncrete market states and employing black-box integration ap-\npears somewhat imprecise. Secondly, traditional data-driven\nfactor construction is polluted by the low signal-to-noise ratio\nof stock data, making predicting returns accurately difficult.\n\nAsset pricing, a central topic in modern financial research,\nseeks to explain the cross-sectional differences in the ex-\npected returns of different assets. Influenced by the Capi-\ntal Asset Pricing Model (CAPM) [Sharpe, 1964], the Fama-\nFrench three-factor model ushers in the era of factor mod-\neling. This approach conceptualizes stock excess returns as\ncombinations of multiple factor-based returns, with these fac-\ntors symbolizing distinct sources of excess returns. However,\nthe traditional static factor exposure is now being reevaluated\nin favor of dynamic models, acknowledging time-varying\ninfluences on investment performance [Stock and Watson,\n2011]. Unlike linear factor models, machine learning can use\nmulti-layer nonlinear networks, offering a more robust frame-\nwork for capturing complex financial relationships.\n\n∗Corresponding Author\n\nIn this paper, we propose a Regime-Shifting Adaptive\nPosterior Dynamic Factor Model for stock returns prediction\ncalled RSAP-DFM. In our approach, we reshape the rela-\ntionship between factor construction, factor return, and factor\nexposure. We leverage a multi-head attention mechanism to\ndynamically generate and sample factors from normal dis-\ntributions. These factors are crucial components within our\ndynamic factor model (DFM), which is instrumental in pre-\ndicting stock returns. To enhance the precision of current fac-\ntor state identification, we have introduced a novel regime\nrecognition method that is applied distinctively to factor re-\nturns and factor loadings. Specifically, we employ a ”jumping\nencoder” to capture the influence of macroeconomic states\n\ning via deep learning methodologies remains limited. [Mari\nand Mari, 2023] only focuses on energy commodity prices,\nwhile [Wei et al., 2023] learns the hierarchical latent space\nby using a moving-average online learning algorithm to iden-\ntify discrete market institutions. Different from any regime\nswitching approach, we believe that market regime shifts in\ncontinuous intervals and maps explicitly.\n\nderived from historical stock time series data on factor re-\nturns. Additionally, a ”loading encoder” characterizes the in-\nfluence of these macro states on factor loadings and idiosyn-\ncratic returns. Furthermore, we have devised an innovative\nbilevel optimization algorithm for constructing posterior fac-\ntors through adversarial learning, which enhances the robust-\nness of the factor constructions and optimizes their predictive\nreturns. Our findings substantiate the superior performance of\nRSAP-DFM compared to alternative baseline methods. The\ncontributions of our paper are as follows:\n\n1. We propose a stock returns prediction framework named\nRSAP-DFM, which discards the artificial factor construc-\ntion process by constructing factors sampled from the normal\ndistribution and posterior factors constructed by adversarial\nlearning. To the best of our knowledge, we are the first to\npropose gradient-based posterior factor construction and op-\ntimize it in a bilevel form.",
+      "textSha256": "d5bc6cc9877b148c30c932850e64e5b2a4dfacab9e022ece4c83821ed6817392"
+    }
+  }
+]

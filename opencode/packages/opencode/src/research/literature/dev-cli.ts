@@ -3,6 +3,7 @@ import path from "path"
 import { LiteratureAgent } from "./literature-agent"
 import { ConfiguredLLMExtractionModel, DisabledExtractionModel } from "./extraction-model"
 import type { LiteratureAgentInput } from "./contract"
+import { ConfiguredPrincipleModel } from "./principle-model"
 
 function parseArgs(argv: string[]) {
   const command = argv[0]
@@ -50,7 +51,7 @@ function sourceFromFlags(flags: Map<string, string | true>): LiteratureAgentInpu
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
-  if (!args.command) throw new Error("Expected build, parse, validate, export, or show-run")
+  if (!args.command) throw new Error("Expected build, build-principles, parse, validate, export, or show-run")
   const neoCastRoot = path.resolve(flag(args.flags, "neo-cast-root") ?? path.join(process.cwd(), "../../../../neo_cast"))
   const knowledgeRoot = flag(args.flags, "output-root") ? path.resolve(flag(args.flags, "output-root")!) : undefined
   const disabled = new DisabledExtractionModel()
@@ -63,6 +64,19 @@ async function main() {
     ...(flag(args.flags, "python") ? { pythonExecutable: flag(args.flags, "python") } : {}),
   })
   try {
+    if (args.command === "build-principles") {
+      if (args.flags.has("no-llm")) throw new Error("build-principles requires a configured model; use parse for parse-only runs")
+      const model = await ConfiguredPrincipleModel.create({ workspaceRoot: process.cwd(), neoCastRoot })
+      if (!model) throw new Error("No configured principle extraction model")
+      const result = await agent.runPrinciples({ source: sourceFromFlags(args.flags), model,
+        options: {
+          ...(flag(args.flags, "max-calls") ? { maxCalls: Number(flag(args.flags, "max-calls")) } : {}),
+          ...(flag(args.flags, "max-context-characters") ? { maxContextCharacters: Number(flag(args.flags, "max-context-characters")) } : {}),
+        } })
+      console.log(JSON.stringify({ runID: result.runID, runPath: result.runPath, status: result.status,
+        acceptedCount: result.cards.length, rejectedCount: result.rejected.length, errors: result.errors, publication: "audit_only" }))
+      return result.status === "completed" ? 0 : 1
+    }
     if (args.command === "build") {
       const result = await agent.run({
         sources: [sourceFromFlags(args.flags)],
