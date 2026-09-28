@@ -17,7 +17,9 @@ import {
   type RetrieveResult,
   type RetrieveTaskContext,
 } from "./contract"
-import { buildRetrievalCandidates, selectBridgeCandidates } from "./candidate-selector"
+import { buildRetrievalCandidates, CLASSIC_COMPONENT_MAPPING_VERSION, COMPATIBILITY_REVIEW_VERSION, PDF_IDENTITY_SCREEN_VERSION, selectBridgeCandidates, type ModelRecipeCompatibilityReview } from "./candidate-selector"
+import { CLASSIC_LIBRARY_VERSION, CLASSIC_PAPERS, classicPaperName } from "./classic-library"
+import { MODEL_RECIPE_SCREEN_VERSION } from "./model-recipe-screen"
 import { extractDatasetEvidence } from "./dataset-evidence"
 import { runLiteratureBridge, type LiteratureAgentBridgeTarget } from "./literature-bridge"
 import { buildLocalIndex } from "./local-index-builder"
@@ -77,6 +79,7 @@ export type RetrieveAgentInput = {
   readonly maxCardsPerPaper?: number
   readonly catalogPath?: string
   readonly taskContext?: RetrieveTaskContext
+  readonly compatibilityReviews?: readonly ModelRecipeCompatibilityReview[]
 }
 
 export class RetrieveAgent {
@@ -142,12 +145,19 @@ export class RetrieveAgent {
       ...(this.config.knowledgeRoot === undefined ? {} : { knowledgeRoot: this.config.knowledgeRoot }),
       ...(input.catalogPath === undefined ? {} : { catalogPath: input.catalogPath }),
     })
+    const classicDocuments = index.documents.filter((paper) => classicPaperName(paper) !== undefined)
+    const sourceDocuments = index.documents.filter((paper) => classicPaperName(paper) === undefined)
     const reportDigest = digest(report)
     const quantitativeReportArtifactID = input.quantitativeReportArtifactID ?? report.sourceArtifactIDs[0] ?? "unregistered_quantitative_report"
     const runDigest = digest({
       reportDigest,
       quantitativeReportArtifactID,
       indexDigest: index.indexDigest,
+      classicLibrary: { version: CLASSIC_LIBRARY_VERSION, papers: CLASSIC_PAPERS },
+      classicComponentMapping: CLASSIC_COMPONENT_MAPPING_VERSION,
+      compatibilityReview: { version: COMPATIBILITY_REVIEW_VERSION, reviews: input.compatibilityReviews ?? [] },
+      pdfIdentityScreen: PDF_IDENTITY_SCREEN_VERSION,
+      modelRecipeScreen: MODEL_RECIPE_SCREEN_VERSION,
       budgets,
       taskContextDigest: contextDigest,
       maxCardsPerPaper,
@@ -175,9 +185,15 @@ export class RetrieveAgent {
     const intents = buildRetrievalIntents(transformations, budgets.maxIntents)
     const candidates = intents.flatMap((intent) => buildRetrievalCandidates(
       intent,
-      searchBM25(index, intent, budgets.maxCandidatesPerIntent),
+      [
+        ...searchBM25({ documents: sourceDocuments }, intent, budgets.maxCandidatesPerIntent)
+          .map((result) => ({ ...result, recallRoute: "source_catalog" as const })),
+        ...searchBM25({ documents: classicDocuments }, intent, Math.max(budgets.maxCandidatesPerIntent, classicDocuments.length))
+          .map((result) => ({ ...result, recallRoute: "classic_library" as const })),
+      ],
       budgets.maxLiteraturePapersPerIntent,
       normalizedTaskContext.context.objective.probabilistic,
+      input.compatibilityReviews,
     ))
     const selectedCandidates = selectBridgeCandidates(candidates, budgets)
     return { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
@@ -270,6 +286,9 @@ export class RetrieveAgent {
         runDigest,
         reportDigest,
         indexDigest: index.indexDigest,
+        classicLibraryVersion: CLASSIC_LIBRARY_VERSION,
+        classicLibraryPapers: CLASSIC_PAPERS,
+        modelRecipeScreenVersion: MODEL_RECIPE_SCREEN_VERSION,
         mappingVersions: {
           scientific: SCIENTIFIC_CONCEPT_MAPPING_VERSION,
           method: METHOD_CONCEPT_MAPPING_VERSION,

@@ -15,6 +15,7 @@ type IndexedField = keyof typeof FIELD_WEIGHTS
 
 export type BM25SearchResult = {
   readonly paper: IndexedPaper
+  readonly recallRoute?: "source_catalog" | "classic_library"
   readonly rank: number
   readonly score: number
   readonly matchedFields: readonly IndexedField[]

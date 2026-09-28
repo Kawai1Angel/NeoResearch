@@ -177,3 +177,25 @@ test("RetrieveAgent performs one BM25 recall per intent and bridges each paper o
   agent.close()
   knowledge.close()
 })
+
+test("RetrieveAgent recalls the classic library independently of the source catalog route", async () => {
+  await using tmp = await tmpdir()
+  const neoCastRoot = path.join(tmp.path, "neo_cast")
+  const catalogRoot = path.join(neoCastRoot, ".neo-cast", "literature-source", "catalog")
+  await mkdir(catalogRoot, { recursive: true })
+  await writeFile(path.join(catalogRoot, "papers.jsonl"), [
+    { paper_id: "source-frequency", title: "Frequency domain forecasting with multiple seasonalities",
+      publication_status: "peer_reviewed", identifiers: {}, download: { status: "no_public_pdf" } },
+    { paper_id: "classic-patchtst", title: "A Time Series is Worth 64 Words: Long-term Forecasting with Transformers",
+      publication_status: "peer_reviewed", identifiers: { arxiv: "2211.14730" }, download: { status: "no_public_pdf" } },
+  ].map((item) => JSON.stringify(item)).join("\n") + "\n")
+  const agent = new RetrieveAgent({ neoCastRoot, workspaceRoot: tmp.path })
+  try {
+    const prepared = await agent.prepare({ quantitativeReport: report() })
+    expect(prepared.candidates.some((item) => item.paperID === "source-frequency" && item.recallRoute === "source_catalog")).toBe(true)
+    expect(prepared.candidates.some((item) => item.paperID === "classic-patchtst" && item.recallRoute === "classic_library")).toBe(true)
+    expect(prepared.candidates.every((item) => item.paperID !== "classic-patchtst" || item.recallRoute === "classic_library")).toBe(true)
+  } finally {
+    agent.close()
+  }
+})

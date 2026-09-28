@@ -1,9 +1,47 @@
 # RetrieveAgent
 
 `RetrieveAgent` consumes `dataset_quantitative_analysis_v1`, performs deterministic
-evidence-to-concept mapping, runs one local BM25 query per retrieval intent, and
+evidence-to-concept mapping, runs two local BM25 queries per retrieval intent, and
 sends deduplicated local-PDF candidates to `LiteratureAgent` in strict integrated
 mode (`includeAgentInference=false`, exact evidence spans required).
+
+The source-catalog route searches ordinary indexed papers. The classic-library
+route searches the reviewed identity list in `config/classic-papers.v1.json`
+(29 papers spanning normalization, linear/MLP/mixer, patch/Transformer,
+recurrent/probabilistic, frequency, convolution and graph modeling). Each entry
+lists `recipeComponents` from the current TSF action registry. This is a
+retrieval association, not a claim that the whole paper architecture can be
+built from those components or that the listed actions form one legal recipe.
+An arXiv ID or normalized title joins an entry to a local
+catalog record. Both routes use the same local index and PDF checks; a classic
+without a local catalog record or PDF cannot be sent to LiteratureAgent. The
+screen also rejects a catalog entry whose PDF first-page text clearly conflicts
+with its title; its candidate records the identity mismatch as an unusable PDF.
+classic route examines every locally indexed library paper, and the fine screen
+can match a paper to an intent through its reviewed ModelRecipe components when
+the paper title does not contain the intent's exact phrase. Component matches
+are recorded in candidate reasons.
+per-intent reading budget reserves a slot for each route when both have an
+eligible paper. Each candidate records its route, and a paper can be sent only
+once after cross-intent deduplication.
+
+Fine screening rejects a paper with an explicitly identified core mechanism
+that ModelRecipe cannot express, before it consumes a reading slot. The
+`unsupported_model_recipe` decision records the missing action family and
+mechanism in candidate reasons and the run report. The screen uses distinctive
+title terms or author-owned abstract, preview, and method claims; background mentions alone
+do not trigger it. The rule list is intentionally explicit and should be
+reviewed when ModelRecipe adds operators. A generic shared term such as
+`Transformer`, `patch`, or `frequency` is not treated as mechanism equivalence.
+
+`RetrieveAgentInput.compatibilityReviews` can supply model or human reviews
+for partially transferable papers. A `direct` or `adaptable` review retains a
+paper despite a missing exact operator, and the candidate still records that
+operator as unavailable. A `research_only` or `exclude` review filters the
+paper from the reading budget. Reviews must contain the indexed paper ID and its
+source SHA-256; stale reviews have no effect. The review list is part of the
+run digest, so a changed judgment cannot reuse an old retrieval result. A
+missing review leaves the conservative static decision in place.
 
 The Research service exposes the DataAnalysis bridge as:
 

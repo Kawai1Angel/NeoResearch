@@ -152,6 +152,7 @@ export const RetrievalCandidateSchema = z.object({
   paperID: z.string().min(1),
   intentID: z.string().min(1),
   queryText: z.string().min(1),
+  recallRoute: z.enum(["source_catalog", "classic_library"]).optional(),
   bm25: z.object({
     rank: z.number().int().positive(),
     score: FiniteNumber.nonnegative(),
@@ -161,7 +162,7 @@ export const RetrievalCandidateSchema = z.object({
   evidenceLevel: z.enum(["metadata_only", "document_available", "paper_backed"]),
   localPDF: z.boolean(),
   publicationStatus: z.string(),
-  decision: z.enum(["send_to_literature_agent", "retain_candidate", "domain_only", "skipped_pdf_unavailable"]),
+  decision: z.enum(["send_to_literature_agent", "retain_candidate", "domain_only", "skipped_pdf_unavailable", "unsupported_model_recipe"]),
   decisionReasons: z.array(z.string()),
 }).strict()
 export type RetrievalCandidate = z.infer<typeof RetrievalCandidateSchema>
