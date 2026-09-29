@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { includesPhrase, type BM25SearchResult } from "../../../src/research/retrieve/bm25-search"
-import { buildRetrievalCandidates, selectBridgeCandidates } from "../../../src/research/retrieve/candidate-selector"
+import { buildRetrievalCandidates, paperScope, selectBridgeCandidates } from "../../../src/research/retrieve/candidate-selector"
 import { fixture } from "./fixtures"
 import { CLASSIC_PAPERS, classicPaperName } from "../../../src/research/retrieve/classic-library"
 import { unsupportedModelRecipeMechanisms } from "../../../src/research/retrieve/model-recipe-screen"
@@ -17,6 +17,32 @@ test("partial structural match cannot pass the scientific screen", () => {
   const intent = fixture().intents.find((item) => item.intentID.includes("structural_break"))!
   const candidates = buildRetrievalCandidates(intent, [result("Patch-wise Structural Loss", 1)], 5)
   expect(candidates[0]!.decision).toBe("domain_only")
+})
+
+test("fine screening defers vertical papers when a general forecasting paper covers the intent", () => {
+  const intent = fixture().intents.find((item) => item.intentID.includes("structural_break"))!
+  const vertical = result("Job Skill Demand Forecasting under Structural Breaks", 1)
+  const general = result("Time Series Forecasting under Structural Breaks", 2)
+  const candidates = buildRetrievalCandidates(intent, [vertical, general], 2)
+  expect(candidates.find((item) => item.paperID === "paper-1")).toMatchObject({
+    paperScope: "domain_specific", decision: "domain_specific",
+  })
+  expect(candidates.find((item) => item.paperID === "paper-2")).toMatchObject({
+    paperScope: "general", decision: "send_to_literature_agent",
+  })
+  expect(selectBridgeCandidates(candidates, { maxLiteraturePapersTotal: 2 }).map((item) => item.paperID)).toEqual(["paper-2"])
+  expect(buildRetrievalCandidates(intent, [vertical], 2)[0]!.decision).toBe("send_to_literature_agent")
+  expect(paperScope("Are Transformers Effective for Time Series Forecasting?")).toBe("general")
+  expect(paperScope("Stock Trend Prediction Based on Improved GRU")).toBe("domain_specific")
+})
+
+test("global reading budget uses general papers before vertical fallback", () => {
+  const intents = fixture().intents.slice(0, 2)
+  const vertical = buildRetrievalCandidates(intents[0]!, [result("Traffic Forecasting under Structural Breaks", 1)], 1)
+  const general = buildRetrievalCandidates(intents[1]!, [result("General Time Series Forecasting", 2,
+    intents[1]!.paperLanguageQuery.phenomenonTerms.join(" "))], 1)
+  const selected = selectBridgeCandidates([...vertical, ...general], { maxLiteraturePapersTotal: 1 })
+  expect(selected[0]?.paperID).toBe("paper-2")
 })
 
 test("supported feature fusion outranks background mentions while correlation attention is screened", () => {

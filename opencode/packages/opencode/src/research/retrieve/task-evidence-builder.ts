@@ -273,6 +273,12 @@ export function buildTaskEvidence(input: {
         excluded.push(exclude(cardID, card.paperID, "no_intent_match", "No scientific/data-feature or method/mechanism intent match passed the threshold."))
         continue
       }
+      if ((card.cardType === "empirical_finding" || card.cardType === "domain_prior") &&
+        !card.implementation?.registryMappings.length) {
+        excluded.push(exclude(cardID, card.paperID, "non_actionable_observation",
+          "Observation has no explicit ModelRecipe action mapping for a testable model change."))
+        continue
+      }
       const intentIDs = unique(bindings.map((item) => item.intentID))
       const transformations = intentIDs.map((intentID) => {
         const intent = input.intents.find((item) => item.intentID === intentID)

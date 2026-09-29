@@ -650,7 +650,7 @@ export function buildUserPrompt(input: {
           }
         : {}),
       instruction:
-        "Propose a new candidate that is different from existing candidates and suitable for the task; do not repeat forbidden_signatures. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
+        "When taskFingerprint.selectedHypothesis is present, test that exact hypothesis and use one of its suggestedBackbones; historical hypotheses and reflections are context, not alternative selections. Propose a new candidate that is different from existing candidates and suitable for the task; do not repeat forbidden_signatures. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
     }
   return JSON.stringify(
     compactPromptContext(prompt),

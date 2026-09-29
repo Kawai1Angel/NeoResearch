@@ -34,6 +34,14 @@ do not trigger it. The rule list is intentionally explicit and should be
 reviewed when ModelRecipe adds operators. A generic shared term such as
 `Transformer`, `patch`, or `frequency` is not treated as mechanism equivalence.
 
+Fine screening first uses eligible general time-series forecasting papers. A
+paper whose title explicitly focuses on a vertical domain (for example stocks,
+traffic, job skills, or weather) is deferred for that intent when a general
+paper is available. Vertical papers can fill an intent with no eligible general
+paper, after general papers have consumed their reading slots. The candidate
+records its scope and the deferral reason;
+title-based classification is conservative and can be reviewed in the report.
+
 `RetrieveAgentInput.compatibilityReviews` can supply model or human reviews
 for partially transferable papers. A `direct` or `adaptable` review retains a
 paper despite a missing exact operator, and the candidate still records that
@@ -60,6 +68,14 @@ to `task_evidence_bundle.json` and registered as `task_evidence_bundle_json`.
 applicability warnings, and conflicts. Task context and mapping version participate
 in cache identity. Legacy results remain readable through `AnyRetrieveResultSchema`,
 but workflow recovery requires v2 and rebuilds invalid results with `force: true`.
+
+For model-search handoff, an empirical finding or domain prior without an
+explicit ModelRecipe action mapping is excluded as
+`non_actionable_observation`. Such claims can remain in the knowledge store as
+scoped observations, but they do not occupy task evidence slots or support a
+model-design hypothesis merely because they describe a hard dataset regime.
+New literature extractions also require the verifier to identify a source-backed,
+testable intervention before accepting an empirical finding or domain prior.
 
 HypoPlanner consumes the registered bundle without querying KnowledgeStore. Each
 hypothesis carries dataset paths, card IDs/revisions/roles, applicability assumptions,

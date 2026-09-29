@@ -385,3 +385,24 @@ test("buildModelDesignerProposalFromHypotheses assigns low risk for low-priority
   )!
   expect(result.proposal.riskLevel).toBe("low")
 })
+
+
+test("design selection ignores closed hypotheses even when they have higher priority", () => {
+  for (const status of ["abandoned", "rejected", "confirmed"] as const) {
+    const closed = hypothesisForDesign({ id: "closed", status, priority: "high" })
+    const pending = hypothesisForDesign({ id: "pending", status: "pending", priority: "medium" })
+    expect(selectHypothesisFromList([closed, pending])?.id).toBe("pending")
+    expect(selectHypothesisFromList([closed])).toBeUndefined()
+  }
+  expect(selectHypothesisFromList([hypothesisForDesign({ testable: false })])).toBeUndefined()
+})
+
+test("design selection follows the latest equal-priority pivot and exposes its contract", () => {
+  const old = hypothesisForDesign({ id: "old", status: "pending" })
+  const pivot = hypothesisForDesign({ id: "pivot", status: "pending", suggestedBackbones: ["diagonal_ssm"] })
+  const selected = selectHypothesisFromList([old, pivot])
+  expect(selected).toEqual(pivot)
+  const fingerprint = buildModelDesignerTaskFingerprint({ baseFingerprint: {}, selectedHypothesis: selected })
+  expect(fingerprint.searchBiases).toContain("hypothesis:pivot")
+  expect(fingerprint.searchBiases).toContain("prefer_backbone:diagonal_ssm")
+})

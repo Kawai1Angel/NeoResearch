@@ -3,7 +3,7 @@ import { requestEvidenceVerification } from "../../../src/research/literature/ex
 import type { EvidenceVerification } from "../../../src/research/literature/contract"
 import { candidate, chunk } from "./fixtures"
 
-const supported: EvidenceVerification = { cardTypeVerdict: "correct", mechanismVerdict: "not_applicable", contributionVerdict: "not_applicable", verdict: "supported", supportedScope: "ETTh1", unsupportedParts: [], evidenceDirectness: "direct", confidence: 0.9 }
+const supported: EvidenceVerification = { cardTypeVerdict: "correct", mechanismVerdict: "not_applicable", contributionVerdict: "not_applicable", actionabilityVerdict: "testable_intervention", verdict: "supported", supportedScope: "ETTh1", unsupportedParts: [], evidenceDirectness: "direct", confidence: 0.9 }
 const input = { candidate: candidate(), chunks: [chunk()] }
 
 test("nullable unused correction is omitted without changing the verifier verdict", async () => {
@@ -32,13 +32,23 @@ test("persistent schema failures stop after two calls and remain errors", async 
   expect(count).toBe(2)
 })
 
-test("a v3 verifier cannot silently omit typed quality checks", async () => {
+test("verifier cannot silently omit typed quality checks", async () => {
   let calls = 0
   await expect(requestEvidenceVerification(input, async () => {
     calls++
     const { cardTypeVerdict, mechanismVerdict, contributionVerdict, ...legacy } = supported
     return JSON.stringify(legacy)
-  })).rejects.toThrow("v3 verifier")
+  })).rejects.toThrow("verifier must return")
+  expect(calls).toBe(2)
+})
+
+test("empirical verification requires an actionability verdict", async () => {
+  let calls = 0
+  await expect(requestEvidenceVerification(input, async () => {
+    calls++
+    const { actionabilityVerdict, ...missing } = supported
+    return JSON.stringify(missing)
+  })).rejects.toThrow("actionabilityVerdict")
   expect(calls).toBe(2)
 })
 

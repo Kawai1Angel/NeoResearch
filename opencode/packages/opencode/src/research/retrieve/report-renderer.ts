@@ -15,6 +15,7 @@ export function renderRetrieveReport(result: RetrieveResult) {
     `- Source catalog candidates: ${result.candidates.filter((candidate) => candidate.recallRoute !== "classic_library").length}`,
     `- Classic library candidates: ${result.candidates.filter((candidate) => candidate.recallRoute === "classic_library").length}`,
     `- ModelRecipe-incompatible papers screened out: ${new Set(result.candidates.filter((candidate) => candidate.decision === "unsupported_model_recipe").map((candidate) => candidate.paperID)).size}`,
+    `- Domain-specific papers deferred in fine screening: ${new Set(result.candidates.filter((candidate) => candidate.decision === "domain_specific").map((candidate) => candidate.paperID)).size}`,
     `- Papers sent to LiteratureAgent: ${result.summary.literaturePaperCount}`,
     `- Paper-backed cards: ${result.summary.paperBackedCardCount}`,
     `- Missing PDFs: ${result.summary.missingPDFCount}`,
@@ -40,6 +41,9 @@ export function renderRetrieveReport(result: RetrieveResult) {
   const screened = result.candidates.filter((candidate) => candidate.decision === "unsupported_model_recipe")
   if (screened.length === 0) lines.push("- No candidate was excluded for a known unsupported ModelRecipe mechanism.")
   for (const candidate of screened) lines.push(`- ${candidate.paperID} (${candidate.recallRoute ?? "source_catalog"}): ${candidate.decisionReasons.filter((reason) => reason.startsWith("ModelRecipe has no")).join("; ")}`)
+  for (const candidate of result.candidates.filter((item) => item.decision === "domain_specific")) {
+    lines.push(`- ${candidate.paperID} (${candidate.recallRoute ?? "source_catalog"}): ${candidate.decisionReasons.at(-1)}`)
+  }
   lines.push("## Literature bridge", "")
   if (result.literatureResults.length === 0) lines.push("- No paper was sent to LiteratureAgent.")
   for (const paper of result.literatureResults) {

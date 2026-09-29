@@ -11,6 +11,19 @@ test("exact source spans and numeric results are accepted", async () => {
   if (result.ok) expect(result.evidence[0].verification).toBe("exact_span")
 })
 
+test("supported difficulty observation is rejected without a testable intervention", async () => {
+  const source = chunk({ text: "Forecasting on series with structural breaks performs worse than on the full dataset." })
+  const observation = candidate({ claim: source.text, subject: "structural breaks", predicate: "reduce", object: "forecast accuracy",
+    sourceLocations: [{ page: 3, section: source.sectionID, evidenceSpan: source.text }],
+  })
+  const model = new FixtureExtractionModel({}, { cardTypeVerdict: "correct", mechanismVerdict: "not_applicable",
+    contributionVerdict: "not_applicable", actionabilityVerdict: "observation_only", verdict: "supported",
+    supportedScope: "series with structural breaks", unsupportedParts: [], evidenceDirectness: "direct", confidence: 1 })
+  const result = await verifyCandidate({ model, candidate: observation, chunks: [source], requireExactEvidenceSpan: true })
+  expect(result.ok).toBe(false)
+  if (!result.ok) expect(result.rejection.reason).toBe("card_quality_failed")
+})
+
 test("fabricated evidence spans and numbers are rejected deterministically", () => {
   const missingSpan = validateCandidateEvidence(candidate({ sourceLocations: [{ page: 3, section: "Results", evidenceSpan: "Not in the paper." }] }), [chunk()], { requireExactEvidenceSpan: true })
   expect(missingSpan.ok).toBe(false)

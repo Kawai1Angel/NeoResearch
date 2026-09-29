@@ -9,10 +9,13 @@ import { LiteratureAgent } from "./literature/literature-agent"
 import { DocumentChunkSchema } from "./literature/contract"
 
 export function literatureDigest(value: unknown): string {
+  // Receipts describe JSON artifacts. Normalize first so optional undefined
+  // fields hash the same before and after the artifact is written to disk.
+  const serialized = JSON.parse(JSON.stringify(value))
   const stable = (v: unknown): string => Array.isArray(v) ? `[${v.map(stable).join(",")}]`
     : v && typeof v === "object" ? `{${Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => `${JSON.stringify(k)}:${stable(x)}`).join(",")}}`
     : JSON.stringify(v)
-  return createHash("sha256").update(stable(value)).digest("hex")
+  return createHash("sha256").update(stable(serialized)).digest("hex")
 }
 
 export const LiteratureReceiptSchema = z.object({

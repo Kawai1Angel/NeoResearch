@@ -130,6 +130,8 @@ export async function verifyCandidate(input: {
   }
   const verification = await input.model.verifyEvidence(request)
   if (verification.cardTypeVerdict === "mismatch" || verification.cardTypeVerdict === "uncertain" ||
+      ((input.candidate.cardType === "empirical_finding" || input.candidate.cardType === "domain_prior") &&
+       verification.actionabilityVerdict !== "testable_intervention") ||
       (input.candidate.cardType === "model_mechanism" &&
        (verification.cardTypeVerdict !== "correct" || verification.mechanismVerdict !== "supported" || verification.contributionVerdict !== "own_method"))) {
     return { ok: false as const, rejection: { candidate: input.candidate, reason: "card_quality_failed" as const,

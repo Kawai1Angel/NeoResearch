@@ -1,4 +1,4 @@
-import { afterEach, expect } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
@@ -6,7 +6,7 @@ import { Research } from "../../src/research"
 import { Session } from "../../src/session"
 import { SessionPrompt } from "../../src/session/prompt"
 import { Bus } from "../../src/bus"
-import { literatureSession } from "../../src/research/literature-phase-executor"
+import { literatureDigest, literatureSession } from "../../src/research/literature-phase-executor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -17,6 +17,13 @@ import { report } from "./retrieve/fixtures"
 
 afterEach(resetDatabase)
 const it = testEffect(CrossSpawnSpawner.defaultLayer)
+
+test("literature receipt digest matches persisted JSON with optional undefined fields", () => {
+  const memory = { taskID: "task", entries: [{ cardID: "card", problem: undefined, evidence: [undefined] }] }
+  const persisted = JSON.parse(JSON.stringify(memory))
+  expect(literatureDigest(memory)).toBe(literatureDigest(persisted))
+  expect(literatureDigest({ ...persisted, taskID: "other" })).not.toBe(literatureDigest(memory))
+})
 
 for (const scenario of ["tool_only", "reply_failed", "not_started", "bad_receipt"] as const) {
   it.live(`Literature service session: ${scenario}`, () => provideTmpdirInstance((directory) => Effect.gen(function* () {

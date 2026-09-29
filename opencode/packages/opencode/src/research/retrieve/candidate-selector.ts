@@ -9,6 +9,19 @@ import { unsupportedModelRecipeMechanisms } from "./model-recipe-screen"
 export const CLASSIC_COMPONENT_MAPPING_VERSION = "classic_component_mapping_v1"
 export const PDF_IDENTITY_SCREEN_VERSION = "pdf_title_identity_screen_v1"
 export const COMPATIBILITY_REVIEW_VERSION = "model_recipe_compatibility_review_v1"
+export const PAPER_SCOPE_SCREEN_VERSION = "paper_scope_screen_v1"
+
+const DOMAIN_TITLE_PATTERNS = [
+  /\b(?:stock|equity|portfolio|financial market|stock returns?)\b/i,
+  /\b(?:traffic|road network|transportation network|telecommunication|wireless network)\b/i,
+  /\b(?:job skill|employment demand|labor market)\b/i,
+  /\b(?:weather|climate|solar|wind power|electricity load|power demand)\b/i,
+  /\b(?:medical|healthcare|disease|epidemic)\b/i,
+] as const
+
+export function paperScope(title: string): "general" | "domain_specific" {
+  return DOMAIN_TITLE_PATTERNS.some((pattern) => pattern.test(title)) ? "domain_specific" : "general"
+}
 
 export type ModelRecipeCompatibilityReview = {
   readonly paperID: string
@@ -78,21 +91,26 @@ export function buildRetrievalCandidates(
     const transferable = compatibility?.verdict === "direct" || compatibility?.verdict === "adaptable"
     const rejectedByReview = compatibility?.verdict === "research_only" || compatibility?.verdict === "exclude"
     return { result, titleMatches, sourceMatches, componentMatches, auxiliary,
+      scope: paperScope(result.paper.title),
       identityMismatch: pdfTitleMismatch(result.paper),
       unsupported: unsupportedModelRecipeMechanisms(result.paper),
       compatibility, transferable, rejectedByReview,
       relevance: (titleMatches.length ? 10 : 0) + Math.min(sourceMatches.length, 5) +
         (componentMatches.length ? 5 : 0) - (auxiliary ? 20 : 0) }
-  }).toSorted((a, b) => b.relevance - a.relevance || a.result.rank - b.result.rank)
-  const eligible = (item: typeof reviewed[number]) => item.result.paper.localPDF &&
+  }).toSorted((a, b) => Number(a.scope === "domain_specific") - Number(b.scope === "domain_specific") ||
+    b.relevance - a.relevance || a.result.rank - b.result.rank)
+  const eligibleBasic = (item: typeof reviewed[number]) => item.result.paper.localPDF &&
     (item.titleMatches.length > 0 || item.sourceMatches.length > 0 || item.componentMatches.length > 0) &&
     !item.auxiliary && !item.identityMismatch && !item.rejectedByReview &&
     (item.unsupported.length === 0 || item.transferable)
+  const generalAvailable = reviewed.some((item) => item.scope === "general" && eligibleBasic(item))
+  const eligible = (item: typeof reviewed[number]) => eligibleBasic(item) &&
+    (item.scope === "general" || !generalAvailable)
   const sourceAvailable = reviewed.some((item) => eligible(item) && item.result.recallRoute !== "classic_library")
   const classicAvailable = reviewed.some((item) => eligible(item) && item.result.recallRoute === "classic_library")
   let selectedSource = 0
   let selectedClassic = 0
-  return reviewed.map(({ result, titleMatches, sourceMatches, componentMatches, auxiliary, identityMismatch, unsupported, compatibility, transferable, rejectedByReview }) => {
+  return reviewed.map(({ result, titleMatches, sourceMatches, componentMatches, auxiliary, scope, identityMismatch, unsupported, compatibility, transferable, rejectedByReview }) => {
     const scientificOrMethodMatch = titleMatches.length > 0 || sourceMatches.length > 0 || componentMatches.length > 0
     const classic = result.recallRoute === "classic_library"
     let decision: RetrievalCandidate["decision"] = "retain_candidate"
@@ -123,6 +141,9 @@ export function buildRetrievalCandidates(
       decisionReasons.push("no scientific or method phrase matched")
     } else if (auxiliary) {
       decisionReasons.push("retained as auxiliary; not consuming mechanism reading quota")
+    } else if (scope === "domain_specific" && generalAvailable) {
+      decision = "domain_specific"
+      decisionReasons.push("domain-specific paper deferred because an eligible general forecasting paper covers this intent")
     } else if (selected < maxLiteraturePapersPerIntent &&
       (maxLiteraturePapersPerIntent === 1 || (classic
         ? selectedClassic < maxLiteraturePapersPerIntent - (sourceAvailable ? 1 : 0)
@@ -142,6 +163,7 @@ export function buildRetrievalCandidates(
       intentID: intent.intentID,
       queryText: intent.paperLanguageQuery.queryText,
       recallRoute: result.recallRoute ?? "source_catalog",
+      paperScope: scope,
       bm25: { rank: result.rank, score: result.score, matchedFields: result.matchedFields, matchedTerms: result.matchedTerms },
       evidenceLevel: result.paper.evidenceLevel,
       localPDF: result.paper.localPDF,
@@ -181,27 +203,30 @@ export function selectBridgeCandidates(
     }
   }
   const selected: Array<NonNullable<ReturnType<typeof grouped.get>>> = []
-  const intentIDs = [...new Set(candidates.filter((item) => item.decision === "send_to_literature_agent").map((item) => item.intentID))]
-  if (budgets.maxLiteraturePapersTotal >= 2) {
-    // A full first pass over intents can exhaust the total budget before the
-    // second route is read. Reserve one distinct paper per available route.
-    for (const route of ["source_catalog", "classic_library"] as const) {
-      const candidate = candidates.find((item) => item.decision === "send_to_literature_agent" &&
-        (item.recallRoute ?? "source_catalog") === route && !selected.some((paper) => paper.paperID === item.paperID))
-      if (candidate) selected.push(grouped.get(candidate.paperID)!)
+  for (const scope of ["general", "domain_specific"] as const) {
+    const scoped = candidates.filter((item) => item.decision === "send_to_literature_agent" &&
+      (item.paperScope ?? "general") === scope)
+    const intentIDs = [...new Set(scoped.map((item) => item.intentID))]
+    if (selected.length + 2 <= budgets.maxLiteraturePapersTotal) {
+      // Preserve both recall routes within each scope when there is room.
+      for (const route of ["source_catalog", "classic_library"] as const) {
+        const candidate = scoped.find((item) => (item.recallRoute ?? "source_catalog") === route &&
+          !selected.some((paper) => paper.paperID === item.paperID))
+        if (candidate) selected.push(grouped.get(candidate.paperID)!)
+      }
     }
-  }
-  while (selected.length < budgets.maxLiteraturePapersTotal) {
-    let added = false
-    for (const intentID of intentIDs) {
-      if (selected.length >= budgets.maxLiteraturePapersTotal) break
-      // Preserve the scientific re-ranking from buildRetrievalCandidates.
-      const next = candidates.find((item) => item.intentID === intentID && item.decision === "send_to_literature_agent" && !selected.some((paper) => paper.paperID === item.paperID))
-      if (!next) continue
-      selected.push(grouped.get(next.paperID)!)
-      added = true
+    while (selected.length < budgets.maxLiteraturePapersTotal) {
+      let added = false
+      for (const intentID of intentIDs) {
+        if (selected.length >= budgets.maxLiteraturePapersTotal) break
+        const next = scoped.find((item) => item.intentID === intentID &&
+          !selected.some((paper) => paper.paperID === item.paperID))
+        if (!next) continue
+        selected.push(grouped.get(next.paperID)!)
+        added = true
+      }
+      if (!added) break
     }
-    if (!added) break
   }
   return selected
 }

@@ -162,7 +162,8 @@ export const RetrievalCandidateSchema = z.object({
   evidenceLevel: z.enum(["metadata_only", "document_available", "paper_backed"]),
   localPDF: z.boolean(),
   publicationStatus: z.string(),
-  decision: z.enum(["send_to_literature_agent", "retain_candidate", "domain_only", "skipped_pdf_unavailable", "unsupported_model_recipe"]),
+  paperScope: z.enum(["general", "domain_specific"]).optional(),
+  decision: z.enum(["send_to_literature_agent", "retain_candidate", "domain_only", "domain_specific", "skipped_pdf_unavailable", "unsupported_model_recipe"]),
   decisionReasons: z.array(z.string()),
 }).strict()
 export type RetrievalCandidate = z.infer<typeof RetrievalCandidateSchema>
@@ -219,6 +220,7 @@ export const TASK_EVIDENCE_EXCLUSION_REASONS = [
   "status_not_eligible",
   "no_direct_exact_evidence",
   "no_intent_match",
+  "non_actionable_observation",
   "hard_applicability_conflict",
   "duplicate_claim",
   "selection_budget",

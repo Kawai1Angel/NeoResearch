@@ -189,6 +189,24 @@ test("does not let domain-only or high BM25 matches bypass the evidence gate", (
   expect(ineligible.excluded[0]?.reasons).toContain("no_direct_exact_evidence")
 })
 
+test("task evidence excludes observational findings without a testable ModelRecipe action", () => {
+  const observation = frequencyCard({
+    cardType: "empirical_finding",
+    claim: "Forecasting performance is worse when seasonal patterns change.",
+    normalizedClaim: { subject: "forecasting", predicate: "performs_worse", object: "multiple_seasonalities" },
+    mechanism: undefined,
+  })
+  const excluded = fixture({ cards: [observation] }).build()
+  expect(excluded.entries).toHaveLength(0)
+  expect(excluded.excluded[0]?.reasons).toEqual(["non_actionable_observation"])
+  const actionable = frequencyCard({ ...observation,
+    implementation: { recipeConcepts: ["frequency modeling"], registryMappings: ["embedding.frequency"],
+      estimatedComplexity: "medium", notes: ["Compare with a time-domain baseline"] },
+  })
+  const included = fixture({ cards: [actionable] }).build()
+  expect(included.entries.map((item) => item.cardID)).toContain(actionable.cardID)
+})
+
 test("records missing accepted cards without silently dropping them when other provenance is valid", () => {
   const good = frequencyCard()
   const value = fixture({ cards: [good], acceptedCardIDs: [good.cardID, "kc_ffffffffffff"] }).build()

@@ -82,6 +82,7 @@ export type CandidateClaim = z.infer<typeof CandidateClaimSchema>
 
 export const EvidenceVerificationSchema = z.object({
   verdict: z.enum(["supported", "partially_supported", "unsupported", "overstated"]),
+  actionabilityVerdict: z.enum(["testable_intervention", "observation_only", "not_applicable"]).optional(),
   cardTypeVerdict: z.enum(["correct", "mismatch", "uncertain"]).optional(),
   mechanismVerdict: z.enum(["supported", "incomplete", "unsupported", "not_applicable"]).optional(),
   contributionVerdict: z.enum(["own_method", "background", "uncertain", "not_applicable"]).optional(),

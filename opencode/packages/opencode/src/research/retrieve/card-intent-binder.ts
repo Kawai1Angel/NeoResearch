@@ -119,4 +119,4 @@ export function bindCardToIntents(input: {
     .toSorted((left, right) => right.score - left.score || left.intentID.localeCompare(right.intentID))
 }
 
-export const TASK_EVIDENCE_MAPPING_VERSION = `${taskEvidenceConfig.schemaVersion}:binding_v4`
+export const TASK_EVIDENCE_MAPPING_VERSION = `${taskEvidenceConfig.schemaVersion}:binding_v5`

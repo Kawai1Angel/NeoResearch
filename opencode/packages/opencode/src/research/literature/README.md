@@ -143,20 +143,20 @@ From `opencode/packages/opencode`:
 
 ```bash
 bun run src/research/literature/dev-cli.ts parse \
-  --neo-cast-root ../../../../neo_cast --paper-id <paper-id>
+  --neo-cast-root ../../../neo_cast --paper-id <paper-id>
 
 bun run src/research/literature/dev-cli.ts build \
-  --neo-cast-root ../../../../neo_cast --pdf /absolute/paper.pdf \
+  --neo-cast-root ../../../neo_cast --pdf /absolute/paper.pdf \
   --title "Paper title" --publication-status unknown
 
 bun run src/research/literature/dev-cli.ts validate \
-  --neo-cast-root ../../../../neo_cast
+  --neo-cast-root ../../../neo_cast
 
 bun run src/research/literature/dev-cli.ts export \
-  --neo-cast-root ../../../../neo_cast --status paper_backed
+  --neo-cast-root ../../../neo_cast --status paper_backed
 
 bun run src/research/literature/dev-cli.ts show-run <run-id> \
-  --neo-cast-root ../../../../neo_cast
+  --neo-cast-root ../../../neo_cast
 ```
 
 `build` uses the existing Neo-Cast LLM configuration when an API key is

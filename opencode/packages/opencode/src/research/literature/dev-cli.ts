@@ -52,7 +52,7 @@ function sourceFromFlags(flags: Map<string, string | true>): LiteratureAgentInpu
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (!args.command) throw new Error("Expected build, build-principles, parse, validate, export, or show-run")
-  const neoCastRoot = path.resolve(flag(args.flags, "neo-cast-root") ?? path.join(process.cwd(), "../../../../neo_cast"))
+  const neoCastRoot = path.resolve(flag(args.flags, "neo-cast-root") ?? path.join(import.meta.dir, "../../../../../../neo_cast"))
   const knowledgeRoot = flag(args.flags, "output-root") ? path.resolve(flag(args.flags, "output-root")!) : undefined
   const disabled = new DisabledExtractionModel()
   const configured = args.command === "build" && !args.flags.has("no-llm")

@@ -257,13 +257,17 @@ export function selectModelDesignerCandidate(input: {
 }
 
 export function selectHypothesisFromList(hypotheses: readonly HypothesisObject[]): HypothesisObject | undefined {
-  if (hypotheses.length === 0) return undefined
+  // The pool includes historical hypotheses in creation order. Closed directions
+  // must not constrain new designs; prefer the latest planner pivot on priority ties.
+  const eligible = hypotheses.filter((item) =>
+    item.testable && (!item.status || ["pending", "active", "testing"].includes(item.status)),
+  )
   const priorityOrder: readonly HypothesisObject["priority"][] = ["high", "medium", "low"]
   for (const priority of priorityOrder) {
-    const hypothesis = hypotheses.find((item) => item.testable && item.priority === priority)
+    const hypothesis = eligible.findLast((item) => item.priority === priority)
     if (hypothesis !== undefined) return hypothesis
   }
-  return hypotheses.find((item) => item.testable) ?? hypotheses[0]
+  return undefined
 }
 
 export function selectHypothesisForDesign(plan: ExperimentPlan | undefined): HypothesisObject | undefined {

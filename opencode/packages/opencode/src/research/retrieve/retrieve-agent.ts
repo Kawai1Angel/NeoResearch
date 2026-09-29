@@ -17,7 +17,7 @@ import {
   type RetrieveResult,
   type RetrieveTaskContext,
 } from "./contract"
-import { buildRetrievalCandidates, CLASSIC_COMPONENT_MAPPING_VERSION, COMPATIBILITY_REVIEW_VERSION, PDF_IDENTITY_SCREEN_VERSION, selectBridgeCandidates, type ModelRecipeCompatibilityReview } from "./candidate-selector"
+import { buildRetrievalCandidates, CLASSIC_COMPONENT_MAPPING_VERSION, COMPATIBILITY_REVIEW_VERSION, PAPER_SCOPE_SCREEN_VERSION, PDF_IDENTITY_SCREEN_VERSION, selectBridgeCandidates, type ModelRecipeCompatibilityReview } from "./candidate-selector"
 import { CLASSIC_LIBRARY_VERSION, CLASSIC_PAPERS, classicPaperName } from "./classic-library"
 import { MODEL_RECIPE_SCREEN_VERSION } from "./model-recipe-screen"
 import { extractDatasetEvidence } from "./dataset-evidence"
@@ -157,6 +157,7 @@ export class RetrieveAgent {
       classicComponentMapping: CLASSIC_COMPONENT_MAPPING_VERSION,
       compatibilityReview: { version: COMPATIBILITY_REVIEW_VERSION, reviews: input.compatibilityReviews ?? [] },
       pdfIdentityScreen: PDF_IDENTITY_SCREEN_VERSION,
+      paperScopeScreen: PAPER_SCOPE_SCREEN_VERSION,
       modelRecipeScreen: MODEL_RECIPE_SCREEN_VERSION,
       budgets,
       taskContextDigest: contextDigest,

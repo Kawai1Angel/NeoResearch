@@ -126,6 +126,8 @@ test("RetrieveAgent performs one BM25 recall per intent and bridges each paper o
     paperID: "paper-frequency",
     claim: "Frequency-domain modeling captures multiple seasonalities in forecasting.",
     normalizedClaim: { subject: "multiple_seasonalities", predicate: "uses", object: "frequency_domain_modeling" },
+    implementation: { recipeConcepts: ["frequency modeling"], registryMappings: ["embedding.frequency"],
+      estimatedComplexity: "medium", notes: ["Compare with a time-domain baseline"] },
     mechanism: {
       mechanismID: "mechanism_frequency",
       name: "frequency multi-scale modeling",
