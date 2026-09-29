@@ -140,7 +140,7 @@ SetBackbone(MLP)
 SetFusion(TemporalFusion)
 AddBranch(InvertEmbedding + Transformer)
 AddFusion(GatedFusion)
-SetHead(DirectMultiHorizonHead)
+SetHead(LinearHead)
 SetLoss(HorizonWeightedMSE)
 ```
 

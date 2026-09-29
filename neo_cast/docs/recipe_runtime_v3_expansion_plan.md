@@ -1,5 +1,6 @@
 # ModelRecipe：真实序列编码器、搜索去重与受控组合修改方案
 
+> 更新：`direct_multi_horizon` 预测头已移除；下文相关内容仅记录历史方案。当前点预测使用 `linear`，多个 horizon 的训练仍受支持。
 > 日期：2026-09-23
 > 状态：主要功能已实施；实际契约、验收边界与未实现项见 [v3 实施说明](recipe_runtime_v3_contract.md)。下文保留原始设计目标，不将目标描述直接视为全部验收通过。
 > 基线：[v2 运行时契约](recipe_runtime_v2_contract.md)及[上一轮修正记录](recipe_runtime_semantic_correction_plan.md)。

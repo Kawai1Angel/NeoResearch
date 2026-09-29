@@ -800,6 +800,8 @@ def train_models(
     candidate_path: str | None = None,
     verification_path: str | None = None,
 ) -> int:
+    # Override inherited OMP/MKL settings so one training run leaves CPU headroom.
+    torch.set_num_threads(4)
     train_config = candidate["train_config"]
     constraints = candidate["constraints"]
     smoke_config = candidate["smoke_config"]

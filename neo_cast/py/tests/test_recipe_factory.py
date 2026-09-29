@@ -56,6 +56,16 @@ def make_recipe(
 
 
 class RecipeFactoryTest(unittest.TestCase):
+    def test_removed_direct_multi_horizon_head_is_rejected(self) -> None:
+        recipe = make_recipe(prediction_head={"type": "direct_multi_horizon", "output_distribution": "point"})
+        self.assertTrue(validate_recipe_against_registry(recipe, input_len=32))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "recipe.json"
+            path.write_text(json.dumps(recipe))
+            self.assertTrue(validate_payload("recipe", path))
+        with self.assertRaises(ValueError):
+            build_model({"recipe": recipe, "num_channels": 7}, input_len=32, horizon=8)
+
     def assert_forward_shape(self, recipe: dict[str, Any], *, input_len: int = 32, horizon: int = 8) -> None:
         torch.manual_seed(7)
         model_config = {"recipe": recipe, "num_channels": 3}
@@ -213,7 +223,7 @@ class RecipeFactoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_channels"):
             build_model({"recipe": recipe}, input_len=32, horizon=8)
 
-    def test_phase2_invert_rnn_feature_direct_head_recipe_forward(self) -> None:
+    def test_phase2_invert_rnn_feature_linear_head_recipe_forward(self) -> None:
         recipe = make_recipe(
             preprocessing=[{"type": "seasonal_differencing", "period": 4, "order": 1}],
             embedding={"type": "invert", "d_model": 12},
