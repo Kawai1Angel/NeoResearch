@@ -6,7 +6,7 @@ import { Agent } from "../../src/agent/agent"
 import * as Truncate from "../../src/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LiteratureRunTool, LiteratureListIntentsTool, LiteratureSearchTool, LiteratureReadPaperTool, LiteratureGetResultsTool, literatureOutput } from "../../src/tool/research-literature"
-import { createLiteraturePhase, bindLiteratureSession, literatureSession } from "../../src/research/literature-phase-executor"
+import { createLiteraturePhase, bindLiteratureSession, literatureDigest, literatureSession } from "../../src/research/literature-phase-executor"
 import { recoverLiteratureReceipt } from "../../src/research/literature-session-receipt"
 import type { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -19,6 +19,13 @@ import { report } from "./retrieve/fixtures"
 afterEach(resetDatabase)
 const it = testEffect(CrossSpawnSpawner.defaultLayer)
 const layer = Layer.mergeAll(Agent.defaultLayer, Truncate.defaultLayer)
+
+test("literature receipt digest matches the result after JSON persistence", () => {
+  const result = { entries: [{ cardID: "kc_example", paperTitle: undefined, problem: undefined }],
+    literatureResults: [{ paperID: "paper_example", error: undefined }] }
+  expect(literatureDigest(result)).toBe(literatureDigest(JSON.parse(JSON.stringify(result))))
+  expect(literatureDigest({ entries: [{ cardID: "kc_other" }] })).not.toBe(literatureDigest(result))
+})
 
 it.live("bound literature tools enforce access, budgets, cancellation and read-only exploration before a deduplicated run", () =>
   provideTmpdirInstance((directory) => Effect.gen(function* () {

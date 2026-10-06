@@ -1,4 +1,5 @@
 import { hasCompleteMechanism } from "../literature/contract"
+import { isTaskEvidenceVerifierVersion } from "../literature/validation-versions"
 import { createHash } from "crypto"
 import taskEvidenceConfig from "./config/tsf-task-evidence.v1.json" with { type: "json" }
 import type { CardRelation, KnowledgeCard } from "../literature/contract"
@@ -257,7 +258,7 @@ export function buildTaskEvidence(input: {
         excluded.push(exclude(cardID, card.paperID, "mechanism_incomplete", "Legacy/incomplete mechanism requires source-based re-extraction."))
         continue
       }
-      if (card.cardType === "model_mechanism" && !["evidence_verifier_v3", "evidence_verifier_v4"].includes(card.provenance.verifierPromptVersion ?? "")) {
+      if (card.cardType === "model_mechanism" && !isTaskEvidenceVerifierVersion(card.provenance.verifierPromptVersion)) {
         excluded.push(exclude(cardID, card.paperID, "card_validation_required", "Mechanism has not passed the current typed verification rule."))
         continue
       }

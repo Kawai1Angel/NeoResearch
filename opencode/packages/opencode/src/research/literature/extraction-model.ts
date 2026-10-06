@@ -1,4 +1,5 @@
 import { createHash } from "crypto"
+import { CURRENT_EVIDENCE_VERIFIER_VERSION } from "./validation-versions"
 import {
   requestNeoCastLLM, resolveEffectiveLLMConfig, resolveNeoCastLLMConfig, type LLMTokenUsage,
 } from "../llm-proposal"
@@ -157,7 +158,7 @@ export async function requestEvidenceVerification(
 
 export class ConfiguredLLMExtractionModel implements LiteratureExtractionModel {
   readonly candidatePromptVersion = "candidate_extractor_v4"
-  readonly verifierPromptVersion = "evidence_verifier_v5"
+  readonly verifierPromptVersion = CURRENT_EVIDENCE_VERIFIER_VERSION
   readonly available = true
   readonly modelIdentifier: string
   private readonly calls: ExtractionCallRecord[] = []

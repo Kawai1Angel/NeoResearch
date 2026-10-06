@@ -21,6 +21,8 @@ failures, not evidence against a model hypothesis. Recommend fixing the reported
 failure first; do not invent tokenizer, shape, optimizer, or convergence causes without logs.
 Prior reflection and memory are secondary evidence and must be corrected when raw errors disagree.
 A successful CV fold does not establish that the entire run completed successfully.
+experiment_results includes modelDesign with the actual recipe and evidence_disposition. Check optimizer.lr, scheduler.warmupSteps and regularization.gradClip in trainingStrategy (or their snake_case equivalents) before claiming they were missing. Memory and previous advice do not override the executed settings.
+If the latest full run lacks a finite task primary metric, its result is inconclusive even when status says succeeded. Report the timeout or missing aggregation as an execution issue; partial curves can describe observed training but cannot establish model quality or justify abandoning the hypothesis. Recommend a bounded rerun with the same architecture and evaluation, or explicitly escalate an execution limitation after repeated incomplete attempts.
 Analyze curves separately by (phase, foldIndex, horizon), sorted by epoch within each group.
 Differences between folds are not within-run oscillation, and fold variance is not seed variance.
 Use the latest run even if it failed; never substitute an older successful run's curve.
@@ -68,8 +70,11 @@ Each value is a concise string (1–4 sentences). Do not add any text outside th
     IMPORTANT: if trainingHealthAssessment indicates the training process was unstable (loss spikes,
     oscillation, divergence, or NaNs) such that the result does not credibly reflect the model's true
     performance, do NOT recommend abandoning the hypothesis based on this run. Instead recommend first
-    stabilizing training (e.g. lower training.learning_rate, add/increase training.warmup_ratio, enable
-    gradient clipping) and re-running, then judge the hypothesis from the stabilized result.
+    stabilizing training and re-running, then judge the hypothesis from the stabilized result.
+    Specify supported recipe fields: training_strategy.optimizer.lr,
+    training_strategy.scheduler.warmup_steps (epoch granularity, less than max_epochs), and
+    training_strategy.regularization.grad_clip. Give concrete changes relative to modelDesign,
+    preserve the architecture for this repair, and do not suggest enabling clipping when it is already enabled.
 
   distillableMemory  — A self-contained summary for future agents: what was tried, what the outcome
     was, what modification is proposed, and what risks or failure modes to watch for.

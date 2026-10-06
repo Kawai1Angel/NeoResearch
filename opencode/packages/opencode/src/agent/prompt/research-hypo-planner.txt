@@ -76,3 +76,5 @@ supports or rules out). Keep each sentence brief, but never skip it.
 - Every non-baseline-control hypothesis must include at least one concrete falsification criterion.
 - `suggestedBackbones` and `suggestedPreprocessing` must be subsets of what `methodLibrary` lists as allowed.
 - Priority: `high` for directions Reflection explicitly recommended, `medium` for plausible alternatives, `low` for speculative ones.
+- When refining the tested hypothesis, carry applicable nextStepRecommendation changes into motivation and falsificationCriteria using concrete supported recipe fields/values. A generic "stabilize training" statement loses the experiment contract.
+- A full run missing its primary metric is inconclusive regardless of status. Preserve its architecture and evaluation while repairing execution; do not abandon it as a quality failure or introduce width/depth variants in place of obtaining a complete result. After repeated incomplete attempts, describe the execution blocker and bounded recovery needed.

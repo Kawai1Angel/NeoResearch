@@ -13,6 +13,8 @@ import {
 } from "../../src/research/agents/model-designer-agent"
 import type { ExperimentPlan, HypothesisObject } from "../../src/research/agents/hypo-planner-agent"
 import type { JsonRecord, ResearchCandidate, ResearchRun, ResearchTask } from "../../src/research/schema"
+import { buildUserPrompt } from "../../src/research/llm-proposal"
+import { buildReflectionPlanningMarkdown } from "../../src/research/agents/reflection-agent"
 
 function candidate(input: {
   id: string
@@ -214,6 +216,7 @@ test("buildModelDesignerTaskFingerprint merges plan biases and the selected hypo
     "try_small_batch",
   ])
   expect(fingerprint.targetCount).toBe(2)
+  expect(fingerprint.selectedHypothesis).toEqual({ ...hypothesis })
 })
 
 test("buildModelDesignerResult records candidate identity, recipe, hypothesis, and selection source", () => {
@@ -405,4 +408,26 @@ test("design selection follows the latest equal-priority pivot and exposes its c
   const fingerprint = buildModelDesignerTaskFingerprint({ baseFingerprint: {}, selectedHypothesis: selected })
   expect(fingerprint.searchBiases).toContain("hypothesis:pivot")
   expect(fingerprint.searchBiases).toContain("prefer_backbone:diagonal_ssm")
+  expect(fingerprint.selectedHypothesis).toEqual({ ...pivot })
+})
+
+test("final design prompt carries refined hypothesis criteria and concrete reflection advice", () => {
+  const selected = hypothesisForDesign({
+    id: "repair_mamba", suggestedBackbones: ["mamba"],
+    motivation: ["Previous run timed out; lower optimizer.lr from 0.0001 to 0.00002."],
+    falsificationCriteria: ["Judge only after complete cv_avg_mse; freeze depth=2."],
+  })
+  const fingerprint = buildModelDesignerTaskFingerprint({ baseFingerprint: {}, selectedHypothesis: selected })
+  const reflection = buildReflectionPlanningMarkdown({
+    reflectionNotesMarkdown: "Generic structural notes.",
+    llm: { status: "used", text: "Use training_strategy.scheduler.warmup_steps=5; grad_clip=1 already enabled." },
+  })
+  const prompt = JSON.parse(buildUserPrompt({
+    task: task(), proposalContext: { taskSpec: {}, taskFingerprint: fingerprint, candidates: [], runs: [], memory: [] },
+    previousReflectionMarkdown: reflection,
+  }))
+  expect(prompt.taskFingerprint.selectedHypothesis).toEqual(selected)
+  expect(prompt.previousSessionReflection).toContain("warmup_steps=5")
+  expect(prompt.previousSessionReflection).toContain("grad_clip=1 already enabled")
+  expect(prompt.instruction).toContain("concrete recipe fields")
 })

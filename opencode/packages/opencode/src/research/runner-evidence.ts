@@ -13,6 +13,36 @@ function finite(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
+export function buildExperimentResultEvidence(input: {
+  readonly runID: string
+  readonly stage: string
+  readonly status: string
+  readonly primaryMetric: string
+  readonly metrics: Record<string, unknown>
+  readonly error?: string | null
+  readonly candidateSpec?: Record<string, unknown>
+  readonly hypothesisID?: string
+  readonly independentEvidence?: boolean
+}) {
+  const value = finite(input.metrics[input.primaryMetric])
+  const duplicate = input.independentEvidence === false
+  const complete = !duplicate && input.status === "succeeded" && value !== undefined
+  const missingMetric = !duplicate && input.status === "succeeded" && input.stage === "full" && value === undefined
+  return {
+    runID: input.runID,
+    stage: input.stage,
+    status: input.status,
+    evidence_disposition: duplicate ? "duplicate" : complete ? "complete" : "inconclusive",
+    ...(input.hypothesisID ? { hypoID: input.hypothesisID, hypothesisID: input.hypothesisID } : {}),
+    ...(complete ? { [input.primaryMetric]: value } : {}),
+    ...(missingMetric ? { evaluationIssue: `Missing finite ${input.primaryMetric}; complete evaluation is required before judging the hypothesis.` } : {}),
+    ...(input.error ? { error: input.error } : {}),
+    ...(input.candidateSpec ? {
+      modelDesign: Object.fromEntries(Object.entries(input.candidateSpec).filter(([key]) => !["notes", "hypothesis"].includes(key))),
+    } : {}),
+  }
+}
+
 // Keep each fold/horizon independent, including during downsampling. The limit is per series.
 export async function extractTrainingCurve(filePath: string, maxPoints = 60): Promise<TrainingCurvePoint[]> {
   const raw = await readFile(filePath, "utf8").catch(() => "")

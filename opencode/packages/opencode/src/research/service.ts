@@ -177,6 +177,7 @@ import {
 import { buildTrainEvalResult, type TrainEvalResult } from "./agents/train-eval-agent"
 import {
   analyzeReflection,
+  buildReflectionPlanningMarkdown,
   reflectionAgentMetadata,
   summarizeReflectionAgent,
   type ReflectionAgentResult,
@@ -2300,7 +2301,7 @@ function buildHypoPlannerUserPrompt(
               ? {
                   decision: latestReflection.decision,
                   decisionReason: latestReflection.decisionReason,
-                  reflectionNotes: latestReflection.reflectionNotesMarkdown,
+                  reflectionNotes: buildReflectionPlanningMarkdown(latestReflection),
                 }
               : null,
           }
@@ -2401,6 +2402,7 @@ type LatestReflectionSummary = {
   reflectionNotesMarkdown: string
   decision: string
   decisionReason: string
+  llm?: ReflectionAgentResult["llm"]
 } | null
 
 async function loadLLMSearchPreferences(workspaceRoot: string, taskID: string): Promise<string[] | undefined> {
@@ -2536,6 +2538,7 @@ function buildReflectionSessionUserPrompt(
         latestMetric: analysis.latestMetric ?? null,
         latestDelta: analysis.latestDelta ?? null,
         succeededRuns: analysis.succeededRuns,
+        inconclusiveRuns: analysis.inconclusiveRuns,
         failedRuns: analysis.failedRuns,
         rejectedRuns: analysis.rejectedRuns,
         plateauStreak: analysis.plateauStreak,
@@ -2565,6 +2568,7 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
         latestMetric: analysis.latestMetric ?? null,
         latestDelta: analysis.latestDelta ?? null,
         succeededRuns: analysis.succeededRuns,
+        inconclusiveRuns: analysis.inconclusiveRuns,
         failedRuns: analysis.failedRuns,
         rejectedRuns: analysis.rejectedRuns,
         plateauStreak: analysis.plateauStreak,
@@ -5423,8 +5427,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const contract = contractWrite?.content as unknown as ExecutionContract | undefined
       const contractMismatches = contract && !duplicateRunning ? verifyExecutionRecords(contract, execution.records) : []
       const contractInvalid = contractMismatches.length > 0
-      const succeeded = !contractInvalid && (execution.exitCode === 0 || runnerTrainingSucceeded)
       const task = yield* getTask(running.taskID)
+      const missingPrimaryMetric = running.stage === "full" && !reused && !duplicateRunning &&
+        metricValue(metrics as ResearchRun["metrics"], objectiveMetricName(task.objective)) === undefined
+      const succeeded = !contractInvalid && !missingPrimaryMetric && (execution.exitCode === 0 || runnerTrainingSucceeded)
       const reproducibility = succeeded
         ? yield* Effect.promise(() => buildReproducibilitySeal(task, prepared.runPlan, Instance.directory))
         : undefined
@@ -5443,7 +5449,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           ...(reproducibility === undefined ? {} : { reproducibility }),
         } as ResearchRun["resourceUsage"],
         artifactRefs,
-        error: succeeded ? undefined : runnerFailureEvidence(execution),
+        error: succeeded ? undefined : missingPrimaryMetric
+          ? `Incomplete full evaluation: missing finite ${objectiveMetricName(task.objective)}; hypothesis outcome is inconclusive.\n${runnerFailureEvidence(execution)}`
+          : runnerFailureEvidence(execution),
       })
 
       if (contractInvalid && contract && running.candidateID) {
@@ -5867,9 +5875,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             const jsonPath = path.join(sessionsDir, dirName, "reflection_result.json")
             try {
               const raw = await readFile(jsonPath, "utf8")
-              return JSON.parse(raw) as {
-                  reflectionNotesMarkdown: string
-              }
+              return JSON.parse(raw) as Pick<ReflectionAgentResult, "reflectionNotesMarkdown" | "llm">
             } catch {
               continue
             }
@@ -5879,7 +5885,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         }
         return null
       })
-      const previousReflectionNotesMarkdown = latestReflection?.reflectionNotesMarkdown
+      const previousReflectionNotesMarkdown = latestReflection ? buildReflectionPlanningMarkdown(latestReflection) : undefined
       const hypotheses = yield* listHypotheses(input.taskID)
       const hypothesisPlan = experimentPlanFromDB(task, hypotheses)
       const selectedHypothesis = recovery?.hypothesisID
@@ -8377,6 +8383,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 		                  reflectionNotesMarkdown: string
 	                  decision: string
 	                  decisionReason: string
+	                  llm?: ReflectionAgentResult["llm"]
 	                }
 	              } catch { continue }
 	            }
@@ -8991,6 +8998,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              decisionReason: result.analysis.decisionReason,
 	              plateauStreak: result.analysis.plateauStreak,
 	              succeededRuns: result.analysis.succeededRuns,
+	              inconclusiveRuns: result.analysis.inconclusiveRuns,
 	              failedRuns: result.analysis.failedRuns,
 	              bestMetric: result.analysis.bestMetric ?? null,
 	              reflectionNotesMarkdown: result.reflectionNotesMarkdown,

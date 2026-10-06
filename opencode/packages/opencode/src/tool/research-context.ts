@@ -1,4 +1,4 @@
-import { extractTrainingCurve, recoverRunnerFailure } from "../research/runner-evidence"
+import { buildExperimentResultEvidence, extractTrainingCurve, recoverRunnerFailure } from "../research/runner-evidence"
 export { extractTrainingCurve } from "../research/runner-evidence"
 import { Effect, Schema } from "effect"
 import { readdir, readFile } from "node:fs/promises"
@@ -100,7 +100,8 @@ export const ExperimentResultsTool = Tool.define(
       "Returns finished runs (succeeded or failed) ordered by most recent first, " +
       "including the primary metric value, any error messages, and the `hypoID` of the " +
       "hypothesis that produced each run's candidate (when resolvable) — use this to identify " +
-      "which hypothesis was tested by the most recent run.",
+      "which hypothesis was tested by the most recent run. Includes the executed modelDesign " +
+      "recipe and evidence_disposition; a missing full-run primary metric is inconclusive.",
     parameters: ExperimentResultsParameters,
     execute: (args: ExperimentResultsArgs, ctx: Tool.Context) =>
       Effect.promise(async () => {
@@ -157,24 +158,28 @@ export const ExperimentResultsTool = Tool.define(
           if (c.hypothesis_id) hypoIDByCandidate.set(c.id, c.hypothesis_id)
         }
 
+        const candidateSpecByID = new Map(candidateRows.map((c) => [c.id, c.candidate_spec]))
         const results = await Promise.all(runs.map(async (r) => {
-          const execution = r.status !== "succeeded" ? Database.use((d) =>
+          const metrics = r.metrics as Record<string, unknown> | null | undefined
+          const metricVal = metrics?.[primaryMetric]
+          const hasMetric = typeof metricVal === "number" && Number.isFinite(metricVal)
+          const execution = (r.status !== "succeeded" || !hasMetric) && r.resource_usage.independentEvidence !== false ? Database.use((d) =>
             d.select({ uri: ResearchArtifactTable.uri }).from(ResearchArtifactTable)
               .where(and(eq(ResearchArtifactTable.task_id, taskID), eq(ResearchArtifactTable.run_id, r.id), eq(ResearchArtifactTable.kind, "runner_execution_log_json"))).get(),
           ) : undefined
           const error = execution ? await recoverRunnerFailure(execution.uri.replace(/^file:\/\//, ""), r.error ?? undefined) : r.error
-          const metrics = r.metrics as Record<string, unknown> | null | undefined
-          const metricVal = metrics ? metrics[primaryMetric] : undefined
           const hypoID = r.candidate_id ? hypoIDByCandidate.get(r.candidate_id) : undefined
-          return {
+          return buildExperimentResultEvidence({
             runID: r.id,
             stage: r.stage,
             status: r.status,
-            ...(hypoID ? { hypoID, hypothesisID: hypoID } : {}),
-            ...(r.status === "invalid" ? { evidence_disposition: "inconclusive" } : {}),
-            ...(r.status !== "invalid" && typeof metricVal === "number" ? { [primaryMetric]: metricVal } : {}),
-            ...(error ? { error } : {}),
-          }
+            primaryMetric,
+            metrics: metrics ?? {},
+            error,
+            hypothesisID: hypoID,
+            independentEvidence: r.resource_usage.independentEvidence === false ? false : undefined,
+            candidateSpec: r.candidate_id ? candidateSpecByID.get(r.candidate_id) : undefined,
+          })
         }))
 
         return {

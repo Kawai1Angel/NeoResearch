@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import { fixture, frequencyCard } from "./fixtures"
 import type { CardRelation } from "../../../src/research/literature/contract"
+import { CURRENT_EVIDENCE_VERIFIER_VERSION } from "../../../src/research/literature/validation-versions"
 import { TaskEvidenceBundleSchema } from "../../../src/research/retrieve/contract"
 import { validateHypothesisEvidence, type HypothesisObject } from "../../../src/research/agents/hypo-planner-agent"
 
@@ -294,6 +295,22 @@ test("legacy mechanism cards require complete fields and current validation", ()
   const old = frequencyCard()
   old.provenance.verifierPromptVersion = "evidence_verifier_v2"
   expect(fixture({ cards: [old] }).build().excluded[0]!.reasons).toContain("card_validation_required")
+})
+
+test("the extractor's current verifier can hand off complete exact-span mechanisms", () => {
+  const source = frequencyCard()
+  for (const version of ["evidence_verifier_v3", "evidence_verifier_v4", CURRENT_EVIDENCE_VERIFIER_VERSION]) {
+    const value = fixture({ cards: [{ ...source, provenance: { ...source.provenance, verifierPromptVersion: version } }] }).build()
+    expect(value.entries.map((entry) => entry.cardID)).toContain(source.cardID)
+    expect(value.entries[0]!.mechanism).toEqual(source.mechanism)
+    expect(value.entries[0]!.evidenceRefs[0]!.verification).toBe("exact_span")
+    expect(value.excluded.some((card) => card.reasons.includes("card_validation_required"))).toBe(false)
+  }
+  for (const version of [undefined, "evidence_verifier_v1", "evidence_verifier_v2", "evidence_verifier_v99"]) {
+    const value = fixture({ cards: [{ ...source, provenance: { ...source.provenance, verifierPromptVersion: version } }] }).build()
+    expect(value.entries).toHaveLength(0)
+    expect(value.excluded[0]!.reasons).toContain("card_validation_required")
+  }
 })
 
 test("warnings alone do not cover a mechanism question", () => {

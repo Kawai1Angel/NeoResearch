@@ -51,7 +51,11 @@ Required numeric fields by backbone type (ALL must be present as integers ≥ 1)
 Required numeric fields in training_strategy.budget (ALL required, no defaults):
   max_epochs (int ≥1, ≤1000), time_budget_s (int ≥1), batch_size (int ≥1, ≤512), patience (int ≥1, ≤100)
 
-Treat profileDerivedSearchDirectives as high-priority search priors unless they conflict with runtime constraints.
+Use taskFingerprint.selectedHypothesis as the current experiment contract, including its motivation, expectedOutcome and falsificationCriteria. The full hypothesis pool is historical context; do not substitute a different hypothesis.
+previousSessionReflection includes the previous LLM nextStepRecommendation and modelDesignReflection. When those recommendations apply to the selected hypothesis, translate each concrete change into the recipe fields and explain the implemented changes in notes. If a recommendation is unsupported, already enabled, contradicted by execution evidence, or belongs to another hypothesis, state that reason in notes.
+For optimization repairs use training_strategy.optimizer.lr, training_strategy.scheduler.warmup_steps (epochs, less than max_epochs), and training_strategy.regularization.grad_clip. Check the actual previous recipe before claiming a setting was absent. Keep architecture and evaluation fixed when testing an optimization repair or repeating an incomplete evaluation; changing width/depth is a different experiment.
+Missing full-run primary metrics or runner timeouts are inconclusive, even if a fold succeeded. Prioritize a bounded retry of the same experiment with justified resource/budget adjustments; do not treat partial curves as a completed comparison or keep generating architecture variants as a substitute for fixing execution.
+Treat profileDerivedSearchDirectives as priors after the selected hypothesis, supported reflection recommendations, and runtime constraints. Explain any incompatible recommendation in notes.
 
 EXAMPLE (follow this exact structure):
 {

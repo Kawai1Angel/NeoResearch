@@ -4,9 +4,11 @@ import {
   buildFailureLogMarkdown,
   buildNextExperimentPlanMarkdown,
   buildReflectionNotesMarkdown,
+  buildReflectionPlanningMarkdown,
   summarizeReflectionAgent,
 } from "../../src/research/agents/reflection-agent"
 import type { ResearchCandidate, ResearchRun, ResearchTask } from "../../src/research/schema"
+import type { ReflectionLLMAnalysis } from "../../src/research/agents/reflection-agent"
 
 function task(extraSpec: Record<string, unknown> = {}): ResearchTask {
   return {
@@ -184,4 +186,41 @@ test("invalid executions retain full error evidence without contributing model m
   expect(analysis.failures[0]?.category).toBe("script_error")
   expect(analysis.bestMetric).toBeUndefined()
   expect(analysis.succeededRuns).toBe(0)
+})
+
+test("historical succeeded runs missing full CV are inconclusive and interrupt repeated retries", () => {
+  const t = { ...task(), objective: { primaryMetric: "cv_avg_mse", direction: "minimize" } } as ResearchTask
+  const complete = { ...run({ id: "complete", status: "succeeded", created: 1 }), metrics: { cv_avg_mse: 0.5 } }
+  const partial = [2, 3, 4].map((created) => run({ id: `partial_${created}`, status: "succeeded", metric: 0.01, created }))
+  const analysis = analyzeReflection({ task: t, candidates: [], runs: [complete, ...partial] })
+  expect(analysis.succeededRuns).toBe(1)
+  expect(analysis.inconclusiveRuns).toBe(3)
+  expect(analysis.bestMetric).toBe(0.5)
+  expect(analysis.plateauStreak).toBe(0)
+  expect(analysis.ineffectiveChanges).toEqual([])
+  expect(analysis.failures.every((failure) => failure.summary.includes("cv_avg_mse"))).toBe(true)
+  expect(analysis.decision).toBe("request_human")
+  const smoke = { ...partial[0]!, stage: "smoke" as const }
+  expect(analyzeReflection({ task: t, candidates: [], runs: [complete, smoke] }).inconclusiveRuns).toBe(0)
+  const cached = { ...partial[0]!, resourceUsage: { independentEvidence: false, duplicateExperiment: true } }
+  expect(analyzeReflection({ task: t, candidates: [], runs: [complete, cached] }).inconclusiveRuns).toBe(0)
+})
+
+test("planning handoff preserves structured recommendations and legacy raw-only reflections", () => {
+  const structured: ReflectionLLMAnalysis = {
+    trainingHealthAssessment: "Incomplete CV after timeout.", hypothesisValidation: "Inconclusive.",
+    attributionAnalysis: "Command timeout, not model rejection.", historicalComparison: "Best CV is 0.5.",
+    modelDesignReflection: "grad_clip=1 already enabled; freeze architecture.",
+    nextStepRecommendation: "Use training_strategy.optimizer.lr=0.00002 and scheduler.warmup_steps=5.",
+    distillableMemory: "Rerun the same Mamba architecture with a bounded budget.",
+  }
+  const notes = "# Reflection Notes\nStructural summary only."
+  const result = buildReflectionPlanningMarkdown({ reflectionNotesMarkdown: notes, llm: { status: "used", structured } })
+  expect(result).toContain(notes)
+  for (const [key, value] of Object.entries(structured)) {
+    expect(result).toContain(key)
+    expect(result).toContain(value)
+  }
+  expect(buildReflectionPlanningMarkdown({ reflectionNotesMarkdown: notes, llm: { status: "used", text: "Legacy concrete recommendation" } })).toContain("Legacy concrete recommendation")
+  expect(buildReflectionPlanningMarkdown({ reflectionNotesMarkdown: notes, llm: { status: "failed", text: "Unusable synthesis" } })).toBe(notes)
 })

@@ -650,7 +650,7 @@ export function buildUserPrompt(input: {
           }
         : {}),
       instruction:
-        "When taskFingerprint.selectedHypothesis is present, test that exact hypothesis and use one of its suggestedBackbones; historical hypotheses and reflections are context, not alternative selections. Propose a new candidate that is different from existing candidates and suitable for the task; do not repeat forbidden_signatures. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
+        "When taskFingerprint.selectedHypothesis is present, test that exact hypothesis, including its motivation and falsificationCriteria, and use one of its suggestedBackbones. Apply previousSessionReflection recommendations that concern this hypothesis to concrete recipe fields; in notes identify changes made or explain why a recommendation cannot apply. Keep architecture/evaluation fixed for optimization repairs or incomplete-run retries; historical hypotheses are context, not alternative selections. For a new scientific experiment propose a different candidate; do not repeat forbidden_signatures unless candidateValidationFeedback explicitly requests repair. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
     }
   return JSON.stringify(
     compactPromptContext(prompt),

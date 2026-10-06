@@ -296,6 +296,7 @@ export function buildModelDesignerTaskFingerprint(input: {
         ]
   return {
     ...input.baseFingerprint,
+    ...(input.selectedHypothesis ? { selectedHypothesis: { ...input.selectedHypothesis } } : {}),
     ...(input.selectedHypothesis?.literatureEvidence?.length ? {
       taskEvidence: projectCitedTaskEvidence(input.taskEvidence, input.selectedHypothesis.literatureEvidence),
     } : {}),

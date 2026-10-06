@@ -3203,6 +3203,43 @@ describe("Research service", () => {
     })
   })
 
+  test("full CV missing its primary metric cannot succeed from a nested done success", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const root = path.join(tmp.path, "partial-cv-neo-cast")
+        await writeTrainingFakeNeoCastRunner(root)
+        const file = path.join(root, "py", "runner.py")
+        const script = (await readFile(file, "utf8"))
+          .replace(/^printf '\{"event":"cv_eval_done".*\n/m, "")
+          .replace("set -euo pipefail\n", `set -euo pipefail
+if [[ "\${1:-}" == "init" ]]; then
+  mkdir -p .neo-cast
+  echo '{"session_id":"test","candidate_counter":0,"crash_streak":0,"no_improve_streak":0,"keep_count":0}' > .neo-cast/runner_state.json
+  exit 0
+fi
+`)
+        await writeFile(file, `${script}\nexit 1\n`)
+        const task = await runResearch(Research.Service.use((svc) => svc.createTask({
+          title: "incomplete CV", domainID: "tsf", mode: "review",
+          taskSpec: validTsfTaskSpec({ bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" }),
+          objective: { primaryMetric: "cv_avg_mse", direction: "minimize" }, budget: { maxRuns: 12 },
+        })))
+        const candidate = await createCandidate({ taskID: task.id })
+        await executeFixtureSmoke(task.id, candidate.id)
+        const executed = await runResearch(Research.Service.use((svc) => svc.executeRun({
+          taskID: task.id, candidateID: candidate.id, stage: "full",
+        })))
+        expect(executed.run.status).toBe("failed")
+        expect(executed.run.metrics).not.toHaveProperty("cv_avg_mse")
+        expect(executed.run.error).toContain("missing finite cv_avg_mse")
+        expect(executed.run.error).toContain("inconclusive")
+        expect(await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))).toBeUndefined()
+      },
+    })
+  })
+
   test("uses the final runner done status when an earlier stage succeeded", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
@@ -4900,6 +4937,18 @@ describe("Research service", () => {
             )
           }
 
+          const reflectionDir = path.join(tmp.path, ".neo-research", "sessions", task.id, "reflect_1")
+          await mkdir(reflectionDir, { recursive: true })
+          await writeFile(path.join(reflectionDir, "reflection_result.json"), JSON.stringify({
+            reflectionNotesMarkdown: "Generic summary without actionable recommendations.",
+            llm: { status: "used", structured: {
+              trainingHealthAssessment: "Smoke only.", hypothesisValidation: "Inconclusive until full evaluation.",
+              attributionAnalysis: "No complete CV yet.", historicalComparison: "First baseline finished.",
+              modelDesignReflection: "grad_clip=1 is already enabled.",
+              nextStepRecommendation: "Use training_strategy.optimizer.lr=0.001 and keep grad_clip=1.",
+              distillableMemory: "Carry the recipe settings into the next design.",
+            } },
+          }))
           const iteration = await runResearch(
             Research.Service.use((svc) =>
               svc.runAutonomousIteration({
@@ -4916,6 +4965,10 @@ describe("Research service", () => {
           expect(JSON.parse(String(fetchCalls[0]!.init?.body))).toMatchObject({ model: "test-model" })
           const retryBody = JSON.parse(String(fetchCalls[1]!.init?.body))
           const retryPrompt = JSON.parse(retryBody.messages[1].content)
+          expect(retryPrompt.taskFingerprint.selectedHypothesis.statement).toContain("declared architecture families")
+          expect(retryPrompt.taskFingerprint.selectedHypothesis.motivation).toContain("Exercise search ranking and stopping policy.")
+          expect(retryPrompt.previousSessionReflection).toContain("training_strategy.optimizer.lr=0.001")
+          expect(retryPrompt.previousSessionReflection).toContain("grad_clip=1 is already enabled")
           expect(retryPrompt.candidateValidationFeedback).toMatchObject({
             attempt: 1,
             issues: [{ path: "notes" }],

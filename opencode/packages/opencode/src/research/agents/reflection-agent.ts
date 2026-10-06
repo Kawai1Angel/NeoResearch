@@ -44,6 +44,7 @@ export interface ReflectionAnalysis {
   readonly latestMetric?: number
   readonly latestDelta?: number
   readonly succeededRuns: number
+  readonly inconclusiveRuns: number
   readonly failedRuns: number
   readonly rejectedRuns: number
   readonly plateauStreak: number
@@ -231,11 +232,23 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
   let failedStreak = 0
   let latestMetric: number | undefined
   let latestDelta: number | undefined
+  let inconclusiveRuns = 0
 
   for (const run of ordered) {
     if (run.status === "succeeded") {
       const value = metricValue(run.metrics, primaryMetricName)
-      if (value === undefined) continue
+      if (value === undefined) {
+        if (run.stage !== "full" || recordValue(run.resourceUsage).independentEvidence === false) continue
+        inconclusiveRuns += 1
+        failures.push({
+          runID: run.id,
+          candidateID: run.candidateID,
+          category: "other",
+          summary: run.error ?? `Incomplete evaluation: missing finite ${primaryMetricName}; hypothesis outcome is inconclusive.`,
+        })
+        failedStreak += 1
+        continue
+      }
       const candidate = run.candidateID ? candidatesByID.get(run.candidateID) : undefined
       latestMetric = value
       const delta = bestMetric === undefined ? 0 : value - bestMetric
@@ -308,6 +321,7 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
     latestDelta,
     succeededRuns: succeededCount,
     failedRuns: failedCount,
+    inconclusiveRuns,
     rejectedRuns: rejectedCount,
     plateauStreak,
     effectiveChanges: effective,
@@ -342,6 +356,7 @@ export function buildReflectionNotesMarkdown(input: {
     "## Run Summary",
     "",
     `- Succeeded runs: ${analysis.succeededRuns}`,
+    `- Inconclusive runs (missing primary metric): ${analysis.inconclusiveRuns}`,
     `- Failed runs: ${analysis.failedRuns}`,
     `- Rejected runs: ${analysis.rejectedRuns}`,
     `- Plateau streak: ${analysis.plateauStreak}`,
@@ -493,10 +508,25 @@ export function reflectionAgentMetadata(result: ReflectionAgentResult): JsonReco
     bestMetric: result.analysis.bestMetric ?? null,
     plateauStreak: result.analysis.plateauStreak,
     succeededRuns: result.analysis.succeededRuns,
+    inconclusiveRuns: result.analysis.inconclusiveRuns,
     failedRuns: result.analysis.failedRuns,
     rejectedRuns: result.analysis.rejectedRuns,
     failureCount: result.analysis.failures.length,
     failureCategories: result.analysis.failures.map((failure) => failure.category),
     maxIterations: result.maxIterations,
   }
+}
+
+// Persisted structural notes omit the LLM synthesis. Planning must receive both,
+// including for historical runs created before this handoff was introduced.
+export function buildReflectionPlanningMarkdown(result: {
+  readonly reflectionNotesMarkdown?: string
+  readonly llm?: ReflectionAgentResult["llm"]
+}) {
+  const notes = result.reflectionNotesMarkdown ?? ""
+  if (result.llm?.status !== "used") return notes
+  const synthesis = result.llm.structured
+    ? Object.entries(result.llm.structured).map(([key, value]) => `### ${key}\n\n${value}`).join("\n\n")
+    : result.llm.text
+  return synthesis ? `${notes}\n## LLM Reflection\n\n${synthesis}\n` : notes
 }

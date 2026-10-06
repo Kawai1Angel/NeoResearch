@@ -25,6 +25,7 @@ it.live("session tools preserve evidence through add/update/list and reject inva
       taskSpec: { contextLength: 96, predictionLengths: [24], dataset: { loaderID: "etth1_tslib_v1", targetCols: ["OT"] },
         metadata: { businessContext: "benchmark", interpretability: "none_required", deploymentTarget: "local_research" } },
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" }, budget: { maxRuns: 2 } })
+    yield* Effect.promise(() => writeFile(path.join(directory, "quantitative.json"), "{}"))
     const q = yield* svc.createArtifact({ taskID: task.id, kind: "dataset_quantitative_analysis_json", uri: `file://${directory}/quantitative.json`, metadata: {} })
     const bundle = { ...fixture().build(), taskID: task.id, quantitativeReportArtifactID: q.id }
     const bundlePath = path.join(directory, "evidence.json")

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { tmpdir } from "../fixture/fixture"
-import { extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure } from "../../src/research/runner-evidence"
+import { buildExperimentResultEvidence, extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure } from "../../src/research/runner-evidence"
 
 test("interleaved folds and horizons retain separate endpoints when sampled", async () => {
   await using tmp = await tmpdir()
@@ -54,4 +54,31 @@ test("historical generic failures recover the exact stdout error from saved exec
   expect(await recoverRunnerFailure(file + ".missing", "original error")).toBe("original error")
   await writeFile(file, JSON.stringify({ records: [{ event: "done", status: "success" }], stdout: "", stderr: "warning", exitCode: 0 }))
   expect(await recoverRunnerFailure(file, "execution contract mismatch")).toBe("execution contract mismatch")
+})
+
+test("reflection evidence includes executed optimizer settings and never exposes partial metrics as a comparison", () => {
+  const candidateSpec = {
+    backbone: { type: "mamba", depth: 2 },
+    trainingStrategy: { optimizer: { type: "adam", lr: 0.0001 }, scheduler: { warmupSteps: 0 }, regularization: { gradClip: 1 } },
+    notes: "Long narrative", hypothesis: "test Mamba",
+  }
+  const input = { runID: "partial", stage: "full", status: "succeeded", primaryMetric: "cv_avg_mse",
+    metrics: { val_avg_mse: 0.01 }, candidateSpec, hypothesisID: "H1", error: "Runner command timeout" }
+  const partial = buildExperimentResultEvidence(input)
+  expect(partial.evidence_disposition).toBe("inconclusive")
+  expect(partial.evaluationIssue).toContain("cv_avg_mse")
+  expect(partial.error).toContain("timeout")
+  expect(partial.modelDesign).toEqual({ backbone: candidateSpec.backbone, trainingStrategy: candidateSpec.trainingStrategy })
+  expect(partial.hypoID).toBe("H1")
+  expect(partial).not.toHaveProperty("cv_avg_mse")
+  const complete = buildExperimentResultEvidence({ ...input, metrics: { cv_avg_mse: 0.4 }, error: undefined })
+  expect(complete.evidence_disposition).toBe("complete")
+  expect(complete).toHaveProperty("cv_avg_mse", 0.4)
+  for (const status of ["invalid", "failed", "rejected"]) {
+    expect(buildExperimentResultEvidence({ ...input, status, metrics: { cv_avg_mse: 0.001 } })).not.toHaveProperty("cv_avg_mse")
+  }
+  expect(buildExperimentResultEvidence({ ...input, metrics: { cv_avg_mse: Number.NaN } }).evidence_disposition).toBe("inconclusive")
+  const cached = buildExperimentResultEvidence({ ...input, independentEvidence: false })
+  expect(cached.evidence_disposition).toBe("duplicate")
+  expect(cached.evaluationIssue).toBeUndefined()
 })
