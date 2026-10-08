@@ -46,6 +46,7 @@ export async function pickReferenceBaseline(
   taskID: ResearchTaskID,
   recipeID: string,
   rationale?: string,
+  source: "tool" | "llm" = "tool",
 ): Promise<{ readonly referenceBaseline: string }> {
   const row = Database.use((d) => d.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get())
   if (!row) throw new TaskNotFoundError(taskID)
@@ -62,7 +63,7 @@ export async function pickReferenceBaseline(
     metadata: {
       ...metadata,
       referenceBaseline: recipeID,
-      referenceBaselineSource: "tool",
+      referenceBaselineSource: source,
       ...(rationale ? { referenceBaselineRationale: rationale } : {}),
     } as unknown as JsonRecord,
   }
@@ -96,7 +97,7 @@ function candidateRecipeID(candidateSpec: unknown): string | undefined {
 export async function loadBaselineOptions(taskID: ResearchTaskID): Promise<{
   readonly options: readonly BaselineOption[]
   readonly picked?: string
-  readonly pickedSource?: "tool" | "heuristic"
+  readonly pickedSource?: "tool" | "llm" | "heuristic"
 }> {
   const row = Database.use((d) => d.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get())
   if (!row) throw new TaskNotFoundError(taskID)
@@ -111,7 +112,7 @@ export async function loadBaselineOptions(taskID: ResearchTaskID): Promise<{
 
   const metadata = recordValue(task.taskSpec.metadata)
   const picked = typeof metadata.referenceBaseline === "string" ? metadata.referenceBaseline : undefined
-  const pickedSource = metadata.referenceBaselineSource === "tool" || metadata.referenceBaselineSource === "heuristic"
+  const pickedSource = metadata.referenceBaselineSource === "tool" || metadata.referenceBaselineSource === "llm" || metadata.referenceBaselineSource === "heuristic"
     ? metadata.referenceBaselineSource
     : undefined
   return { options, ...(picked ? { picked, pickedSource } : {}) }

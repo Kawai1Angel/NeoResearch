@@ -58,12 +58,12 @@ export interface ExperimentPlan {
     readonly noImprovementRounds: number
     readonly targetMetricValue?: number
   }
-  // Recipe ID explicitly picked as the comparison anchor on the first invocation.
-  // It never overrides nextExperiment or forces a candidate to run first. Only set on
+  // Explicitly picked comparison baseline. It must complete a verified full
+  // evaluation before nextExperiment schedules subsequent hypotheses. Only set on
   // that first call; later calls omit it and the previously persisted value is kept.
   readonly referenceBaseline?: string
   // No reference baseline is inferred from profile thresholds or pool order.
-  readonly referenceBaselineSource?: "tool"
+  readonly referenceBaselineSource?: "tool" | "llm"
 }
 
 export interface HypoPlannerResult {
@@ -91,6 +91,7 @@ export interface HypoPlannerInput {
   // when buildHypoPlannerResult is invoked on the first call. Validated against
   // referenceBaselineOptions(task) before use; ignored otherwise.
   readonly toolReferenceBaseline?: string
+  readonly referenceBaselineSource?: "tool" | "llm"
   readonly taskEvidence?: TaskEvidenceBundle
 }
 
@@ -567,6 +568,7 @@ export function buildExperimentPlan(input: {
   readonly task: ResearchTask
   readonly isFirstCall?: boolean
   readonly toolReferenceBaseline?: string
+  readonly referenceBaselineSource?: "tool" | "llm"
   readonly nextExperiment?: NextExperimentDecision
 }): ExperimentPlan {
   const searchBiases = unique([...taskSearchBiases(input.task), ...hypothesisSearchBiases(input.hypotheses)])
@@ -586,7 +588,7 @@ export function buildExperimentPlan(input: {
     input.toolReferenceBaseline !== undefined &&
     referenceBaselineOptions(input.task).includes(input.toolReferenceBaseline)
   const referenceBaseline = input.isFirstCall && toolReferenceBaselineValid ? input.toolReferenceBaseline : undefined
-  const referenceBaselineSource = referenceBaseline === undefined ? undefined : ("tool" as const)
+  const referenceBaselineSource = referenceBaseline === undefined ? undefined : (input.referenceBaselineSource ?? "tool")
   return {
     hypotheses: input.hypotheses,
     ...(input.nextExperiment ? { nextExperiment: input.nextExperiment } : {}),
@@ -762,12 +764,13 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
     }
   }
   validateHypothesisEvidence(hypotheses, input.taskEvidence)
-  const isFirstCall = input.runs.length === 0 && input.memory.length === 0
+  const isFirstCall = !input.runs.some((run) => run.candidateID)
   const plan = buildExperimentPlan({
     hypotheses,
     task: input.task,
     isFirstCall,
     toolReferenceBaseline: input.toolReferenceBaseline,
+    referenceBaselineSource: input.referenceBaselineSource,
     nextExperiment: input.nextExperiment,
   })
   const partial = {

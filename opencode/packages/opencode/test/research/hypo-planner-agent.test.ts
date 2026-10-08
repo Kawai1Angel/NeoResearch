@@ -370,3 +370,11 @@ test("an explicit stop with an empty pool does not generate fallback hypotheses"
   expect(result.plan.nextExperiment).toEqual(nextExperiment)
   expect(result.llm.status).toBe("used")
 })
+
+
+test("an explicit direct-planner baseline selection preserves its source", () => {
+  const result = buildHypoPlannerResult({ task: task(), dataAnalysisSummary: dataAnalysisSummary([]), runs: [], memory: [],
+    toolReferenceBaseline: "tsf_baseline_dlinear", referenceBaselineSource: "llm" })
+  expect(result.plan.referenceBaseline).toBe("tsf_baseline_dlinear")
+  expect(result.plan.referenceBaselineSource).toBe("llm")
+})
