@@ -29,7 +29,7 @@ import { Log } from "@/util"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
-import { HypothesisAddTool, HypothesisAbandonTool, HypothesisListTool, HypothesisUpdateTool } from "./research-hypothesis"
+import { HypothesisAddTool, HypothesisAbandonTool, HypothesisListTool, HypothesisUpdateTool, HypothesisSelectTool } from "./research-hypothesis"
 import { BaselinePickTool, BaselineLoadTool } from "./research-baseline"
 import { ReadReflectionTool, ExperimentResultsTool, ReadTrainingCurveTool, ReadMemoryLessonsTool } from "./research-context"
 import { AnalyzeDatasetTool } from "./research-data-analysis"
@@ -124,6 +124,7 @@ export const layer: Layer.Layer<
     const hypoAdd = yield* HypothesisAddTool
     const hypoUpdate = yield* HypothesisUpdateTool
     const hypoAbandon = yield* HypothesisAbandonTool
+    const hypoSelect = yield* HypothesisSelectTool
     const hypoList = yield* HypothesisListTool
     const pickBaseline = yield* BaselinePickTool
     const loadBaseline = yield* BaselineLoadTool
@@ -230,6 +231,7 @@ export const layer: Layer.Layer<
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
+          hypoSelect: Tool.init(hypoSelect),
           hypoAdd: Tool.init(hypoAdd),
           hypoUpdate: Tool.init(hypoUpdate),
           hypoAbandon: Tool.init(hypoAbandon),
@@ -272,6 +274,7 @@ export const layer: Layer.Layer<
             tool.patch,
             ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [tool.lsp] : []),
             ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [tool.plan] : []),
+            tool.hypoSelect,
             tool.hypoAdd,
             tool.hypoUpdate,
             tool.hypoAbandon,

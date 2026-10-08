@@ -101,6 +101,7 @@ import {
   UpdateRunStatusInput,
   UpdateTaskStatusInput,
 } from "./schema"
+import { MODEL_CAPABILITIES, validMechanisms, unsupportedMechanisms } from "./model-capabilities"
 import { Event } from "./event"
 import { addHypothesisToPool, bindTaskEvidenceToSession, loadTaskEvidenceForTask } from "./hypothesis-store"
 import {
@@ -159,6 +160,9 @@ import {
   generateHypotheses,
   validateHypothesisEvidence,
   referenceBaselineOptions,
+  parseNextExperiment,
+  isOpenHypothesis,
+  type NextExperimentDecision,
   type ExperimentPlan,
   type HypoPlannerInput,
   type HypoPlannerResult,
@@ -177,6 +181,7 @@ import {
 import { buildTrainEvalResult, type TrainEvalResult } from "./agents/train-eval-agent"
 import {
   analyzeReflection,
+  buildInlineReflectionSystemPrompt,
   buildReflectionPlanningMarkdown,
   reflectionAgentMetadata,
   summarizeReflectionAgent,
@@ -244,6 +249,7 @@ export type AutonomousLoopStoppedReason =
   | "time_budget_exhausted"
   | "crash_streak_exceeded"
   | "no_new_candidate"
+  | "planner_stopped"
 
 export interface AutonomousLoopResult {
   readonly iterations: AutonomousIterationResult[]
@@ -789,7 +795,6 @@ function abandonedHypothesesFromMetadata(metadata: Record<string, unknown>): rea
 }
 
 function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
-  const priority = row.priority
   const status = row.status
   const validStatus: HypothesisStatus =
     status === "pending" ||
@@ -807,7 +812,7 @@ function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
     expectedOutcome: row.expected_outcome,
     suggestedBackbones: Array.isArray(row.suggested_backbones) ? (row.suggested_backbones as string[]) : [],
     suggestedPreprocessing: Array.isArray(row.suggested_preprocessing) ? (row.suggested_preprocessing as string[]) : [],
-    priority: priority === "high" || priority === "medium" || priority === "low" ? priority : "medium",
+    requiredMechanisms: validMechanisms(row.required_mechanisms) ? row.required_mechanisms : [],
     risk: row.risk,
     testable: row.testable,
     datasetEvidencePaths: Array.isArray(row.dataset_evidence_paths) ? row.dataset_evidence_paths : [],
@@ -824,7 +829,7 @@ function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly Hypothesi
   if (hypotheses.length === 0) return undefined
   const metadata = recordValue(task.taskSpec.metadata)
   const baselineStrategy =
-    typeof metadata.baselineStrategy === "string" ? metadata.baselineStrategy : "domain_baselines_first"
+    typeof metadata.baselineStrategy === "string" ? metadata.baselineStrategy : "planner_selected_experiments"
   const referenceBaseline =
     typeof metadata.referenceBaseline === "string" ? metadata.referenceBaseline : undefined
   const searchBiases = Array.isArray(metadata.searchBiases)
@@ -846,12 +851,13 @@ function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly Hypothesi
       ...(targetMetricValue !== undefined ? { targetMetricValue } : {}),
     },
     ...(referenceBaseline !== undefined ? { referenceBaseline } : {}),
+    ...(parseNextExperiment(metadata.nextExperiment) ? { nextExperiment: parseNextExperiment(metadata.nextExperiment) } : {}),
   }
 }
 
 function hypothesisDefinitionDigest(hypothesis: HypothesisObject) {
-  const { id, status, abandonReason, ...definition } = hypothesis
-  return digest(definition)
+  const { id, status, abandonReason, priority, ...definition } = hypothesis
+  return digest({ ...definition, requiredMechanisms: hypothesis.requiredMechanisms ?? [] })
 }
 
 function recoverHypoPlannerResultFromPlan(input: {
@@ -1144,7 +1150,7 @@ function sessionLocalMetricState(input: {
   let bestMetric: number | undefined
   let noImproveStreak = 0
   const runs = input.runs
-    .filter((run) => run.stage === input.stage && run.status === "succeeded" && run.resourceUsage.independentEvidence !== false)
+    .filter((run) => run.stage === input.stage && run.status === "succeeded" && run.resourceUsage.independentEvidence !== false && run.resourceUsage.duplicateExperiment !== true)
     .toSorted((left, right) =>
       (left.timeFinished ?? left.time.updated ?? left.time.created) -
       (right.timeFinished ?? right.time.updated ?? right.time.created),
@@ -2246,7 +2252,7 @@ function buildHypoPlannerUserPrompt(
   dataAnalysisSummary: string,
   runs: readonly ResearchRun[],
   memory: readonly ResearchMemory[],
-  existingHypotheses: readonly { statement: string; status: string }[],
+  existingHypotheses: readonly { id?: string; statement: string; status: string }[],
   latestReflection: LatestReflectionSummary,
   llmSearchPreferences?: string[],
   abandonedHypotheses?: readonly { statement: string }[],
@@ -2254,6 +2260,7 @@ function buildHypoPlannerUserPrompt(
   opts?: {
     sessionMode?: boolean
     baselineOptions?: readonly { recipeID: string; description: string }[]
+    experimentHistory?: readonly unknown[]
   },
 ): string {
   const primaryMetricName = typeof (task.objective as Record<string, unknown>)?.primaryMetric === "string"
@@ -2291,6 +2298,9 @@ function buildHypoPlannerUserPrompt(
     compactPromptContext({
       taskSpec: task.taskSpec,
       taskDefinition: buildTaskDefinition(task),
+      modelCapabilities: MODEL_CAPABILITIES,
+      experimentHistory: opts?.experimentHistory ?? null,
+      searchProgress: recordValue(task.taskSpec.metadata).searchProgress ?? null,
       dataAnalysis: dataAnalysisSummary,
       methodLibrary: llmSearchPreferences && llmSearchPreferences.length > 0
         ? { ...MODEL_RECIPE_LIBRARY, preferences: llmSearchPreferences }
@@ -2311,7 +2321,7 @@ function buildHypoPlannerUserPrompt(
         ? { triedConfigurations }
         : {}),
       existingHypotheses: existingHypotheses.length > 0
-        ? existingHypotheses.map((h) => ({ statement: h.statement, status: h.status }))
+        ? existingHypotheses.map((h) => ({ id: h.id, statement: h.statement, status: h.status }))
         : null,
       abandonedHypotheses: abandonedHypotheses && abandonedHypotheses.length > 0
         ? abandonedHypotheses.map((h) => ({ statement: h.statement }))
@@ -2331,6 +2341,9 @@ function buildHypoPlannerUserPrompt(
         "abandonedHypotheses lists ideas already abandoned in earlier rounds — do not regenerate hypotheses that restate or closely resemble these. " +
         "Ground each hypothesis's motivation in specific values from dataAnalysis or outcomes from previousReflection. " +
         "Set expectedOutcome to a concrete, metric-referenced prediction. " +
+        "Choose the next experiment yourself from the entire open pool, considering exploration, local plateau and completed results; no priority field controls scheduling. " +
+        (opts?.sessionMode ? "Finish by calling hypothesis_select exactly once, with an open hypoID and an evidence-based rationale, or action=stop if no useful experiment remains. " : "Return hypotheses plus nextExperiment={action:experiment,hypothesisID,rationale} or {action:stop,rationale} in one JSON object. ") +
+        "Include requiredMechanisms for the mechanisms the hypothesis claims to test. Use modelCapabilities actual implementations; unsupported mechanisms cannot be inferred from backbone names. " +
         "Only cite cardID/revision/role combinations supplied in taskEvidence; relevance is not truth confidence. " +
         "Use evidenceLevel=data_only with empty literatureEvidence when no eligible entry exists. " +
         "Treat expectedOutcome as a prediction, surface contradictions in risk/applicabilityAssumptions, and provide at least one falsificationCriteria item per non-baseline hypothesis." +
@@ -2348,8 +2361,8 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
   if (Object.keys(rec).length === 0) return undefined
   const id = typeof rec.id === "string" && rec.id.trim() ? rec.id.trim() : undefined
   const statement = typeof rec.statement === "string" && rec.statement.trim() ? rec.statement.trim() : undefined
-  const priority = rec.priority === "high" || rec.priority === "medium" || rec.priority === "low" ? rec.priority : undefined
-  if (!id || !statement || !priority) return undefined
+  if (!id || !statement) return undefined
+  if (rec.requiredMechanisms !== undefined && !validMechanisms(rec.requiredMechanisms)) return undefined
   const filterStrings = (value: unknown) =>
     Array.isArray(value)
       ? (value as unknown[]).filter((s): s is string => typeof s === "string" && s.trim().length > 0)
@@ -2380,6 +2393,7 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
     }
   })
   if (literatureEvidence.some((item) => item === undefined)) return undefined
+  if (rec.requiredMechanisms !== undefined && !validMechanisms(rec.requiredMechanisms)) return undefined
   return {
     id,
     statement,
@@ -2387,7 +2401,7 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
     expectedOutcome,
     suggestedBackbones,
     suggestedPreprocessing,
-    priority,
+    requiredMechanisms: validMechanisms(rec.requiredMechanisms) ? rec.requiredMechanisms : [],
     risk,
     testable,
     datasetEvidencePaths,
@@ -2421,7 +2435,7 @@ async function loadLLMSearchPreferences(workspaceRoot: string, taskID: string): 
 function parseLLMHypothesesResult(
   text: string,
   usage: import("./llm-proposal").LLMTokenUsage,
-): { hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined {
+): { hypotheses: readonly HypothesisObject[]; nextExperiment: NextExperimentDecision; usage: import("./llm-proposal").LLMTokenUsage } | undefined {
   try {
     const parsed = extractJsonObject(text)
     const parsedRec = recordValue(parsed)
@@ -2429,7 +2443,9 @@ function parseLLMHypothesesResult(
     const rawHypotheses = (parsedRec.hypotheses as unknown[]).slice(0, 8)
     const validated = rawHypotheses.map(validateLLMHypothesisItem)
     if (validated.some((item) => item === undefined)) return undefined
-    return validated.length > 0 ? { hypotheses: validated as HypothesisObject[], usage } : undefined
+    const nextExperiment = parseNextExperiment(parsedRec.nextExperiment)
+    if (!nextExperiment || (nextExperiment.action === "experiment" && !validated.some((h) => h?.id === nextExperiment.hypothesisID && isOpenHypothesis(h) && !unsupportedMechanisms(h.requiredMechanisms ?? []).length))) return undefined
+    return validated.length > 0 || nextExperiment.action === "stop" ? { hypotheses: validated as HypothesisObject[], nextExperiment, usage } : undefined
   } catch {
     return undefined
   }
@@ -2443,11 +2459,12 @@ async function generateLLMHypotheses(
   draftHypotheses: readonly HypothesisObject[],
   workspaceRoot: string,
   onDelta?: (delta: string) => void,
-  existingHypotheses?: readonly { statement: string; status: string }[],
+  existingHypotheses?: readonly { id?: string; statement: string; status: string }[],
   latestReflection?: LatestReflectionSummary,
   abandonedHypotheses?: readonly { statement: string }[],
   taskEvidence?: TaskEvidenceBundle,
-): Promise<{ hypotheses: readonly HypothesisObject[]; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
+  experimentHistory?: readonly unknown[],
+): Promise<{ hypotheses: readonly HypothesisObject[]; nextExperiment: NextExperimentDecision; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
     const neoCastProjectRoot = typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined
@@ -2467,8 +2484,8 @@ async function generateLLMHypotheses(
       }
     }
     const llmSearchPreferences = await loadLLMSearchPreferences(workspaceRoot, task.id)
-    const system = buildHypoPlannerSystemPrompt()
-    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences, abandonedHypotheses ?? [], taskEvidence)
+    const system = buildHypoPlannerSystemPrompt() + "\nDirect mode: no tool calls. Return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms."
+    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences, abandonedHypotheses ?? [], taskEvidence, { experimentHistory })
     const llmPromise = onDelta
       ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
       : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
@@ -2496,6 +2513,7 @@ interface ReflectionLLMContext {
   readonly currentHypothesis?: string
   /** candidateSpec JSON of the most recent candidate (architecture + training recipe). */
   readonly experimentDesign?: unknown
+  readonly executedModel?: unknown
   /** Training curve: ordered array of { epoch, valLoss, horizon?, elapsedS? } data points. */
   readonly trainingCurve: readonly TrainingCurvePoint[]
   /** Lessons from the two most recent distinct memory entries. */
@@ -2505,7 +2523,7 @@ interface ReflectionLLMContext {
 }
 
 function buildReflectionLLMSystemPrompt(): string {
-  return PROMPT_RESEARCH_REFLECTION
+  return buildInlineReflectionSystemPrompt(PROMPT_RESEARCH_REFLECTION)
 }
 
 function buildReflectionSessionUserPrompt(
@@ -2528,6 +2546,7 @@ function buildReflectionSessionUserPrompt(
       taskSpec: task.taskSpec,
       taskObjective,
       maxIterations,
+      modelCapabilities: MODEL_CAPABILITIES,
       currentHypothesis: currentHypothesis ?? null,
       structuralAnalysis: {
         decision: analysis.decision,
@@ -2560,6 +2579,8 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
       maxIterations: context.maxIterations,
       originalHypothesis: context.currentHypothesis ?? null,
       experimentDesign: context.experimentDesign ?? null,
+      modelCapabilities: MODEL_CAPABILITIES,
+      executedModel: context.executedModel ?? null,
       experimentResults: {
         primaryMetricName: analysis.primaryMetricName,
         direction: analysis.direction,
@@ -2692,6 +2713,13 @@ async function generateLLMReflectionSynthesis(
     const llmResult = await Promise.race([llmPromise, timeoutPromise])
     if (llmResult === undefined) return { ...result, llm: { status: "failed" } }
     const structured = parseReflectionLLMStructured(llmResult.text)
+    if (!structured) {
+      return { ...result, llm: {
+        status: "failed", model: effectiveConfig.model,
+        error: "Reflection response must contain the seven required analysis fields.",
+        usage: llmResult.usage,
+      } }
+    }
     return {
       ...result,
       llm: {
@@ -3837,6 +3865,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           baselineStrategy: input.hypothesisPlan.baselineStrategy,
           searchBiases: input.hypothesisPlan.searchBiases,
           stopConditions: input.hypothesisPlan.stopConditions,
+          nextExperiment: input.hypothesisPlan.nextExperiment as unknown as JsonRecord ?? null,
           ...(input.hypothesisPlan.referenceBaseline === undefined
             ? {}
             : { referenceBaseline: input.hypothesisPlan.referenceBaseline }),
@@ -3883,7 +3912,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 expected_outcome: h.expectedOutcome,
                 suggested_backbones: [...h.suggestedBackbones],
                 suggested_preprocessing: [...h.suggestedPreprocessing],
-                priority: h.priority,
+                priority: "medium",
+                required_mechanisms: [...(h.requiredMechanisms ?? [])],
                 risk: h.risk,
                 testable: h.testable,
                 dataset_evidence_paths: [...h.datasetEvidencePaths],
@@ -4134,9 +4164,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const seedBaselines = Effect.fn("Research.seedBaselines")(function* (input: SeedBaselinesInput) {
       const task = yield* getTask(input.taskID)
       const allProposals = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
-      // HypoPlanner selects one of these baselines (via LLM or heuristic) as the
-      // referenceBaseline / first candidate to run. Only that baseline is seeded as a
-      // candidate — the other baseline options are dropped from the search entirely.
+      // An explicitly selected reference baseline narrows the comparison controls.
+      // Seeding queues candidates; nextExperiment determines what runs next.
       const referenceBaseline = recordValue(recordValue(task.taskSpec).metadata).referenceBaseline
       const referenceProposals = typeof referenceBaseline === "string"
         ? allProposals.filter((proposal) => candidateRecipeID(proposal.candidateSpec) === referenceBaseline)
@@ -4163,7 +4192,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               expectedOutcome: "Produce a reproducible metric floor for subsequent hypothesis tests.",
               suggestedBackbones: [String(recordValue(proposal.candidateSpec.backbone).type)],
               suggestedPreprocessing: [],
-              priority: "low",
               risk: "The reference baseline may underfit the dataset.",
               testable: true,
               falsificationCriteria: ["Reject this control if it cannot complete the configured evaluation protocol."],
@@ -5859,7 +5887,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const resumeCandidate = resumeBlocker ? yield* getCandidateForTask(task.id, String(resumeBlocker.metadata.candidateID) as ResearchCandidateID) : undefined
       const resumeSeed = typeof resumeBlocker?.metadata.seed === "number" ? resumeBlocker.metadata.seed : undefined
       yield* ensureRunBudget(task, "queued")
-      const forceExplore = input.forceExplore === true
+      const plannerDecision = parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment)
+      if (plannerDecision?.action === "stop" && !resumeCandidate && !recovery?.feedback && !recovery?.hypothesisID) throw new Error(`HypoPlanner stopped search: ${plannerDecision.rationale}`)
+      const forceExplore = input.forceExplore === true && !plannerDecision
       const baseFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
 
       const latestReflection = yield* Effect.promise(async () => {
@@ -5892,6 +5922,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         ? hypotheses.find((item) => item.id === recovery.hypothesisID)
         : resumeCandidate ? hypotheses.find((item) => item.id === resumeCandidate.hypothesisID) : selectHypothesisForDesign(hypothesisPlan)
 
+      if (!plannerDecision && hypotheses.length > 0 && !resumeCandidate && !recovery?.hypothesisID)
+        throw new Error("HypoPlanner must explicitly select the next experiment; no order-based fallback is permitted")
+      if (plannerDecision?.action === "experiment" && !selectedHypothesis) throw new Error(`HypoPlanner selected an unavailable hypothesis: ${plannerDecision.hypothesisID}`)
       const designTaskEvidence = selectedHypothesis?.literatureEvidence?.length
         ? yield* loadTaskEvidenceBundle(input.taskID)
         : undefined
@@ -5948,11 +5981,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const runs = yield* listRuns(task.id)
       const primaryMetricName = objectiveMetricName(task.objective)
       const designerSelection = selectModelDesignerCandidate({
-        candidates,
+        candidates: plannerDecision?.action === "experiment" && !resumeCandidate
+          ? candidates.filter((item) => item.hypothesisID === selectedHypothesis?.id)
+          : candidates,
         runs,
         primaryMetricName,
         maxFailedRetries: maxFailedCandidateRetries(task),
       })
+      if (!plannerDecision && !resumeCandidate && !recovery?.hypothesisID && designerSelection.readyCandidateIDs.length > 1)
+        throw new Error("HypoPlanner must explicitly select among the queued experiments; no baseline order is permitted")
       const readyCandidateIDs = [...designerSelection.readyCandidateIDs]
       const attemptState = {
         attemptedCandidateIDs: new Set(designerSelection.attemptedCandidateIDs),
@@ -6179,7 +6216,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 expectedOutcome: "Evaluate the proposed architecture under the task protocol.",
                 suggestedBackbones: [String(recordValue(proposal!.candidateSpec.backbone).type)],
                 suggestedPreprocessing: [],
-                priority: "medium",
                 risk: "Heuristic proposal requires empirical verification.",
                 testable: true,
               }))
@@ -6668,7 +6704,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const getAutonomousLoopStopReason = Effect.fn("Research.getAutonomousLoopStopReason")(function* (
       task: ResearchTask,
     ) {
-      const candidates = yield* listCandidates(task.id)
+      const currentTask = yield* getTask(task.id)
+      const decision = parseNextExperiment(recordValue(currentTask.taskSpec.metadata).nextExperiment)
+      const pool = yield* listCandidates(task.id)
+      const candidates = decision?.action === "experiment"
+        ? pool.filter((candidate) => candidate.hypothesisID === decision.hypothesisID)
+        : pool
       if (candidates.length === 0) return undefined
 
       const runs = yield* listRuns(task.id)
@@ -6688,7 +6729,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (hasPendingCandidate) return "approval_required" as const
 
       const pendingApprovals = yield* listApprovals({ taskID: task.id, status: "pending" })
-      const hasBlockingApproval = pendingApprovals.some((approval) => approval.kind !== "ref_test")
+      const selectedCandidateIDs = new Set(candidates.map((candidate) => candidate.id))
+      const hasBlockingApproval = pendingApprovals.some((approval) => approval.kind !== "ref_test" &&
+        (approval.kind !== "candidate" || !approval.candidateID || selectedCandidateIDs.has(approval.candidateID)))
       return hasBlockingApproval ? ("approval_required" as const) : undefined
     })
 
@@ -6734,11 +6777,29 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       let bestMetric = initialMetricState.bestMetric
       let noImproveStreak = initialMetricState.noImproveStreak
       let crashStreak = cycle.crash_streak
+      let completedIterations = cycle.iterations
       let duplicateStreak = 0
       const stopClock = cycleClock(cycle.id)
       return yield* Effect.gen(function* () {
       if (maxCrashStreak !== undefined && crashStreak >= maxCrashStreak) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "crash_streak_exceeded" })
-      if (cycle.iterations > 0 && maxNoImprove !== undefined && noImproveStreak >= maxNoImprove) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
+      const refreshPlanner = Effect.fn("Research.planNextExperiment")(function* () {
+        const current = yield* getTask(task.id)
+        yield* db((d) => d.update(ResearchTaskTable).set({
+          task_spec: { ...current.taskSpec, metadata: { ...recordValue(current.taskSpec.metadata), searchProgress: {
+            noImproveStreak, plateauThreshold: maxNoImprove, globalPlateauObserved: noImproveStreak >= maxNoImprove,
+            bestMetric: bestMetric ?? null, remainingIterations: maxIterations - completedIterations,
+            instruction: "Decide the next experiment from completed independent results. A local plateau is a signal to reconsider the direction, not an automatic global stop. Hard iteration/time/resource limits still apply.",
+          } } },
+          time_updated: Date.now(),
+        }).where(eq(ResearchTaskTable.id, task.id)).run())
+        return yield* runHypoPlannerAgent({ taskID: task.id })
+      })
+      if (timeBudgetSeconds !== undefined && cycle.elapsed_ms + Date.now() - startedAt >= timeBudgetSeconds * 1000) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "time_budget_exhausted" })
+      if (cycle.iterations < maxIterations && parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment)?.action === "stop") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" })
+      if (cycle.iterations > 0 && noImproveStreak >= maxNoImprove && cycle.iterations < maxIterations) {
+        const planned = yield* refreshPlanner()
+        if (planned.llm.status !== "used") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
+      }
       for (let index = cycle.iterations; index < maxIterations; index++) {
         if (timeBudgetSeconds !== undefined && cycle.elapsed_ms + Date.now() - startedAt >= timeBudgetSeconds * 1000) {
           return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "time_budget_exhausted" })
@@ -6751,9 +6812,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const blockedReason = yield* getAutonomousLoopStopReason(task)
         if (blockedReason) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: blockedReason })
 
+        const nextDecision = parseNextExperiment(recordValue((yield* getTask(task.id)).taskSpec.metadata).nextExperiment)
+        if (nextDecision?.action === "stop") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" })
         const description =
           input.description === undefined ? undefined : `${input.description} (iteration ${index + 1})`
         chargeIteration(cycle.id)
+        completedIterations += 1
         const iterationResult = yield* runAutonomousIteration({
           taskID: input.taskID,
           stage,
@@ -6781,6 +6845,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         if (iterationResult.iteration.run.resourceUsage.duplicateExperiment === true) {
           duplicateStreak += 1
           if (duplicateStreak >= 3) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "no_new_candidate" })
+          if (index === maxIterations - 1) continue
+          if (timeBudgetSeconds !== undefined && cycle.elapsed_ms + Date.now() - startedAt >= timeBudgetSeconds * 1000) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "time_budget_exhausted" })
+          yield* refreshPlanner()
+          yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
           continue
         }
         duplicateStreak = 0
@@ -6795,7 +6863,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           saveCrashStreak(cycle.id, crashStreak)
         }
         const metric =
-          stage === "smoke" ? undefined : metricValue(iterationResult.iteration.run.metrics, primaryMetricName)
+          stage === "smoke" || !["succeeded", "rejected"].includes(iterationResult.iteration.run.status) || iterationResult.iteration.run.resourceUsage.independentEvidence === false
+            ? undefined : metricValue(iterationResult.iteration.run.metrics, primaryMetricName)
         if (metric !== undefined) {
           const improved =
             bestMetric === undefined ||
@@ -6810,9 +6879,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             targetMetricValue !== undefined &&
             (direction === "minimize" ? metric <= targetMetricValue : metric >= targetMetricValue)
           if (targetReached) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "target_reached" })
-          if (maxNoImprove !== undefined && noImproveStreak >= maxNoImprove) {
-            return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
-          }
+
         }
         // Per-iteration reflection: run after every TrainEval, LLM-augmented, non-blocking.
         yield* runReflectionAgent({ taskID: input.taskID, maxIterations }).pipe(Effect.catchCause(() => Effect.void))
@@ -6828,7 +6895,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: nextIterBlockedReason })
           }
           // Next iteration will run: refresh hypotheses, then restore searching status.
-          yield* runHypoPlannerAgent({ taskID: input.taskID }).pipe(Effect.catchCause(() => Effect.void))
+          const planned = yield* refreshPlanner()
+          if (planned.plan.nextExperiment?.action === "stop") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" })
+          if (noImproveStreak >= maxNoImprove && planned.llm.status !== "used") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
           yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
         }
       }
@@ -8362,10 +8431,19 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const task = yield* getTask(input.taskID)
 	        const runs = yield* listRuns(input.taskID)
 	        const memory = yield* listMemory(input.taskID)
-	        const existingHypothesesRaw = yield* db((d) =>
+	        const plannerCandidates = yield* listCandidates(input.taskID)
+        const experimentHistory = runs.map((run) => ({
+          runID: run.id, candidateID: run.candidateID,
+          hypothesisID: plannerCandidates.find((c) => c.id === run.candidateID)?.hypothesisID,
+          stage: run.stage, status: run.status, metrics: run.metrics,
+          independentEvidence: run.resourceUsage.duplicateExperiment !== true && run.resourceUsage.independentEvidence !== false,
+          executedModel: recordValue(recordValue(run.resourceUsage.executionContract).manifest).actual,
+          error: run.error,
+        }))
+        const existingHypothesesRaw = yield* db((d) =>
 	          d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.task_id, input.taskID)).all(),
 	        )
-	        const existingHypotheses = existingHypothesesRaw.map((r) => ({ statement: r.statement, status: r.status }))
+	        const existingHypotheses = existingHypothesesRaw.map((r) => ({ id: r.hypo_id, statement: r.statement, status: r.status }))
         const abandonedHypotheses = abandonedHypothesesFromMetadata(recordValue(task.taskSpec.metadata))
 	        const latestReflection = yield* Effect.promise(async () => {
 	          try {
@@ -8424,13 +8502,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          : []
 	        const evidenceArtifactID = input.taskEvidenceArtifactID ?? (yield* listArtifacts(task.id))
             .find((item) => item.kind === "task_evidence_bundle_json" && recordValue(item.metadata).retrieveRunID === taskEvidence?.retrieveRunID)?.id
-	        const hypoSessionAttempt = yield* requestViaSession({
+	        yield* db((d) => d.update(ResearchTaskTable).set({
+          task_spec: { ...task.taskSpec, metadata: { ...recordValue(task.taskSpec.metadata), nextExperiment: null } },
+          time_updated: Date.now(),
+        }).where(eq(ResearchTaskTable.id, task.id)).run())
+        const hypoSessionAttempt = yield* requestViaSession({
 	          evidenceBinding: { taskID: task.id, artifactID: evidenceArtifactID },
 	          rootSessionID: task.sessionID,
 	          agent: "research-hypo-planner",
 	          stageLabel: "HypoPlanner",
 	          taskID: task.id,
-	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses, latestReflection, hypoSearchPreferences, abandonedHypotheses, taskEvidence, { sessionMode: true, baselineOptions }),
+	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses, latestReflection, hypoSearchPreferences, abandonedHypotheses, taskEvidence, { sessionMode: true, baselineOptions, experimentHistory }),
 	          modelRef: mapToModelRef(hypoConfig),
 	          onDelta: (delta) => bus.publish(Event.HypoPlannerAgentStreamDelta, { taskID: task.id, agent: "HypoPlannerAgent", delta }),
           onPartUpdated: (part) => {
@@ -8467,7 +8549,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const llmHypothesesResult = hypoSessionAttempt
 	          ? undefined
 	          : yield* Effect.promise(() =>
-	              generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses, taskEvidence),
+	              generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses, taskEvidence, experimentHistory),
 	            )
 	        const llmHypoUsage = hypoSessionAttempt ? hypoSessionAttempt.usage : llmHypothesesResult?.usage
 	        // Session mode: agent used hypothesis_* tools to write to DB; read current pool state.
@@ -8476,9 +8558,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          : undefined
 	        // The pick_baseline tool (if called during the session) wrote referenceBaseline/
 	        // referenceBaselineSource/referenceBaselineRationale straight to task_spec.metadata —
-	        // re-fetch to pick that up. Falls through to buildExperimentPlan's heuristic when the
-	        // tool was never called (e.g. no session, or the agent didn't call it).
-	        const refreshedTask = hypoSessionAttempt && isFirstHypoPlannerCall ? yield* getTask(input.taskID) : task
+	        // re-fetch to pick that up. No baseline is inferred when the tool was not called.
+	        const refreshedTask = hypoSessionAttempt ? yield* getTask(input.taskID) : task
 	        const refreshedMetadata = recordValue(refreshedTask.taskSpec.metadata)
 	        const toolReferenceBaseline =
 	          typeof refreshedMetadata.referenceBaseline === "string" ? refreshedMetadata.referenceBaseline : undefined
@@ -8486,7 +8567,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          typeof refreshedMetadata.referenceBaselineRationale === "string"
 	            ? refreshedMetadata.referenceBaselineRationale
 	            : undefined
-	        let result = buildHypoPlannerResult({
+	        const nextExperiment = hypoSessionAttempt
+          ? parseNextExperiment(refreshedMetadata.nextExperiment)
+          : llmHypothesesResult?.nextExperiment
+        if (hypoSessionAttempt && !nextExperiment) throw new Error("HypoPlanner must explicitly call hypothesis_select before the next experiment")
+        if (nextExperiment?.action === "experiment" && !sessionPoolHypotheses?.some((h) => h.id === nextExperiment.hypothesisID && isOpenHypothesis(h)) && hypoSessionAttempt)
+          throw new Error(`HypoPlanner selection is no longer open: ${nextExperiment.hypothesisID}`)
+        let result = buildHypoPlannerResult({
 	          task,
 	          dataAnalysisSummary,
 	          runs,
@@ -8494,6 +8581,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          taskEvidence,
 	          llmHypotheses: sessionPoolHypotheses ?? llmHypothesesResult?.hypotheses,
 	          toolReferenceBaseline,
+              nextExperiment,
 	        })
 
         if (!(hypoSessionAttempt && result.llm.status === "used")) {
@@ -8508,7 +8596,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               ? { ...h, id: `${h.id}_${ResearchHypothesisID.ascending()}` }
               : h
           })
-          const plan = { ...result.plan, hypotheses }
+          const decision = result.plan.nextExperiment
+          const chosenIndex = decision?.action === "experiment" ? result.plan.hypotheses.findIndex((h) => h.id === decision.hypothesisID) : -1
+          const plan = { ...result.plan, hypotheses, ...(chosenIndex >= 0 ? { nextExperiment: { ...decision!, action: "experiment" as const, hypothesisID: hypotheses[chosenIndex]!.id } } : {}) }
           result = { ...result, plan, hypothesesYaml: buildHypothesesYaml(plan, taskEvidence?.readiness) }
           result = { ...result, planMarkdown: buildHypoPlanMarkdown(result) }
         }
@@ -8577,6 +8667,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              baselineStrategy: result.plan.baselineStrategy,
 	              searchBiases: result.plan.searchBiases,
 	              stopConditions: result.plan.stopConditions,
+              nextExperiment: result.plan.nextExperiment as unknown as JsonRecord ?? null,
 	              ...(result.plan.referenceBaseline === undefined
 	                ? {}
 	                : { referenceBaseline: result.plan.referenceBaseline }),
@@ -8967,6 +9058,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	                maxIterations: baseResult.maxIterations,
 	                currentHypothesis: latestCandidate?.rationale || undefined,
 	                experimentDesign: latestCandidate?.candidateSpec,
+                executedModel: recordValue(recordValue(latestRunForContext?.resourceUsage.executionContract).manifest).actual,
 	                trainingCurve,
 	                recentMemories: recentLessons,
 	                bestMemoryLesson: bestMemory && bestMemory.id !== sortedMemories[0]?.id && bestMemory.id !== sortedMemories[1]?.id
@@ -9747,8 +9839,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           typeof checkpointReferenceBaseline === "string"
             ? allBaselines.filter((proposal) => candidateRecipeID(proposal.candidateSpec) === checkpointReferenceBaseline)
             : []
-        // HypoPlanner already picked the one baseline to run via pick_baseline (or the
-        // heuristic fallback) — show only that one, not every option it could have chosen.
+        // Show the explicitly selected comparison anchor when present; otherwise
+        // show all options without assigning a default.
         const baselines = referenceBaselines.length > 0 ? referenceBaselines : allBaselines
         const ssSearchPreferences = yield* Effect.promise(() => loadLLMSearchPreferences(Instance.directory, currentTask.id))
         const baselineList = baselines

@@ -197,6 +197,7 @@ export const ResearchHypothesisTable = sqliteTable(
     >(),
     applicability_assumptions: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
     falsification_criteria: text({ mode: "json" }).notNull().default([]).$type<string[]>(),
+    required_mechanisms: text({ mode: "json" }).notNull().default([]).$type<import("./model-capabilities").ModelMechanism[]>(),
     evidence_level: text().notNull().default("data_only"),
     // pending | active | testing | confirmed | rejected | abandoned
     status: text().notNull().default("pending"),

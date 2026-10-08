@@ -1,4 +1,5 @@
 import { resolveTSFProfileSource, TSFTaskSpec } from "../domains/tsf"
+import { decomposeSeasonality } from "../seasonality"
 import { taskExecutionRoot } from "../task-isolation"
 import { analyzeDatasetProfileForPrompt, renderCorrelationMatrixSummary } from "../prompt-context"
 import { deflateSync } from "zlib"
@@ -403,35 +404,6 @@ function frequencyAnalysis(series: readonly number[]) {
   }
 }
 
-function movingAverage(values: readonly number[], window: number) {
-  const radius = Math.max(1, Math.floor(window / 2))
-  return values.map((_, index) => {
-    const slice = values.slice(Math.max(0, index - radius), Math.min(values.length, index + radius + 1))
-    return finiteMean(slice) ?? values[index] ?? 0
-  })
-}
-
-function decompositionAnalysis(series: readonly number[], period: number | undefined) {
-  const values = finiteSeries(series)
-  if (values.length < 4) return {}
-  const resolvedPeriod = Math.max(2, Math.min(Math.floor(values.length / 2), Math.round(period ?? 12)))
-  const trend = movingAverage(values, resolvedPeriod)
-  const detrended = values.map((value, index) => value - trend[index]!)
-  const seasonalMeans = Array.from({ length: resolvedPeriod }, (_, seasonalIndex) =>
-    finiteMean(detrended.filter((_, index) => index % resolvedPeriod === seasonalIndex)) ?? 0,
-  )
-  const seasonal = detrended.map((_, index) => seasonalMeans[index % resolvedPeriod]!)
-  const residual = values.map((value, index) => value - trend[index]! - seasonal[index]!)
-  const totalVariance = variance(values) ?? 0
-  const share = (part: readonly number[]) => (totalVariance > 0 ? (variance(part) ?? 0) / totalVariance : undefined)
-  return {
-    period: resolvedPeriod,
-    trendVarianceShare: roundAnalysisValue(share(trend)),
-    seasonalVarianceShare: roundAnalysisValue(share(seasonal)),
-    residualVarianceShare: roundAnalysisValue(share(residual)),
-  }
-}
-
 function changepointAnalysis(series: readonly number[]) {
   const values = finiteSeries(series)
   const std = Math.sqrt(variance(values) ?? 0)
@@ -500,7 +472,7 @@ function buildStatisticalAnalysis(matrix: DatasetSeriesMatrix | undefined, finge
   return {
     stationarity: stationarityAnalysis(matrix, profile),
     acf: acfPacfAnalysis(matrix, maxLag),
-    decomposition: decompositionAnalysis(series, numericProfileValue(profile, "acfMainPeriod")),
+    decomposition: decomposeSeasonality(matrix.values, numericProfileValue(profile, "acfMainPeriod")),
     frequency: frequencyAnalysis(series),
     changepoint: changepointAnalysis(series),
     crossLag: crossLagAnalysis(matrix, Math.min(24, maxLag)),
@@ -584,7 +556,7 @@ function buildDatasetAnalysisPlots(
   ]
   const crossLagValue = statistics.crossLag.correlation === undefined ? [0] : [Math.abs(statistics.crossLag.correlation)]
   const baseMetadata = { format: "png", role: "quantitative-data-analyst", phase: "data_analysis" } as JsonRecord
-  return [
+  const plots: DatasetAnalysisPlot[] = [
     {
       kind: "dataset_analysis_plot_png",
       filename: "time-series-overview.png",
@@ -607,7 +579,7 @@ function buildDatasetAnalysisPlots(
       relativePath: "quantitative/plots/stl-decomposition.png",
       role: "quantitative-data-analyst",
       data: simplePng(480, 240, decompositionValues, [110, 190, 120]),
-      metadata: { ...baseMetadata, plotType: "stl_decomposition", title: "STL-style decomposition" },
+      metadata: { ...baseMetadata, plotType: "stl_decomposition", title: "Per-channel moving-average seasonal decomposition" },
     },
     {
       kind: "dataset_analysis_plot_png",
@@ -618,6 +590,7 @@ function buildDatasetAnalysisPlots(
       metadata: { ...baseMetadata, plotType: "cross_lag", title: "Cross-lag correlation" },
     },
   ]
+  return plots.filter((plot) => plot.metadata.plotType !== "stl_decomposition" || statistics.decomposition.period !== undefined)
 }
 
 export async function buildDatasetAnalysisContext(task: ResearchTask, fingerprint: JsonRecord): Promise<DatasetAnalysisContext> {
@@ -714,12 +687,12 @@ export function analyzeDataset(input: {
     ["Targets", targetCols.length, "forecast target columns used by the task"],
     ["Missing rate", profile.missingRate, "fraction of missing numeric target cells"],
     ["Trend strength", profile.trendStrength, "mean absolute correlation with time index"],
-    ["Seasonality strength", profile.seasonalityStrength, "best lag-correlation over common TSF lags"],
+    ["Seasonality strength", profile.seasonalityStrength, "mean positive detrended ACF peak strength; cadence-aware periods, at least three cycles"],
     ["Cross-variate correlation", profile.crossVarCorrelation, "mean absolute pairwise target correlation"],
     ["Distribution shift", profile.distributionShift, "normalized first-half vs second-half drift"],
     ["Outlier rate", profile.outlierRate, "IQR-based extreme-value share"],
-    ["ACF main period", rawProfile.acfMainPeriod, "dominant lag from average target autocorrelation"],
-    ["ACF main period strength", rawProfile.acfMainPeriodStrength, "mean autocorrelation strength at the dominant lag"],
+    ["ACF main period", rawProfile.acfMainPeriod, "detected seasonal period in observations; short-lag persistence alone is insufficient"],
+    ["ACF main period strength", rawProfile.acfMainPeriodStrength, "mean detrended periodic peak strength at the detected period"],
     ["ADF statistic", rawProfile.adfStatistic, "Augmented Dickey-Fuller style stationarity statistic"],
     ["ADF stationarity", rawProfile.adfStationary, "whether the profile suggests stationarity at the default threshold"],
     ["Irregular interval ratio", profile.irregularIntervalRatio, "timestamp cadence instability"],
@@ -777,9 +750,11 @@ export function analyzeDataset(input: {
     `- KPSS statistic: ${renderAnalysisValue(stats.stationarity.kpssStatistic)}; stationary=${renderAnalysisValue(stats.stationarity.kpssStationary)}`,
     `- PACF top lag: ${renderAnalysisValue(stats.acf.pacfTopLag)} (${renderAnalysisValue(stats.acf.pacfTopCorrelation)})`,
     "",
-    "## STL-style decomposition",
+    "## Per-channel moving-average seasonal decomposition",
     "",
     `- Period: ${renderAnalysisValue(stats.decomposition.period)}`,
+    "- Method: centered moving-average detrending and phase means, averaged per channel; this is not STL. Variance shares need not sum to one. A low global phase share does not rule out changing local seasonality.",
+    ...(stats.decomposition.period === undefined ? ["- No supported seasonal period was detected; decomposition shares are unavailable, not zero."] : []),
     `- Trend variance share: ${renderAnalysisValue(stats.decomposition.trendVarianceShare)}`,
     `- Seasonal variance share: ${renderAnalysisValue(stats.decomposition.seasonalVarianceShare)}`,
     `- Residual variance share: ${renderAnalysisValue(stats.decomposition.residualVarianceShare)}`,

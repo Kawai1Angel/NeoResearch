@@ -17,6 +17,7 @@ When candidateValidationFeedback contains execution errors or contract mismatche
 parallel_two_branch requires secondary={backbone,embedding,representation} and merge=latent_gate|history_time_gate|forecast_step_gate; decomposition_two_branch requires secondary and an odd kernel_size. Primary is the top-level backbone; primary models trend for decomposition. Use temporal/independent fusion for compositions.
 Forecast-space merges support point heads only. History gates require matching sequence layout, d_model and representation; latent gates require matching latent_dim.
 Use feature_mlp instead of its temporal/shared alias. Naming changes do not create a new architecture; duplicate results are not independent evidence.
+Use taskFingerprint.modelCapabilities as the implementation contract. DLinear/linear encode context to latent_dim, then a shared per-channel head maps latent_dim to H; a single-branch 64-wide linear/DLinear path with raw preprocessing and independent temporal fusion has affine temporal rank at most 64 (input-dependent normalization/centering/restoration can change the overall map). Width 64 is a baseline choice, not a universal optimum. Generic nbeats uses learned MLP residual backcast/latent-forecast blocks, with no fixed trend/Fourier bases and no N-HiTS multirate sampling. Never claim an unsupported mechanism was tested. Implement every selectedHypothesis.requiredMechanisms item or explicitly report that the intended experiment is unavailable.
 TimesNet-lite is paper_derived, not a full TimesNet reproduction; gated_depthwise_conv is not an SSM. Never attribute legacy proxy results to these paper architectures.
 Dropout is module-level only. Do not emit regularization.dropout, share_across_horizons, horizon_specific, base_head, variate_token, cross_attention, graph_type, or fill_policy.
 missing_mask must be the first preprocessing action, with mask_channel=true and cross-variable fusion. static graph requires topology_artifact with ordered channel_names and adjacency; correlation fits train rows only.
@@ -63,7 +64,7 @@ EXAMPLE (follow this exact structure):
   "representation": {"layout": "channel_latent", "readout": "none", "latent_dim": 32},
   "composition": {"type": "single"},
   "recipe_id": "recipe_dlinear_decomp_example",
-  "hypothesis": "DLinear 通过趋势-残差分解直接预测，参数量少，适合具有明显趋势的序列。",
+  "hypothesis": "DLinear 将趋势与残差分别映射到 latent_dim，再通过共享预测头映射到 horizon；测试该分解和低秩表示的效果。",
   "preprocessing": {
     "actions": [
       {
@@ -86,9 +87,6 @@ EXAMPLE (follow this exact structure):
   "prediction_head": {
     "type": "linear",
     "output_distribution": "point"
-  },
-  "post_processing": {
-    "type": "auto"
   },
   "training_strategy": {
     "loss": {
@@ -114,10 +112,6 @@ EXAMPLE (follow this exact structure):
       "patience": 3,
       "seed": 42
     }
-  },
-  "constraints": {
-    "max_params": 500000,
-    "max_latency_ms": 30
   },
   "notes": "轻量基线，用于趋势主导场景。"
 }

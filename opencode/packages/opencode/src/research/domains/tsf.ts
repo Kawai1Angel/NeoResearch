@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { analyzeSeasonality } from "../seasonality"
 import z from "zod"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
@@ -1321,55 +1322,6 @@ function profileTrend(matrix: number[][], timeAxis?: number[]) {
   return meanFinite(strengths)
 }
 
-function firstDifference(values: number[]) {
-  const result: number[] = []
-  for (let index = 1; index < values.length; index++) {
-    const current = values[index]
-    const previous = values[index - 1]
-    result.push(Number.isFinite(current) && Number.isFinite(previous) ? current! - previous! : Number.NaN)
-  }
-  return result
-}
-
-function profileSeasonality(matrix: number[][]) {
-  if (matrix.length < 8) return 0
-  const candidateLags = [24, 48, 96, 12, 7].filter((lag) => lag < (matrix.length - 1) / 2)
-  if (candidateLags.length === 0) return 0
-  const strengths: number[] = []
-  for (let col = 0; col < matrix[0]!.length; col++) {
-    const values = firstDifference(column(matrix, col))
-    const best = Math.max(
-      ...candidateLags.map((lag) => Math.abs(pearson(values.slice(lag), values.slice(0, values.length - lag)))),
-    )
-    strengths.push(best)
-  }
-  return meanFinite(strengths)
-}
-
-function profileACFMainPeriod(matrix: number[][]) {
-  if (matrix.length < 8) return undefined
-  const candidateLags = [24, 48, 96, 12, 7].filter((lag) => lag < (matrix.length - 1) / 2)
-  if (candidateLags.length === 0) return undefined
-  let bestLag = candidateLags[0]!
-  let bestStrength = 0
-  for (const lag of candidateLags) {
-    const strengths: number[] = []
-    for (let col = 0; col < matrix[0]!.length; col++) {
-      const values = column(matrix, col)
-      strengths.push(Math.abs(pearson(values.slice(lag), values.slice(0, values.length - lag))))
-    }
-    const strength = meanFinite(strengths)
-    if (strength > bestStrength) {
-      bestLag = lag
-      bestStrength = strength
-    }
-  }
-  return {
-    lag: bestLag,
-    strength: roundProfileValue(bestStrength),
-  }
-}
-
 function adfStatistic(values: number[]) {
   const xs: number[] = []
   const ys: number[] = []
@@ -1681,11 +1633,12 @@ function profileTSFDataset(task: TSFTaskSpec, context?: DomainSummaryContext): D
 	  )
 	  const timeAxis = profileTimeAxis(profileHeader, dataRows)
 	  const numericColumns = numericIndexes.map((index) => header[index] ?? `col_${index}`)
-	  const acf = profileACFMainPeriod(matrix)
+	  const seasonality = analyzeSeasonality(matrix, timeAxis)
 	  const adf = profileADF(matrix)
 	  const correlationMatrix = profileCorrelationMatrix(matrix, numericColumns)
 	  const totalCells = Math.max(dataRows.length * numericIndexes.length, 1)
 	  const profileFingerprint = createHash("sha256")
+	    .update("seasonality.v2\0")
 	    .update(sourceFingerprint)
 	    .update("\0")
 	    .update(raw)
@@ -1707,17 +1660,17 @@ function profileTSFDataset(task: TSFTaskSpec, context?: DomainSummaryContext): D
       profiledColumnCount: numericIndexes.length,
       missingRate: roundProfileValue(missing / totalCells),
       trendStrength: roundProfileValue(profileTrend(matrix, timeAxis)),
-      seasonalityStrength: roundProfileValue(profileSeasonality(matrix)),
+      seasonalityStrength: roundProfileValue(seasonality.strength),
 	      crossVarCorrelation: roundProfileValue(
 	        correlationMatrix ? crossCorrelationFromMatrix(correlationMatrix) : profileCrossCorrelation(matrix),
 	      ),
 	      distributionShift: roundProfileValue(profileDistributionShift(matrix)),
 	      outlierRate: roundProfileValue(profileOutlierRate(matrix)),
-	      ...(acf === undefined
+	      ...(seasonality.period === undefined
 	        ? {}
 	        : {
-	            acfMainPeriod: acf.lag,
-	            acfMainPeriodStrength: acf.strength,
+	            acfMainPeriod: seasonality.period,
+	            acfMainPeriodStrength: roundProfileValue(seasonality.strength),
 	          }),
 	      ...(adf === undefined
 	        ? {}
@@ -1734,7 +1687,7 @@ function profileTSFDataset(task: TSFTaskSpec, context?: DomainSummaryContext): D
 function datasetProfileBiases(profile: DatasetProfile | undefined) {
   if (!profile) return []
   return [
-    profile.seasonalityStrength >= 0.4 ? "seasonal" : undefined,
+    profile.seasonalityStrength >= 0.4 || (profile.acfMainPeriod !== undefined && profile.seasonalityStrength >= 0.2) ? "seasonal" : undefined,
     profile.trendStrength >= 0.2 ? "trend" : undefined,
     profile.crossVarCorrelation >= 0.5 ? "cross_var_correlated" : undefined,
     profile.missingRate > 0 ? "missing_values" : undefined,

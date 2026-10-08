@@ -72,6 +72,28 @@ export interface ReflectionLLMAnalysis {
   readonly distillableMemory: string
 }
 
+export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string {
+  const outputStart = sessionPrompt.indexOf("## Output format")
+  const narrationStart = sessionPrompt.indexOf("## Narration")
+  if (outputStart < 0 || narrationStart < 0 || narrationStart >= outputStart) {
+    throw new Error("Reflection prompt is missing its evidence/output sections")
+  }
+  const evidencePrompt = sessionPrompt.slice(0, narrationStart).replace(
+    "Use the four\ntools below to gather evidence.",
+    "Use the supplied inline evidence to assess the experiment.",
+  )
+  const outputPrompt = sessionPrompt.slice(outputStart).replace(
+    "After completing the four tool calls,",
+    "Using the supplied inline evidence,",
+  )
+  return `${evidencePrompt}## Inline evidence\n` +
+    "This is a direct API synthesis call. All available evidence is supplied in the user JSON. " +
+    "Tools are unavailable; produce the final analysis directly. " +
+    "experimentResults and experimentDesign contain the run outcome and executed recipe; " +
+    "trainingCurve contains observed curves, and historicalExperimentMemory contains prior lessons. " +
+    "Treat absent evidence as unavailable and state the limitation.\n\n" + outputPrompt
+}
+
 export interface ReflectionAgentResult {
   readonly agent: "ReflectionAgent"
   readonly taskID: ResearchTaskID

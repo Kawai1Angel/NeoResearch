@@ -86,6 +86,17 @@ function buildCompileReportMarkdown(input: {
     `- Candidate ID: ${input.candidateID}`,
     `- Smoke Run ID: ${input.run.id}`,
     `- Verdict: ${verdict}`,
+    ...((input.run.resourceUsage as any).executionContract?.manifest?.actual
+      ? [
+          "",
+          "## Executed implementation",
+          "",
+          "```json",
+          JSON.stringify((input.run.resourceUsage as any).executionContract.manifest.actual, null, 2),
+          "```",
+          "",
+        ]
+      : []),
     `- Metric: ${input.smokeMetric === undefined ? "n/a" : input.smokeMetric}`,
     ...(input.failureReason === undefined ? [] : [`- Failure reason: ${input.failureReason}`]),
     "",

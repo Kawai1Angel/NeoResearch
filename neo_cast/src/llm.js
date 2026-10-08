@@ -1,5 +1,7 @@
 "use strict";
 
+const modelCapabilities = require("../py/registry/model_capabilities.json");
+
 const { formatUserCorrections } = require("./corrections");
 const { isMockLlmEnabled } = require("./mock-mode");
 
@@ -164,9 +166,9 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   const hypotheses = {
     tiny_transformer: "Patch transformer: captures temporal patterns with multi-head attention over patched windows.",
     patch_mlp: "Patch MLP-Mixer: mixes local patch features with compact MLP layers.",
-    dlinear: "DLinear: decomposes trend and seasonal components with a compact linear forecast head.",
+    dlinear: "DLinear: decomposes trend/residual history into latent features, then uses a shared per-channel horizon head. Its temporal map can be rank limited by latent_dim.",
     tcn: "TCN: uses causal dilated convolutions to capture local and medium-range temporal dependencies.",
-    nbeats: "N-BEATS-lite: stacks residual backcast/forecast blocks for expressive univariate temporal extrapolation.",
+    nbeats: "N-BEATS-lite: generic learned residual backcast/latent-forecast blocks; no fixed trend/Fourier bases and no N-HiTS multirate sampling.",
     timesnet_lite: "TimesNet-lite: uses FFT-derived period grids and compact 2D convolutions to model periodic variation.",
     nlinear: "NLinear baseline: channel-independent linear mapping, strongest lightweight reference.",
   };
@@ -331,6 +333,8 @@ Your job is to propose one concrete model candidate for the prepared multivariat
 
 ## Task context
 ${_formatTaskContext(taskContext)}
+Actual implementation capabilities (authoritative; names do not imply paper mechanisms):
+${JSON.stringify(modelCapabilities)}
 
 ## Supported ModelRecipe DSL controlled design space
 
@@ -429,6 +433,8 @@ function _buildSystemPrompt(taskContext = {}) {
   const definitions = ["preprocessingAction", "embeddingAction", "backboneAction", "fusionAction", "predictionHead"];
   return `You are a time-series forecasting model designer. Return one ModelRecipe DSL JSON object only.
 ${_formatTaskContext(taskContext)}
+Actual implementation capabilities (authoritative; names do not imply paper mechanisms):
+${JSON.stringify(modelCapabilities)}
 schema_version: "model_recipe.v2"; model_name, hypothesis, input, architecture, training and constraints are required.
 The runtime compiles this into recipe_schema_v3. Each H is independently trained; no cross-H sharing.
 ${actions.map((name, i) => `- ${name}: ${schema.$defs[definitions[i]].oneOf.map((b) => b.properties.type.const).join(", ")}`).join("\n")}

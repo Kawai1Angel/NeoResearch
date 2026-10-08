@@ -39,12 +39,7 @@ function candidate(input: {
   } as unknown as ResearchCandidate
 }
 
-function run(input: {
-  id: string
-  candidateID: string
-  status: ResearchRun["status"]
-  metric?: number
-}): ResearchRun {
+function run(input: { id: string; candidateID: string; status: ResearchRun["status"]; metric?: number }): ResearchRun {
   return {
     id: input.id,
     taskID: "rtsk_designer",
@@ -109,7 +104,8 @@ function plan(): ExperimentPlan {
         evidenceLevel: "data_only",
       },
     ],
-    baselineStrategy: "domain_baselines_first",
+    nextExperiment: { action: "experiment", hypothesisID: "H1", rationale: "Test decomposition explicitly." },
+    baselineStrategy: "planner_selected_experiments",
     searchBiases: ["seasonal", "trend"],
     stopConditions: { maxTrials: 8, noImprovementRounds: 2 },
   }
@@ -150,7 +146,7 @@ test("candidateAttemptStateFromRuns treats successful runs without the primary m
   expect(state.attemptedCandidateIDs.has(withMetric.id)).toBe(true)
 })
 
-test("selectModelDesignerCandidate prefers an inconclusive approved candidate before untouched frontier candidates", () => {
+test("multiple eligible candidates do not imply a queue or retry priority", () => {
   const untouched = candidate({ id: "rcnd_untouched" })
   const retry = candidate({ id: "rcnd_retry" })
   const selection = selectModelDesignerCandidate({
@@ -160,7 +156,10 @@ test("selectModelDesignerCandidate prefers an inconclusive approved candidate be
     maxFailedRetries: 1,
   })
 
-  expect(selection.candidate?.id).toBe(retry.id)
+  expect(selection.candidate).toBeUndefined()
+  expect(
+    selectModelDesignerCandidate({ candidates: [retry, untouched], runs: [], maxFailedRetries: 1 }).candidate,
+  ).toBeUndefined()
   expect(selection.readyCandidateIDs).toEqual([untouched.id, retry.id])
   expect(selection.inconclusiveCandidateIDs).toEqual([retry.id])
   expect(selection.selectionSource).toBe("existing_frontier")
@@ -182,7 +181,7 @@ test("selectModelDesignerCandidate skips attempted and pending candidates", () =
   expect(selection.attemptedCandidateIDs).toEqual([attempted.id])
 })
 
-test("buildExistingFrontierRankings mirrors ready candidate order with stable scores", () => {
+test("frontier diagnostics assign no preference scores", () => {
   const c1 = candidate({ id: "rcnd_a", recipeID: "recipe_a" })
   const c2 = candidate({ id: "rcnd_b", recipeID: "recipe_b" })
   const rankings = buildExistingFrontierRankings({
@@ -190,8 +189,8 @@ test("buildExistingFrontierRankings mirrors ready candidate order with stable sc
     readyCandidateIDs: [c2.id, c1.id],
   })
 
-  expect(rankings.map((item) => item.rank)).toEqual([1, 2])
-  expect(rankings.map((item) => item.score)).toEqual([2, 1])
+  expect(rankings.map((item) => item.rank)).toEqual([1, 1])
+  expect(rankings.map((item) => item.score)).toEqual([0, 0])
   expect(rankings[0]!.candidateSpec.recipeID).toBe("recipe_b")
   expect(rankings[0]!.reasons).toContain("existing approved frontier candidate")
 })
@@ -301,8 +300,8 @@ function hypothesisForDesign(overrides?: Partial<HypothesisObject>): HypothesisO
     statement: "seasonal structure needs decomposition.",
     motivation: ["seasonalityStrength=0.7"],
     expectedOutcome: "val_avg_mse should decrease with decomposition-aware backbone.",
-    suggestedBackbones: ["dlinear", "mixer"],
-    suggestedPreprocessing: ["series_decomposition", "instance_norm"],
+    suggestedBackbones: ["dlinear"],
+    suggestedPreprocessing: ["series_decomposition"],
     priority: "high",
     risk: "period may drift",
     testable: true,
@@ -315,12 +314,17 @@ function hypothesisForDesign(overrides?: Partial<HypothesisObject>): HypothesisO
   }
 }
 
-function designerInput(hypotheses: readonly HypothesisObject[], bridgeOnly = false): ModelDesignerInput {
+function designerInput(
+  hypotheses: readonly HypothesisObject[],
+  bridgeOnly = false,
+  selectedHypothesisID = "H1",
+): ModelDesignerInput {
   const lib = buildModelDesignerComponentLibrary({ actionRegistry: tsfActionRegistry, bridgeOnly })
   return {
     task: task(),
     dataAnalysisSummary: "seasonalityStrength=0.7, trendStrength=0.3",
     hypotheses,
+    selectedHypothesisID,
     componentLibrary: lib,
   }
 }
@@ -329,29 +333,37 @@ test("selectHypothesisFromList returns undefined for an empty list", () => {
   expect(selectHypothesisFromList([])).toBeUndefined()
 })
 
-test("selectHypothesisFromList picks the highest-priority testable hypothesis", () => {
+test("selection requires an explicit ID and ignores priority and pool order", () => {
   const h1 = hypothesisForDesign({ id: "H1", priority: "low" })
   const h2 = hypothesisForDesign({ id: "H2", priority: "high" })
   const h3 = hypothesisForDesign({ id: "H3", priority: "medium" })
-  expect(selectHypothesisFromList([h1, h2, h3])?.id).toBe("H2")
+  for (const pool of [
+    [h1, h2, h3],
+    [h3, h2, h1],
+  ]) {
+    expect(selectHypothesisFromList(pool)).toBeUndefined()
+    expect(selectHypothesisFromList(pool, "H1")?.id).toBe("H1")
+    expect(selectHypothesisFromList(pool, "missing")).toBeUndefined()
+  }
 })
 
-test("selectHypothesisFromList skips non-testable hypotheses when testable ones exist", () => {
+test("selection rejects a non-testable ID without choosing another hypothesis", () => {
   const nonTestable = hypothesisForDesign({ id: "H1", testable: false, priority: "high" })
   const testable = hypothesisForDesign({ id: "H2", testable: true, priority: "low" })
-  expect(selectHypothesisFromList([nonTestable, testable])?.id).toBe("H2")
+  expect(selectHypothesisFromList([nonTestable, testable], "H1")).toBeUndefined()
+  expect(selectHypothesisFromList([nonTestable, testable], "H2")?.id).toBe("H2")
 })
 
 test("buildModelDesignerProposalFromHypotheses returns undefined for an empty hypothesis list", () => {
   expect(buildModelDesignerProposalFromHypotheses(designerInput([]))).toBeUndefined()
 })
 
-test("buildModelDesignerProposalFromHypotheses selects the highest-priority hypothesis and picks matching backbone and preprocessing", () => {
+test("proposal uses the explicitly selected hypothesis and matching components", () => {
   const low = hypothesisForDesign({ id: "H_low", priority: "low" })
   const high = hypothesisForDesign({ id: "H_high", priority: "high" })
-  const result = buildModelDesignerProposalFromHypotheses(designerInput([low, high]))
+  const result = buildModelDesignerProposalFromHypotheses(designerInput([low, high], false, "H_low"))
   expect(result).toBeDefined()
-  expect(result!.selectedHypothesis.id).toBe("H_high")
+  expect(result!.selectedHypothesis.id).toBe("H_low")
   const spec = result!.proposal.candidateSpec as Record<string, unknown>
   expect((spec.backbone as Record<string, unknown>).type).toBe("dlinear")
   expect(((spec.preprocessing as Record<string, unknown>).actions as Array<Record<string, unknown>>)[0]!.type).toBe(
@@ -359,13 +371,19 @@ test("buildModelDesignerProposalFromHypotheses selects the highest-priority hypo
   )
 })
 
-test("buildModelDesignerProposalFromHypotheses falls back to available components when suggestions are unavailable in bridgeOnly mode", () => {
-  const result = buildModelDesignerProposalFromHypotheses(designerInput([hypothesisForDesign()], true))
-  expect(result).toBeDefined()
-  const spec = result!.proposal.candidateSpec as Record<string, unknown>
-  const backboneType = (spec.backbone as Record<string, unknown>).type as string
-  expect(["linear", "mlp", "transformer"]).toContain(backboneType)
-  expect((spec.preprocessing as Record<string, unknown>).actions).toBeDefined()
+test("proposal does not substitute unsupported suggestions with the first library component", () => {
+  expect(buildModelDesignerProposalFromHypotheses(designerInput([hypothesisForDesign()], true))).toBeUndefined()
+})
+
+test("ambiguous component suggestions require an explicit model design", () => {
+  for (const suggestedBackbones of [
+    ["linear", "mlp"],
+    ["mlp", "linear"],
+  ]) {
+    expect(
+      buildModelDesignerProposalFromHypotheses(designerInput([hypothesisForDesign({ suggestedBackbones })])),
+    ).toBeUndefined()
+  }
 })
 
 test("buildModelDesignerProposalFromHypotheses embeds hypothesis id and statement in candidateSpec and rationale", () => {
@@ -377,33 +395,40 @@ test("buildModelDesignerProposalFromHypotheses embeds hypothesis id and statemen
   expect(result.proposal.rationale).toContain(hypothesis.expectedOutcome)
 })
 
-test("buildModelDesignerProposalFromHypotheses assigns medium risk for high-priority hypothesis", () => {
+test("proposal risk uses explicit risk rather than priority", () => {
   const result = buildModelDesignerProposalFromHypotheses(designerInput([hypothesisForDesign({ priority: "high" })]))!
   expect(result.proposal.riskLevel).toBe("medium")
 })
 
-test("buildModelDesignerProposalFromHypotheses assigns low risk for low-priority hypothesis", () => {
+test("proposal with no stated risk is low risk regardless of priority", () => {
   const result = buildModelDesignerProposalFromHypotheses(
-    designerInput([hypothesisForDesign({ priority: "low" })]),
+    designerInput([hypothesisForDesign({ priority: "high", risk: "" })]),
   )!
   expect(result.proposal.riskLevel).toBe("low")
 })
-
 
 test("design selection ignores closed hypotheses even when they have higher priority", () => {
   for (const status of ["abandoned", "rejected", "confirmed"] as const) {
     const closed = hypothesisForDesign({ id: "closed", status, priority: "high" })
     const pending = hypothesisForDesign({ id: "pending", status: "pending", priority: "medium" })
-    expect(selectHypothesisFromList([closed, pending])?.id).toBe("pending")
-    expect(selectHypothesisFromList([closed])).toBeUndefined()
+    expect(selectHypothesisFromList([closed, pending], "pending")?.id).toBe("pending")
+    expect(selectHypothesisFromList([closed, pending], "closed")).toBeUndefined()
   }
-  expect(selectHypothesisFromList([hypothesisForDesign({ testable: false })])).toBeUndefined()
+  expect(selectHypothesisFromList([hypothesisForDesign({ testable: false })], "H1")).toBeUndefined()
 })
 
-test("design selection follows the latest equal-priority pivot and exposes its contract", () => {
+test("design selection follows explicit planner choice regardless of priority or creation order", () => {
   const old = hypothesisForDesign({ id: "old", status: "pending" })
   const pivot = hypothesisForDesign({ id: "pivot", status: "pending", suggestedBackbones: ["diagonal_ssm"] })
-  const selected = selectHypothesisFromList([old, pivot])
+  const selected = selectHypothesisForDesign({
+    ...plan(),
+    hypotheses: [old, pivot],
+    nextExperiment: {
+      action: "experiment",
+      hypothesisID: "pivot",
+      rationale: "Test the unexplored state-space direction.",
+    },
+  })
   expect(selected).toEqual(pivot)
   const fingerprint = buildModelDesignerTaskFingerprint({ baseFingerprint: {}, selectedHypothesis: selected })
   expect(fingerprint.searchBiases).toContain("hypothesis:pivot")
@@ -413,7 +438,8 @@ test("design selection follows the latest equal-priority pivot and exposes its c
 
 test("final design prompt carries refined hypothesis criteria and concrete reflection advice", () => {
   const selected = hypothesisForDesign({
-    id: "repair_mamba", suggestedBackbones: ["mamba"],
+    id: "repair_mamba",
+    suggestedBackbones: ["mamba"],
     motivation: ["Previous run timed out; lower optimizer.lr from 0.0001 to 0.00002."],
     falsificationCriteria: ["Judge only after complete cv_avg_mse; freeze depth=2."],
   })
@@ -422,12 +448,32 @@ test("final design prompt carries refined hypothesis criteria and concrete refle
     reflectionNotesMarkdown: "Generic structural notes.",
     llm: { status: "used", text: "Use training_strategy.scheduler.warmup_steps=5; grad_clip=1 already enabled." },
   })
-  const prompt = JSON.parse(buildUserPrompt({
-    task: task(), proposalContext: { taskSpec: {}, taskFingerprint: fingerprint, candidates: [], runs: [], memory: [] },
-    previousReflectionMarkdown: reflection,
-  }))
+  const prompt = JSON.parse(
+    buildUserPrompt({
+      task: task(),
+      proposalContext: { taskSpec: {}, taskFingerprint: fingerprint, candidates: [], runs: [], memory: [] },
+      previousReflectionMarkdown: reflection,
+    }),
+  )
   expect(prompt.taskFingerprint.selectedHypothesis).toEqual(selected)
   expect(prompt.previousSessionReflection).toContain("warmup_steps=5")
   expect(prompt.previousSessionReflection).toContain("grad_clip=1 already enabled")
   expect(prompt.instruction).toContain("concrete recipe fields")
+})
+
+test("explicit planner choice never falls back to another hypothesis", () => {
+  const h = hypothesisForDesign()
+  expect(selectHypothesisForDesign({ ...plan(), nextExperiment: undefined })).toBeUndefined()
+  for (const decision of [
+    { action: "stop" as const, rationale: "Evidence exhausted" },
+    { action: "experiment" as const, hypothesisID: "missing", rationale: "Invalid selection" },
+  ])
+    expect(selectHypothesisForDesign({ ...plan(), hypotheses: [h], nextExperiment: decision })).toBeUndefined()
+  expect(
+    selectHypothesisForDesign({
+      ...plan(),
+      hypotheses: [hypothesisForDesign({ status: "abandoned" })],
+      nextExperiment: { action: "experiment", hypothesisID: h.id, rationale: "Closed choice" },
+    }),
+  ).toBeUndefined()
 })

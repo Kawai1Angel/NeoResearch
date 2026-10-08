@@ -1,5 +1,6 @@
 import type { JsonRecord, ResearchMemory, ResearchRun, ResearchTask, ResearchTaskID } from "../schema"
 import type { TaskEvidenceBundle, TaskEvidenceEntry, TaskEvidenceRole } from "../retrieve/contract"
+import type { ModelMechanism } from "../model-capabilities"
 import { NAS_DEFAULT_MAX_ITERATIONS, NAS_DEFAULT_MAX_NO_IMPROVE } from "../defaults"
 
 export type HypothesisStatus = "pending" | "active" | "testing" | "confirmed" | "rejected" | "abandoned"
@@ -11,7 +12,9 @@ export interface HypothesisObject {
   readonly expectedOutcome: string
   readonly suggestedBackbones: readonly string[]
   readonly suggestedPreprocessing: readonly string[]
-  readonly priority: "high" | "medium" | "low"
+  /** Legacy metadata only; never controls experiment selection. */
+  readonly priority?: "high" | "medium" | "low"
+  readonly requiredMechanisms?: readonly ModelMechanism[]
   readonly risk: string
   readonly testable: boolean
   readonly datasetEvidencePaths: readonly string[]
@@ -27,7 +30,26 @@ export interface HypothesisObject {
   readonly abandonReason?: string
 }
 
+export type NextExperimentDecision =
+  | { readonly action: "experiment"; readonly hypothesisID: string; readonly rationale: string }
+  | { readonly action: "stop"; readonly rationale: string }
+
+export function parseNextExperiment(value: unknown): NextExperimentDecision | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const item = value as Record<string, unknown>
+  if (typeof item.rationale !== "string" || !item.rationale.trim()) return undefined
+  if (item.action === "stop") return { action: "stop", rationale: item.rationale.trim() }
+  if (item.action === "experiment" && typeof item.hypothesisID === "string" && item.hypothesisID.trim())
+    return { action: "experiment", hypothesisID: item.hypothesisID.trim(), rationale: item.rationale.trim() }
+  return undefined
+}
+
+export function isOpenHypothesis(h: HypothesisObject) {
+  return h.testable && (!h.status || ["pending", "active", "testing"].includes(h.status))
+}
+
 export interface ExperimentPlan {
+  readonly nextExperiment?: NextExperimentDecision
   readonly hypotheses: readonly HypothesisObject[]
   readonly baselineStrategy: string
   readonly searchBiases: readonly string[]
@@ -36,13 +58,12 @@ export interface ExperimentPlan {
     readonly noImprovementRounds: number
     readonly targetMetricValue?: number
   }
-  // Recipe ID of the baseline HypoPlanner picked as the comparison anchor and first candidate
-  // to run, on its first invocation (runs.length === 0 && memory.length === 0). Only set on
+  // Recipe ID explicitly picked as the comparison anchor on the first invocation.
+  // It never overrides nextExperiment or forces a candidate to run first. Only set on
   // that first call; later calls omit it and the previously persisted value is kept.
   readonly referenceBaseline?: string
-  // Whether referenceBaseline was chosen via the pick_baseline tool (session mode) or by the
-  // deterministic heuristic fallback (e.g. no session, or the tool was never called).
-  readonly referenceBaselineSource?: "tool" | "heuristic"
+  // No reference baseline is inferred from profile thresholds or pool order.
+  readonly referenceBaselineSource?: "tool"
 }
 
 export interface HypoPlannerResult {
@@ -65,6 +86,7 @@ export interface HypoPlannerInput {
   readonly runs: readonly ResearchRun[]
   readonly memory: readonly ResearchMemory[]
   readonly llmHypotheses?: readonly HypothesisObject[]
+  readonly nextExperiment?: NextExperimentDecision
   // Recipe ID picked via the pick_baseline tool as the reference baseline / first candidate,
   // when buildHypoPlannerResult is invoked on the first call. Validated against
   // referenceBaselineOptions(task) before use; ignored otherwise.
@@ -79,7 +101,6 @@ interface HypothesisRule {
   readonly suggestedBackbones: readonly string[]
   readonly suggestedPreprocessing: readonly string[]
   readonly expectedOutcome: string
-  readonly priority: "high" | "medium" | "low"
   readonly risk: string
   readonly evidenceConcepts: readonly string[]
 }
@@ -91,8 +112,9 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["seasonalityStrength", "acfMainPeriodStrength"],
     suggestedBackbones: ["dlinear", "nbeats", "patch_transformer"],
     suggestedPreprocessing: ["seasonal_decomposition", "per_series_normalization"],
-    expectedOutcome: "Decomposition-aware backbones should reduce cv_avg_mse compared to non-seasonal baselines by better capturing periodic patterns.",
-    priority: "high",
+    expectedOutcome:
+      "Decomposition-aware backbones should reduce cv_avg_mse compared to non-seasonal baselines by better capturing periodic patterns.",
+
     risk: "The detected period may be weak or unstable across the evaluation horizon.",
     evidenceConcepts: ["seasonality", "multiple_seasonalities", "seasonal_decomposition", "frequency_multiscale"],
   },
@@ -102,8 +124,9 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["trendStrength", "adfStatistic"],
     suggestedBackbones: ["dlinear", "linear", "mixer"],
     suggestedPreprocessing: ["detrend", "standard_scaling"],
-    expectedOutcome: "Detrending preprocessing combined with linear or mixer backbones should yield stable cv_avg_mse and cv_std_mse across time folds.",
-    priority: "high",
+    expectedOutcome:
+      "Detrending preprocessing combined with linear or mixer backbones should yield stable cv_avg_mse and cv_std_mse across time folds.",
+
     risk: "Aggressive detrending can remove useful low-frequency signal.",
     evidenceConcepts: ["trend_dynamics", "non_stationarity", "trend_decomposition", "adaptive_normalization"],
   },
@@ -113,10 +136,16 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["crossVarCorrelation"],
     suggestedBackbones: ["mixer", "patch_transformer", "tcn"],
     suggestedPreprocessing: ["channel_normalization", "correlation_screening"],
-    expectedOutcome: "Channel-mixing backbones should outperform independent-channel baselines by leveraging inter-variate dependencies.",
-    priority: "high",
+    expectedOutcome:
+      "Channel-mixing backbones should outperform independent-channel baselines by leveraging inter-variate dependencies.",
+
     risk: "Spurious channel correlations can overfit small validation windows.",
-    evidenceConcepts: ["cross_series_dependency", "lead_lag_relationship", "cross_variable_modeling", "lag_aware_fusion"],
+    evidenceConcepts: [
+      "cross_series_dependency",
+      "lead_lag_relationship",
+      "cross_variable_modeling",
+      "lag_aware_fusion",
+    ],
   },
   {
     bias: "missing_values",
@@ -124,8 +153,9 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["missingRate"],
     suggestedBackbones: ["linear", "dlinear", "mixer"],
     suggestedPreprocessing: ["forward_fill", "mask_features", "robust_scaling"],
-    expectedOutcome: "Imputation and masking should prevent training divergence, improving cv_avg_mse compared to unmasked inputs.",
-    priority: "medium",
+    expectedOutcome:
+      "Imputation and masking should prevent training divergence, improving cv_avg_mse compared to unmasked inputs.",
+
     risk: "Imputation can leak future information if it is not restricted to causal context.",
     evidenceConcepts: ["incomplete_observations", "missingness_aware"],
   },
@@ -135,10 +165,16 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["distributionShift", "outlierRate"],
     suggestedBackbones: ["dlinear", "mixer", "linear"],
     suggestedPreprocessing: ["robust_scaling", "rolling_normalization", "time_ordered_validation"],
-    expectedOutcome: "Robust-scaling candidates should show smaller degradation between validation and reference-test MSE under distribution shift.",
-    priority: "high",
+    expectedOutcome:
+      "Robust-scaling candidates should show smaller degradation between validation and reference-test MSE under distribution shift.",
+
     risk: "A short validation split may not represent the shifted test regime.",
-    evidenceConcepts: ["non_stationarity", "potential_structural_break", "contaminated_observations", "robust_forecasting"],
+    evidenceConcepts: [
+      "non_stationarity",
+      "potential_structural_break",
+      "contaminated_observations",
+      "robust_forecasting",
+    ],
   },
   {
     bias: "probabilistic",
@@ -146,8 +182,9 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: [],
     suggestedBackbones: ["mixer", "patch_transformer", "tcn"],
     suggestedPreprocessing: ["quantile_targets", "calibration_check"],
-    expectedOutcome: "Distributional heads should achieve better calibration (CRPS/quantile coverage) while not degrading point-MSE by more than 5%.",
-    priority: "medium",
+    expectedOutcome:
+      "Distributional heads should achieve better calibration (CRPS/quantile coverage) while not degrading point-MSE by more than 5%.",
+
     risk: "Distributional losses can improve calibration while worsening the primary point metric.",
     evidenceConcepts: ["probabilistic", "evaluation_protocol"],
   },
@@ -157,8 +194,9 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["horizonContextRatio"],
     suggestedBackbones: ["dlinear", "patch_transformer", "nbeats"],
     suggestedPreprocessing: ["multi_horizon_validation", "context_window_ablation"],
-    expectedOutcome: "Patch-based and low-frequency candidates should maintain lower MSE at horizon 336 and 720 compared to step-by-step recurrent alternatives.",
-    priority: "medium",
+    expectedOutcome:
+      "Patch-based and low-frequency candidates should maintain lower MSE at horizon 336 and 720 compared to step-by-step recurrent alternatives.",
+
     risk: "Long horizons can hide short-term errors behind averaged metrics.",
     evidenceConcepts: ["long_horizon_dependency", "efficient_long_range"],
   },
@@ -168,10 +206,16 @@ const hypothesisRules: readonly HypothesisRule[] = [
     metricKeys: ["targetCount"],
     suggestedBackbones: ["mixer", "patch_transformer", "linear"],
     suggestedPreprocessing: ["per_channel_scaling", "target_correlation_audit"],
-    expectedOutcome: "Channel-mixing variants should improve cv_avg_mse over per-channel baselines when cross-channel correlation is confirmed.",
-    priority: "medium",
+    expectedOutcome:
+      "Channel-mixing variants should improve cv_avg_mse over per-channel baselines when cross-channel correlation is confirmed.",
+
     risk: "Extra channel capacity may add noise when targets are weakly related.",
-    evidenceConcepts: ["cross_series_dependency", "cross_variable_modeling", "covariate_conditioning", "covariate_fusion"],
+    evidenceConcepts: [
+      "cross_series_dependency",
+      "cross_variable_modeling",
+      "covariate_conditioning",
+      "covariate_fusion",
+    ],
   },
 ]
 
@@ -215,7 +259,11 @@ function taskSearchBiases(task: ResearchTask) {
 function profileDerivedBiases(task: ResearchTask) {
   const profile = taskProfile(task)
   const biases: string[] = []
-  if ((numberValue(profile.seasonalityStrength) ?? 0) >= 0.35) biases.push("seasonal")
+  if (
+    (numberValue(profile.seasonalityStrength) ?? 0) >= 0.35 ||
+    ((numberValue(profile.acfMainPeriod) ?? 0) >= 3 && (numberValue(profile.seasonalityStrength) ?? 0) >= 0.2)
+  )
+    biases.push("seasonal")
   if ((numberValue(profile.trendStrength) ?? 0) >= 0.3) biases.push("trend")
   if ((numberValue(profile.crossVarCorrelation) ?? 0) >= 0.4) biases.push("cross_var_correlated")
   if ((numberValue(profile.missingRate) ?? 0) > 0) biases.push("missing_values")
@@ -229,10 +277,7 @@ function orderedBiases(task: ResearchTask) {
   const explicit = taskSearchBiases(task)
   const source = explicit.length > 0 ? explicit : profileDerivedBiases(task)
   const known = hypothesisRules.map((rule) => rule.bias)
-  return unique([
-    ...known.filter((bias) => source.includes(bias)),
-    ...source.filter((bias) => !known.includes(bias)),
-  ])
+  return unique([...known.filter((bias) => source.includes(bias)), ...source.filter((bias) => !known.includes(bias))])
 }
 
 function formatNumber(value: number) {
@@ -268,16 +313,19 @@ function fallbackHypothesis(input: HypoPlannerInput): HypothesisObject {
       ...historyMotivations(input.runs),
       ...memoryMotivations(input.memory),
     ],
-    expectedOutcome: "cv_avg_mse should decrease below the naive baseline, providing a reliable reference point for subsequent search.",
+    expectedOutcome:
+      "cv_avg_mse should decrease below the naive baseline, providing a reliable reference point for subsequent search.",
     suggestedBackbones: ["linear", "dlinear"],
     suggestedPreprocessing: ["standard_scaling"],
-    priority: "medium",
+
     risk: "A conservative baseline may underfit complex temporal structure.",
     testable: true,
     datasetEvidencePaths: [],
     literatureEvidence: [],
     applicabilityAssumptions: [],
-    falsificationCriteria: ["Reject the baseline-control hypothesis if it cannot complete the configured time-ordered evaluation protocol."],
+    falsificationCriteria: [
+      "Reject the baseline-control hypothesis if it cannot complete the configured time-ordered evaluation protocol.",
+    ],
     evidenceLevel: "data_only",
   }
 }
@@ -304,12 +352,20 @@ function literatureReference(entry: TaskEvidenceEntry) {
 }
 
 function applicabilityAssumptions(entries: readonly TaskEvidenceEntry[]) {
-  return unique(entries.flatMap((entry) => [
-    ...(entry.applicability.status === "unknown" ? [`${entry.cardID} has unspecified applicability; transfer to this dataset must be validated.`] : []),
-    ...entry.applicability.matchedConditions.map((condition) => `${entry.cardID} applies when ${condition}.`),
-    ...entry.applicability.uncertainConditions.map((condition) => `${entry.cardID} requires validation because ${condition} is uncertain.`),
-    ...entry.applicability.violatedConditions.map((condition) => `${entry.cardID} may not transfer because ${condition}.`),
-  ]))
+  return unique(
+    entries.flatMap((entry) => [
+      ...(entry.applicability.status === "unknown"
+        ? [`${entry.cardID} has unspecified applicability; transfer to this dataset must be validated.`]
+        : []),
+      ...entry.applicability.matchedConditions.map((condition) => `${entry.cardID} applies when ${condition}.`),
+      ...entry.applicability.uncertainConditions.map(
+        (condition) => `${entry.cardID} requires validation because ${condition} is uncertain.`,
+      ),
+      ...entry.applicability.violatedConditions.map(
+        (condition) => `${entry.cardID} may not transfer because ${condition}.`,
+      ),
+    ]),
+  )
 }
 
 function ruleFalsificationCriteria(rule: HypothesisRule) {
@@ -333,8 +389,8 @@ export function generateHypotheses(input: HypoPlannerInput): HypothesisObject[] 
 
   return rules.map((rule, index) => {
     const entries = evidenceForRule(rule, input.taskEvidence)
-    const conflicted = entries.some((entry) =>
-      entry.applicability.status === "conflicted" || entry.roles.includes("contradicts"),
+    const conflicted = entries.some(
+      (entry) => entry.applicability.status === "conflicted" || entry.roles.includes("contradicts"),
     )
     const limitations = unique(entries.flatMap((entry) => entry.limitations))
     return {
@@ -350,14 +406,22 @@ export function generateHypotheses(input: HypoPlannerInput): HypothesisObject[] 
       expectedOutcome: rule.expectedOutcome,
       suggestedBackbones: rule.suggestedBackbones,
       suggestedPreprocessing: rule.suggestedPreprocessing,
-      priority: rule.priority,
-      risk: [rule.risk, ...limitations, ...(conflicted ? ["The task evidence bundle contains applicability or literature conflicts."] : [])].join(" "),
+      risk: [
+        rule.risk,
+        ...limitations,
+        ...(conflicted ? ["The task evidence bundle contains applicability or literature conflicts."] : []),
+      ].join(" "),
       testable: true,
       datasetEvidencePaths: unique(entries.flatMap((entry) => entry.linkage.datasetEvidencePaths)),
       literatureEvidence: entries.map(literatureReference),
       applicabilityAssumptions: applicabilityAssumptions(entries),
       falsificationCriteria: ruleFalsificationCriteria(rule),
-      evidenceLevel: entries.length === 0 ? "data_only" as const : conflicted ? "conflicted" as const : "paper_supported" as const,
+      evidenceLevel:
+        entries.length === 0
+          ? ("data_only" as const)
+          : conflicted
+            ? ("conflicted" as const)
+            : ("paper_supported" as const),
     }
   })
 }
@@ -369,7 +433,10 @@ export function validateHypothesisEvidence(
   const entries = new Map((taskEvidence?.entries ?? []).map((entry) => [entry.cardID, entry]))
   const errors: string[] = []
   for (const hypothesis of hypotheses) {
-    if (!hypothesis.falsificationCriteria.some((item) => item.trim().length > 0) && !/baseline[ -]?control/i.test(hypothesis.statement)) {
+    if (
+      !hypothesis.falsificationCriteria.some((item) => item.trim().length > 0) &&
+      !/baseline[ -]?control/i.test(hypothesis.statement)
+    ) {
       errors.push(`${hypothesis.id}: at least one falsification criterion is required`)
     }
     if (hypothesis.evidenceLevel === "data_only" && hypothesis.literatureEvidence.length > 0) {
@@ -378,9 +445,11 @@ export function validateHypothesisEvidence(
     if (hypothesis.evidenceLevel === "paper_supported" && hypothesis.literatureEvidence.length === 0) {
       errors.push(`${hypothesis.id}: paper_supported hypotheses must cite task evidence`)
     }
-    if (hypothesis.literatureEvidence.length > 0 && (
-      hypothesis.applicabilityAssumptions.every((item) => item.trim().length === 0) || hypothesis.datasetEvidencePaths.length === 0
-    )) {
+    if (
+      hypothesis.literatureEvidence.length > 0 &&
+      (hypothesis.applicabilityAssumptions.every((item) => item.trim().length === 0) ||
+        hypothesis.datasetEvidencePaths.length === 0)
+    ) {
       errors.push(`${hypothesis.id}: literature evidence requires dataset paths and applicability assumptions`)
     }
     if (hypothesis.evidenceLevel === "conflicted" && hypothesis.literatureEvidence.length === 0) {
@@ -400,15 +469,24 @@ export function validateHypothesisEvidence(
       if (!entry.roles.includes(reference.role)) {
         errors.push(`${hypothesis.id}: role ${reference.role} is not allowed for ${reference.cardID}`)
       }
-      if ((entry.applicability.status === "conflicted" || entry.cardStatus === "contradicted" || entry.roles.includes("contradicts")) && reference.role !== "warns_limitation" && reference.role !== "contradicts") {
-        errors.push(`${hypothesis.id}: conflicted card ${reference.cardID} cannot be used as unconditional positive evidence`)
+      if (
+        (entry.applicability.status === "conflicted" ||
+          entry.cardStatus === "contradicted" ||
+          entry.roles.includes("contradicts")) &&
+        reference.role !== "warns_limitation" &&
+        reference.role !== "contradicts"
+      ) {
+        errors.push(
+          `${hypothesis.id}: conflicted card ${reference.cardID} cannot be used as unconditional positive evidence`,
+        )
       }
       if (entry.roles.includes("contradicts") || entry.applicability.status === "conflicted") citesConflict = true
       for (const evidencePath of entry.linkage.datasetEvidencePaths) linkedPaths.add(evidencePath)
     }
     if (hypothesis.literatureEvidence.length > 0) {
       for (const evidencePath of hypothesis.datasetEvidencePaths) {
-        if (!linkedPaths.has(evidencePath)) errors.push(`${hypothesis.id}: dataset evidence path is outside cited entries: ${evidencePath}`)
+        if (!linkedPaths.has(evidencePath))
+          errors.push(`${hypothesis.id}: dataset evidence path is outside cited entries: ${evidencePath}`)
       }
     }
     if (hypothesis.evidenceLevel === "conflicted" && !citesConflict) {
@@ -433,9 +511,7 @@ function hypothesisSearchBiases(hypotheses: readonly HypothesisObject[]) {
     ["multivariate", "multivariate"],
   ]
   return hypotheses.flatMap((hypothesis) =>
-    pairs
-      .filter(([needle]) => hypothesis.statement.includes(needle))
-      .map(([, bias]) => bias),
+    pairs.filter(([needle]) => hypothesis.statement.includes(needle)).map(([, bias]) => bias),
   )
 }
 
@@ -486,36 +562,14 @@ export function referenceBaselineOptions(task: ResearchTask): readonly string[] 
     : [TSF_BASELINE_RECIPE_IDS.patchtst, TSF_BASELINE_RECIPE_IDS.dlinear, TSF_BASELINE_RECIPE_IDS.itransformer]
 }
 
-// Deterministic fallback used only when no baseline was picked via the pick_baseline tool
-// (e.g. no session, or the agent never called the tool): strong seasonality/trend favors
-// DLinear's decomposition, strong cross-variate correlation favors iTransformer's
-// cross-attention, otherwise PatchTST is the general-purpose default.
-function selectReferenceBaseline(task: ResearchTask, searchBiases: readonly string[]): string {
-  if (isBridgeOnly(task)) return TSF_BASELINE_RECIPE_IDS.linear
-  const profile = taskProfile(task)
-  if (
-    (numberValue(profile.seasonalityStrength) ?? 0) >= 0.4 ||
-    searchBiases.includes("seasonal") ||
-    searchBiases.includes("trend")
-  ) {
-    return TSF_BASELINE_RECIPE_IDS.dlinear
-  }
-  if ((numberValue(profile.crossVarCorrelation) ?? 0) >= 0.5 || searchBiases.includes("cross_var_correlated")) {
-    return TSF_BASELINE_RECIPE_IDS.itransformer
-  }
-  return TSF_BASELINE_RECIPE_IDS.patchtst
-}
-
 export function buildExperimentPlan(input: {
   readonly hypotheses: readonly HypothesisObject[]
   readonly task: ResearchTask
   readonly isFirstCall?: boolean
   readonly toolReferenceBaseline?: string
+  readonly nextExperiment?: NextExperimentDecision
 }): ExperimentPlan {
-  const searchBiases = unique([
-    ...taskSearchBiases(input.task),
-    ...hypothesisSearchBiases(input.hypotheses),
-  ])
+  const searchBiases = unique([...taskSearchBiases(input.task), ...hypothesisSearchBiases(input.hypotheses)])
   const maxTrials = Math.max(
     1,
     Math.floor(loopBudgetNumber(input.task, "maxIterations", "maxTrials") ?? NAS_DEFAULT_MAX_ITERATIONS),
@@ -531,17 +585,12 @@ export function buildExperimentPlan(input: {
   const toolReferenceBaselineValid =
     input.toolReferenceBaseline !== undefined &&
     referenceBaselineOptions(input.task).includes(input.toolReferenceBaseline)
-  const referenceBaseline = input.isFirstCall
-    ? toolReferenceBaselineValid
-      ? input.toolReferenceBaseline
-      : selectReferenceBaseline(input.task, searchBiases)
-    : undefined
-  const referenceBaselineSource = input.isFirstCall ? (toolReferenceBaselineValid ? "tool" : "heuristic") : undefined
+  const referenceBaseline = input.isFirstCall && toolReferenceBaselineValid ? input.toolReferenceBaseline : undefined
+  const referenceBaselineSource = referenceBaseline === undefined ? undefined : ("tool" as const)
   return {
     hypotheses: input.hypotheses,
-    baselineStrategy: searchBiases.includes("bridge_safe") || isBridgeOnly(input.task)
-      ? "bridge_safe_baselines_first"
-      : "domain_baselines_first",
+    ...(input.nextExperiment ? { nextExperiment: input.nextExperiment } : {}),
+    baselineStrategy: "planner_selected_experiments",
     searchBiases,
     stopConditions: {
       maxTrials,
@@ -564,7 +613,10 @@ function yamlList(items: readonly string[], indent: string) {
   return items.length === 0 ? [`${indent}[]`] : items.map((item) => `${indent}- ${yamlScalar(item)}`)
 }
 
-export function buildHypothesesYaml(plan: ExperimentPlan, readiness: TaskEvidenceBundle["readiness"] = "ready_data_only"): string {
+export function buildHypothesesYaml(
+  plan: ExperimentPlan,
+  readiness: TaskEvidenceBundle["readiness"] = "ready_data_only",
+): string {
   const lines = [
     `literatureReadiness: ${readiness}`,
     `baselineStrategy: ${yamlScalar(plan.baselineStrategy)}`,
@@ -574,6 +626,16 @@ export function buildHypothesesYaml(plan: ExperimentPlan, readiness: TaskEvidenc
       : [`referenceBaselineSource: ${yamlScalar(plan.referenceBaselineSource)}`]),
     "searchBiases:",
     ...yamlList(plan.searchBiases, "  "),
+    ...(plan.nextExperiment
+      ? [
+          "nextExperiment:",
+          `  action: ${plan.nextExperiment.action}`,
+          ...(plan.nextExperiment.action === "experiment"
+            ? [`  hypothesisID: ${yamlScalar(plan.nextExperiment.hypothesisID)}`]
+            : []),
+          `  rationale: ${yamlScalar(plan.nextExperiment.rationale)}`,
+        ]
+      : []),
     "stopConditions:",
     `  maxTrials: ${plan.stopConditions.maxTrials}`,
     `  noImprovementRounds: ${plan.stopConditions.noImprovementRounds}`,
@@ -593,7 +655,8 @@ export function buildHypothesesYaml(plan: ExperimentPlan, readiness: TaskEvidenc
       ...yamlList(hypothesis.suggestedBackbones, "      "),
       "    suggestedPreprocessing:",
       ...yamlList(hypothesis.suggestedPreprocessing, "      "),
-      `    priority: ${hypothesis.priority}`,
+      "    requiredMechanisms:",
+      ...yamlList(hypothesis.requiredMechanisms ?? [], "      "),
       `    risk: ${yamlScalar(hypothesis.risk)}`,
       `    testable: ${hypothesis.testable ? "true" : "false"}`,
       `    evidenceLevel: ${hypothesis.evidenceLevel}`,
@@ -632,6 +695,7 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
           }`,
         ]),
     `- Search biases: ${plan.searchBiases.length > 0 ? plan.searchBiases.join(", ") : "none"}`,
+    ...(plan.nextExperiment ? [`- Next experiment decision: ${JSON.stringify(plan.nextExperiment)}`] : []),
     `- Stop conditions: maxTrials=${plan.stopConditions.maxTrials}, noImprovementRounds=${plan.stopConditions.noImprovementRounds}${
       plan.stopConditions.targetMetricValue === undefined
         ? ""
@@ -651,7 +715,7 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
       "",
       hypothesis.statement,
       "",
-      `- Priority: ${hypothesis.priority}`,
+      `- Required mechanisms: ${(hypothesis.requiredMechanisms ?? []).join(", ") || "none"}`,
       `- Testable: ${hypothesis.testable ? "yes" : "no"}`,
       `- Expected outcome: ${hypothesis.expectedOutcome}`,
       `- Suggested backbones: ${hypothesis.suggestedBackbones.join(", ")}`,
@@ -665,7 +729,9 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
       ...hypothesis.motivation.map((item) => `- ${item}`),
       "",
       "Applicability assumptions:",
-      ...(hypothesis.applicabilityAssumptions.length === 0 ? ["- none"] : hypothesis.applicabilityAssumptions.map((item) => `- ${item}`)),
+      ...(hypothesis.applicabilityAssumptions.length === 0
+        ? ["- none"]
+        : hypothesis.applicabilityAssumptions.map((item) => `- ${item}`)),
       "",
       "Falsification criteria:",
       ...hypothesis.falsificationCriteria.map((item) => `- ${item}`),
@@ -681,8 +747,11 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
     input.taskEvidence
       ? `Literature readiness: ${input.taskEvidence.readiness}; selected=${input.taskEvidence.summary.selectedEntryCount}; gaps=${input.taskEvidence.gaps.length}; conflicts=${input.taskEvidence.conflicts.length}.`
       : "Literature readiness: ready_data_only; no task evidence bundle was supplied.",
-  ].filter(Boolean).join("\n")
-  let useLLMHypotheses = input.llmHypotheses !== undefined && input.llmHypotheses.length > 0
+  ]
+    .filter(Boolean)
+    .join("\n")
+  let useLLMHypotheses =
+    input.llmHypotheses !== undefined && (input.llmHypotheses.length > 0 || input.nextExperiment?.action === "stop")
   let hypotheses = useLLMHypotheses ? [...input.llmHypotheses!] : generateHypotheses(input)
   if (useLLMHypotheses) {
     try {
@@ -699,6 +768,7 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
     task: input.task,
     isFirstCall,
     toolReferenceBaseline: input.toolReferenceBaseline,
+    nextExperiment: input.nextExperiment,
   })
   const partial = {
     agent: "HypoPlannerAgent" as const,

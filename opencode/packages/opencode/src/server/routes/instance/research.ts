@@ -971,6 +971,8 @@ export const ResearchRoutes = lazy(() =>
                       "plateau",
                       "time_budget_exhausted",
                       "crash_streak_exceeded",
+                      "no_new_candidate",
+                      "planner_stopped",
                     ]),
                     artifact: Research.ResearchArtifact.zod,
                   }),

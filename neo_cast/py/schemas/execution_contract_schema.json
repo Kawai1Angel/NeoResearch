@@ -114,6 +114,32 @@
         "output_channels": {
           "type": "integer",
           "minimum": 0
+        },
+        "input_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "head_input_width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "head_channel_shared": {
+          "type": "boolean"
+        },
+        "mechanisms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "moving_average_decomposition",
+              "learned_residual_backcast",
+              "multiscale_patches",
+              "fixed_trend_basis",
+              "fixed_seasonal_basis",
+              "multirate_sampling",
+              "direct_horizon_forecast"
+            ]
+          }
         }
       }
     }

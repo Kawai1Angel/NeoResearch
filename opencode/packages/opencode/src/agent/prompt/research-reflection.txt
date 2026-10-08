@@ -78,3 +78,5 @@ Each value is a concise string (1–4 sentences). Do not add any text outside th
 
   distillableMemory  — A self-contained summary for future agents: what was tried, what the outcome
     was, what modification is proposed, and what risks or failure modes to watch for.
+
+Interpret performance using executedModel/experiment_results actual implementation facts and modelCapabilities. Recipe/backbone names alone are not proof of mechanisms. DLinear/linear context-to-latent-to-horizon paths can be rank limited; generic nbeats has no fixed trend/seasonal basis or N-HiTS multirate sampling. An unsupported or unverified mechanism is untested, not falsified. Judge a local plateau separately from untested directions in the pool; HypoPlanner selects the next experiment explicitly.

@@ -74,15 +74,13 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
         from factory.encoders import DiagonalSSM, Mamba1, TimesBlock
         sequence_types = {DiagonalSSM: "diagonal_ssm", Mamba1: "mamba", TimesBlock: "timesblock_encoder"}
         primary_core = next((module for module in model.model.modules() if type(module) in sequence_types), None)
-        backbone = sequence_types.get(type(primary_core), model.backbone_type)
         base = describe_model(model, _typed=False)
+        backbone = sequence_types.get(type(primary_core), base["backbone"])
         return {
             **base,
             "runtime_semantics_revision": 3, "recipe_version": "recipe_schema_v3",
             "model_class": type(model).__name__, "backbone": backbone,
-            "embedding": model.embedding_type, "fusion": model.fusion_type, "channel_mode": model.channel_mode,
-            "preprocessing": [a["type"] for a in model.recipe["preprocessing"]["actions"]],
-            "prediction_head": model.head_cfg["type"], "representation": model.representation,
+            "representation": model.representation,
             "composition": model.composition_config,
             "implementation_status": "paper_derived" if backbone == "timesblock_encoder" else "native",
             "backend": "torch_reference", "horizon_sharing": False,
@@ -183,6 +181,7 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
     }.get(type(model.prediction_head), "unknown")
     ordered = latent if isinstance(latent, factory.OrderedChannelMixer) else mixer
     return {
+        **describe_implementation(model, factory),
         "runtime_semantics_revision": model.runtime_semantics_revision,
         "implementation_status": "paper_derived" if backbone == "timesnet_lite" else "native",
         "fusion_equivalence": "feature_mlp" if fusion == "temporal" and type(mixer) is factory.ChannelMixer else None,
@@ -215,6 +214,41 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
         "future_exogenous_channels": model.num_future_covariate_channels,
         "output_channels": model.num_output_channels,
         "num_parameters": sum(p.numel() for p in model.parameters()),
+    }
+
+
+def describe_implementation(model: Any, factory: Any) -> dict[str, Any]:
+    """Report mechanisms from concrete modules, not recipe/backbone claims."""
+    import torch.nn as nn
+
+    modules = list(model.modules())
+    mechanisms = set()
+    if any(type(m) in {factory.DLinearCore, factory.SeriesDecompositionAction} for m in modules):
+        mechanisms.add("moving_average_decomposition")
+    if getattr(model, "composition_config", {}).get("type") == "decomposition_two_branch":
+        # TypedRecipeModel executes the actual moving-average branch split.
+        from factory.typed_model import TypedRecipeModel
+        if type(model) is TypedRecipeModel and model.secondary is not None:
+            mechanisms.add("moving_average_decomposition")
+    if any(type(m) is factory.NBeatsCore and len(m.blocks) > 0
+           and all(type(b) is factory.NBeatsBlock for b in m.blocks) for m in modules):
+        mechanisms.add("learned_residual_backcast")
+    if any(type(m) is factory.MultiScalePatchEmbedding and len(m.embeddings) > 1 for m in modules):
+        mechanisms.add("multiscale_patches")
+    head = model.prediction_head
+    head_types = {factory.LinearHead, factory.ResidualCorrectionHead,
+                  factory.QuantilePointHead, factory.GaussianPointHead}
+    projection = (head if type(head) is factory.LinearHead else
+                  head.base if type(head) is factory.ResidualCorrectionHead else
+                  head.proj if type(head) is factory.QuantilePointHead else
+                  head.mean if type(head) is factory.GaussianPointHead else None)
+    return {
+        "input_length": model.input_len,
+        "head_input_width": projection.in_features if isinstance(projection, nn.Linear) else None,
+        "head_channel_shared": type(head) in head_types,
+        "forecast_horizon": model.horizon,
+        "mechanisms": sorted(mechanisms),
+        "forecast_path": "history -> encoder latent -> shared channel head -> horizon",
     }
 
 

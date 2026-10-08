@@ -8,7 +8,9 @@ import {
   resolveTaskIDBySessionID,
   updateHypothesisInPool,
   HypothesisNotFoundError,
+  selectNextExperimentInPool,
 } from "@/research/hypothesis-store"
+import { MODEL_CAPABILITIES, validMechanisms } from "@/research/model-capabilities"
 import { validateHypothesisEvidence, type HypothesisObject } from "@/research/agents/hypo-planner-agent"
 
 type SafeResult<T> = { ok: true; value: T } | { ok: false; error: string }
@@ -21,7 +23,6 @@ async function safe<T>(fn: () => Promise<T>): Promise<SafeResult<T>> {
   }
 }
 
-const Priority = Schema.Literals(["high", "medium", "low"])
 const StringArray = Schema.optional(Schema.Array(Schema.String))
 const EvidenceLevel = Schema.Literals(["data_only", "paper_supported", "conflicted"])
 const EvidenceRole = Schema.Literals([
@@ -32,11 +33,15 @@ const EvidenceRole = Schema.Literals([
   "warns_limitation",
   "contradicts",
 ])
-const LiteratureEvidence = Schema.optional(Schema.Array(Schema.Struct({
-  cardID: Schema.String,
-  cardRevision: Schema.Number,
-  role: EvidenceRole,
-})))
+const LiteratureEvidence = Schema.optional(
+  Schema.Array(
+    Schema.Struct({
+      cardID: Schema.String,
+      cardRevision: Schema.Number,
+      role: EvidenceRole,
+    }),
+  ),
+)
 
 const NOT_IN_RESEARCH_SESSION =
   "This tool can only be used inside a research task session — could not resolve the current research task."
@@ -49,15 +54,21 @@ const AddParameters = Schema.Struct({
   }),
   suggestedBackbones: StringArray.annotate({ description: "Candidate model backbones/architectures to try." }),
   suggestedPreprocessing: StringArray.annotate({ description: "Candidate preprocessing steps to try." }),
-  priority: Priority.annotate({ description: "Relative priority of this hypothesis." }),
+  requiredMechanisms: StringArray.annotate({
+    description: `Mechanisms the experiment must actually implement: ${Object.keys(MODEL_CAPABILITIES.mechanisms).join(", ")}. Unsupported mechanisms cannot be tested by relabeling a backbone.`,
+  }),
   risk: Schema.optional(Schema.String).annotate({ description: "Key risk or failure mode for this hypothesis." }),
   testable: Schema.optional(Schema.Boolean).annotate({
     description: "Whether this hypothesis can be tested with an experiment run. Defaults to true.",
   }),
   datasetEvidencePaths: StringArray.annotate({ description: "Dataset JSON paths grounding this hypothesis." }),
-  literatureEvidence: LiteratureEvidence.annotate({ description: "Exact cardID/revision/role references from the task evidence bundle." }),
+  literatureEvidence: LiteratureEvidence.annotate({
+    description: "Exact cardID/revision/role references from the task evidence bundle.",
+  }),
   applicabilityAssumptions: StringArray.annotate({ description: "Conditions that must hold for literature transfer." }),
-  falsificationCriteria: StringArray.annotate({ description: "Concrete observations that would reject the hypothesis." }),
+  falsificationCriteria: StringArray.annotate({
+    description: "Concrete observations that would reject the hypothesis.",
+  }),
   evidenceLevel: Schema.optional(EvidenceLevel).annotate({ description: "data_only, paper_supported, or conflicted." }),
 })
 
@@ -73,30 +84,41 @@ export const HypothesisAddTool = Tool.define(
       Effect.gen(function* () {
         const taskID = yield* Effect.promise(() => resolveTaskIDBySessionID(ctx.sessionID))
         if (!taskID) {
-          return { title: "hypothesis_add", metadata: { hypoID: undefined as string | undefined }, output: NOT_IN_RESEARCH_SESSION }
+          return {
+            title: "hypothesis_add",
+            metadata: { hypoID: undefined as string | undefined },
+            output: NOT_IN_RESEARCH_SESSION,
+          }
         }
         const hypothesis = {
-            statement: args.statement,
-            motivation: args.motivation ?? [],
-            expectedOutcome: args.expectedOutcome ?? "",
-            suggestedBackbones: args.suggestedBackbones ?? [],
-            suggestedPreprocessing: args.suggestedPreprocessing ?? [],
-            priority: args.priority,
-            risk: args.risk ?? "",
-            testable: args.testable ?? true,
-            datasetEvidencePaths: args.datasetEvidencePaths ?? [],
-            literatureEvidence: args.literatureEvidence ?? [],
-            applicabilityAssumptions: args.applicabilityAssumptions ?? [],
-            falsificationCriteria: args.falsificationCriteria ?? [],
-            evidenceLevel: args.evidenceLevel ?? "data_only" as const,
-          }
-        const result = yield* Effect.promise(() => safe(async () => {
-          const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
-          validateHypothesisEvidence([{ id: "pending", status: "pending", ...hypothesis }], taskEvidence)
-          return addHypothesisToPool(taskID, hypothesis)
-        }))
+          statement: args.statement,
+          motivation: args.motivation ?? [],
+          expectedOutcome: args.expectedOutcome ?? "",
+          suggestedBackbones: args.suggestedBackbones ?? [],
+          suggestedPreprocessing: args.suggestedPreprocessing ?? [],
+          requiredMechanisms: (args.requiredMechanisms ?? []) as NonNullable<HypothesisObject["requiredMechanisms"]>,
+          risk: args.risk ?? "",
+          testable: args.testable ?? true,
+          datasetEvidencePaths: args.datasetEvidencePaths ?? [],
+          literatureEvidence: args.literatureEvidence ?? [],
+          applicabilityAssumptions: args.applicabilityAssumptions ?? [],
+          falsificationCriteria: args.falsificationCriteria ?? [],
+          evidenceLevel: args.evidenceLevel ?? ("data_only" as const),
+        }
+        const result = yield* Effect.promise(() =>
+          safe(async () => {
+            if (!validMechanisms(hypothesis.requiredMechanisms)) throw new Error("Unknown required mechanism")
+            const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
+            validateHypothesisEvidence([{ id: "pending", status: "pending", ...hypothesis }], taskEvidence)
+            return addHypothesisToPool(taskID, hypothesis)
+          }),
+        )
         if (!result.ok) {
-          return { title: "hypothesis_add", metadata: { hypoID: undefined as string | undefined }, output: result.error }
+          return {
+            title: "hypothesis_add",
+            metadata: { hypoID: undefined as string | undefined },
+            output: result.error,
+          }
         }
         const created = result.value
         return {
@@ -115,7 +137,7 @@ const UpdateParameters = Schema.Struct({
   expectedOutcome: Schema.optional(Schema.String),
   suggestedBackbones: StringArray,
   suggestedPreprocessing: StringArray,
-  priority: Schema.optional(Priority),
+  requiredMechanisms: StringArray,
   risk: Schema.optional(Schema.String),
   testable: Schema.optional(Schema.Boolean),
   datasetEvidencePaths: StringArray,
@@ -137,19 +159,38 @@ export const HypothesisUpdateTool = Tool.define(
       Effect.gen(function* () {
         const taskID = yield* Effect.promise(() => resolveTaskIDBySessionID(ctx.sessionID))
         if (!taskID) {
-          return { title: "hypothesis_update", metadata: { hypoID: undefined as string | undefined }, output: NOT_IN_RESEARCH_SESSION }
+          return {
+            title: "hypothesis_update",
+            metadata: { hypoID: undefined as string | undefined },
+            output: NOT_IN_RESEARCH_SESSION,
+          }
         }
         const { hypoID, ...rest } = args
-        const result = yield* Effect.promise(() => safe(async () => {
-          const existing = (await listHypothesesInPool(taskID, { includeAbandoned: true })).find((item) => item.id === hypoID)
-          if (!existing) throw new HypothesisNotFoundError(hypoID)
-          const candidate: HypothesisObject = { ...existing, ...rest }
-          const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
-          validateHypothesisEvidence([candidate], taskEvidence)
-          return updateHypothesisInPool(taskID, hypoID, rest)
-        }))
+        const result = yield* Effect.promise(() =>
+          safe(async () => {
+            const existing = (await listHypothesesInPool(taskID, { includeAbandoned: true })).find(
+              (item) => item.id === hypoID,
+            )
+            if (!existing) throw new HypothesisNotFoundError(hypoID)
+            if (rest.requiredMechanisms && !validMechanisms(rest.requiredMechanisms))
+              throw new Error("Unknown required mechanism")
+            const candidate: HypothesisObject = {
+              ...existing,
+              ...rest,
+              requiredMechanisms:
+                (rest.requiredMechanisms as HypothesisObject["requiredMechanisms"]) ?? existing.requiredMechanisms,
+            }
+            const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
+            validateHypothesisEvidence([candidate], taskEvidence)
+            return updateHypothesisInPool(taskID, hypoID, { ...rest, requiredMechanisms: candidate.requiredMechanisms })
+          }),
+        )
         if (!result.ok) {
-          return { title: "hypothesis_update", metadata: { hypoID: hypoID as string | undefined }, output: result.error }
+          return {
+            title: "hypothesis_update",
+            metadata: { hypoID: hypoID as string | undefined },
+            output: result.error,
+          }
         }
         return {
           title: "hypothesis_update",
@@ -177,11 +218,21 @@ export const HypothesisAbandonTool = Tool.define(
       Effect.gen(function* () {
         const taskID = yield* Effect.promise(() => resolveTaskIDBySessionID(ctx.sessionID))
         if (!taskID) {
-          return { title: "hypothesis_abandon", metadata: { hypoID: undefined as string | undefined }, output: NOT_IN_RESEARCH_SESSION }
+          return {
+            title: "hypothesis_abandon",
+            metadata: { hypoID: undefined as string | undefined },
+            output: NOT_IN_RESEARCH_SESSION,
+          }
         }
-        const result = yield* Effect.promise(() => safe(() => abandonHypothesisInPool(taskID, args.hypoID, args.reason)))
+        const result = yield* Effect.promise(() =>
+          safe(() => abandonHypothesisInPool(taskID, args.hypoID, args.reason)),
+        )
         if (!result.ok) {
-          return { title: "hypothesis_abandon", metadata: { hypoID: args.hypoID as string | undefined }, output: result.error }
+          return {
+            title: "hypothesis_abandon",
+            metadata: { hypoID: args.hypoID as string | undefined },
+            output: result.error,
+          }
         }
         return {
           title: "hypothesis_abandon",
@@ -210,7 +261,11 @@ export const HypothesisListTool = Tool.define(
       Effect.gen(function* () {
         const taskID = yield* Effect.promise(() => resolveTaskIDBySessionID(ctx.sessionID))
         if (!taskID) {
-          return { title: "hypothesis_list", metadata: { count: undefined as number | undefined }, output: NOT_IN_RESEARCH_SESSION }
+          return {
+            title: "hypothesis_list",
+            metadata: { count: undefined as number | undefined },
+            output: NOT_IN_RESEARCH_SESSION,
+          }
         }
         const hypotheses = yield* Effect.promise(() =>
           listHypothesesInPool(taskID, { includeAbandoned: args.includeAbandoned }),
@@ -219,6 +274,49 @@ export const HypothesisListTool = Tool.define(
           title: "hypothesis_list",
           metadata: { count: hypotheses.length as number | undefined },
           output: JSON.stringify(hypotheses, null, 2),
+        }
+      }),
+  }),
+)
+
+const SelectParameters = Schema.Struct({
+  action: Schema.Literals(["experiment", "stop"]),
+  hypoID: Schema.optional(Schema.String).annotate({
+    description: "Open testable hypothesis ID; required for action=experiment.",
+  }),
+  rationale: Schema.String.annotate({
+    description:
+      "Evidence-based reason for the next experiment or for stopping. Explain exploration vs refinement and local plateau evidence.",
+  }),
+})
+
+export const HypothesisSelectTool = Tool.define(
+  "hypothesis_select",
+  Effect.succeed({
+    description:
+      "Choose the next experiment explicitly after updating the pool, or stop the search. This decision, not priority or creation order, controls the next model design.",
+    parameters: SelectParameters,
+    execute: (args: Schema.Schema.Type<typeof SelectParameters>, ctx: Tool.Context) =>
+      Effect.gen(function* () {
+        const taskID = yield* Effect.promise(() => resolveTaskIDBySessionID(ctx.sessionID))
+        if (!taskID) return { title: "hypothesis_select", metadata: {}, output: NOT_IN_RESEARCH_SESSION }
+        const result = yield* Effect.promise(() =>
+          safe(async () => {
+            if (!args.rationale.trim()) throw new Error("A selection rationale is required")
+            if (args.action === "experiment" && !args.hypoID?.trim())
+              throw new Error("hypoID is required for an experiment")
+            return selectNextExperimentInPool(
+              taskID,
+              args.action === "stop"
+                ? { action: "stop", rationale: args.rationale.trim() }
+                : { action: "experiment", hypothesisID: args.hypoID!.trim(), rationale: args.rationale.trim() },
+            )
+          }),
+        )
+        return {
+          title: "hypothesis_select",
+          metadata: {},
+          output: result.ok ? JSON.stringify(result.value) : result.error,
         }
       }),
   }),

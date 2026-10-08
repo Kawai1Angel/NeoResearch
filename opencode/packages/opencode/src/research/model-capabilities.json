@@ -1,0 +1,58 @@
+{
+  "schema_version": "model_capabilities.v1",
+  "runtime_semantics_revision": 3,
+  "representation": {
+    "legacy_default_width": "min(context_length, 64)",
+    "forecast_path": "history -> encoder latent -> shared per-channel prediction head -> horizon",
+    "head_channel_shared": true,
+    "horizons_trained_independently": true,
+    "linear_rank_bound": "With single composition, raw preprocessing (no input-dependent normalization, centering or restoration), temporal/independent fusion, and a linear head, the linear/DLinear affine temporal map has rank at most latent_dim. This is not the original direct context-to-horizon DLinear."
+  },
+  "mechanisms": {
+    "moving_average_decomposition": "Moving-average trend/residual split in DLinear or series_decomposition preprocessing.",
+    "learned_residual_backcast": "Generic NBeats learned backcast and latent forecast residual blocks; no fixed polynomial/Fourier basis.",
+    "multiscale_patches": "Multiple patch lengths/strides in multiscale_patch embedding; not N-HiTS multirate pooling/interpolation.",
+    "fixed_trend_basis": "Unsupported: no fixed polynomial trend basis.",
+    "fixed_seasonal_basis": "Unsupported: no fixed Fourier seasonal basis.",
+    "multirate_sampling": "Unsupported: no N-HiTS-style pooling/interpolation hierarchy.",
+    "direct_horizon_forecast": "Unsupported: encoders emit latent features; heads own horizon projection."
+  },
+  "backbones": {
+    "linear": {
+      "mechanisms": [],
+      "implementation": "Context-to-latent linear encoder plus shared horizon head."
+    },
+    "dlinear": {
+      "mechanisms": [
+        "moving_average_decomposition"
+      ],
+      "implementation": "Moving-average split with learned trend/residual context-to-latent maps plus shared horizon head."
+    },
+    "nbeats": {
+      "mechanisms": [
+        "learned_residual_backcast"
+      ],
+      "implementation": "Generic learned MLP backcast/latent-forecast blocks; neither interpretable-basis N-BEATS nor N-HiTS."
+    },
+    "timesnet_lite": {
+      "mechanisms": [],
+      "implementation": "Paper-derived periodic convolution proxy, not full TimesNet."
+    }
+  },
+  "preprocessing": {
+    "series_decomposition": [
+      "moving_average_decomposition"
+    ]
+  },
+  "embeddings": {
+    "multiscale_patch": [
+      "multiscale_patches"
+    ]
+  },
+  "unsupported_mechanisms": [
+    "fixed_trend_basis",
+    "fixed_seasonal_basis",
+    "multirate_sampling",
+    "direct_horizon_forecast"
+  ]
+}

@@ -169,7 +169,7 @@ export const ExperimentResultsTool = Tool.define(
           ) : undefined
           const error = execution ? await recoverRunnerFailure(execution.uri.replace(/^file:\/\//, ""), r.error ?? undefined) : r.error
           const hypoID = r.candidate_id ? hypoIDByCandidate.get(r.candidate_id) : undefined
-          return buildExperimentResultEvidence({
+          return { ...buildExperimentResultEvidence({
             runID: r.id,
             stage: r.stage,
             status: r.status,
@@ -179,7 +179,7 @@ export const ExperimentResultsTool = Tool.define(
             hypothesisID: hypoID,
             independentEvidence: r.resource_usage.independentEvidence === false ? false : undefined,
             candidateSpec: r.candidate_id ? candidateSpecByID.get(r.candidate_id) : undefined,
-          })
+          }), executedModel: (r.resource_usage.executionContract as any)?.manifest?.actual }
         }))
 
         return {

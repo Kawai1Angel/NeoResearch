@@ -100,7 +100,13 @@ test("invalid LLM literature citations fall back to deterministic data-only hypo
 test("paper-supported and conflicted hypotheses preserve citations, assumptions and rendered evidence", () => {
   for (const conflicted of [false, true]) {
     const taskEvidence = fixture({ cards: [frequencyCard(conflicted ? { status: "contradicted" } : {})] }).build()
-    const result = buildHypoPlannerResult({ task: task(), dataAnalysisSummary: dataAnalysisSummary(), runs: [], memory: [], taskEvidence })
+    const result = buildHypoPlannerResult({
+      task: task(),
+      dataAnalysisSummary: dataAnalysisSummary(),
+      runs: [],
+      memory: [],
+      taskEvidence,
+    })
     const hypothesis = result.plan.hypotheses.find((item) => item.literatureEvidence.length > 0)!
     expect(hypothesis).toBeDefined()
     expect(hypothesis.evidenceLevel).toBe(conflicted ? "conflicted" : "paper_supported")
@@ -117,7 +123,7 @@ test("paper-supported and conflicted hypotheses preserve citations, assumptions 
   }
 })
 
-test("generateHypotheses creates prioritized seasonal, trend, and channel hypotheses from task evidence", () => {
+test("generateHypotheses creates seasonal, trend, and channel hypotheses from task evidence", () => {
   const hypotheses = generateHypotheses({
     task: task(),
     dataAnalysisSummary: dataAnalysisSummary(["seasonal", "cross_var_correlated"]),
@@ -127,7 +133,6 @@ test("generateHypotheses creates prioritized seasonal, trend, and channel hypoth
 
   expect(hypotheses.map((item) => item.id)).toEqual(["H1", "H2", "H3", "H4"])
   expect(hypotheses[0]).toMatchObject({
-    priority: "high",
     testable: true,
   })
   expect(hypotheses[0]!.statement).toContain("seasonal")
@@ -166,7 +171,6 @@ test("generateHypotheses falls back to a baseline-control hypothesis without pro
   expect(hypotheses).toHaveLength(1)
   expect(hypotheses[0]).toMatchObject({
     id: "H1",
-    priority: "medium",
     suggestedBackbones: ["linear", "dlinear"],
     testable: true,
   })
@@ -181,7 +185,7 @@ test("buildExperimentPlan derives stop conditions and deduplicated search biases
   })
   const plan = buildExperimentPlan({ hypotheses, task: task() })
 
-  expect(plan.baselineStrategy).toBe("domain_baselines_first")
+  expect(plan.baselineStrategy).toBe("planner_selected_experiments")
   expect(plan.searchBiases).toContain("seasonal")
   expect(plan.searchBiases).toContain("trend")
   expect(plan.searchBiases.filter((item) => item === "seasonal")).toHaveLength(1)
@@ -201,7 +205,15 @@ test("buildExperimentPlan only sets referenceBaseline on the first call", () => 
   })
 
   const firstCall = buildExperimentPlan({ hypotheses, task: task(), isFirstCall: true })
-  expect(firstCall.referenceBaseline).toBe("tsf_baseline_dlinear")
+  expect(firstCall.referenceBaseline).toBeUndefined()
+  const explicit = buildExperimentPlan({
+    hypotheses,
+    task: task(),
+    isFirstCall: true,
+    toolReferenceBaseline: "tsf_baseline_dlinear",
+  })
+  expect(explicit.referenceBaseline).toBe("tsf_baseline_dlinear")
+  expect(explicit.referenceBaselineSource).toBe("tool")
 
   const laterCall = buildExperimentPlan({ hypotheses, task: task(), isFirstCall: false })
   expect(laterCall.referenceBaseline).toBeUndefined()
@@ -210,7 +222,7 @@ test("buildExperimentPlan only sets referenceBaseline on the first call", () => 
   expect(defaultCall.referenceBaseline).toBeUndefined()
 })
 
-test("selectReferenceBaseline picks DLinear for seasonal/trend-heavy datasets", () => {
+test("seasonal and trend signals do not implicitly select a baseline", () => {
   const seasonalTask = task({
     datasetProfile: { seasonalityStrength: 0.72, trendStrength: 0.41, crossVarCorrelation: 0.1 },
     searchBiases: ["seasonal", "trend"],
@@ -227,10 +239,10 @@ test("selectReferenceBaseline picks DLinear for seasonal/trend-heavy datasets", 
     isFirstCall: true,
   })
 
-  expect(plan.referenceBaseline).toBe("tsf_baseline_dlinear")
+  expect(plan.referenceBaseline).toBeUndefined()
 })
 
-test("selectReferenceBaseline picks iTransformer for cross-variate-correlated datasets", () => {
+test("cross-variate correlation does not implicitly select a baseline", () => {
   const crossVarTask = task({
     datasetProfile: { seasonalityStrength: 0.1, trendStrength: 0.1, crossVarCorrelation: 0.66 },
     searchBiases: ["cross_var_correlated"],
@@ -247,10 +259,10 @@ test("selectReferenceBaseline picks iTransformer for cross-variate-correlated da
     isFirstCall: true,
   })
 
-  expect(plan.referenceBaseline).toBe("tsf_baseline_itransformer")
+  expect(plan.referenceBaseline).toBeUndefined()
 })
 
-test("selectReferenceBaseline falls back to PatchTST when no profile signal dominates", () => {
+test("an absent profile does not select a default baseline", () => {
   const hypotheses = generateHypotheses({
     task: task({ datasetProfile: {}, searchBiases: [] }, { maxRuns: 1 }),
     dataAnalysisSummary: dataAnalysisSummary([]),
@@ -263,10 +275,10 @@ test("selectReferenceBaseline falls back to PatchTST when no profile signal domi
     isFirstCall: true,
   })
 
-  expect(plan.referenceBaseline).toBe("tsf_baseline_patchtst")
+  expect(plan.referenceBaseline).toBeUndefined()
 })
 
-test("selectReferenceBaseline picks the linear baseline for bridge-only tasks", () => {
+test("bridge-only tasks still require explicit baseline selection", () => {
   const hypotheses = generateHypotheses({
     task: task(),
     dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
@@ -279,7 +291,7 @@ test("selectReferenceBaseline picks the linear baseline for bridge-only tasks", 
     isFirstCall: true,
   })
 
-  expect(plan.referenceBaseline).toBe("tsf_linear_raw_baseline")
+  expect(plan.referenceBaseline).toBeUndefined()
 })
 
 test("buildHypothesesYaml and buildHypoPlanMarkdown surface referenceBaseline when present", () => {
@@ -291,6 +303,7 @@ test("buildHypothesesYaml and buildHypoPlanMarkdown surface referenceBaseline wh
   })
   const result = buildHypoPlannerResult({
     task: task(),
+    toolReferenceBaseline: "tsf_baseline_dlinear",
     dataAnalysisSummary: dataAnalysisSummary(["seasonal", "trend"]),
     runs: [],
     memory: [],
@@ -318,7 +331,7 @@ test("buildHypoPlannerResult emits markdown and yaml artifacts from the same pla
   expect(result.planMarkdown).toContain("# Hypothesis Plan")
   expect(result.planMarkdown).toContain("## Hypotheses")
   expect(result.hypothesesYaml).toContain("hypotheses:")
-  expect(result.hypothesesYaml).toContain("baselineStrategy: domain_baselines_first")
+  expect(result.hypothesesYaml).toContain("baselineStrategy: planner_selected_experiments")
   expect(result.evidenceSummary).toContain("seasonal")
 })
 
@@ -341,4 +354,19 @@ test("markdown and yaml builders render stable hypothesis IDs and suggested back
   expect(buildHypothesesYaml(plan)).toContain("- dlinear")
   expect(buildHypoPlanMarkdown(result)).toContain("### H1")
   expect(buildHypoPlanMarkdown(result)).toContain("Suggested backbones")
+})
+
+test("an explicit stop with an empty pool does not generate fallback hypotheses", () => {
+  const nextExperiment = { action: "stop" as const, rationale: "No useful hypothesis remains." }
+  const result = buildHypoPlannerResult({
+    task: task(),
+    dataAnalysisSummary: dataAnalysisSummary([]),
+    runs: [],
+    memory: [],
+    llmHypotheses: [],
+    nextExperiment,
+  })
+  expect(result.plan.hypotheses).toEqual([])
+  expect(result.plan.nextExperiment).toEqual(nextExperiment)
+  expect(result.llm.status).toBe("used")
 })

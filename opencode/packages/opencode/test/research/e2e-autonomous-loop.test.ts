@@ -5,6 +5,7 @@ import { tmpdir as osTmpdir } from "os"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
+import { addHypothesisToPool, selectNextExperimentInPool } from "../../src/research/hypothesis-store"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
 
@@ -39,7 +40,9 @@ async function writeProfileDataset() {
   for (let index = 0; index < 96; index++) {
     const seasonal = index % 24
     const trend = index * 0.25
-    lines.push(`2024-01-${String((index % 28) + 1).padStart(2, "0")},${trend + seasonal},${trend + seasonal * 2},${trend}`)
+    lines.push(
+      `2024-01-${String((index % 28) + 1).padStart(2, "0")},${trend + seasonal},${trend + seasonal * 2},${trend}`,
+    )
   }
   await writeFile(csvPath, `${lines.join("\n")}\n`, "utf8")
   return csvPath
@@ -48,7 +51,7 @@ async function writeProfileDataset() {
 async function writeMockNeoCastRunner(root: string) {
   await mkdir(path.join(root, "bin"), { recursive: true })
   await mkdir(path.join(root, "py"), { recursive: true })
-  await writeFile(path.join(root, "pyproject.toml"), "[project]\nname = \"fake-neo-cast\"\n", "utf8")
+  await writeFile(path.join(root, "pyproject.toml"), '[project]\nname = "fake-neo-cast"\n', "utf8")
   await writeFile(path.join(root, "py", "prepare_tsf.py"), "PREPROCESS_VERSION = 1\n", "utf8")
   await writeFile(
     path.join(root, "bin", "neo-cast.js"),
@@ -133,11 +136,17 @@ printf '{"event":"done","status":"success"}\\n'
   )
   const fullRunner = (await readFile(path.join(root, "py", "validate.py"), "utf8"))
     .replace("smoke_eval_done", "eval_done")
-    .replace('"event":"done"', '"event":"cv_eval_done","cv_avg_mse":0.123,"cv_std_mse":0.01,"val_avg_mse":0.123,"val_avg_mae":0.456')
+    .replace(
+      '"event":"done"',
+      '"event":"cv_eval_done","cv_avg_mse":0.123,"cv_std_mse":0.01,"val_avg_mse":0.123,"val_avg_mae":0.456',
+    )
   await writeFile(path.join(root, "py", "runner.py"), fullRunner, "utf8")
 }
 
+let restoreLLMFixture: (() => void) | undefined
 afterEach(async () => {
+  restoreLLMFixture?.()
+  restoreLLMFixture = undefined
   await resetDatabase()
 })
 
@@ -178,6 +187,85 @@ describe("AutoResearch alpha e2e smoke", () => {
           schema_version: "dataset.v2",
           target_columns: ["a", "b"],
         })
+
+        const hypothesis = await addHypothesisToPool(task.id, {
+          id: "H_e2e_linear",
+          statement: "Compare linear temporal controls under the same protocol.",
+          motivation: ["Explicit planner fixture"],
+          expectedOutcome: "Lower val_avg_mse",
+          suggestedBackbones: ["linear"],
+          suggestedPreprocessing: [],
+          risk: "Underfit",
+          testable: true,
+        })
+        const spec = Research.DomainRegistry.buildBaselines("tsf", task.taskSpec)[0]!.candidateSpec
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.createCandidate({
+              taskID: task.id,
+              domainID: "tsf",
+              hypothesisID: hypothesis.id,
+              candidateSpec: spec,
+              rationale: hypothesis.statement,
+              generatedBy: "heuristic",
+              riskLevel: "low",
+              approvalStatus: "auto_approved",
+            }),
+          ),
+        )
+        await selectNextExperimentInPool(task.id, {
+          action: "experiment",
+          hypothesisID: hypothesis.id,
+          rationale: "Run this linear control first.",
+        })
+        const keys = [
+          "NEO_CAST_LLM_PROVIDER",
+          "NEO_CAST_LLM_BASE_URL",
+          "NEO_CAST_LLM_MODEL",
+          "NEO_CAST_LLM_API_KEY",
+        ] as const
+        const previousEnv = keys.map((key) => process.env[key])
+        const previousFetch = globalThis.fetch
+        restoreLLMFixture = () => {
+          globalThis.fetch = previousFetch
+          keys.forEach((key, index) => {
+            if (previousEnv[index] === undefined) delete process.env[key]
+            else process.env[key] = previousEnv[index]
+          })
+        }
+        process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+        process.env.NEO_CAST_LLM_BASE_URL = "http://e2e.fixture/v1"
+        process.env.NEO_CAST_LLM_MODEL = "fixture-model"
+        process.env.NEO_CAST_LLM_API_KEY = "fixture-key"
+        globalThis.fetch = (async (_: RequestInfo | URL, init?: RequestInit) => {
+          const body = JSON.parse(String(init?.body))
+          const system = body.messages[0].content as string
+          const result = system.startsWith("You are the NeoResearch HypoPlanner")
+            ? {
+                hypotheses: [hypothesis],
+                nextExperiment: {
+                  action: "experiment",
+                  hypothesisID: hypothesis.id,
+                  rationale: "Compare another linear training configuration.",
+                },
+              }
+            : {
+                ...spec,
+                recipeID: "e2e_linear_second",
+                trainingStrategy: {
+                  ...(spec.trainingStrategy as any),
+                  optimizer: { ...(spec.trainingStrategy as any).optimizer, lr: 0.0003 },
+                },
+              }
+          const content = JSON.stringify(result)
+          return body.stream
+            ? new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, {
+                headers: { "content-type": "text/event-stream" },
+              })
+            : new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+                headers: { "content-type": "application/json" },
+              })
+        }) as typeof fetch
 
         const loop = await runResearch(
           Research.Service.use((svc) =>

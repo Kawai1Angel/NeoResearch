@@ -27,7 +27,7 @@ export const BaselinePickTool = Tool.define(
   "pick_baseline",
   Effect.succeed({
     description:
-      "Pick exactly one baseline recipe as this research task's reference baseline and first candidate to run. Call this once, after the hypothesis pool has been populated on the first iteration only — later baseline search only considers this recipe. Do not call on any later iteration.",
+      "Pick exactly one baseline recipe as this research task's reference baseline. This sets the comparison anchor; hypothesis_select schedules the next experiment. Call this once, after the hypothesis pool has been populated on the first iteration only — later baseline search only considers this recipe. Do not call on any later iteration.",
     parameters: PickParameters,
     execute: (args: PickArgs, ctx: Tool.Context) =>
       Effect.gen(function* () {

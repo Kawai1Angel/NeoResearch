@@ -1,3 +1,4 @@
+import { candidateMechanisms } from "./model-capabilities"
 import { createHash } from "crypto"
 import type { HypothesisObject } from "./agents/hypo-planner-agent"
 import type { ResearchCandidate, ResearchTask, JsonRecord } from "./schema"
@@ -59,6 +60,10 @@ export function buildExecutionContract(
     candidate_id: candidate.id,
     candidate_spec_sha256: digest(payload),
     expected: {
+      input_length: task.taskSpec.contextLength,
+      head_input_width: spec.representation?.latentDim ?? Math.min(Number(task.taskSpec.contextLength), 64),
+      head_channel_shared: true,
+      mechanisms: candidateMechanisms(spec),
       runtime_semantics_revision: spec.recipeVersion === "recipe_schema_v3" ? 3 : 2,
       recipe_version: spec.recipeVersion,
       preprocessing: spec.preprocessing.actions.map((action: any) => action.type),
@@ -67,7 +72,9 @@ export function buildExecutionContract(
       ...(spec.backbone.type === "linear" ? { linear_shared: spec.backbone.shared ?? false } : {}),
       fusion: spec.fusion.type,
       ...(spec.fusion.type === "gated_hybrid" ? { fusion_gate_type: spec.fusion.gateType ?? "channel" } : {}),
-      ...(["temporal_then_feature", "feature_then_temporal"].includes(spec.fusion.type) ? { fusion_gate: spec.fusion.gate ?? false, fusion_residual: spec.fusion.residual ?? false } : {}),
+      ...(["temporal_then_feature", "feature_then_temporal"].includes(spec.fusion.type)
+        ? { fusion_gate: spec.fusion.gate ?? false, fusion_residual: spec.fusion.residual ?? false }
+        : {}),
       channel_mode: spec.fusion.channelMode ?? "independent",
       prediction_head: spec.predictionHead.type,
       target_channels: targets,
@@ -88,6 +95,9 @@ export function validateCandidateAgainstHypothesis(
   const mismatches: ContractMismatch[] = []
   const add = (path: string, expected: unknown, actual: unknown) =>
     mismatches.push({ path, expected, actual: actual ?? null, source: "hypothesis_candidate_gate" })
+  const mechanisms = candidateMechanisms(spec)
+  for (const required of hypothesis.requiredMechanisms ?? [])
+    if (!mechanisms.includes(required)) add(`requiredMechanisms.${required}`, true, false)
   if (candidate.hypothesisID !== hypothesis.id) add("hypothesis_id", hypothesis.id, candidate.hypothesisID)
   const aliases: Record<string, string> = {
     patch_transformer: "transformer",

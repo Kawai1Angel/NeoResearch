@@ -1,3 +1,5 @@
+import { MODEL_CAPABILITIES } from "../model-capabilities"
+import { isOpenHypothesis } from "./hypo-planner-agent"
 import { projectCitedTaskEvidence } from "../retrieve/evidence-handoff"
 import type { TaskEvidenceBundle } from "../retrieve/contract"
 import type { DomainCandidateProposal, DomainCandidateRanking } from "../domain"
@@ -24,6 +26,7 @@ export interface ModelDesignerInput {
   readonly task: ResearchTask
   readonly dataAnalysisSummary: string
   readonly hypotheses: readonly HypothesisObject[]
+  readonly selectedHypothesisID?: string
   readonly componentLibrary: ModelDesignerComponentLibrary
 }
 
@@ -50,8 +53,10 @@ export function buildModelDesignerComponentLibrary(input: {
   }
 }
 
-function firstAvailable(suggestions: readonly string[], available: readonly string[]): string | undefined {
-  return suggestions.find((s) => available.includes(s)) ?? (available.length > 0 ? available[0] : undefined)
+function unambiguousComponent(suggestions: readonly string[], available: readonly string[]): string | undefined {
+  const matches = [...new Set(suggestions.filter((s) => available.includes(s)))]
+  if (matches.length === 1) return matches[0]
+  return undefined
 }
 
 function buildRationaleFromHypothesis(
@@ -77,11 +82,11 @@ export function buildModelDesignerProposalFromHypotheses(
   input: ModelDesignerInput,
 ): ModelDesignerHypothesisProposal | undefined {
   const { componentLibrary: lib } = input
-  const hypothesis = selectHypothesisFromList(input.hypotheses)
+  const hypothesis = selectHypothesisFromList(input.hypotheses, input.selectedHypothesisID)
   if (!hypothesis) return undefined
 
-  const backbone = firstAvailable(hypothesis.suggestedBackbones, lib.backbones)
-  const preprocessing = firstAvailable(hypothesis.suggestedPreprocessing, lib.preprocessing)
+  const backbone = unambiguousComponent(hypothesis.suggestedBackbones, lib.backbones)
+  const preprocessing = unambiguousComponent(hypothesis.suggestedPreprocessing, lib.preprocessing)
   if (!backbone || !preprocessing) return undefined
 
   const loss = lib.losses.includes("mse") ? "mse" : (lib.losses[0] ?? "mse")
@@ -107,7 +112,7 @@ export function buildModelDesignerProposalFromHypotheses(
     proposal: {
       candidateSpec,
       rationale: buildRationaleFromHypothesis(hypothesis, backbone, preprocessing),
-      riskLevel: hypothesis.priority === "high" ? "medium" : "low",
+      riskLevel: hypothesis.risk ? "medium" : "low",
       approvalStatus: "auto_approved",
       generatedBy: "heuristic",
     },
@@ -202,13 +207,13 @@ export function buildExistingFrontierRankings(input: {
   readonly readyCandidateIDs: readonly ResearchCandidateID[]
 }): DomainCandidateRanking[] {
   const candidatesByID = new Map(input.candidates.map((candidate) => [candidate.id, candidate]))
-  return input.readyCandidateIDs.flatMap((candidateID, index) => {
+  return input.readyCandidateIDs.flatMap((candidateID) => {
     const candidate = candidatesByID.get(candidateID)
     if (candidate === undefined) return []
     return [
       {
-        rank: index + 1,
-        score: input.readyCandidateIDs.length - index,
+        rank: 1,
+        score: 0,
         reasons: ["existing approved frontier candidate"],
         predictorVersion: "existing_frontier_v1",
         candidateSpec: candidate.candidateSpec,
@@ -235,17 +240,11 @@ export function selectModelDesignerCandidate(input: {
   const readyCandidateIDs = input.candidates
     .filter((candidate) => isApproved(candidate) && !attemptState.attemptedCandidateIDs.has(candidate.id))
     .map((candidate) => candidate.id)
-  const retryCandidate = input.candidates.find(
-    (candidate) =>
-      isApproved(candidate) &&
-      attemptState.inconclusiveCandidateIDs.has(candidate.id) &&
-      !attemptState.attemptedCandidateIDs.has(candidate.id),
-  )
+  // Reuse only an unambiguous queued implementation. With several eligible
+  // candidates, ModelDesigner must make a concrete design; queue order, age,
+  // retry status and scores do not pick an experiment for it.
   const candidate =
-    retryCandidate ??
-    input.candidates.find(
-      (item) => isApproved(item) && !attemptState.attemptedCandidateIDs.has(item.id),
-    )
+    readyCandidateIDs.length === 1 ? input.candidates.find((item) => item.id === readyCandidateIDs[0]) : undefined
   return {
     candidate,
     selectionSource: "existing_frontier",
@@ -256,22 +255,19 @@ export function selectModelDesignerCandidate(input: {
   }
 }
 
-export function selectHypothesisFromList(hypotheses: readonly HypothesisObject[]): HypothesisObject | undefined {
-  // The pool includes historical hypotheses in creation order. Closed directions
-  // must not constrain new designs; prefer the latest planner pivot on priority ties.
-  const eligible = hypotheses.filter((item) =>
-    item.testable && (!item.status || ["pending", "active", "testing"].includes(item.status)),
-  )
-  const priorityOrder: readonly HypothesisObject["priority"][] = ["high", "medium", "low"]
-  for (const priority of priorityOrder) {
-    const hypothesis = eligible.findLast((item) => item.priority === priority)
-    if (hypothesis !== undefined) return hypothesis
-  }
-  return undefined
+export function selectHypothesisFromList(
+  hypotheses: readonly HypothesisObject[],
+  selectedHypothesisID?: string,
+): HypothesisObject | undefined {
+  // Only resolve an explicit identity. Array order, creation time, status changes,
+  // legacy priority and candidate scores never select a research direction.
+  if (!selectedHypothesisID) return undefined
+  return hypotheses.find((h) => h.id === selectedHypothesisID && isOpenHypothesis(h))
 }
 
 export function selectHypothesisForDesign(plan: ExperimentPlan | undefined): HypothesisObject | undefined {
-  return plan === undefined ? undefined : selectHypothesisFromList(plan.hypotheses)
+  if (plan?.nextExperiment?.action !== "experiment") return undefined
+  return selectHypothesisFromList(plan.hypotheses, plan.nextExperiment.hypothesisID)
 }
 
 export function buildModelDesignerTaskFingerprint(input: {
@@ -296,16 +292,15 @@ export function buildModelDesignerTaskFingerprint(input: {
         ]
   return {
     ...input.baseFingerprint,
+    modelCapabilities: MODEL_CAPABILITIES,
+    ...(input.hypothesisPlan?.nextExperiment ? { nextExperiment: input.hypothesisPlan.nextExperiment } : {}),
     ...(input.selectedHypothesis ? { selectedHypothesis: { ...input.selectedHypothesis } } : {}),
-    ...(input.selectedHypothesis?.literatureEvidence?.length ? {
-      taskEvidence: projectCitedTaskEvidence(input.taskEvidence, input.selectedHypothesis.literatureEvidence),
-    } : {}),
-    searchBiases: unique([
-      ...baseBiases,
-      ...planBiases,
-      ...hypothesisBiases,
-      ...(input.reflectionHypotheses ?? []),
-    ]),
+    ...(input.selectedHypothesis?.literatureEvidence?.length
+      ? {
+          taskEvidence: projectCitedTaskEvidence(input.taskEvidence, input.selectedHypothesis.literatureEvidence),
+        }
+      : {}),
+    searchBiases: unique([...baseBiases, ...planBiases, ...hypothesisBiases, ...(input.reflectionHypotheses ?? [])]),
   } as JsonRecord
 }
 

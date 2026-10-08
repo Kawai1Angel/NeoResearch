@@ -319,6 +319,7 @@ export const layer = Layer.effect(
                 hypothesis_update: "allow",
                 hypothesis_abandon: "allow",
                 hypothesis_list: "allow",
+                hypothesis_select: "allow",
                 pick_baseline: "allow",
                 load_baseline: "allow",
                 experiment_results: "allow",

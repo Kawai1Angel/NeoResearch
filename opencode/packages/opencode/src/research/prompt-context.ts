@@ -243,7 +243,7 @@ function profileMetricEntries(value: unknown) {
     seasonalityStrength: numericMetric(
       profile.seasonalityStrength,
       (item) => item < 0.2 ? "weak seasonality" : item < 0.5 ? "moderate seasonality" : "strong seasonality",
-      "Stronger seasonality supports seasonal decomposition, frequency features, or period-aligned patches.",
+      "Positive detrended periodic peaks support seasonal decomposition, frequency features, or period-aligned patches. A low score does not rule out local or changing seasonality.",
     ),
     crossVarCorrelation: numericMetric(
       profile.crossVarCorrelation,
@@ -262,12 +262,12 @@ function profileMetricEntries(value: unknown) {
     ),
     acfMainPeriod: numericMetric(
       profile.acfMainPeriod,
-      (item) => `dominant lag ${rounded(item)}`,
-      "Use the dominant lag to choose seasonal differences, decomposition kernels, and patch scales.",
+      (item) => `detected seasonal period ${rounded(item)} observations`,
+      "Use this detrended periodic peak to choose seasonal differences, decomposition kernels, and patch scales; do not infer a seasonal period from short-lag persistence alone.",
     ),
     acfMainPeriodStrength: numericMetric(
       profile.acfMainPeriodStrength,
-      (item) => item < 0.2 ? "weak periodic persistence" : item < 0.5 ? "moderate periodic persistence" : "strong periodic persistence",
+      (item) => item < 0.2 ? "weak detrended periodic peak" : item < 0.5 ? "moderate detrended periodic peak" : "strong detrended periodic peak",
       "Indicates how strongly the dominant lag should influence architecture priors.",
     ),
     adfStatistic: numericMetric(

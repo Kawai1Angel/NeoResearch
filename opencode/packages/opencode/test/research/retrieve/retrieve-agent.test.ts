@@ -71,6 +71,18 @@ test("concept mapping requires evidence and never turns method hypotheses into c
   expect(mapScientificConcepts(trendOnly, extractDatasetEvidence(trendOnly)).map((item) => item.conceptID)).not.toContain("non_stationarity")
 })
 
+test("a supported period survives moderate channel-averaged seasonality in retrieval", () => {
+  const base = report()
+  const value = report({
+    profile: { ...base.profile, seasonalityStrength: 0.23 },
+    statistics: { ...base.statistics, acf: { topLag: 1, topCorrelation: 0.97 }, decomposition: { period: 96 }, frequency: { spectralPeaks: [] } },
+  })
+  const mapping = mapScientificConcepts(value, extractDatasetEvidence(value)).find((item) => item.conceptID === "seasonality")
+  expect(mapping?.evidence).toContainEqual(expect.objectContaining({ path: "$.statistics.decomposition.period", value: 96 }))
+  const persistenceOnly = report({ ...value, statistics: { ...value.statistics, decomposition: {} } })
+  expect(mapScientificConcepts(persistenceOnly, extractDatasetEvidence(persistenceOnly)).map((item) => item.conceptID)).not.toContain("seasonality")
+})
+
 test("RetrieveAgent performs one BM25 recall per intent and bridges each paper once", async () => {
   await using tmp = await tmpdir()
   const neoCastRoot = path.join(tmp.path, "neo_cast")

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import {
   analyzeReflection,
+  buildInlineReflectionSystemPrompt,
   buildFailureLogMarkdown,
   buildNextExperimentPlanMarkdown,
   buildReflectionNotesMarkdown,
@@ -9,6 +10,23 @@ import {
 } from "../../src/research/agents/reflection-agent"
 import type { ResearchCandidate, ResearchRun, ResearchTask } from "../../src/research/schema"
 import type { ReflectionLLMAnalysis } from "../../src/research/agents/reflection-agent"
+import REFLECTION_PROMPT from "../../src/agent/prompt/research-reflection.txt"
+
+test("direct reflection synthesizes inline evidence without requesting session tools", () => {
+  const prompt = buildInlineReflectionSystemPrompt(REFLECTION_PROMPT)
+  expect(prompt).toContain("Tools are unavailable; produce the final analysis directly")
+  expect(prompt).toContain("experimentDesign")
+  expect(prompt).toContain("trainingCurve")
+  expect(prompt).toContain("historicalExperimentMemory")
+  expect(prompt).toContain("lacks a finite task primary metric")
+  expect(prompt).toContain("training_strategy.scheduler.warmup_steps")
+  expect(prompt).toContain("EXACTLY these 7 keys")
+  expect(prompt).not.toContain("Call `experiment_results")
+  expect(prompt).not.toContain("After completing the four tool calls")
+  expect(prompt).not.toContain("Before EVERY tool call")
+  // Session mode retains its original tool workflow.
+  expect(REFLECTION_PROMPT).toContain("Call `experiment_results")
+})
 
 function task(extraSpec: Record<string, unknown> = {}): ResearchTask {
   return {

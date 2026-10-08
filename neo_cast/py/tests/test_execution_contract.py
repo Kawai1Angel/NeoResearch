@@ -65,6 +65,38 @@ class ExecutionContractTests(unittest.TestCase):
                 {"model_config": self.config},
             )
 
+    def test_dlinear_latent_width_and_shared_head_are_reported(self):
+        recipe = copy.deepcopy(self.recipe)
+        recipe["backbone"] = {"type": "dlinear", "kernel_size": 25}
+        model = build_model({**self.config, "recipe": recipe}, 336, 96)
+        actual = describe_model(model)
+        self.assertEqual(actual["input_length"], 336)
+        self.assertEqual(actual["head_input_width"], 64)
+        self.assertEqual(actual["forecast_horizon"], 96)
+        self.assertTrue(actual["head_channel_shared"])
+        self.assertEqual(actual["mechanisms"], ["moving_average_decomposition"])
+        self.assertEqual(model.model.seasonal.out_features, 64)
+
+    def test_generic_nbeats_does_not_claim_fixed_bases_or_multirate(self):
+        recipe = copy.deepcopy(self.recipe)
+        recipe["backbone"] = {"type": "nbeats", "hidden_dim": 16, "n_blocks": 2,
+                              "n_layers": 2, "dropout": 0.0, "activation": "gelu"}
+        model = build_model({**self.config, "recipe": recipe}, 336, 96)
+        self.assertEqual(describe_model(model)["mechanisms"], ["learned_residual_backcast"])
+        import torch.nn as nn
+        # The recipe still says nbeats; a replaced module must change actual facts.
+        model.model = nn.Linear(336, 64)
+        self.assertEqual(describe_model(model)["mechanisms"], [])
+        self.assertEqual(describe_model(model)["backbone"], "linear")
+
+    def test_replaced_head_width_is_a_contract_violation(self):
+        from factory.build_model import LinearHead
+        self.contract["expected"]["head_input_width"] = 32
+        self.model.prediction_head = LinearHead(16, 8)
+        _, mismatches = self.verify()
+        self.assertTrue(any(item["path"] == "head_input_width" and item["actual"] == 16
+                            for item in mismatches))
+
     def test_timesnet_verified(self):
         manifests, mismatches = self.verify()
         self.assertEqual(mismatches, [])

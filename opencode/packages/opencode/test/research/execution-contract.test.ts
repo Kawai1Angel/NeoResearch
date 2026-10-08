@@ -12,9 +12,10 @@ import {
   validateCandidateAgainstHypothesis,
   verifyExecutionRecords,
 } from "../../src/research/execution-contract"
-import { addHypothesisToPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
+import { addHypothesisToPool, listHypothesesInPool, selectNextExperimentInPool } from "../../src/research/hypothesis-store"
 import { analyzeReflection } from "../../src/research/agents/reflection-agent"
 import { candidateAttemptStateFromRuns } from "../../src/research/agents/model-designer-agent"
+import { MODEL_CAPABILITIES, candidateMechanisms } from "../../src/research/model-capabilities"
 import type { ExecutionContract } from "../../src/research/execution-contract"
 import type { HypothesisObject } from "../../src/research/agents/hypo-planner-agent"
 
@@ -122,6 +123,7 @@ async function setup(root: string) {
     backbone: { type: "timesnet_lite", hiddenDim: 8, nLayers: 1, topK: 2, kernelSize: 3, dropout: 0 },
   }
   await addHypothesisToPool(task.id, hypothesis)
+  await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: hypothesis.id, rationale: "Verify and, if needed, repair this exact experiment." })
   const candidate = await run((svc) =>
     svc.createCandidate({
       taskID: task.id,
@@ -348,4 +350,21 @@ test("Gate A preserves selected preprocessing order and task covariate declarati
     { dataset: { knownFutureCovariates: ["calendar"] } },
   )
   expect(mismatches.map((item) => item.path)).toEqual(["preprocessing", "knownFutureCovariates"])
+})
+
+
+test("mechanism gate rejects NBeats names standing in for fixed bases or multirate", () => {
+  const candidate = { hypothesisID: "H1", candidateSpec: { backbone: { type: "nbeats" }, embedding: { type: "none" } } } as any
+  const h = { ...hypothesis, suggestedBackbones: ["nbeats"], requiredMechanisms: ["fixed_trend_basis", "multirate_sampling"] as const }
+  expect(validateCandidateAgainstHypothesis(h, candidate).map((m) => m.path)).toEqual([
+    "requiredMechanisms.fixed_trend_basis", "requiredMechanisms.multirate_sampling",
+  ])
+  expect(validateCandidateAgainstHypothesis({ ...h, requiredMechanisms: ["learned_residual_backcast"] }, candidate)).toEqual([])
+})
+
+
+test("packaged capabilities stay synchronized with the Python registry", async () => {
+  const registry = JSON.parse(await readFile(new URL("../../../../../neo_cast/py/registry/model_capabilities.json", import.meta.url), "utf8"))
+  expect(MODEL_CAPABILITIES).toEqual(registry)
+  expect(candidateMechanisms({ backbone: { type: "nbeats" }, embedding: { type: "none" } })).toEqual(["learned_residual_backcast"])
 })

@@ -10,12 +10,12 @@ import { SessionPrompt } from "../../src/session/prompt"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
-import { ResearchRunTable } from "../../src/research/research.sql"
+import { ResearchRunTable, ResearchHypothesisTable } from "../../src/research/research.sql"
 import { createFileResearchRuntime } from "../../src/research/runtime"
 import { Database, eq } from "../../src/storage"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
-import { addHypothesisToPool } from "../../src/research/hypothesis-store"
+import { addHypothesisToPool, selectNextExperimentInPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
 import { validateCandidateAgainstHypothesis } from "../../src/research/execution-contract"
 
 function runResearch<A, E>(fx: Effect.Effect<A, E, Research.Service>) {
@@ -424,10 +424,23 @@ printf '{"event":"done","status":"success"}\\n'
   )
 }
 
+async function runRankingBaselineFixtures(taskID: Research.ResearchTaskID) {
+  await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID })))
+  const candidates = await runResearch(Research.Service.use((svc) => svc.listCandidates(taskID)))
+  // The planner now selects a direction explicitly. Schedule each comparison
+  // control before measuring the proposal ranker, instead of relying on priority.
+  for (const candidate of candidates) {
+    await selectNextExperimentInPool(taskID, { action: "experiment", hypothesisID: candidate.hypothesisID!,
+      rationale: "Evaluate this queued baseline control under the shared protocol." })
+    await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID, stage: "full" })))
+  }
+  await createSearchHypothesis(taskID)
+}
+
 async function createSearchHypothesis(taskID: Research.ResearchTaskID) {
   // Ranking/loop tests deliberately explore multiple architectures. Contract-gate
   // tests use narrow hypotheses instead of this search-policy fixture.
-  return addHypothesisToPool(taskID, {
+  const hypothesis = await addHypothesisToPool(taskID, {
     statement: "Compare the declared architecture families under a shared evaluation protocol.",
     motivation: ["Exercise search ranking and stopping policy."],
     expectedOutcome: "Select the best verified full-run result.",
@@ -437,6 +450,8 @@ async function createSearchHypothesis(taskID: Research.ResearchTaskID) {
     risk: "Architecture ranking is dataset-dependent.",
     testable: true,
   })
+  await selectNextExperimentInPool(taskID, { action: "experiment", hypothesisID: hypothesis.id, rationale: "Compare the remaining declared architectures." })
+  return hypothesis
 }
 
 async function createCandidate(input: {
@@ -456,6 +471,7 @@ async function createCandidate(input: {
     risk: "Fixture",
     testable: true,
   })
+  await selectNextExperimentInPool(input.taskID, { action: "experiment", hypothesisID: hypothesis.id, rationale: "Execute this declared fixture experiment." })
   return runResearch(
     Research.Service.use((svc) =>
       svc.createCandidate({
@@ -538,6 +554,61 @@ async function approveIntentCheckpoint(taskID: Research.ResearchTaskID, replyMes
   )
 }
 
+const plannerFixtureEnvKeys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"] as const
+let restorePlannerFixture: (() => void) | undefined
+
+// These workflow tests exercise execution/checkpoints. Their planner explicitly
+// chooses a named direction; production never inherits this test decision.
+function installPlannerFixture() {
+  if (restorePlannerFixture) return
+  const previousFetch = globalThis.fetch
+  const previousEnv = Object.fromEntries(plannerFixtureEnvKeys.map((key) => [key, process.env[key]]))
+  process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+  process.env.NEO_CAST_LLM_BASE_URL = "http://planner.fixture/v1"
+  process.env.NEO_CAST_LLM_MODEL = "fixture-model"
+  process.env.NEO_CAST_LLM_API_KEY = "fixture-key"
+  globalThis.fetch = (async (_: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body))
+    const user = JSON.parse(body.messages[1].content)
+    const system = body.messages[0].content as string
+    let result: unknown = {
+      trainingHealthAssessment: "The fixture completed the execution protocol.", hypothesisValidation: "Evaluate only completed primary metrics.",
+      attributionAnalysis: "Compare under the shared protocol.", historicalComparison: "Use the task history.",
+      modelDesignReflection: "The actual implementation manifest is available.", nextStepRecommendation: "Ask HypoPlanner for an explicit next experiment.",
+      distillableMemory: "Fixture workflow result.",
+    }
+    if (system.startsWith("You are the NeoResearch HypoPlanner")) {
+      const h = { id: "H_fixture_search", statement: "Test the declared architecture families under the shared protocol.",
+        motivation: ["Workflow fixture with explicit experiment selection."], expectedOutcome: "Improve the primary metric",
+        suggestedBackbones: ["linear", "mlp", "transformer", "dlinear", "nbeats", "rnn", "freq_mixer"],
+        suggestedPreprocessing: [], requiredMechanisms: [], risk: "May underfit", testable: true,
+        datasetEvidencePaths: [], literatureEvidence: [], applicabilityAssumptions: [],
+        falsificationCriteria: ["No improvement in completed independent experiments."], evidenceLevel: "data_only" }
+      const progress = user.searchProgress
+      // Reuse the exact execution binding for incomplete runs; no age/order
+      // rule decides which hypothesis should be retried.
+      const lastRun = user.experimentHistory?.find((run: any) => run.stage !== "smoke") ?? user.experimentHistory?.[0]
+      const failedID = lastRun?.status === "failed" ? lastRun.hypothesisID : undefined
+      const failedRow = failedID ? Database.use((d) => d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.hypo_id, failedID)).get()) : undefined
+      const failed = failedRow ? (await listHypothesesInPool(failedRow.task_id)).find((item) => item.id === failedID) : undefined
+      result = { hypotheses: failed ? [failed] : [h], nextExperiment: progress?.globalPlateauObserved
+        ? { action: "stop", rationale: "Fixture planner stops after the configured plateau." }
+        : { action: "experiment", hypothesisID: failed?.id ?? h.id, rationale: "Explicit workflow fixture decision." } }
+    }
+    const content = JSON.stringify(result)
+    if (body.stream) return Promise.resolve(new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } }))
+    return Promise.resolve(new Response(JSON.stringify({ choices: [{ message: { content } }] }), { headers: { "content-type": "application/json" } }))
+  }) as typeof fetch
+  restorePlannerFixture = () => {
+    globalThis.fetch = previousFetch
+    for (const key of plannerFixtureEnvKeys) {
+      if (previousEnv[key] === undefined) delete process.env[key]
+      else process.env[key] = previousEnv[key]
+    }
+    restorePlannerFixture = undefined
+  }
+}
+
 async function runFullPipelineAfterIntentConfirmation(input: {
   taskID: Research.ResearchTaskID
   stage?: Research.ExecutableRunStage
@@ -546,6 +617,7 @@ async function runFullPipelineAfterIntentConfirmation(input: {
   targetMetricValue?: number
   outputDir?: string
 }) {
+  installPlannerFixture()
   try {
     return await runResearch(Research.Service.use((svc) => svc.runFullPipeline(input)))
   } catch (error) {
@@ -563,6 +635,7 @@ async function runFullPipelineAfterIntentConfirmation(input: {
 }
 
 afterEach(async () => {
+  restorePlannerFixture?.()
   await resetDatabase()
 })
 
@@ -829,7 +902,8 @@ describe("Research service", () => {
         expect(unified).toContain("ACF main period")
         expect(unified).toContain("KPSS statistic")
         expect(unified).toContain("PACF top lag")
-        expect(unified).toContain("STL-style decomposition")
+        expect(unified).toContain("Per-channel moving-average seasonal decomposition")
+        expect(unified).toContain("this is not STL")
         expect(unified).toContain("Dominant frequency period")
         expect(unified).toContain("Change point")
         expect(unified).toContain("Cross-lag")
@@ -1268,6 +1342,7 @@ describe("Research service", () => {
   })
 
   test("Socratic pipeline pauses at intent checkpoint before DataAnalysis (mirrors Companion behaviour)", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const datasetPath = await writeProfileDataset()
 
@@ -1448,6 +1523,7 @@ describe("Research service", () => {
   })
 
   test("companion rejected budget accepts existing results and rejected final/release checkpoints never publish", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const datasetPath = await writeProfileDataset()
     await Instance.provide({ directory: tmp.path, fn: async () => {
@@ -2958,10 +3034,12 @@ describe("Research service", () => {
       const duplicate = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
       expect(duplicate.candidates).toHaveLength(0)
       expect(await runResearch(Research.Service.use((svc) => svc.listHypotheses(task.id)))).toHaveLength(2)
+      await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: control.id, rationale: "Run this baseline control explicitly." })
       const iteration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })))
       expect(iteration.candidate.id).toBe(baseline.id)
       expect(iteration.run.status).toBe("succeeded")
 
+      await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: intervention.id, rationale: "Test the declared attention intervention." })
       const exploration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke", forceExplore: true })))
       expect(exploration.candidate.hypothesisID).toBe(intervention.id)
       expect(exploration.candidate.candidateSpec.backbone).toMatchObject({ type: "transformer" })
@@ -2994,6 +3072,7 @@ describe("Research service", () => {
       expect(pool.find((h) => h.id === version.id)?.statement).toBe(version.statement)
       expect(result.hypothesesYaml).toContain(version.id)
       expect(result.planMarkdown).toContain(version.id)
+      await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: original.id, rationale: "Run the preserved historical control." })
       const iteration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })))
       expect(iteration.candidate.id).toBe(candidate.id)
       expect(iteration.candidate.hypothesisID).toBe(original.id)
@@ -4242,6 +4321,7 @@ fi
   })
 
   test("writes an autonomous loop summary artifact", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4339,6 +4419,7 @@ fi
   })
 
   test("autonomous loop defaults beyond one iteration when no maxIterations is provided", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4380,6 +4461,7 @@ fi
   })
 
   test("autonomous loop retries metricless smoke runs as compiler failures", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4463,6 +4545,7 @@ fi
   })
 
   test("autonomous loop stops on a no-improvement plateau", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4492,13 +4575,14 @@ fi
           ),
         )
 
-        expect(loop.stoppedReason).toBe("plateau")
+        expect(loop.stoppedReason).toBe("planner_stopped")
         expect(loop.iterations).toHaveLength(2)
       },
     })
   })
 
   test("autonomous loop uses the default plateau threshold against the current task best", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4542,7 +4626,7 @@ fi
           ),
         )
 
-        expect(loop.stoppedReason).toBe("plateau")
+        expect(loop.stoppedReason).toBe("planner_stopped")
         expect(loop.iterations).toHaveLength(NAS_DEFAULT_MAX_NO_IMPROVE)
         expect(loop.iterations.every((iteration) => iteration.run.metrics.val_avg_mse === 0.101)).toBe(true)
       },
@@ -4550,6 +4634,7 @@ fi
   }, 60_000)
 
   test("autonomous loop does not use smoke metrics for no-improvement stopping", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -4720,18 +4805,7 @@ fi
           ),
         )
 
-        await createSearchHypothesis(task.id)
-        for (let index = 0; index < 3; index++) {
-          await runResearch(
-            Research.Service.use((svc) =>
-              svc.runAutonomousIteration({
-                taskID: task.id,
-                stage: "full",
-                description: `baseline ${index + 1}`,
-              }),
-            ),
-          )
-        }
+        await runRankingBaselineFixtures(task.id)
 
         const iteration = await runResearch(
           Research.Service.use((svc) =>
@@ -4743,7 +4817,7 @@ fi
           ),
         )
 
-        expect(iteration.candidate.candidateSpec.recipeID).toBe("tsf_ranked_frequency_mixer_profiled")
+        expect(iteration.candidate.candidateSpec.recipeID).toBe("tsf_ranked_invert_rnn_feature_profiled")
         expect(iteration.selectionArtifact?.kind).toBe("research_candidate_selection_json")
         expect(iteration.selectionArtifact?.runID).toBe(iteration.run.id)
         expect(iteration.run.artifactRefs).toContain(iteration.selectionArtifact!.id)
@@ -4751,13 +4825,13 @@ fi
         const selectionRecord = JSON.parse(await readFile(iteration.selectionArtifact!.uri.replace("file://", ""), "utf8"))
         expect(selectionRecord.selectionSource).toBe("domain_proposal")
         expect(selectionRecord.selectedCandidateID).toBe(iteration.candidate.id)
-        expect(selectionRecord.selectedRecipeID).toBe("tsf_ranked_frequency_mixer_profiled")
+        expect(selectionRecord.selectedRecipeID).toBe("tsf_ranked_invert_rnn_feature_profiled")
         expect(selectionRecord.rankings[0]).toMatchObject({
-          recipeID: "tsf_ranked_frequency_mixer_profiled",
+          recipeID: "tsf_ranked_invert_rnn_feature_profiled",
           rank: 1,
         })
         expect(selectionRecord.rankings[0].score).toBeGreaterThan(0)
-        expect(selectionRecord.rankings[0].reasons).toContain("seasonality favors frequency embedding")
+        expect(selectionRecord.rankings[0].reasons).toContain("cross-var correlation favors inverted feature modeling")
         expect(selectionRecord.rankPredictor).toMatchObject({
           version: "tsf_profile_learned_memory_ranker_v1",
           featureSource: "taskFingerprint.datasetProfile",
@@ -4796,9 +4870,9 @@ fi
         })
         expect(selectionRecord.rankings[0].candidateActions).toMatchObject({
           preprocessing: expect.arrayContaining(["missing_mask"]),
-          embedding: "frequency",
-          backbone: "mixer",
-          fusion: "gated_hybrid",
+          embedding: "invert",
+          backbone: "rnn",
+          fusion: "variate_attention",
           predictionHead: "linear",
           outputDistribution: "point",
           loss: "huber",
@@ -4924,7 +4998,8 @@ fi
             "autonomous",
           )
 
-          await createSearchHypothesis(task.id)
+          const baseline = (await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))).candidates[0]!
+          await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: baseline.hypothesisID!, rationale: "Run the queued linear control." })
           for (let index = 0; index < 1; index++) {
             await runResearch(
               Research.Service.use((svc) =>
@@ -4937,6 +5012,7 @@ fi
             )
           }
 
+          await createSearchHypothesis(task.id)
           const reflectionDir = path.join(tmp.path, ".neo-research", "sessions", task.id, "reflect_1")
           await mkdir(reflectionDir, { recursive: true })
           await writeFile(path.join(reflectionDir, "reflection_result.json"), JSON.stringify({
@@ -5064,18 +5140,7 @@ fi
           ),
         )
 
-        await createSearchHypothesis(task.id)
-        for (let index = 0; index < 3; index++) {
-          await runResearch(
-            Research.Service.use((svc) =>
-              svc.runAutonomousIteration({
-                taskID: task.id,
-                stage: "full",
-                description: `baseline ${index + 1}`,
-              }),
-            ),
-          )
-        }
+        await runRankingBaselineFixtures(task.id)
 
         const iteration = await runResearch(
           Research.Service.use((svc) =>
@@ -5185,18 +5250,7 @@ fi
           ),
         )
 
-        await createSearchHypothesis(task.id)
-        for (let index = 0; index < 3; index++) {
-          await runResearch(
-            Research.Service.use((svc) =>
-              svc.runAutonomousIteration({
-                taskID: task.id,
-                stage: "full",
-                description: `baseline ${index + 1}`,
-              }),
-            ),
-          )
-        }
+        await runRankingBaselineFixtures(task.id)
 
         const iteration = await runResearch(
           Research.Service.use((svc) =>
@@ -5208,7 +5262,7 @@ fi
           ),
         )
 
-        expect(iteration.candidate.candidateSpec.recipeID).toBe("tsf_ranked_frequency_mixer_profiled")
+        expect(iteration.candidate.candidateSpec.recipeID).toBe("tsf_ranked_invert_rnn_feature_profiled")
         const selectionRecord = JSON.parse(await readFile(iteration.selectionArtifact!.uri.replace("file://", ""), "utf8"))
         expect(selectionRecord.rankings[0].features.historyDomainMemoryCount).toBe(0)
       },
@@ -5447,4 +5501,122 @@ fi
     expect(result.experimentLogMarkdown).toContain("tsf_linear_raw_baseline")
     expect(result.experimentLogMarkdown).toContain("A raw linear temporal baseline")
   })
+})
+
+
+test("HypoPlanner chooses an untested direction at plateau and hard iteration limits still stop search", async () => {
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  const previousFetch = globalThis.fetch
+  const envKeys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"]
+  const previousEnv = envKeys.map((key) => process.env[key])
+  let plannerCalls = 0
+  let plannerContext: any
+  try {
+    process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+    process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
+    process.env.NEO_CAST_LLM_MODEL = "test-model"
+    process.env.NEO_CAST_LLM_API_KEY = "test-key"
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const root = path.join(tmp.path, "runner")
+      await writeTrainingFakeNeoCastRunner(root)
+      const task = await createTSFTask("Planner owns scheduling", { neoCastProjectRoot: root, pythonExecutable: "bash", bridgeOnly: true }, "autonomous")
+      const spec = validTsfCandidateSpec()
+      const previous = await createCandidate({ taskID: task.id, candidateSpec: { ...spec, recipeID: "historical_best", trainingStrategy: { ...(spec.trainingStrategy as any), optimizer: { ...((spec.trainingStrategy as any).optimizer), lr: 0.0003 } } } })
+      await createRun({ taskID: task.id, candidateID: previous.id, stage: "full", status: "succeeded", metrics: { val_avg_mse: 0.05 } })
+      const draft = { statement: "Compare independent temporal representations", motivation: ["Validation best is 0.05"],
+        expectedOutcome: "Lower val_avg_mse", suggestedPreprocessing: [], risk: "Overfit", testable: true,
+        falsificationCriteria: ["No improvement in full-run val_avg_mse"] }
+      const h1 = await addHypothesisToPool(task.id, { ...draft, id: "H1", suggestedBackbones: ["linear"] })
+      const h2 = await addHypothesisToPool(task.id, { ...draft, id: "H2", suggestedBackbones: ["mlp"] })
+      const candidates = []
+      for (const [h, candidateSpec] of [[h1, spec], [h2, { ...spec, recipeID: "untested_mlp",
+        embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 16 }, backbone: { type: "mlp", depth: 2, hiddenDim: 16, activation: "gelu", dropout: 0 } }]] as const) {
+        candidates.push(await runResearch(Research.Service.use((svc) => svc.createCandidate({ taskID: task.id,
+          domainID: "tsf", hypothesisID: h.id, candidateSpec: candidateSpec as Research.JsonRecord,
+          generatedBy: "heuristic", rationale: h.statement, riskLevel: "low", approvalStatus: "auto_approved" }))))
+      }
+      globalThis.fetch = ((_: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? "{}"))
+        const system = body.messages?.[0]?.content ?? ""
+        let result: unknown
+        if (system.startsWith("You are the NeoResearch HypoPlanner")) {
+          plannerCalls++
+          plannerContext = JSON.parse(body.messages[1].content)
+          result = { hypotheses: [h1, h2], nextExperiment: { action: "experiment", hypothesisID: h2.id,
+            rationale: "The linear direction plateaued; test the untouched nonlinear representation." } }
+        } else {
+          result = { experimentSummary: "Completed linear trial", metricAssessment: "MSE 0.101 did not beat 0.05",
+            trainingHealthAssessment: "Stable training", hypothesisValidation: "No improvement in this trial",
+            failureOrLimitationAnalysis: "Only one direction was tested", modelDesignReflection: "Head consumes latent features",
+            nextStepRecommendation: "Let HypoPlanner choose the untouched MLP direction" }
+        }
+        const content = JSON.stringify(result)
+        return Promise.resolve(new Response(body.stream
+          ? `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`
+          : JSON.stringify({ choices: [{ message: { content } }] }),
+          { headers: { "content-type": body.stream ? "text/event-stream" : "application/json" } }))
+      }) as typeof fetch
+      await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: h1.id, rationale: "Evaluate the linear direction first" })
+      const loop = await runResearch(Research.Service.use((svc) => svc.runAutonomousLoop({ taskID: task.id,
+        stage: "full", maxIterations: 3, maxNoImprove: 1, explorationRate: 1 })))
+      expect(loop.stoppedReason).toBe("max_iterations")
+      expect(loop.iterations.map((iteration) => iteration.candidate.id)).toEqual(candidates.map((candidate) => candidate.id))
+      expect(loop.iterations.map((iteration) => iteration.candidate.hypothesisID)).toEqual([h1.id, h2.id])
+      expect(plannerCalls).toBe(1)
+      expect(plannerContext.searchProgress).toMatchObject({ noImproveStreak: 1, remainingIterations: 1 })
+      expect(plannerContext.experimentHistory.some((run: any) => run.hypothesisID === h1.id && run.stage === "full")).toBe(true)
+      expect(plannerContext.modelCapabilities.backbones.nbeats.implementation).toContain("neither interpretable-basis")
+    } })
+  } finally {
+    globalThis.fetch = previousFetch
+    envKeys.forEach((key, index) => previousEnv[index] === undefined ? delete process.env[key] : process.env[key] = previousEnv[index])
+  }
+}, 30_000)
+
+
+test("the first experiment follows the planner choice despite baseline and candidate insertion order", async () => {
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeFakeNeoCastRunner(root)
+    const task = await createTSFTask("explicit first experiment", { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" }, "autonomous")
+    const selected = await addHypothesisToPool(task.id, { id: "H_explicit_first", statement: "Test an MLP representation first.",
+      motivation: ["Explicit planner decision"], expectedOutcome: "Improve the validation metric", suggestedBackbones: ["mlp"],
+      suggestedPreprocessing: [], risk: "May overfit", testable: true })
+    const spec = validTsfCandidateSpec() as Record<string, any>
+    const chosen = await runResearch(Research.Service.use((svc) => svc.createCandidate({
+      taskID: task.id, domainID: "tsf", hypothesisID: selected.id,
+      candidateSpec: { ...spec, recipeID: "chosen_mlp", embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 64 }, backbone: { type: "mlp", hiddenDim: 64, depth: 2, activation: "gelu", dropout: 0 } },
+      rationale: "The chosen first experiment", generatedBy: "heuristic", riskLevel: "low", approvalStatus: "auto_approved",
+    })))
+    const controls = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
+    expect(controls.candidates).toHaveLength(1)
+    await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: selected.id, rationale: "Evaluate the MLP before any comparison control." })
+    const iteration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })))
+    expect(iteration.candidate.id).toBe(chosen.id)
+    expect(iteration.candidate.hypothesisID).toBe(selected.id)
+    expect(iteration.run.status).toBe("succeeded")
+    expect((await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).every((run) => run.candidateID === chosen.id)).toBe(true)
+  } })
+})
+
+
+test("direct HypoPlanner can stop with an empty hypothesis pool", async () => {
+  installPlannerFixture()
+  globalThis.fetch = (async (_: RequestInfo | URL, _init?: RequestInit) => {
+    const content = JSON.stringify({ hypotheses: [], nextExperiment: { action: "stop", rationale: "No useful experiment remains." } })
+    return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }) as typeof fetch
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const task = await createTSFTask("Explicit empty-pool stop", { bridgeOnly: true }, "autonomous")
+    const planned = await runResearch(Research.Service.use((svc) => svc.runHypoPlannerAgent({ taskID: task.id })))
+    expect(planned.plan.nextExperiment).toMatchObject({ action: "stop" })
+    expect(planned.plan.hypotheses).toEqual([])
+    expect(planned.llm.status).toBe("used")
+    const loop = await runResearch(Research.Service.use((svc) => svc.runAutonomousLoop({ taskID: task.id, maxIterations: 3 })))
+    expect(loop.stoppedReason).toBe("planner_stopped")
+    expect(loop.iterations).toEqual([])
+    expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toEqual([])
+  } })
 })

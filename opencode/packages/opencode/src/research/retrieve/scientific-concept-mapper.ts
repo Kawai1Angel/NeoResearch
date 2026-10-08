@@ -39,9 +39,12 @@ export function mapScientificConcepts(
   const peakEvidence = byPath.get("$.statistics.frequency.spectralPeaks")
   const significantPeaks = report.statistics.frequency.spectralPeaks.filter((item) => item.significant)
   const hasPeriodicSupport = Math.abs(report.statistics.acf.topCorrelation ?? 0) >= 0.3 || significantPeaks.length > 0
-  if (report.profile.seasonalityStrength >= 0.4 && hasPeriodicSupport) {
+  const detectedPeriod = report.statistics.decomposition.period
+  const hasDetectedPeriod = detectedPeriod !== undefined && detectedPeriod >= 3 && report.profile.seasonalityStrength >= 0.2
+  if ((report.profile.seasonalityStrength >= 0.4 && hasPeriodicSupport) || hasDetectedPeriod) {
     result.push(concept("seasonality", Math.max(report.profile.seasonalityStrength, 0.6), [
       byPath.get("$.profile.seasonalityStrength"),
+      byPath.get("$.statistics.decomposition.period"),
       byPath.get("$.statistics.acf.topCorrelation"),
       peakEvidence,
     ], "Represent recurrent temporal patterns."))

@@ -33,7 +33,7 @@ it.live("session tools preserve evidence through add/update/list and reject inva
     const artifact = yield* svc.createArtifact({ taskID: task.id, kind: "task_evidence_bundle_json", uri: `file://${bundlePath}`, metadata: { retrieveRunID: bundle.retrieveRunID } })
     const entry = bundle.entries[0]!
     const draft = { statement: "Seasonal decomposition improves validation MSE", motivation: [entry.claim], expectedOutcome: "Lower MSE",
-      suggestedBackbones: ["dlinear"], suggestedPreprocessing: [], priority: "high" as const, risk: "Transfer uncertainty", testable: true,
+      suggestedBackbones: ["dlinear"], suggestedPreprocessing: [], requiredMechanisms: ["moving_average_decomposition"], risk: "Transfer uncertainty", testable: true,
       datasetEvidencePaths: entry.linkage.datasetEvidencePaths,
       literatureEvidence: [{ cardID: entry.cardID, cardRevision: entry.cardRevision, role: entry.roles[0]! }],
       applicabilityAssumptions: ["Stable seasonal structure"], falsificationCriteria: ["MSE fails to improve"], evidenceLevel: "paper_supported" as const }

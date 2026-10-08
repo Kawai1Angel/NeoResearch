@@ -9,16 +9,51 @@ const { spawnSync } = require("node:child_process");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const BIN = path.join(REPO_ROOT, "bin", "neo-cast.js");
+const PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-e2e-project-"));
+const DATA_ROOT = path.join(PROJECT_ROOT, ".neo-cast", "dataset");
 let testedRunId;
 
 function runNode(args, options = {}) {
   const result = spawnSync("node", [BIN, ...args], {
-    cwd: options.cwd || REPO_ROOT,
-    env: { ...require("./python-env"), ...(options.env || {}) },
+    cwd: options.cwd || PROJECT_ROOT,
+    env: {
+      ...require("./python-env"),
+      NEO_TSF_DATA_ROOT: DATA_ROOT,
+      OMP_NUM_THREADS: "1",
+      MKL_NUM_THREADS: "1",
+      ...(options.env || {}),
+    },
     encoding: "utf8",
   });
   return result;
 }
+
+test.before(() => {
+  const runtimeDir = path.join(PROJECT_ROOT, ".neo-cast", "runtime");
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const installedVenv = process.env.NEO_CAST_PYTHON
+    ? path.resolve(path.dirname(process.env.NEO_CAST_PYTHON), "..")
+    : path.join(REPO_ROOT, ".neo-cast", "runtime", ".venv");
+  fs.symlinkSync(installedVenv, path.join(runtimeDir, ".venv"), "dir");
+
+  const source = path.join(PROJECT_ROOT, "series.csv");
+  const rows = ["date,a,b"];
+  for (let index = 0; index < 512; index++) {
+    const timestamp = new Date(Date.UTC(2024, 0, 1) + index * 3600000).toISOString();
+    rows.push(`${timestamp},${Math.sin(index / 12) + index / 1000},${Math.cos(index / 12)}`);
+  }
+  fs.writeFileSync(source, `${rows.join("\n")}\n`);
+  const prepared = runNode([
+    "prepare-data", "--source", source, "--task-id", "e2e_synthetic",
+    "--target-cols", "a,b", "--input-len", "24", "--horizons", "12",
+    "--train-rows", "0:320", "--val-rows", "320:416", "--ref-test-rows", "416:512",
+  ]);
+  assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout);
+});
+
+test.after(() => {
+  fs.rmSync(PROJECT_ROOT, { recursive: true, force: true });
+});
 
 test("prepare-data rejects unsupported covariates before accessing the source", () => {
   for (const flag of ["known-future-covariates", "static-covariates", "known-future-source", "known-future-available"]) {
@@ -65,8 +100,8 @@ test("init-runtime supports skip-install for fast project bootstrap", () => {
 });
 
 test("design mock mode runs one candidate and updates results", () => {
-  const before = fs.existsSync(path.join(REPO_ROOT, ".neo-cast", "results.tsv"))
-    ? fs.readFileSync(path.join(REPO_ROOT, ".neo-cast", "results.tsv"), "utf8")
+  const before = fs.existsSync(path.join(PROJECT_ROOT, ".neo-cast", "results.tsv"))
+    ? fs.readFileSync(path.join(PROJECT_ROOT, ".neo-cast", "results.tsv"), "utf8")
     : "";
 
   const result = runNode(
@@ -82,27 +117,27 @@ test("design mock mode runs one candidate and updates results", () => {
       "--skip-smoke",
     ],
     {
-      cwd: REPO_ROOT,
+      cwd: PROJECT_ROOT,
       env: { NEO_CAST_FAST_E2E: "1" },
     }
   );
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  const after = fs.readFileSync(path.join(REPO_ROOT, ".neo-cast", "results.tsv"), "utf8");
+  const after = fs.readFileSync(path.join(PROJECT_ROOT, ".neo-cast", "results.tsv"), "utf8");
   assert.notEqual(after, before);
   assert.match(result.stdout, /design_best_run_id=/);
   const runId = /runner_run_id=([^\s]+)/.exec(result.stdout)?.[1];
   testedRunId = runId;
   assert.ok(runId, "design output should expose current runner run id");
-  const artifactDir = path.join(REPO_ROOT, ".neo-cast", "artifacts", `run_${runId}`);
+  const artifactDir = path.join(PROJECT_ROOT, ".neo-cast", "artifacts", `run_${runId}`);
   const tracePath = path.join(artifactDir, "research_trace.json");
   assert.ok(fs.existsSync(tracePath), "artifact should include research_trace.json");
   const trace = JSON.parse(fs.readFileSync(tracePath, "utf8"));
   assert.equal(trace.schema_version, "research_trace.v1");
   assert.ok(trace.entries.some((entry) => entry.made_by === "ModelDesigner Agent"));
-  const validateTrace = runNode(["validate", "research-trace", tracePath], { cwd: REPO_ROOT });
+  const validateTrace = runNode(["validate", "research-trace", tracePath]);
   assert.equal(validateTrace.status, 0, validateTrace.stderr || validateTrace.stdout);
-  const globalTracePath = path.join(REPO_ROOT, ".neo-cast", "research_trace.jsonl");
+  const globalTracePath = path.join(PROJECT_ROOT, ".neo-cast", "research_trace.jsonl");
   assert.ok(fs.existsSync(globalTracePath), "runner should append global research_trace.jsonl");
   assert.match(fs.readFileSync(globalTracePath, "utf8"), new RegExp(runId));
 });
@@ -146,7 +181,7 @@ test("mutation policy writes a schema-valid next recipe", () => {
 });
 
 test("runner ref-test evaluates the newly trained v2 artifact and updates metadata", () => {
-  const statePath = path.join(REPO_ROOT, ".neo-cast", "runner_state.json");
+  const statePath = path.join(PROJECT_ROOT, ".neo-cast", "runner_state.json");
   assert.ok(fs.existsSync(statePath), "runner state must exist before ref-test");
 
   const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -154,13 +189,13 @@ test("runner ref-test evaluates the newly trained v2 artifact and updates metada
 
   const result = runNode(
     ["runner", "ref-test", "--run-id", testedRunId],
-    { cwd: REPO_ROOT }
+    { cwd: PROJECT_ROOT }
   );
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /ref_test_done/);
 
-  const artifactDir = path.join(REPO_ROOT, ".neo-cast", "artifacts", `run_${testedRunId}`);
+  const artifactDir = path.join(PROJECT_ROOT, ".neo-cast", "artifacts", `run_${testedRunId}`);
   const metricsPath = path.join(artifactDir, "ref_test_metrics.json");
   const metadataPath = path.join(artifactDir, "metadata.json");
 

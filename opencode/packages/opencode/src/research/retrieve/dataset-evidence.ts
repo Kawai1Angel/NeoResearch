@@ -14,7 +14,8 @@ function evidence(
 
 export function extractDatasetEvidence(report: DatasetQuantitativeAnalysis): DatasetEvidence[] {
   const values = [
-    evidence(report, "$.profile.seasonalityStrength", "seasonality_strength", "Strength of recurrent temporal structure."),
+    evidence(report, "$.profile.seasonalityStrength", "seasonality_strength", "Mean positive detrended periodic peak strength across channels."),
+    evidence(report, "$.statistics.decomposition.period", "seasonal_period", "Supported seasonal period in observations, requiring detrended recurrence rather than short-lag persistence."),
     evidence(report, "$.statistics.acf.topLag", "acf_top_lag", "Lag with the strongest measured autocorrelation."),
     evidence(report, "$.statistics.acf.topCorrelation", "acf_top_correlation", "Strength of the dominant autocorrelation."),
     evidence(report, "$.statistics.frequency.spectralPeaks", "spectral_peaks", "Significant periods identified by spectral analysis."),
