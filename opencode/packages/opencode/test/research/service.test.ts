@@ -17,6 +17,7 @@ import { createFileResearchRuntime } from "../../src/research/runtime"
 import { Database, eq } from "../../src/storage"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
+import { pickReferenceBaseline } from "../../src/research/baseline-store"
 import { addHypothesisToPool, selectNextExperimentInPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
 import { validateCandidateAgainstHypothesis } from "../../src/research/execution-contract"
 import { readDesignHistory } from "../../src/research/design-history"
@@ -608,7 +609,9 @@ function installPlannerFixture() {
       const failedID = lastRun?.status === "failed" ? lastRun.hypothesisID : undefined
       const failedRow = failedID ? Database.use((d) => d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.hypo_id, failedID)).get()) : undefined
       const failed = failedRow ? (await listHypothesesInPool(failedRow.task_id)).find((item) => item.id === failedID) : undefined
-      result = !history ? { status: "history_request", request: { limit: 5 } } : { hypotheses: failed ? [failed] : [h], nextExperiment: progress?.globalPlateauObserved
+      result = !history ? { status: "history_request", request: { limit: 5 } } : { hypotheses: failed ? [failed] : [h],
+        ...(user.baselineOptions?.length ? { referenceBaseline: "tsf_linear_raw_baseline", referenceBaselineRationale: "Establish the explicit linear comparison floor." } : {}),
+        nextExperiment: progress?.globalPlateauObserved
         ? { action: "stop", rationale: "Fixture planner stops after the configured plateau." }
         : { action: "experiment", hypothesisID: failed?.id ?? h.id, rationale: "Explicit workflow fixture decision." } }
     }
@@ -5684,31 +5687,85 @@ test("HypoPlanner chooses an untested direction at plateau and hard iteration li
 }, 30_000)
 
 
-test("the first experiment follows the planner choice despite baseline and candidate insertion order", async () => {
+test("the explicitly selected baseline completes full evaluation before the planner chooses subsequent experiments", async () => {
   await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
-  await Instance.provide({ directory: tmp.path, fn: async () => {
-    const root = path.join(tmp.path, "runner")
-    await writeFakeNeoCastRunner(root)
-    const task = await createTSFTask("explicit first experiment", { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" }, "autonomous")
-    const selected = await addHypothesisToPool(task.id, { id: "H_explicit_first", experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const root = path.join(tmp.path, "runner")
+      await writeTrainingFakeNeoCastRunner(root)
+      const task = await createTSFTask(
+        "explicit first experiment",
+        { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" },
+        "autonomous",
+      )
+      const selected = await addHypothesisToPool(task.id, {
+        id: "H_explicit_first",
+        experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
         statement: "Test an MLP representation first.",
-      motivation: ["Explicit planner decision"], expectedOutcome: "Improve the validation metric", suggestedBackbones: ["mlp"],
-      suggestedPreprocessing: [], risk: "May overfit", testable: true })
-    const spec = validTsfCandidateSpec() as Record<string, any>
-    const chosen = await runResearch(Research.Service.use((svc) => svc.createCandidate({
-      taskID: task.id, domainID: "tsf", hypothesisID: selected.id,
-      candidateSpec: { ...spec, recipeID: "chosen_mlp", embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 64 }, backbone: { type: "mlp", hiddenDim: 64, depth: 2, activation: "gelu", dropout: 0 } },
-      rationale: "The chosen first experiment", generatedBy: "heuristic", riskLevel: "low", approvalStatus: "auto_approved",
-    })))
-    const controls = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
-    expect(controls.candidates).toHaveLength(1)
-    await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: selected.id, rationale: "Evaluate the MLP before any comparison control." })
-    const iteration = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })))
-    expect(iteration.candidate.id).toBe(chosen.id)
-    expect(iteration.candidate.hypothesisID).toBe(selected.id)
-    expect(iteration.run.status).toBe("succeeded")
-    expect((await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).every((run) => run.candidateID === chosen.id)).toBe(true)
-  } })
+        motivation: ["Explicit planner decision"],
+        expectedOutcome: "Improve the validation metric",
+        suggestedBackbones: ["mlp"],
+        suggestedPreprocessing: [],
+        risk: "May overfit",
+        testable: true,
+      })
+      const spec = validTsfCandidateSpec() as Record<string, any>
+      const chosen = await runResearch(
+        Research.Service.use((svc) =>
+          svc.createCandidate({
+            taskID: task.id,
+            domainID: "tsf",
+            hypothesisID: selected.id,
+            candidateSpec: {
+              ...spec,
+              recipeID: "chosen_mlp",
+              embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 64 },
+              backbone: { type: "mlp", hiddenDim: 64, depth: 2, activation: "gelu", dropout: 0 },
+            },
+            rationale: "The chosen first experiment",
+            generatedBy: "heuristic",
+            riskLevel: "low",
+            approvalStatus: "auto_approved",
+          }),
+        ),
+      )
+      await pickReferenceBaseline(task.id, "tsf_linear_raw_baseline", "Establish the comparison floor first.")
+      const controls = await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))
+      expect(controls.candidates).toHaveLength(1)
+      await selectNextExperimentInPool(task.id, {
+        action: "experiment",
+        hypothesisID: selected.id,
+        rationale: "Evaluate the MLP before any comparison control.",
+      })
+      const smoke = await runResearch(
+        Research.Service.use((svc) =>
+          svc.runAutonomousIteration({ taskID: task.id, stage: "smoke", forceExplore: true }),
+        ),
+      )
+      expect(smoke.candidate.id).toBe(controls.candidates[0]!.id)
+      expect(smoke.run.status).toBe("succeeded")
+      const baseline = await runResearch(
+        Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" })),
+      )
+      expect(baseline.candidate.id).toBe(controls.candidates[0]!.id)
+      expect(baseline.run.stage).toBe("full")
+      expect(baseline.run.status).toBe("succeeded")
+      expect(
+        (await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).every(
+          (run) => run.candidateID === controls.candidates[0]!.id,
+        ),
+      ).toBe(true)
+      expect((await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))).taskSpec.metadata).toMatchObject({
+        nextExperiment: { hypothesisID: selected.id },
+      })
+      const subsequent = await runResearch(
+        Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "smoke" })),
+      )
+      expect(subsequent.candidate.id).toBe(chosen.id)
+      expect(subsequent.candidate.hypothesisID).toBe(selected.id)
+    },
+  })
 })
 
 
@@ -5731,3 +5788,135 @@ test("direct HypoPlanner can stop with an empty hypothesis pool", async () => {
     expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toEqual([])
   } })
 })
+
+
+for (const kind of ["unseeded", "unverified_full", "failed_full"] as const) {
+  test(`reference baseline initialization stays bound to the explicit recipe: ${kind}`, async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const root = path.join(tmp.path, "runner")
+        await writeTrainingFakeNeoCastRunner(root)
+        const task = await createTSFTask(
+          "Initialize the selected control",
+          { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" },
+          "autonomous",
+        )
+        const h = await addHypothesisToPool(task.id, {
+          id: "H_after_baseline",
+          statement: "Evaluate an independent nonlinear representation.",
+          motivation: ["Explicit later experiment"],
+          expectedOutcome: "Improve the primary metric",
+          suggestedBackbones: ["mlp"],
+          suggestedPreprocessing: [],
+          risk: "Overfit",
+          testable: true,
+        })
+        await runResearch(
+          Research.Service.use((svc) =>
+            svc.createCandidate({
+              taskID: task.id,
+              domainID: "tsf",
+              hypothesisID: h.id,
+              candidateSpec: {
+                ...validTsfCandidateSpec(),
+                recipeID: "later_mlp",
+                embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 16 },
+                backbone: { type: "mlp", depth: 2, hiddenDim: 16, activation: "gelu", dropout: 0 },
+              },
+              rationale: h.statement,
+              generatedBy: "heuristic",
+              riskLevel: "low",
+              approvalStatus: "auto_approved",
+            }),
+          ),
+        )
+        await pickReferenceBaseline(task.id, "tsf_linear_raw_baseline", "Run this specific comparison control first.")
+        await selectNextExperimentInPool(task.id, {
+          action: "experiment",
+          hypothesisID: h.id,
+          rationale: "Evaluate the nonlinear representation after initialization.",
+        })
+        if (kind !== "unseeded") {
+          const baseline = (await runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id }))))
+            .candidates[0]!
+          await createRun({
+            taskID: task.id,
+            candidateID: baseline.id,
+            stage: "full",
+            status: kind === "unverified_full" ? "succeeded" : "failed",
+            metrics: { val_avg_mse: 0.8 },
+          })
+        }
+        const iteration = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousIteration({ taskID: task.id, stage: "full", forceExplore: true }),
+          ),
+        )
+        expect(iteration.candidate.candidateSpec.recipeID).toBe("tsf_linear_raw_baseline")
+        expect(iteration.candidate.hypothesisID).not.toBe(h.id)
+        expect(iteration.run.stage).toBe("full")
+        expect(iteration.run.status).toBe("succeeded")
+        expect(iteration.managerTrace[0]!.metadata).toMatchObject({ initializationPhase: "reference_baseline" })
+      },
+    })
+  })
+}
+
+for (const stage of ["smoke", "full"] as const) {
+  test(`unfinished baseline initialization does not refresh or switch hypotheses in the loop: ${stage}`, async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const root = path.join(tmp.path, "runner")
+        await writeTrainingFakeNeoCastRunner(root)
+        if (stage === "full")
+          await writeFile(
+            path.join(root, "py", "runner.py"),
+            `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "init" ]]; then exit 0; fi
+${fakeContractEvents}
+printf '{"event":"done","status":"failed"}\\n'
+exit 1
+`,
+            "utf8",
+          )
+        const task = await createTSFTask(
+          "Unfinished reference baseline",
+          { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" },
+          "autonomous",
+        )
+        await pickReferenceBaseline(
+          task.id,
+          "tsf_linear_raw_baseline",
+          "Initialize with the explicitly chosen control.",
+        )
+        const h = await createSearchHypothesis(task.id)
+        const loop = await runResearch(
+          Research.Service.use((svc) =>
+            svc.runAutonomousLoop({ taskID: task.id, stage, maxIterations: 2, explorationRate: 1 }),
+          ),
+        )
+        expect(loop.iterations).toHaveLength(2)
+        expect(
+          loop.iterations.every(
+            (iteration) => iteration.candidate.candidateSpec.recipeID === "tsf_linear_raw_baseline",
+          ),
+        ).toBe(true)
+        expect(loop.iterations[0]!.candidate.id).toBe(loop.iterations[1]!.candidate.id)
+        if (stage === "full") expect(loop.iterations.every((iteration) => iteration.run.status === "failed")).toBe(true)
+        expect(
+          (await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))).taskSpec.metadata,
+        ).toMatchObject({ nextExperiment: { hypothesisID: h.id } })
+        expect(
+          (await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))).filter(
+            (candidate) => candidate.hypothesisID === h.id,
+          ),
+        ).toEqual([])
+      },
+    })
+  })
+}
