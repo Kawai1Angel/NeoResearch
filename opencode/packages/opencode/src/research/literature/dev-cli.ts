@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import path from "path"
 import { LiteratureAgent } from "./literature-agent"
-import { ConfiguredLLMExtractionModel, DisabledExtractionModel } from "./extraction-model"
 import type { LiteratureAgentInput } from "./contract"
 import { ConfiguredPrincipleModel } from "./principle-model"
 
@@ -54,13 +53,12 @@ async function main() {
   if (!args.command) throw new Error("Expected build, build-principles, parse, validate, export, or show-run")
   const neoCastRoot = path.resolve(flag(args.flags, "neo-cast-root") ?? path.join(import.meta.dir, "../../../../../../neo_cast"))
   const knowledgeRoot = flag(args.flags, "output-root") ? path.resolve(flag(args.flags, "output-root")!) : undefined
-  const disabled = new DisabledExtractionModel()
   const configured = args.command === "build" && !args.flags.has("no-llm")
-    ? await ConfiguredLLMExtractionModel.create({ workspaceRoot: process.cwd(), neoCastRoot })
+    ? await ConfiguredPrincipleModel.create({ workspaceRoot: process.cwd(), neoCastRoot })
     : undefined
   const agent = new LiteratureAgent({
     neoCastRoot, workspaceRoot: process.cwd(), knowledgeRoot,
-    model: configured ?? disabled,
+    principleModel: configured,
     ...(flag(args.flags, "python") ? { pythonExecutable: flag(args.flags, "python") } : {}),
   })
   try {
@@ -68,13 +66,13 @@ async function main() {
       if (args.flags.has("no-llm")) throw new Error("build-principles requires a configured model; use parse for parse-only runs")
       const model = await ConfiguredPrincipleModel.create({ workspaceRoot: process.cwd(), neoCastRoot })
       if (!model) throw new Error("No configured principle extraction model")
-      const result = await agent.runPrinciples({ source: sourceFromFlags(args.flags), model,
+      const result = await agent.runPrinciples({ source: sourceFromFlags(args.flags), model, publish: true,
         options: {
           ...(flag(args.flags, "max-calls") ? { maxCalls: Number(flag(args.flags, "max-calls")) } : {}),
           ...(flag(args.flags, "max-context-characters") ? { maxContextCharacters: Number(flag(args.flags, "max-context-characters")) } : {}),
         } })
       console.log(JSON.stringify({ runID: result.runID, runPath: result.runPath, status: result.status,
-        acceptedCount: result.cards.length, rejectedCount: result.rejected.length, errors: result.errors, publication: "audit_only" }))
+        acceptedCount: result.cards.length, rejectedCount: result.rejected.length, errors: result.errors, publication: "active_v2" }))
       return result.status === "completed" ? 0 : 1
     }
     if (args.command === "build") {
@@ -105,7 +103,7 @@ async function main() {
     if (args.command === "show-run") {
       const runID = args.positional[0]
       if (!runID) throw new Error("show-run requires a run ID")
-      console.log(JSON.stringify(agent.showRun(runID)))
+      console.log(JSON.stringify(await agent.showRun(runID)))
       return 0
     }
     throw new Error(`Unknown command: ${args.command}`)

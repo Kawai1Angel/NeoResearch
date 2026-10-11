@@ -1,12 +1,5 @@
 import type { VerifierContext, VerifierResult } from "./types"
-import { metricOf } from "./types"
-
-function objectiveMetricName(task: VerifierContext["task"]): string {
-  const o = task.objective as Record<string, unknown>
-  if (typeof o.primaryMetric === "string") return o.primaryMetric
-  if (typeof o.metric === "string") return o.metric
-  return "val_avg_mse"
-}
+import { metricOf, objectiveMetricName } from "./types"
 
 export function runMetricVerifier(ctx: VerifierContext): VerifierResult {
   const name = "metric_verifier" as const
@@ -14,6 +7,7 @@ export function runMetricVerifier(ctx: VerifierContext): VerifierResult {
     return {
       name,
       accepted: false,
+      status: "failed",
       reason: `Run did not succeed (status=${ctx.run.status}); no metric to verify.`,
       evidence: { runStatus: ctx.run.status },
     }
@@ -24,30 +18,25 @@ export function runMetricVerifier(ctx: VerifierContext): VerifierResult {
     return {
       name,
       accepted: false,
+      status: "failed",
       reason: `Primary metric "${metricName}" is absent in run results.`,
       evidence: { metricName, metricsKeys: Object.keys(ctx.run.metrics as object) },
     }
   }
-  if (value <= 0) {
+  if (value < 0 && /(?:^|_)(mse|mae|rmse|mape|smape|crps)$/.test(metricName)) {
     return {
       name,
       accepted: false,
-      reason: `Primary metric "${metricName}"=${value} is non-positive, which is physically implausible for MSE/MAE.`,
-      evidence: { metricName, value },
-    }
-  }
-  if (value > 1e6) {
-    return {
-      name,
-      accepted: false,
-      reason: `Primary metric "${metricName}"=${value} exceeds 1e6; likely a training divergence or unit error.`,
+      status: "failed",
+      reason: `Primary error metric "${metricName}"=${value} cannot be negative.`,
       evidence: { metricName, value },
     }
   }
   return {
     name,
     accepted: true,
-    reason: `Primary metric "${metricName}"=${Number(value.toFixed(6))} is present and within plausible range.`,
+    status: "passed",
+    reason: `Primary metric "${metricName}"=${Number(value.toFixed(6))} is finite and valid for its metric type.`,
     evidence: { metricName, value },
   }
 }

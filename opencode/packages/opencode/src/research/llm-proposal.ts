@@ -1,12 +1,13 @@
+import { normalizedRecipeKey } from "./recipe-naming"
+import { DesignUnavailable, DesignHistoryRequest, type HistoryRequest, designTaskSpec, recipeConfiguration } from "./design-feedback"
+import { MODEL_CAPABILITIES } from "./model-capabilities"
 import { readFile } from "fs/promises"
-import { createHash } from "crypto"
 import { TSFCandidateRecipe } from "./domains/tsf"
 import { z } from "zod"
 import os from "os"
 import path from "path"
 import type { DomainCandidateProposal, DomainProposalContext } from "./domain"
 import type { JsonRecord, ResearchTask } from "./schema"
-import { analyzeDatasetProfileForPrompt, compactMarkdownForPrompt, compactPromptContext } from "./prompt-context"
 import PROMPT_RESEARCH_MODEL_DESIGNER from "../agent/prompt/research-model-designer.txt"
 
 type LLMProvider = "anthropic" | "openai-compatible"
@@ -55,6 +56,8 @@ export type NeoCastLLMConfig = {
 }
 
 export type LLMProposalResult = {
+  readonly unavailable?: DesignUnavailable
+  readonly historyRequest?: HistoryRequest
   readonly proposal?: DomainCandidateProposal
   readonly metadata: JsonRecord
 }
@@ -66,57 +69,7 @@ const DEFAULT_CONFIG: NeoCastLLMConfig = {
   temperature: 0.2,
 }
 
-const keyMap: Record<string, string> = {
-  recipe_version: "recipeVersion",
-  recipe_id: "recipeID",
-  d_model: "dModel",
-  state_dim: "stateDim",
-  d_state: "dState",
-  d_conv: "dConv",
-  d_ff: "dFf",
-  num_kernels: "numKernels",
-  latent_dim: "latentDim",
-  patch_len: "patchLen",
-  n_freq: "nFreq",
-  complex_mode: "complexMode",
-  embed_dim: "embedDim",
-  hidden_dim: "hiddenDim",
-  n_heads: "nHeads",
-  n_layers: "nLayers",
-  ffn_mult: "ffnMult",
-  num_layers: "numLayers",
-  kernel_size: "kernelSize",
-  num_blocks: "numBlocks",
-  mask_channel: "maskChannel",
-  topology_artifact: "topologyArtifact",
-  temporal_mixing: "temporalMixing",
-  channel_mixing: "channelMixing",
-  n_blocks: "nBlocks",
-  top_k: "topK",
-  channel_mode: "channelMode",
-  variate_token: "variateToken",
-  cross_attention: "crossAttention",
-  adjacency_source: "adjacencySource",
-  gate_type: "gateType",
-  prediction_head: "predictionHead",
-  share_across_horizons: "shareAcrossHorizons",
-  output_distribution: "outputDistribution",
-  horizon_specific: "horizonSpecific",
-  variance_floor: "varianceFloor",
-  base_head: "baseHead",
-  correction_dim: "correctionDim",
-  training_strategy: "trainingStrategy",
-  horizon_weighting: "horizonWeighting",
-  weight_decay: "weightDecay",
-  warmup_steps: "warmupSteps",
-  grad_clip: "gradClip",
-  max_epochs: "maxEpochs",
-  time_budget_s: "timeBudgetS",
-  batch_size: "batchSize",
-  supervised_weight: "supervisedWeight",
-  teacher_weight: "teacherWeight",
-  post_processing: "postProcessing",
-}
+
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -205,12 +158,51 @@ export function extractJsonObject(text: string) {
   return JSON.parse(stripped.slice(start, end + 1))
 }
 
+// Session responses may contain earlier prose with inline recipe fragments.
+// Read complete top-level objects, not the span from the first to last brace.
+// Multiple design envelopes are ambiguous; a truncated envelope is never repaired.
+function extractDesignerResponse(text: string): Record<string, any> {
+  const responses: Record<string, any>[] = []
+  const parseErrors: string[] = []
+  let start = -1, depth = 0, quoted = false, escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (start < 0) {
+      if (ch !== "{") continue
+      start = i; depth = 1; quoted = false; escaped = false
+      continue
+    }
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (ch === "\\") escaped = true
+      else if (ch === '"') quoted = false
+      continue
+    }
+    if (ch === '"') quoted = true
+    else if (ch === "{") depth++
+    else if (ch === "}" && --depth === 0) {
+      try {
+        const value = JSON.parse(text.slice(start, i + 1))
+        if (isRecord(value) && ("status" in value || "recipeVersion" in value || "recipe_version" in value)) responses.push(value)
+      } catch (error) {
+        if (/"(?:status|recipeVersion|recipe_version)"\s*:/.test(text.slice(start, i + 1)))
+          parseErrors.push(error instanceof Error ? error.message : String(error))
+      }
+      start = -1
+    }
+  }
+  if (start >= 0) throw new Error("Incomplete JSON object in ModelDesigner response")
+  if (parseErrors.length) throw new Error(`Invalid JSON in ModelDesigner response: ${parseErrors.join("; ")}`)
+  if (responses.length !== 1) throw new Error(`Expected one ModelDesigner response object, found ${responses.length}`)
+  return responses[0]!
+}
+
 export function camelizeKnown(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(camelizeKnown)
   if (!isRecord(value)) return value
   const result: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(value)) {
-    result[keyMap[key] ?? key] = camelizeKnown(item)
+    result[normalizedRecipeKey(key)] = camelizeKnown(item)
   }
   return result
 }
@@ -408,201 +400,13 @@ function buildSystemPrompt() {
   return PROMPT_RESEARCH_MODEL_DESIGNER
 }
 
-function numberFromRecord(record: Record<string, unknown>, key: string) {
-  const value = record[key]
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined
-}
-
-function stringList(value: unknown) {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : []
-}
-
-function profileRecord(taskFingerprint: unknown) {
-  if (!isRecord(taskFingerprint)) return {}
-  return isRecord(taskFingerprint.datasetProfile) ? taskFingerprint.datasetProfile : {}
-}
-
-function profileDerivedSearchDirectives(taskFingerprint: unknown) {
-  const fingerprint = isRecord(taskFingerprint) ? taskFingerprint : {}
-  const profile = profileRecord(fingerprint)
-  const biases = new Set(stringList(fingerprint.searchBiases))
-  const directives: string[] = []
-
-  if ((numberFromRecord(profile, "seasonalityStrength") ?? 0) >= 0.4 || biases.has("seasonal")) {
-    const period = numberFromRecord(profile, "acfMainPeriod")
-    directives.push(
-      [
-        "seasonal: prefer frequency embedding, series_decomposition, seasonal_differencing, or dlinear/timesnet_lite-style seasonal structure.",
-        period === undefined ? undefined : `acfMainPeriod=${period} can guide decomposition kernel, seasonal period, or n_freq.`,
-      ]
-        .filter((item): item is string => Boolean(item))
-        .join(" "),
-    )
-  }
-  if ((numberFromRecord(profile, "crossVarCorrelation") ?? 0) >= 0.5 || biases.has("cross_var_correlated")) {
-    directives.push("cross_var_correlated: prefer invert/calendar embeddings with variate_attention, feature_mlp, gated_hybrid, or graph fusion.")
-  }
-  if ((numberFromRecord(profile, "missingRate") ?? 0) > 0 || biases.has("missing_values")) {
-    directives.push("missing_values: include missing_mask preprocessing and avoid recipes that assume dense targets.")
-  }
-  if ((numberFromRecord(profile, "distributionShift") ?? 0) >= 0.5 || biases.has("distribution_shift")) {
-    directives.push("distribution_shift: include sample_reweighting or instance_norm and use robust huber loss.")
-  }
-  if ((numberFromRecord(profile, "trendStrength") ?? 0) >= 0.2 || biases.has("trend")) {
-    directives.push("trend: preserve long lookback context and consider residual_correction or decomposition-aware heads.")
-  }
-  if (biases.has("probabilistic")) {
-    directives.push("probabilistic: prefer quantile or gaussian prediction_head with matching loss.")
-  }
-
-  return directives
-}
-
-function pushUniqueBy<T>(items: T[], item: T | undefined, key: (item: T) => string) {
-  if (item === undefined) return
-  const itemKey = key(item)
-  if (items.some((existing) => key(existing) === itemKey)) return
-  items.push(item)
-}
-
-function metricSortValue(run: DomainProposalContext["runs"][number]) {
-  const value = run.metrics.cv_avg_mse ?? run.metrics.val_avg_mse
-  return typeof value === "number" && Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
-}
-
-function representativeCandidates(context: DomainProposalContext) {
-  const selected: DomainProposalContext["candidates"][number][] = []
-  const byID = new Map(context.candidates.map((candidate) => [candidate.id, candidate]))
-  pushUniqueBy(selected, context.champion === undefined ? undefined : byID.get(context.champion.candidateID), (item) => item.id)
-  for (const run of [...context.runs].filter((item) => item.status === "succeeded").sort((a, b) => metricSortValue(a) - metricSortValue(b)).slice(0, 3)) {
-    pushUniqueBy(selected, byID.get(run.candidateID), (item) => item.id)
-  }
-  pushUniqueBy(selected, context.candidates.find((item) => item.approvalStatus === "rejected"), (item) => item.id)
-  pushUniqueBy(selected, byID.get(context.runs.find((item) => item.status === "failed")?.candidateID ?? ""), (item) => item.id)
-  for (const candidate of context.candidates.slice(-5)) pushUniqueBy(selected, candidate, (item) => item.id)
-  return selected.slice(0, 10)
-}
-
-function representativeRuns(context: DomainProposalContext) {
-  const selected: DomainProposalContext["runs"][number][] = []
-  const key = (run: DomainProposalContext["runs"][number]) => `${run.candidateID}:${run.stage}:${run.status}:${JSON.stringify(run.metrics)}`
-  for (const run of context.runs.filter((item) => item.candidateID === context.champion?.candidateID)) {
-    pushUniqueBy(selected, run, key)
-  }
-  pushUniqueBy(selected, context.runs.find((item) => item.status === "failed"), key)
-  for (const run of [...context.runs].filter((item) => item.status === "succeeded").sort((a, b) => metricSortValue(a) - metricSortValue(b)).slice(0, 4)) {
-    pushUniqueBy(selected, run, key)
-  }
-  for (const run of context.runs.slice(-6)) pushUniqueBy(selected, run, key)
-  return selected.slice(0, 12)
-}
-
-function memoryWeight(item: DomainProposalContext["memory"][number], now: number) {
-  if (typeof item.time !== "number" || !Number.isFinite(item.time)) return 1
-  const ageMinutes = Math.max(0, (now - item.time) / 60_000)
-  return 1 / (1 + ageMinutes / 60)
-}
-
-function memoryPromptRecord(item: DomainProposalContext["memory"][number], now: number) {
-  const fingerprint = isRecord(item.fingerprintSummary) ? item.fingerprintSummary : {}
-  const profileAnalysis = analyzeDatasetProfileForPrompt(profileRecord(fingerprint))
-  const profileMetrics = isRecord(profileAnalysis.metrics) ? profileAnalysis.metrics : {}
-  const candidateSummary = isRecord(item.candidateSummary) ? item.candidateSummary : {}
-  const candidateKeys = [
-    "candidateID",
-    "runID",
-    "stage",
-    "status",
-    "recipeID",
-    "primaryMetric",
-    "bestMetric",
-    "candidateActions",
-    "role",
-    "decision",
-    "decisionReason",
-    "plateauStreak",
-    "failureCategories",
-    "championUpdated",
-  ]
-  const compactCandidateSummary = Object.fromEntries(
-    candidateKeys
-      .filter((key) => candidateSummary[key] !== undefined)
-      .map((key) => [key, candidateSummary[key]]),
-  )
-  return {
-    scope: item.scope,
-    outcome: item.outcome,
-    lesson: item.lesson,
-    fingerprintAnalysis: item.scope === "task"
-      ? { relationship: "same_task" }
-      : {
-          relationship: "same_domain",
-          ...(typeof fingerprint.sourceCsv === "string" ? { sourceCsv: fingerprint.sourceCsv } : {}),
-          comparableProfileMetrics: Object.fromEntries(
-            ["targetCount", "trendStrength", "seasonalityStrength", "crossVarCorrelation", "distributionShift"]
-              .filter((key) => profileMetrics[key] !== undefined)
-              .map((key) => [key, profileMetrics[key]]),
-          ),
-        },
-    candidateSummary: compactCandidateSummary,
-    time: item.time,
-    memoryWeight: Number(memoryWeight(item, now).toFixed(4)),
-  }
-}
-
-function representativeMemory(context: DomainProposalContext) {
-  const selected: DomainProposalContext["memory"][number][] = []
-  const key = (item: DomainProposalContext["memory"][number]) => `${item.outcome}:${item.lesson}`
-  const now = Date.now()
-  const byWeight = (left: DomainProposalContext["memory"][number], right: DomainProposalContext["memory"][number]) =>
-    memoryWeight(right, now) - memoryWeight(left, now)
-  for (const outcome of ["accepted", "rejected", "failed"]) {
-    for (const item of context.memory.filter((memory) => memory.outcome === outcome).sort(byWeight).slice(0, 3)) {
-      pushUniqueBy(selected, item, key)
-    }
-  }
-  for (const item of [...context.memory].sort(byWeight).slice(0, 4)) pushUniqueBy(selected, item, key)
-  return selected.slice(0, 12).map((item) => memoryPromptRecord(item, now))
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`
-  if (!isRecord(value)) return JSON.stringify(value)
-  return `{${Object.keys(value)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
-    .join(",")}}`
-}
-
-function candidateSignatureFromMemory(item: DomainProposalContext["memory"][number]) {
-  const summary = isRecord(item.candidateSummary) ? item.candidateSummary : {}
-  const candidateSpec = isRecord(summary.candidateSpec) ? summary.candidateSpec : undefined
-  const recipeID =
-    typeof summary.recipeID === "string"
-      ? summary.recipeID
-      : candidateSpec && typeof candidateSpec.recipeID === "string"
-        ? candidateSpec.recipeID
-        : undefined
-  const signatureSource = candidateSpec ?? (recipeID === undefined ? undefined : { recipeID })
-  if (signatureSource === undefined) return undefined
-  const hash = createHash("sha256").update(stableJson(signatureSource)).digest("hex").slice(0, 12)
-  return `${recipeID ?? "candidate"}#${hash}`
-}
-
-function forbiddenCandidateSignatures(context: DomainProposalContext) {
-  const signatures = context.memory
-    .filter((item) => item.outcome === "failed" || item.outcome === "rejected")
-    .map(candidateSignatureFromMemory)
-    .filter((item): item is string => item !== undefined)
-  return [...new Set(signatures)].slice(0, 24)
-}
-
 export function buildUserPrompt(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
   readonly dataAnalysisMarkdown?: string
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
+  readonly requestedHistory?: readonly unknown[]
   readonly validationFeedback?: {
     readonly attempt: number
     readonly issues: readonly {
@@ -614,49 +418,42 @@ export function buildUserPrompt(input: {
     readonly rejectedCandidate?: JsonRecord
   }
 }) {
-  const profile = profileRecord(input.proposalContext.taskFingerprint)
-  const searchBiases = isRecord(input.proposalContext.taskFingerprint)
-    ? stringList(input.proposalContext.taskFingerprint.searchBiases)
-    : []
+  const fingerprint = isRecord(input.proposalContext.taskFingerprint) ? input.proposalContext.taskFingerprint : {}
+  const champion = input.proposalContext.champion
+  const championCandidate = input.proposalContext.candidates.find((candidate) => candidate.id === champion?.candidateID)
   const prompt = {
-      task: {
-        id: input.task.id,
-        title: input.task.title,
-        domainID: input.task.domainID,
-        objective: input.task.objective,
-        budget: input.task.budget,
-        taskSpec: input.task.taskSpec,
+    task: {
+      id: input.task.id,
+      objective: input.task.objective,
+      budget: input.task.budget,
+      taskSpec: designTaskSpec(input.task.taskSpec),
+    },
+    taskFingerprint: {
+      selectedHypothesis: fingerprint.selectedHypothesis ?? null,
+      modelCapabilities: MODEL_CAPABILITIES,
+      ...(fingerprint.taskEvidence ? { taskEvidence: fingerprint.taskEvidence } : {}),
+    },
+    currentChampion: championCandidate ? {
+      candidateID: championCandidate.id,
+      primaryMetric: champion?.primaryMetric,
+      configuration: recipeConfiguration(championCandidate.candidateSpec),
+      role: "Current best observation; use the hypothesis's stated comparison run when it differs.",
+    } : null,
+    historyAccess: {
+      tool: "experiment_results",
+      filters: ["runID", "candidateID", "hypothesisID", "limit", "offset"],
+      instruction: "Retrieve the named comparison run before designing a controlled change. History and reflections are available on demand; no memory or search recommendations are preloaded. If tools are unavailable, return {status:'history_request', request:{runID:...}} as JSON and the coordinator will return the requested facts.",
+    },
+    ...(input.requestedHistory?.length ? { requestedHistory: input.requestedHistory } : {}),
+    ...(input.validationFeedback ? {
+      candidateValidationFeedback: {
+        ...input.validationFeedback,
+        instruction: "Repair syntax or missing fields only when the original experiment remains achievable. If the constraint conflicts with the hypothesis, return status=unavailable with the exact reason and proposed hypothesis revision. Do not substitute a proxy or clamp an experimental value merely to pass validation.",
       },
-      taskFingerprint: input.proposalContext.taskFingerprint,
-      searchBiases,
-      profileDerivedSearchDirectives: profileDerivedSearchDirectives(input.proposalContext.taskFingerprint),
-      ...(input.dataAnalysisMarkdown
-        ? { dataAnalysisReport: compactMarkdownForPrompt(input.dataAnalysisMarkdown, profile.correlationMatrix) }
-        : {}),
-      ...(input.hypoPlanMarkdown ? { hypothesisPlan: input.hypoPlanMarkdown } : {}),
-      ...(input.previousReflectionMarkdown ? { previousSessionReflection: input.previousReflectionMarkdown } : {}),
-      existingCandidates: representativeCandidates(input.proposalContext),
-      runs: representativeRuns(input.proposalContext),
-      memory: representativeMemory(input.proposalContext),
-      forbidden_signatures: forbiddenCandidateSignatures(input.proposalContext),
-      champion: input.proposalContext.champion,
-      ...(input.validationFeedback
-        ? {
-            candidateValidationFeedback: {
-              ...input.validationFeedback,
-              instruction:
-                "Correct the rejected candidate while preserving its intended experiment and selected hypothesis. Return one complete replacement JSON object.",
-            },
-          }
-        : {}),
-      instruction:
-        "When taskFingerprint.selectedHypothesis is present, test that exact hypothesis, including its motivation and falsificationCriteria, and use one of its suggestedBackbones. Apply previousSessionReflection recommendations that concern this hypothesis to concrete recipe fields; in notes identify changes made or explain why a recommendation cannot apply. Keep architecture/evaluation fixed for optimization repairs or incomplete-run retries; historical hypotheses are context, not alternative selections. For a new scientific experiment propose a different candidate; do not repeat forbidden_signatures unless candidateValidationFeedback explicitly requests repair. Prefer Chinese for explanatory natural-language fields while preserving required JSON/schema field names.",
-    }
-  return JSON.stringify(
-    compactPromptContext(prompt),
-    null,
-    2,
-  )
+    } : {}),
+    instruction: "Implement the selected hypothesis faithfully. Treat its mechanism descriptions as claims to verify against component semantics, not as implementation facts. If unsupported or internally contradictory, return unavailable for HypoPlanner to regenerate the hypothesis. Do not change the scientific question to produce a legal recipe. Write concise Chinese explanations and preserve schema field names.",
+  }
+  return JSON.stringify(prompt, null, 2)
 }
 
 async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string, system: string, user: string): Promise<LLMResponse> {
@@ -995,7 +792,25 @@ export function candidateGovernance(candidateSpec: JsonRecord) {
  */
 export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, config: NeoCastLLMConfig): LLMProposalResult {
   try {
-    const candidateSpec = pruneCandidateSpec(camelizeKnown(extractJsonObject(text)))
+    const response = extractDesignerResponse(text)
+    if (response.status === "unavailable") {
+      const unavailable = DesignUnavailable.parse(response)
+      return { unavailable, metadata: llmMetadata(config, "used", { designStatus: "unavailable" }, usage) }
+    }
+    if (response.status === "history_request") {
+      const request = DesignHistoryRequest.parse(response)
+      return { historyRequest: request.request, metadata: llmMetadata(config, "used", { designStatus: "history_request" }, usage) }
+    }
+    const raw = camelizeKnown(response.status === "proposed" ? response.candidate : response) as Record<string, any>
+    if (raw.recipeVersion === "recipe_schema_v3") {
+      for (const [prefix, branch] of [["backbone", raw.backbone], ["composition.secondary.backbone", raw.composition?.secondary?.backbone]] as const) {
+        if (branch?.type === "linear" && typeof branch.shared !== "boolean")
+          throw new Error(`${prefix}.shared must be explicitly true (shared encoder) or false (per-channel encoder); shared prediction heads do not imply shared encoders`)
+        if (branch?.type === "dlinear" && typeof branch.individual !== "boolean")
+          throw new Error(`${prefix}.individual must be explicit: false shares encoder weights; true gives per-channel weights`)
+      }
+    }
+    const candidateSpec = pruneCandidateSpec(raw)
     const governance = candidateGovernance(candidateSpec)
     return {
       proposal: {
@@ -1041,6 +856,7 @@ export async function proposeLLMCandidate(input: {
   readonly dataAnalysisMarkdown?: string
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
+  readonly requestedHistory?: readonly unknown[]
   readonly validationFeedback?: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
 }): Promise<LLMProposalResult> {
   const runtime = isRecord(input.task.taskSpec.runtime) ? input.task.taskSpec.runtime : {}
@@ -1081,6 +897,7 @@ export async function proposeLLMCandidate(input: {
     hypoPlanMarkdown: input.hypoPlanMarkdown,
     previousReflectionMarkdown: input.previousReflectionMarkdown,
     validationFeedback: input.validationFeedback,
+    requestedHistory: input.requestedHistory,
   }
   let user = buildUserPrompt(promptInput)
   const maxAttempts = 3
@@ -1089,6 +906,7 @@ export async function proposeLLMCandidate(input: {
     try {
       const { text, usage } = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
       const result = buildLLMProposalFromText(text, usage, effectiveConfig)
+      if (result.unavailable || result.historyRequest) return result
       if (!result?.proposal) {
         const message = typeof result?.metadata.llmError === "string" ? result.metadata.llmError : "Failed to parse LLM proposal JSON"
         user = buildUserPrompt({ ...promptInput, validationFeedback: { attempt, issues: llmProposalValidationIssues(result?.metadata ?? {}) } })

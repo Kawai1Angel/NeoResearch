@@ -202,7 +202,7 @@ test("bridge-mode LLM proposals require review when the content raises execution
   })
 })
 
-test("LLM proposal prompt exposes profile-derived search directives", async () => {
+test("LLM proposal prompt excludes search directives and exposes factual component semantics", async () => {
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "opencode-llm-proposal-profile-"))
   process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
   process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
@@ -245,15 +245,15 @@ test("LLM proposal prompt exposes profile-derived search directives", async () =
   })
 
   const prompt = JSON.stringify(requestBody)
-  expect(prompt).toContain("profileDerivedSearchDirectives")
+  expect(prompt).not.toContain("profileDerivedSearchDirectives")
   expect(prompt).toContain("series_decomposition")
   expect(prompt).toContain("missing_mask")
   expect(prompt).toContain("sample_reweighting")
   expect(prompt).toContain("huber")
-  expect(prompt).toContain("acfMainPeriod")
+  expect(prompt).not.toContain("acfMainPeriod")
 })
 
-test("ModelDesigner prompt summarizes correlation matrices and other unbounded arrays", () => {
+test("ModelDesigner omits unrelated history and preserves the exact task contract", () => {
   const width = 321
   const columns = Array.from({ length: width }, (_, index) => String(index))
   const values = Array.from({ length: width }, (_, left) =>
@@ -308,61 +308,16 @@ test("ModelDesigner prompt summarizes correlation matrices and other unbounded a
   }))
 
   expect(prompt.taskFingerprint.datasetProfile).toBeUndefined()
-  expect(prompt.taskFingerprint.datasetProfileAnalysis.correlationStructure).toMatchObject({
-    kind: "correlation_matrix_summary",
-    rows: width,
-    columns: width,
-  })
-  expect(prompt.taskFingerprint.datasetProfileAnalysis.metrics.crossVarCorrelation).toMatchObject({
-    value: 0.5,
-    assessment: expect.any(String),
-    modelingImplication: expect.any(String),
-  })
-  expect(prompt.taskFingerprint.datasetProfileAnalysis.correlationStructure.strongestPairs.length).toBeLessThanOrEqual(12)
-  expect(prompt.memory[0].fingerprintSummary).toBeUndefined()
-  expect(prompt.memory[0].fingerprintAnalysis).toEqual({ relationship: "same_task" })
-  expect(prompt.runs[0].metrics.perTargetMSE).toMatchObject({
-    kind: "numeric_array_analysis",
-    count: width,
-    mean: expect.any(Number),
-    standardDeviation: expect.any(Number),
-    analysis: expect.any(String),
-  })
-  expect(prompt.runs[0].metrics.residualMatrix).toMatchObject({
-    kind: "numeric_matrix_analysis",
-    rows: 2,
-    columns: 3,
-    valueDistribution: expect.objectContaining({
-      mean: 3,
-      analysis: expect.any(String),
-    }),
-    rowMeanDistribution: expect.objectContaining({ analysis: expect.any(String) }),
-    columnMeanDistribution: expect.objectContaining({ analysis: expect.any(String) }),
-  })
-  expect(prompt.runs[0].metrics.trainingCurve).toMatchObject({
-    kind: "training_curve_analysis",
-    rawPointCount: 3,
-    validPointCount: 3,
-    analysis: expect.stringContaining("independently"),
-  })
-  expect(prompt.runs[0].metrics.trainingCurve.series).toHaveLength(2)
-  expect(prompt.runs[0].metrics.trainingCurve.series[0]).toMatchObject({
-    firstValLoss: 0.5,
-    lastValLoss: 0.4,
-    analysis: expect.stringContaining("improved"),
-  })
-  expect(prompt.task.taskSpec.dataset.targetCols).toMatchObject({
-    kind: "collection_analysis",
-    count: width,
-    uniqueCount: width,
-    analysis: expect.any(String),
-  })
-  expect(prompt.dataAnalysisReport).not.toContain("FULL_MATRIX_SENTINEL")
-  expect(prompt.dataAnalysisReport).toContain("Full matrix omitted from LLM context")
+  expect(prompt.taskFingerprint.datasetProfileAnalysis).toBeUndefined()
+  expect(prompt.memory).toBeUndefined()
+  expect(prompt.runs).toBeUndefined()
+  expect(prompt.task.taskSpec.dataset.targetCols).toEqual(columns)
+  expect(prompt.dataAnalysisReport).toBeUndefined()
+  expect(JSON.stringify(prompt)).not.toContain("FULL_MATRIX_SENTINEL")
   expect(JSON.stringify(prompt).length).toBeLessThan(50_000)
 })
 
-test("LLM proposal prompt samples representative candidate, run, and memory history", async () => {
+test("LLM proposal prompt retains only the factual current champion and on-demand history access", async () => {
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "opencode-llm-proposal-sampling-"))
   process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
   process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
@@ -424,13 +379,14 @@ test("LLM proposal prompt samples representative candidate, run, and memory hist
 
   const body = requestBody as { messages: Array<{ role: string; content: string }> }
   const userPrompt = JSON.parse(body.messages.find((message) => message.role === "user")?.content ?? "{}")
-  expect(userPrompt.existingCandidates.map((item: { id: string }) => item.id)).toContain("candidate_champion_origin")
-  expect(userPrompt.runs.map((item: { candidateID: string }) => item.candidateID)).toContain("candidate_champion_origin")
-  expect(userPrompt.memory.map((item: { lesson: string }) => item.lesson)).toContain("accepted lesson from early champion")
-  expect(userPrompt.memory.map((item: { lesson: string }) => item.lesson)).toContain("failed lesson from late crash")
+  expect(userPrompt.currentChampion.candidateID).toBe("candidate_champion_origin")
+  expect(userPrompt.existingCandidates).toBeUndefined()
+  expect(userPrompt.runs).toBeUndefined()
+  expect(userPrompt.memory).toBeUndefined()
+  expect(userPrompt.historyAccess.filters).toContain("runID")
 })
 
-test("LLM proposal prompt weights memory by recency and exposes forbidden failed signatures", async () => {
+test("LLM proposal prompt does not preload memory or turn negative narratives into forbidden designs", async () => {
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "opencode-llm-proposal-memory-policy-"))
   process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
   process.env.NEO_CAST_LLM_BASE_URL = "http://llm.test/v1"
@@ -479,28 +435,10 @@ test("LLM proposal prompt weights memory by recency and exposes forbidden failed
 
   const body = requestBody as { messages: Array<{ role: string; content: string }> }
   const userPrompt = JSON.parse(body.messages.find((message) => message.role === "user")?.content ?? "{}")
-  expect(userPrompt.memory).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        lesson: "ancient failed MLP recipe should not be repeated",
-        memoryWeight: expect.any(Number),
-      }),
-      expect.objectContaining({
-        lesson: "recent rejected transformer recipe should not be repeated",
-        memoryWeight: expect.any(Number),
-      }),
-    ]),
-  )
-  const ancient = userPrompt.memory.find((item: { lesson: string }) => item.lesson.startsWith("ancient failed"))
-  const recent = userPrompt.memory.find((item: { lesson: string }) => item.lesson.startsWith("recent rejected"))
-  expect(recent.memoryWeight).toBeGreaterThan(ancient.memoryWeight)
-  expect(userPrompt.forbidden_signatures).toEqual(
-    expect.arrayContaining([
-      expect.stringContaining("ancient_failed_mlp"),
-      expect.stringContaining("recent_rejected_transformer"),
-    ]),
-  )
-  expect(userPrompt.instruction).toContain("do not repeat")
+  expect(userPrompt.memory).toBeUndefined()
+  expect(userPrompt.forbidden_signatures).toBeUndefined()
+  expect(JSON.stringify(userPrompt)).not.toContain("ancient failed MLP")
+  expect(JSON.stringify(userPrompt)).not.toContain("recent rejected transformer")
 })
 
 
@@ -590,4 +528,54 @@ test("direct transport feeds validation errors to the agent before retrying", as
   expect(result.proposal).toBeDefined()
   expect(requests).toHaveLength(2)
   expect(requests[1]).toContain("backbone.hiddenDim")
+})
+
+
+test("unavailable is a normal design result and cannot carry a proxy candidate", () => {
+  const config = { provider: "openai-compatible" as const, model: "fixture", maxTokens: 1000, temperature: 0 }
+  const response = { status: "unavailable" as const, hypothesisID: "H-recency", reason: "Runtime has no time-index weighting.",
+    conflicts: [{ field: "sample_reweighting.scheme", requested: "recency", supported: "uniform|horizon_tail|outlier_robust" }],
+    suggestedRevision: "Generate a separate hypothesis for amplitude-based weighting, or choose another supported intervention." }
+  const result = buildLLMProposalFromText(JSON.stringify(response), ZERO_USAGE, config)
+  expect(result.unavailable).toEqual(response)
+  expect(result.proposal).toBeUndefined()
+  expect(result.metadata.llmStatus).toBe("used")
+  const prose = 'The comparison is [{"type":"none"}], while the declaration uses {"after":"instance_norm"}.\n'
+  expect(buildLLMProposalFromText(prose + JSON.stringify(response), ZERO_USAGE, config).unavailable).toEqual(response)
+  expect(buildLLMProposalFromText(prose + '```json\n' + JSON.stringify(response) + '\n```', ZERO_USAGE, config).unavailable).toEqual(response)
+  expect(buildLLMProposalFromText(JSON.stringify(response) + '\n' + JSON.stringify(response), ZERO_USAGE, config).metadata.llmStatus).toBe("invalid")
+  expect(buildLLMProposalFromText(prose + JSON.stringify(response).slice(0, -1), ZERO_USAGE, config).metadata.llmStatus).toBe("invalid")
+  expect(buildLLMProposalFromText(JSON.stringify({ ...response, candidate: llmRecipe() }), ZERO_USAGE, config).unavailable).toBeUndefined()
+})
+
+test("historical facts can be requested by ID without preloading memory", () => {
+  const result = buildLLMProposalFromText(JSON.stringify({ status: "history_request", request: { runID: "comparison-run" } }), ZERO_USAGE,
+    { provider: "openai-compatible", model: "fixture", maxTokens: 1000, temperature: 0 })
+  expect(result.historyRequest).toEqual({ runID: "comparison-run" })
+  expect(result.proposal).toBeUndefined()
+})
+
+test("malformed response envelopes retain the JSON error instead of reporting zero objects", () => {
+  const config = { provider: "openai-compatible" as const, model: "fixture", maxTokens: 16000, temperature: 0 }
+  const malformed = '{"status":"unavailable","hypothesisID":"H-control","reason":"requiredMechanisms=["moving_average_decomposition"] conflicts with the control","conflicts":[],"suggestedRevision":"Revise the candidate arm"}'
+  const result = buildLLMProposalFromText(malformed, ZERO_USAGE, config)
+  expect(result.metadata.llmStatus).toBe("invalid")
+  expect(result.metadata.llmError).toContain("Invalid JSON in ModelDesigner response")
+  expect(result.metadata.llmError).not.toContain("found 0")
+  expect(result.proposal).toBeUndefined()
+  // A malformed envelope must not be silently ignored in favor of another design.
+  expect(buildLLMProposalFromText(malformed + '\n' + JSON.stringify(llmRecipe()), ZERO_USAGE, config).proposal).toBeUndefined()
+  const wrongField = buildLLMProposalFromText(JSON.stringify({ ...llmRecipe(), recipe_version: "recipe_schema_v3",
+    representation: { layout: "channel_latent", readout: "none", latent_dim: 64 }, composition: { type: "single" },
+    comparisonRunID: "anchor" }), ZERO_USAGE, config)
+  expect(wrongField.metadata.llmError).toContain("comparisonRunID")
+})
+
+test("v3 linear designs cannot silently inherit non-shared encoder defaults", () => {
+  const result = buildLLMProposalFromText(JSON.stringify({ ...bridgeSafeLLMRecipe(), recipe_version: "recipe_schema_v3",
+    representation: { layout: "channel_latent", readout: "none", latent_dim: 64 }, composition: { type: "single" },
+    backbone: { type: "linear" }, embedding: { type: "none" } }), ZERO_USAGE,
+    { provider: "openai-compatible", model: "fixture", maxTokens: 1000, temperature: 0 })
+  expect(result.proposal).toBeUndefined()
+  expect(result.metadata.llmError).toContain("shared must be explicitly")
 })

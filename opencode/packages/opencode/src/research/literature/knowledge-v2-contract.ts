@@ -1,9 +1,10 @@
+import { INITIAL_KNOWLEDGE_CONFIDENCE, KnowledgeValidationSchema } from "./knowledge-confidence"
 import z from "zod"
 
 // V1 remains an audit format. Never coerce a fragment into this contract.
 export const KNOWLEDGE_V2_VERSIONS = {
   schema: "knowledge_card_v2", analysis: "paper_analysis_v1",
-  synthesis: "paper_principle_v8", verifier: "principle_verifier_v10",
+  synthesis: "paper_principle_v8", verifier: "principle_verifier_v11",
   sourceRecovery: "registered_spans_v1",
 } as const
 
@@ -127,6 +128,8 @@ export type PrincipleReview = z.infer<typeof PrincipleReviewSchema>
 export const KnowledgeCardV2Schema = KnowledgeCandidateSchema.omit({ schemaVersion: true }).extend({
   schemaVersion: z.literal("knowledge_card_v2"),
   knowledgeID: z.string().regex(/^kn_[a-f0-9]{24}$/), revision: z.number().int().positive(),
+  confidence: z.number().finite().min(0).max(1).default(INITIAL_KNOWLEDGE_CONFIDENCE),
+  experimentValidations: z.array(KnowledgeValidationSchema).default([]),
   review: PrincipleReviewSchema,
   provenance: z.object({
     documentSha256: hash, analysisHash: hash, extractionRunID: text,

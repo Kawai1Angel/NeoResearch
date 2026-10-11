@@ -1,10 +1,15 @@
 import { expect, test } from "bun:test"
 import { requestEvidenceVerification } from "../../../src/research/literature/extraction-model"
 import type { EvidenceVerification } from "../../../src/research/literature/contract"
-import { candidate, chunk } from "./fixtures"
+import { candidate, candidateScope, chunk } from "./fixtures"
 
 const supported: EvidenceVerification = { cardTypeVerdict: "correct", mechanismVerdict: "not_applicable", contributionVerdict: "not_applicable", actionabilityVerdict: "testable_intervention", verdict: "supported", supportedScope: "ETTh1", unsupportedParts: [], evidenceDirectness: "direct", confidence: 0.9 }
 const input = { candidate: candidate(), chunks: [chunk()] }
+
+test("scope-bearing candidates cannot silently omit the scope verdict", async () => {
+  await expect(requestEvidenceVerification({ ...input, candidate: candidate({ scope: candidateScope() }) },
+    async () => JSON.stringify(supported))).rejects.toThrow("scopeVerdict")
+})
 
 test("nullable unused correction is omitted without changing the verifier verdict", async () => {
   const result = await requestEvidenceVerification(input, async () => JSON.stringify({ ...supported, correctedClaim: null }))

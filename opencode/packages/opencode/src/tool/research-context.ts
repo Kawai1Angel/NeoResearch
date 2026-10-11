@@ -1,19 +1,19 @@
-import { buildExperimentResultEvidence, extractTrainingCurve, recoverRunnerFailure } from "../research/runner-evidence"
+import { readDesignHistory } from "../research/design-history"
+import { extractTrainingCurve } from "../research/runner-evidence"
 export { extractTrainingCurve } from "../research/runner-evidence"
 import { Effect, Schema } from "effect"
 import { readdir, readFile } from "node:fs/promises"
 import path from "node:path"
 import * as Tool from "./tool"
 import { resolveTaskIDBySessionID } from "@/research/hypothesis-store"
-import { Database, and, desc, eq, inArray } from "@/storage"
+import { Database, and, desc, eq } from "@/storage"
 import {
   ResearchArtifactTable,
-  ResearchCandidateTable,
   ResearchMemoryTable,
   ResearchRunTable,
   ResearchTaskTable,
 } from "@/research/research.sql"
-import type { ResearchCandidateID, ResearchRunID } from "@/research/schema"
+import type { ResearchRunID } from "@/research/schema"
 import { Instance } from "@/project/instance"
 
 const NOT_IN_RESEARCH_SESSION =
@@ -85,8 +85,12 @@ export const ReadReflectionTool = Tool.define(
 // ---------------------------------------------------------------------------
 
 const ExperimentResultsParameters = Schema.Struct({
+  runID: Schema.optional(Schema.String).annotate({ description: "Read a specific comparison run, scoped to this task." }),
+  candidateID: Schema.optional(Schema.String).annotate({ description: "Read runs of a particular candidate." }),
+  hypothesisID: Schema.optional(Schema.String).annotate({ description: "Read runs testing a particular hypothesis." }),
+  offset: Schema.optional(Schema.Number).annotate({ description: "Pagination offset; use nextOffset from the previous response." }),
   limit: Schema.optional(Schema.Number).annotate({
-    description: "Maximum number of recent runs to return (1–50, default: 10).",
+    description: "Maximum number of runs to return (1–20, default: 5).",
   }),
 })
 
@@ -113,79 +117,11 @@ export const ExperimentResultsTool = Tool.define(
             output: NOT_IN_RESEARCH_SESSION,
           }
         }
-        const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 10)), 50)
-
-        const taskRow = Database.use((d) =>
-          d
-            .select({ objective: ResearchTaskTable.objective })
-            .from(ResearchTaskTable)
-            .where(eq(ResearchTaskTable.id, taskID))
-            .get(),
-        )
-        const objective = taskRow?.objective as Record<string, unknown> | null | undefined
-        const primaryMetric =
-          typeof objective?.primaryMetric === "string" ? objective.primaryMetric : "val_avg_mse"
-
-        const runs = Database.use((d) =>
-          d
-            .select()
-            .from(ResearchRunTable)
-            .where(
-              and(
-                eq(ResearchRunTable.task_id, taskID),
-                inArray(ResearchRunTable.status, ["succeeded", "failed", "invalid", "rejected"]),
-              ),
-            )
-            .orderBy(desc(ResearchRunTable.time_updated))
-            .limit(limit)
-            .all(),
-        )
-
-        const candidateIds = [
-          ...new Set(runs.map((r) => r.candidate_id).filter((id): id is ResearchCandidateID => !!id)),
-        ]
-        const candidateRows = candidateIds.length > 0
-          ? Database.use((d) =>
-              d
-                .select({ id: ResearchCandidateTable.id, candidate_spec: ResearchCandidateTable.candidate_spec, hypothesis_id: ResearchCandidateTable.hypothesis_id })
-                .from(ResearchCandidateTable)
-                .where(inArray(ResearchCandidateTable.id, candidateIds))
-                .all(),
-            )
-          : []
-        const hypoIDByCandidate = new Map<string, string>()
-        for (const c of candidateRows) {
-          if (c.hypothesis_id) hypoIDByCandidate.set(c.id, c.hypothesis_id)
-        }
-
-        const candidateSpecByID = new Map(candidateRows.map((c) => [c.id, c.candidate_spec]))
-        const results = await Promise.all(runs.map(async (r) => {
-          const metrics = r.metrics as Record<string, unknown> | null | undefined
-          const metricVal = metrics?.[primaryMetric]
-          const hasMetric = typeof metricVal === "number" && Number.isFinite(metricVal)
-          const execution = (r.status !== "succeeded" || !hasMetric) && r.resource_usage.independentEvidence !== false ? Database.use((d) =>
-            d.select({ uri: ResearchArtifactTable.uri }).from(ResearchArtifactTable)
-              .where(and(eq(ResearchArtifactTable.task_id, taskID), eq(ResearchArtifactTable.run_id, r.id), eq(ResearchArtifactTable.kind, "runner_execution_log_json"))).get(),
-          ) : undefined
-          const error = execution ? await recoverRunnerFailure(execution.uri.replace(/^file:\/\//, ""), r.error ?? undefined) : r.error
-          const hypoID = r.candidate_id ? hypoIDByCandidate.get(r.candidate_id) : undefined
-          return { ...buildExperimentResultEvidence({
-            runID: r.id,
-            stage: r.stage,
-            status: r.status,
-            primaryMetric,
-            metrics: metrics ?? {},
-            error,
-            hypothesisID: hypoID,
-            independentEvidence: r.resource_usage.independentEvidence === false ? false : undefined,
-            candidateSpec: r.candidate_id ? candidateSpecByID.get(r.candidate_id) : undefined,
-          }), executedModel: (r.resource_usage.executionContract as any)?.manifest?.actual }
-        }))
-
+        const result = await readDesignHistory(taskID, args, { forReflection: ctx.agent === "research-reflection" })
         return {
           title: "experiment_results",
-          metadata: { runCount: results.length },
-          output: JSON.stringify({ primaryMetric, runs: results }, null, 2),
+          metadata: { runCount: result.runs.length },
+          output: JSON.stringify(result, null, 2),
         }
       }),
   }),

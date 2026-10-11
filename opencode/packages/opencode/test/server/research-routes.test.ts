@@ -11,6 +11,7 @@ import { ResearchPaths } from "../../src/server/routes/instance/httpapi/research
 import { Log } from "../../src/util"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
+import { addHypothesisToPool, selectNextExperimentInPool } from "../../src/research/hypothesis-store"
 
 void Log.init({ print: false })
 
@@ -56,12 +57,85 @@ async function json<T>(response: Response) {
   return (await response.json()) as T
 }
 
+const fakeContractEvents = `
+${process.execPath} -e '
+const fs = require("fs"), crypto = require("crypto")
+const c = JSON.parse(fs.readFileSync(process.env.NEO_CAST_EXECUTION_CONTRACT))
+const canonical = v => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v)
+const d = crypto.createHash("sha256").update(canonical(c)).digest("hex")
+const manifest = {event:"executed_model_manifest", candidate_id:c.candidate_id, candidate_spec_sha256:c.candidate_spec_sha256, contract_digest:d, actual:c.expected}
+console.log(JSON.stringify(manifest))
+console.log(JSON.stringify({event:"execution_contract_verified", status:"verified", candidate_id:c.candidate_id, candidate_spec_sha256:c.candidate_spec_sha256, contract_digest:d, manifest}))
+'
+`
+
+async function selectSearchHypothesis(taskID: Research.ResearchTaskID) {
+  const hypothesis = await addHypothesisToPool(taskID, {
+    statement: "Compare the declared architecture families under a shared protocol.",
+    motivation: ["Exercise the API search and budget controls."],
+    expectedOutcome: "Evaluate the next declared architecture.",
+    suggestedBackbones: ["linear", "mlp", "transformer", "rnn", "dlinear", "tcn", "nbeats"],
+    suggestedPreprocessing: [],
+    risk: "Fixture",
+    testable: true,
+  })
+  await selectNextExperimentInPool(taskID, {
+    action: "experiment", hypothesisID: hypothesis.id, rationale: "Compare the next declared architecture through the API.",
+  })
+}
+
+const plannerEnvKeys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"] as const
+let restorePlanner: (() => void) | undefined
+
+function installPlannerFixture() {
+  if (restorePlanner) return
+  const previousFetch = globalThis.fetch
+  const previousEnv = Object.fromEntries(plannerEnvKeys.map((key) => [key, process.env[key]]))
+  process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+  process.env.NEO_CAST_LLM_BASE_URL = "http://route-planner.fixture/v1"
+  process.env.NEO_CAST_LLM_MODEL = "fixture-model"
+  process.env.NEO_CAST_LLM_API_KEY = "fixture-key"
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!String(input).startsWith("http://route-planner.fixture/")) return previousFetch(input, init)
+    const body = JSON.parse(String(init?.body))
+    const system = body.messages[0].content as string
+    const result = system.startsWith("You are the NeoResearch HypoPlanner") ? {
+      hypotheses: [{
+        id: "H_route_search", statement: "Compare the declared architectures under the task protocol.",
+        motivation: ["API workflow fixture with an explicit experiment selection."], expectedOutcome: "Improve the primary metric.",
+        suggestedBackbones: ["linear", "mlp", "transformer", "dlinear", "nbeats", "rnn", "freq_mixer"],
+        suggestedPreprocessing: [], requiredMechanisms: [], risk: "May underfit", testable: true,
+        datasetEvidencePaths: [], literatureEvidence: [], applicabilityAssumptions: [],
+        falsificationCriteria: ["No improvement in completed independent experiments."], evidenceLevel: "data_only",
+      }],
+      nextExperiment: { action: "experiment", hypothesisID: "H_route_search", rationale: "Evaluate this declared direction." },
+    } : {
+      trainingHealthAssessment: "The fixture completed the execution protocol.", hypothesisValidation: "Use completed primary metrics.",
+      attributionAnalysis: "Compare under the shared protocol.", historicalComparison: "Use the task history.",
+      modelDesignReflection: "An implementation manifest is available.", nextStepRecommendation: "Ask HypoPlanner for the next experiment.",
+      distillableMemory: "API workflow result.",
+    }
+    const content = JSON.stringify(result)
+    if (body.stream) return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  restorePlanner = () => {
+    globalThis.fetch = previousFetch
+    for (const key of plannerEnvKeys) {
+      if (previousEnv[key] === undefined) delete process.env[key]
+      else process.env[key] = previousEnv[key]
+    }
+    restorePlanner = undefined
+  }
+}
+
 async function writeFakeNeoCastRunner(root: string) {
   await mkdir(path.join(root, "py"), { recursive: true })
   await writeFile(
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_fake
 cat > .neo-cast/artifacts/run_fake/model_impl.py <<'PY'
 class Model:
@@ -78,9 +152,23 @@ printf '{"event":"done","status":"success"}\\n'
 `,
     "utf8",
   )
+  await writeFile(path.join(root, "py", "runner.py"), `#!/usr/bin/env bash
+set -euo pipefail
+${fakeContractEvents}
+mkdir -p .neo-cast/artifacts/run_train
+printf '{"val_avg_mse":0.123,"val_avg_mae":0.456}' > .neo-cast/artifacts/run_train/val_metrics.json
+printf '{"cv_avg_mse":0.123,"cv_std_mse":0.01}' > .neo-cast/artifacts/run_train/cv_metrics.json
+cp .neo-cast/artifacts/run_fake/model_impl.py .neo-cast/artifacts/run_train/model_impl.py
+cp .neo-cast/artifacts/run_fake/inference.py .neo-cast/artifacts/run_train/inference.py
+printf '{"event":"eval_done","val_avg_mse":0.123,"val_avg_mae":0.456}\\n'
+printf '{"event":"cv_eval_done","cv_avg_mse":0.123,"cv_std_mse":0.01}\\n'
+printf '{"event":"artifact_ready","run_id":"train","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_train"
+printf '{"event":"done","status":"success"}\\n'
+`, "utf8")
 }
 
 afterEach(async () => {
+  restorePlanner?.()
   await Instance.disposeAll()
   await resetDatabase()
 })
@@ -149,7 +237,7 @@ describe("research routes", () => {
             body: JSON.stringify({ taskSpec }),
           }),
         )
-        expect(baselines).toHaveLength(3)
+        expect(baselines).toHaveLength(1)
 
         const validation = await json<Research.DomainValidationResult>(
           await app().request(pathFor(ResearchPaths.domainValidateCandidate, { domainID: "tsf" }), {
@@ -177,7 +265,7 @@ describe("research routes", () => {
         )
         expect(plan.validation.ok).toBe(true)
         expect(plan.writes[0]!.path).toBe(".neo-cast/current_candidate.json")
-        expect(plan.writes[0]!.content.recipe_version).toBe("recipe_schema_v1")
+        expect(plan.writes[0]!.content.recipe_version).toBe("recipe_schema_v3")
       },
     })
   })
@@ -566,8 +654,8 @@ describe("research routes", () => {
             headers,
           }),
         )
-        expect(seeded.candidates).toHaveLength(3)
-        expect(seeded.approvals).toHaveLength(3)
+        expect(seeded.candidates).toHaveLength(1)
+        expect(seeded.approvals).toHaveLength(1)
 
         const approved = await json<Research.ResearchApproval>(
           await app().request(pathFor(ResearchPaths.approvalReply, { approvalID: seeded.approvals[0]!.id }), {
@@ -598,6 +686,16 @@ describe("research routes", () => {
           await app().request(pathFor(ResearchPaths.task, { taskID: task.id }), { headers }),
         )
         expect(researching.status).toBe("researching")
+
+        const queuedExecution = await app().request(
+          pathFor(ResearchPaths.taskCandidateExecuteRun, { taskID: task.id, candidateID: seeded.candidates[0]!.id }),
+          { method: "POST", headers, body: JSON.stringify({ stage: "smoke" }) },
+        )
+        expect(queuedExecution.status).toBe(409)
+        expect(await queuedExecution.json()).toMatchObject({ name: "ResearchReconciliationRequired" })
+        await json<Research.ResearchRun>(await app().request(pathFor(ResearchPaths.runStatus, { runID: prepared.run.id }), {
+          method: "PATCH", headers, body: JSON.stringify({ status: "failed", error: "Canceled queued preparation." }),
+        }))
 
         const executed = await json<{ run: Research.ResearchRun; runPlan: Research.DomainRunPlan }>(
           await app().request(
@@ -680,8 +778,8 @@ describe("research routes", () => {
           }),
         )
 
-        expect(first.candidates).toHaveLength(3)
-        expect(first.approvals).toHaveLength(3)
+        expect(first.candidates).toHaveLength(1)
+        expect(first.approvals).toHaveLength(1)
         expect(second.candidates).toHaveLength(0)
         expect(second.approvals).toHaveLength(0)
 
@@ -691,8 +789,8 @@ describe("research routes", () => {
         const approvals = await json<Research.ResearchApproval[]>(
           await app().request(pathFor(ResearchPaths.taskApprovals, { taskID: task.id }), { headers }),
         )
-        expect(candidates).toHaveLength(3)
-        expect(approvals).toHaveLength(3)
+        expect(candidates).toHaveLength(1)
+        expect(approvals).toHaveLength(1)
       },
     })
   })
@@ -743,7 +841,7 @@ describe("research routes", () => {
             body: JSON.stringify({ stage: "smoke", description: "autonomous route smoke" }),
           }),
         )
-        expect(iteration.seededCandidates).toHaveLength(3)
+        expect(iteration.seededCandidates).toHaveLength(1)
         expect(iteration.approvals).toHaveLength(0)
         expect(iteration.candidate.approvalStatus).toBe("auto_approved")
         expect(iteration.run.status).toBe("succeeded")
@@ -784,6 +882,7 @@ describe("research routes", () => {
   })
 
   test("runs an autonomous loop for multiple budgeted iterations", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -863,6 +962,7 @@ describe("research routes", () => {
   })
 
   test("runs the multi-agent research pipeline through the API", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
     const datasetPath = await writeProfileDataset()
@@ -918,7 +1018,7 @@ describe("research routes", () => {
           method: "POST",
           headers,
           body: JSON.stringify({
-            stage: "smoke",
+            stage: "full",
             maxIterations: 1,
             description: "api pipeline smoke",
             outputDir: ".neo-research/api-pipeline",
@@ -957,13 +1057,13 @@ describe("research routes", () => {
           method: "POST",
           headers,
           body: JSON.stringify({
-            stage: "smoke",
+            stage: "full",
             maxIterations: 1,
             description: "api pipeline smoke",
             outputDir: ".neo-research/api-pipeline",
           }),
         })
-        expect(response.status).toBe(200)
+        expect(response.status, JSON.stringify(await response.clone().json())).toBe(200)
         const pipeline = (await response.json()) as Research.RunFullPipelineResult
 
         expect(pipeline.intent.taskID).toBe(task.id)
@@ -1056,6 +1156,7 @@ describe("research routes", () => {
   })
 
   test("autonomous loop returns partial iterations when run budget is exhausted", async () => {
+    installPlannerFixture()
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1216,7 +1317,7 @@ describe("research routes", () => {
           await app().request(pathFor(ResearchPaths.taskAutonomousIterate, { taskID: task.id }), {
             method: "POST",
             headers,
-            body: JSON.stringify({ stage: "smoke", description: "domain evaluator smoke" }),
+            body: JSON.stringify({ stage: "full", description: "domain evaluator full run" }),
           }),
         )
         expect(iteration.run.metrics).toMatchObject({ val_avg_mse: 0.123, val_avg_mae: 0.456 })
@@ -1241,6 +1342,8 @@ describe("research routes", () => {
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writeFakeNeoCastRunner(fakeNeoCastRoot)
         const task = await json<Research.ResearchTask>(
           await app().request(ResearchPaths.tasks, {
             method: "POST",
@@ -1249,7 +1352,7 @@ describe("research routes", () => {
               title: "TSF external runner evaluation",
               domainID: "tsf",
               mode: "review",
-              taskSpec: validTsfTaskSpec(),
+              taskSpec: { ...validTsfTaskSpec(), runtime: { neoCastProjectRoot: fakeNeoCastRoot, pythonExecutable: "bash" } },
               objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
               budget: { maxRuns: 3 },
             }),
@@ -1274,6 +1377,11 @@ describe("research routes", () => {
           }),
         )
 
+        const smoke = await json<{ run: Research.ResearchRun }>(await app().request(
+          pathFor(ResearchPaths.taskCandidateExecuteRun, { taskID: task.id, candidateID: candidate.id }),
+          { method: "POST", headers, body: JSON.stringify({ stage: "smoke" }) },
+        ))
+        expect(smoke.run.status).toBe("succeeded")
         const run = await json<Research.ResearchRun>(
           await app().request(ResearchPaths.runs, {
             method: "POST",
@@ -1281,7 +1389,7 @@ describe("research routes", () => {
             body: JSON.stringify({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
+              stage: "full",
               status: "running",
             }),
           }),
@@ -1291,7 +1399,7 @@ describe("research routes", () => {
           await app().request(pathFor(ResearchPaths.runStatus, { runID: run.id }), {
             method: "PATCH",
             headers,
-            body: JSON.stringify({ status: "succeeded", metrics: { val_avg_mse: 0.111 } }),
+            body: JSON.stringify({ status: "succeeded", metrics: { val_avg_mse: 0.111 }, resourceUsage: { executionContract: { status: "verified" } } }),
           }),
         )
 
@@ -1360,8 +1468,9 @@ describe("research routes", () => {
             body: JSON.stringify({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
+              stage: "full",
               status: "succeeded",
+              resourceUsage: { executionContract: { status: "verified" } },
               metrics: { val_avg_mse: 0.109 },
             }),
           }),
@@ -1452,7 +1561,7 @@ describe("research routes", () => {
         expect(memory).toHaveLength(1)
         expect(memory[0]).toMatchObject({
           outcome: "failed",
-          lesson: `[dataset:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: bridge timeout`,
+          lesson: `[dataset:loader:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: bridge timeout`,
         })
         expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, status: "failed" })
       },
@@ -1518,7 +1627,7 @@ describe("research routes", () => {
         expect(memory).toHaveLength(1)
         expect(memory[0]).toMatchObject({
           outcome: "failed",
-          lesson: `[dataset:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: failed`,
+          lesson: `[dataset:loader:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: failed`,
         })
         expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, status: "failed" })
       },
@@ -1557,7 +1666,7 @@ describe("research routes", () => {
           }),
         )
 
-        for (let index = 0; index < 3; index++) {
+        for (let index = 0; index < 1; index++) {
           await json<{
             candidate: Research.ResearchCandidate
             run: Research.ResearchRun
@@ -1569,6 +1678,8 @@ describe("research routes", () => {
             }),
           )
         }
+
+        await selectSearchHypothesis(task.id)
 
         const iteration = await json<{
           candidate: Research.ResearchCandidate
@@ -1591,7 +1702,7 @@ describe("research routes", () => {
         const candidates = await json<Research.ResearchCandidate[]>(
           await app().request(pathFor(ResearchPaths.taskCandidates, { taskID: task.id }), { headers }),
         )
-        expect(candidates).toHaveLength(4)
+        expect(candidates).toHaveLength(2)
       },
     })
   })
@@ -1655,7 +1766,7 @@ describe("research routes", () => {
     })
   })
 
-  test("prepare-run enforces maxParallel active run budget", async () => {
+  test("prepare-run blocks unreconciled active runs until their status is confirmed", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1715,7 +1826,7 @@ describe("research routes", () => {
         const blocked = await app().request(
           pathFor(ResearchPaths.taskCandidatePrepareRun, {
             taskID: task.id,
-            candidateID: seeded.candidates[1]!.id,
+            candidateID: seeded.candidates[0]!.id,
           }),
           {
             method: "POST",
@@ -1723,16 +1834,16 @@ describe("research routes", () => {
             body: JSON.stringify({ stage: "smoke", description: "second active run" }),
           },
         )
-        expect(blocked.status).toBe(400)
+        expect(blocked.status).toBe(409)
         const body = (await blocked.json()) as { name: string; data: { limit: number; used: number } }
-        expect(body.name).toBe("ResearchBudgetExceededError")
-        expect(body.data).toMatchObject({ limit: 1, used: 1 })
+        expect(body.name).toBe("ResearchReconciliationRequired")
+        expect(body).toMatchObject({ state: { recoveryState: "needs_reconciliation" } })
 
         await json<Research.ResearchRun>(
           await app().request(pathFor(ResearchPaths.runStatus, { runID: first.run.id }), {
             method: "PATCH",
             headers,
-            body: JSON.stringify({ status: "succeeded", metrics: { val_avg_mse: 0.2 } }),
+            body: JSON.stringify({ status: "failed", error: "Canceled queued preparation." }),
           }),
         )
 
@@ -1740,7 +1851,7 @@ describe("research routes", () => {
           await app().request(
             pathFor(ResearchPaths.taskCandidatePrepareRun, {
               taskID: task.id,
-              candidateID: seeded.candidates[1]!.id,
+              candidateID: seeded.candidates[0]!.id,
             }),
             {
               method: "POST",
@@ -1754,7 +1865,7 @@ describe("research routes", () => {
     })
   })
 
-  test("autonomous iteration does not create proposal candidates when maxParallel is full", async () => {
+  test("autonomous iteration does not create proposal candidates while execution needs reconciliation", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1785,9 +1896,9 @@ describe("research routes", () => {
             headers,
           }),
         )
-        expect(seeded.candidates).toHaveLength(3)
+        expect(seeded.candidates).toHaveLength(1)
 
-        for (const [index, candidate] of seeded.candidates.entries()) {
+        for (const candidate of seeded.candidates) {
           await json<Research.ResearchRun>(
             await app().request(ResearchPaths.runs, {
               method: "POST",
@@ -1796,8 +1907,8 @@ describe("research routes", () => {
                 taskID: task.id,
                 candidateID: candidate.id,
                 stage: "smoke",
-                status: index === 2 ? "queued" : "succeeded",
-                metrics: index === 2 ? {} : { val_avg_mse: 0.3 + index / 10 },
+                status: "queued",
+                metrics: {},
               }),
             }),
           )
@@ -1808,15 +1919,15 @@ describe("research routes", () => {
           headers,
           body: JSON.stringify({ stage: "smoke", description: "parallel full mutation" }),
         })
-        expect(response.status).toBe(400)
+        expect(response.status).toBe(409)
         const body = (await response.json()) as { name: string; data: { limit: number; used: number } }
-        expect(body.name).toBe("ResearchBudgetExceededError")
-        expect(body.data).toMatchObject({ limit: 1, used: 1 })
+        expect(body.name).toBe("ResearchReconciliationRequired")
+        expect(body).toMatchObject({ state: { recoveryState: "needs_reconciliation" } })
 
         const candidates = await json<Research.ResearchCandidate[]>(
           await app().request(pathFor(ResearchPaths.taskCandidates, { taskID: task.id }), { headers }),
         )
-        expect(candidates).toHaveLength(3)
+        expect(candidates).toHaveLength(1)
       },
     })
   })
@@ -1862,6 +1973,21 @@ describe("research routes", () => {
           }),
         )
 
+        const fullRun = await json<Research.ResearchRun>(
+          await app().request(ResearchPaths.runs, {
+            method: "POST", headers,
+            body: JSON.stringify({ taskID: task.id, candidateID: candidate.id, stage: "full", status: "succeeded",
+              metrics: { val_avg_mse: 0.123 }, resourceUsage: { executionContract: { status: "verified" } } }),
+          }),
+        )
+        await json<Research.ResearchArtifact>(
+          await app().request(ResearchPaths.artifacts, {
+            method: "POST", headers,
+            body: JSON.stringify({ taskID: task.id, runID: fullRun.id, kind: "runner_artifact",
+              uri: "file:///tmp/neo-cast/artifacts/run_route_full", metadata: {} }),
+          }),
+        )
+
         const blocked = await app().request(
           pathFor(ResearchPaths.taskCandidatePrepareRun, {
             taskID: task.id,
@@ -1873,11 +1999,11 @@ describe("research routes", () => {
             body: JSON.stringify({ stage: "ref_test", description: "blind ref test" }),
           },
         )
-        expect(blocked.status).toBe(400)
         const blockedBody = (await blocked.json()) as {
           name: string
           data: { kind: string; candidateID: string }
         }
+        expect(blocked.status, JSON.stringify(blockedBody)).toBe(400)
         expect(blockedBody.name).toBe("ResearchApprovalRequiredError")
         expect(blockedBody.data).toMatchObject({ kind: "ref_test", candidateID: candidate.id })
 
@@ -1970,8 +2096,9 @@ describe("research routes", () => {
             body: JSON.stringify({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
+              stage: "full",
               status: "succeeded",
+              resourceUsage: { executionContract: { status: "verified" } },
               metrics: { val_avg_mse: 0.25 },
             }),
           }),
@@ -2109,10 +2236,10 @@ describe("research routes", () => {
             body: JSON.stringify({
               taskID: task.id,
               candidateID: candidate.id,
-              stage: "smoke",
-              status: "running",
+              stage: "full",
+              status: "succeeded",
               metrics: {},
-              resourceUsage: {},
+              resourceUsage: { executionContract: { status: "verified" } },
               artifactRefs: [],
             }),
           }),

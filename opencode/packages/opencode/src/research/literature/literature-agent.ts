@@ -19,6 +19,8 @@ import { loadTaxonomy } from "./taxonomy"
 import { renderCardExport, renderReview, renderPrincipleReview } from "./report-renderer"
 import { extractPaperPrinciples } from "./paper-principle-extractor"
 import type { PrincipleModel } from "./principle-model"
+import { KNOWLEDGE_V2_VERSIONS, KnowledgeCardV2Schema } from "./knowledge-v2-contract"
+import { KnowledgeV2Store } from "./knowledge-v2-store"
 
 const DEFAULT_CARD_TYPES: CandidateClaim["cardType"][] = [
   "model_mechanism", "empirical_finding", "applicability_rule", "limitation", "evaluation_protocol", "implementation_hint",
@@ -63,55 +65,131 @@ export type ParserSummary = {
 export class LiteratureAgent {
   private readonly knowledgeRoot: string
   private readonly store: KnowledgeStore
+  private readonly principles: KnowledgeV2Store
 
   constructor(private readonly config: {
     readonly onProgress?: (progress: LiteratureProgress) => Promise<void>
     readonly neoCastRoot: string
     readonly workspaceRoot: string
     readonly model?: LiteratureExtractionModel
+    readonly principleModel?: PrincipleModel
+    readonly signal?: AbortSignal
     readonly knowledgeRoot?: string
     readonly pythonExecutable?: string
     readonly documentParser?: (source: LiteratureAgentInput["sources"][number]) => Promise<ParserSummary>
   }) {
     this.knowledgeRoot = path.resolve(config.knowledgeRoot ?? path.join(config.neoCastRoot, ".neo-cast", "literature-knowledge"))
     this.store = new KnowledgeStore(path.join(this.knowledgeRoot, "knowledge.db"))
+    this.principles = new KnowledgeV2Store(path.join(this.knowledgeRoot, "knowledge.db"))
   }
 
-  close() { this.store.close() }
+  close() { this.principles.close(); this.store.close() }
 
   async parseOnly(source: LiteratureAgentInput["sources"][number]) {
     return this.config.documentParser?.(source) ?? this.parseSource(source)
   }
 
-  // Explicit rollout entry point. V2 artifacts do not enter the legacy database,
-  // export index or task handoff until all downstream consumers support v2.
+  // Audit calls remain opt-in; the main run publishes only independently reviewed v2 principles.
   async runPrinciples(input: {
     source: LiteratureAgentInput["sources"][number]
     model: PrincipleModel
     verifier?: PrincipleModel
+    publish?: boolean
+    force?: boolean
+    maxCards?: number
     signal?: AbortSignal
     options?: { maxCalls?: number; batchCharacters?: number; maxContextCharacters?: number }
   }) {
     input.signal?.throwIfAborted()
+    if (input.maxCards !== undefined && (!Number.isInteger(input.maxCards) || input.maxCards < 1 || input.maxCards > 1000)) throw new Error("maxCards must be an integer between 1 and 1000")
+    await this.config.onProgress?.({ step: "parse", paperID: input.source.kind === "catalog_paper" ? input.source.paperID : undefined, status: "running" })
     const parsed = await this.parseOnly(input.source)
     const document = NormalizedDocumentSchema.parse(JSON.parse(await readFile(parsed.documentPath, "utf8")))
     const chunks = parseJsonl(await readFile(parsed.chunksPath, "utf8"), DocumentChunkSchema)
+    const inputDigest = digest({ versions: KNOWLEDGE_V2_VERSIONS, document, chunks, model: input.model.modelIdentifier,
+      verifier: (input.verifier ?? input.model).modelIdentifier, options: input.options, maxCards: input.maxCards })
+    const cached = input.publish && !input.force ? this.store.findCompletedRun(inputDigest) : undefined
+    if (cached) {
+      const runPath = path.join(this.knowledgeRoot, "principle-runs", String(cached.run_id))
+      const result = JSON.parse(await readFile(path.join(runPath, "result.json"), "utf8")) as Awaited<ReturnType<typeof extractPaperPrinciples>>
+      result.cards = result.cards.flatMap((value) => {
+        const card = this.principles.getCard(KnowledgeCardV2Schema.parse(value).knowledgeID)
+        return card ? [card] : []
+      })
+      return { ...result, runPath }
+    }
     const runID = `principles_${crypto.randomUUID()}`
-    const result = await extractPaperPrinciples({ ...input, document, chunks, runID })
+    await this.config.onProgress?.({ step: "extract", paperID: document.paperID, status: "running" })
+    const withProgress = (model: PrincipleModel): PrincipleModel => ({ modelIdentifier: model.modelIdentifier,
+      request: async (stage, payload) => {
+        input.signal?.throwIfAborted()
+        await this.config.onProgress?.({ step: stage === "verify" ? "verify" : "extract", paperID: document.paperID, status: "running" })
+        const response = await model.request(stage, payload)
+        input.signal?.throwIfAborted()
+        return response
+      } })
+    const result = await extractPaperPrinciples({ ...input, model: withProgress(input.model),
+      verifier: withProgress(input.verifier ?? input.model), document, chunks, runID })
+    input.signal?.throwIfAborted()
+    if (input.publish) {
+      const context = { paperID: document.paperID, documentID: document.documentID, documentSha256: document.sourceSha256, chunks }
+      const selected = result.cards.slice(0, input.maxCards ?? 30)
+      for (const omitted of result.cards.slice(selected.length)) result.deferred.push({ candidateID: omitted.candidateID, reason: "selection_budget" })
+      this.store.transaction(() => {
+        this.store.saveDocument({ document, chunks, documentPath: parsed.documentPath, parseStatus: parsed.status })
+        this.store.createRun({ runID, paperID: document.paperID, documentID: document.documentID, status: "running",
+          extractorModel: input.model.modelIdentifier, promptVersions: { synthesis: KNOWLEDGE_V2_VERSIONS.synthesis, verifier: KNOWLEDGE_V2_VERSIONS.verifier },
+          schemaVersions: { card: "knowledge_card_v2" }, inputDigest,
+          counters: { acceptedCount: 0, rejectedCount: result.rejected.length }, startedAt: Date.now() })
+      })
+      result.cards = this.principles.publish(selected, context, result.status === "completed" && result.deferred.length === 0)
+    }
     const runPath = path.join(this.knowledgeRoot, "principle-runs", runID)
     await writeJson(path.join(runPath, "result.json"), result)
     await writeJsonl(path.join(runPath, "knowledge_cards_v2.jsonl"), result.cards)
-    await atomicWrite(path.join(runPath, "review.md"), renderPrincipleReview(result))
+    await atomicWrite(path.join(runPath, "review.md"), renderPrincipleReview(result, input.publish ? "active_v2" : "audit_only"))
     await writeJson(path.join(runPath, "manifest.json"), {
       schemaVersion: "principle_run_manifest_v1", runID, status: result.status, cacheKey: result.cacheKey,
       documentSha256: document.sourceSha256, resultHash: digest(result),
-      acceptedCount: result.cards.length, rejectedCount: result.rejected.length,
-      publication: "audit_only", completedAt: new Date().toISOString(),
+      acceptedCount: result.cards.length, rejectedCount: result.rejected.length, verificationErrorCount: result.verificationErrors.length, deferredCount: result.deferred.length,
+      publication: input.publish ? "active_v2" : "audit_only", completedAt: new Date().toISOString(),
     })
+    if (input.publish) {
+      await this.export()
+      this.store.finishRun(runID, result.status, { acceptedCount: result.cards.length, rejectedCount: result.rejected.length, verificationErrorCount: result.verificationErrors.length, deferredCount: result.deferred.length })
+    }
     return { ...result, runPath }
   }
 
   async run(input: LiteratureAgentInput): Promise<LiteratureAgentResult> {
+    const maxCards = input.options?.maxCardsPerPaper ?? 30
+    if (!Number.isInteger(maxCards) || maxCards < 1 || maxCards > 1000) throw new Error("maxCardsPerPaper must be an integer between 1 and 1000")
+    const result: LiteratureAgentResult = { agent: "LiteratureAgent", runIDs: [], processed: [],
+      summary: { paperCount: input.sources.length, acceptedCardCount: 0, paperBackedCount: 0, agentInferenceCount: 0, duplicateCount: 0, failedCount: 0 } }
+    for (const source of input.sources) {
+      this.config.signal?.throwIfAborted()
+      try {
+        if (!this.config.principleModel) throw new Error("V2 principle extraction model is not configured")
+        const extracted = await this.runPrinciples({ source, model: this.config.principleModel, publish: true,
+          force: input.options?.force, maxCards, signal: this.config.signal })
+        result.runIDs.push(extracted.runID)
+        result.processed.push({ paperID: extracted.paperID, documentID: extracted.analysis?.documentID ?? "",
+          status: extracted.status, acceptedCardIDs: extracted.cards.map((c) => c.knowledgeID), rejectedCandidateCount: extracted.rejected.length,
+          warningCount: extracted.errors.length, reviewPath: path.join(extracted.runPath, "review.md") })
+        result.summary.acceptedCardCount += extracted.cards.length
+        result.summary.paperBackedCount += extracted.cards.length
+      } catch (error) {
+        if (error instanceof SyntaxError || (error instanceof Error && ["ZodError", "SQLiteError", "AbortError", "TimeoutError"].includes(error.name))) throw error
+        result.summary.failedCount++
+        result.processed.push({ paperID: source.kind === "catalog_paper" ? source.paperID : "unresolved-local-pdf",
+          documentID: "", status: "failed", acceptedCardIDs: [], rejectedCandidateCount: 0, warningCount: 0, reviewPath: "",
+          error: error instanceof Error ? error.message : String(error) })
+      }
+    }
+    return result
+  }
+
+  async runLegacyAudit(input: LiteratureAgentInput): Promise<LiteratureAgentResult> {
     const model = this.config.model ?? new DisabledExtractionModel()
     const options = {
       force: input.options?.force ?? false,
@@ -380,19 +458,35 @@ export class LiteratureAgent {
     ])
   }
 
-  async export(status?: string) {
+  async exportLegacyAudit(status?: string) {
     await this.exportCurrentCards(status)
     return { status: "completed", cardCount: this.store.listCards(status ? { status } : {}).length, exportRoot: path.join(this.knowledgeRoot, "exports") }
   }
 
-  validate() {
+  validateLegacyAudit() {
     const cards = this.store.listCards().map((item) => KnowledgeCardSchema.parse(item))
     return { status: "valid", cardCount: cards.length, relationCount: this.store.listRelations().length }
   }
 
-  showRun(runID: string) {
+  async export(status?: string) {
+    if (status && status !== "paper_backed") throw new Error("V2 export contains active reviewed principles; v1 status filters are unsupported")
+    const cards = this.principles.listCards()
+    const exportRoot = path.join(this.knowledgeRoot, "exports")
+    await writeJsonl(path.join(exportRoot, "knowledge_cards_v2.jsonl"), cards)
+    return { status: "completed", schemaVersion: "knowledge_card_v2", cardCount: cards.length, exportRoot }
+  }
+
+  validate() {
+    return { status: "valid", schemaVersion: "knowledge_card_v2", cardCount: this.principles.listCards().length }
+  }
+
+  async showRun(runID: string) {
     const run = this.store.getRun(runID)
     if (!run) throw new Error(`Extraction run not found: ${runID}`)
+    if (JSON.parse(String(run.schema_versions_json)).card === "knowledge_card_v2") {
+      const result = JSON.parse(await readFile(path.join(this.knowledgeRoot, "principle-runs", runID, "result.json"), "utf8"))
+      return { run, result }
+    }
     return { run, rejected: this.store.listRejected(runID) }
   }
 }

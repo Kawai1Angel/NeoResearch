@@ -1,3 +1,5 @@
+import { checkExperimentConstraints } from "./experiment-constraints"
+import { comparisonRecipe, hypothesisConstraints } from "./comparison-run"
 import { candidateMechanisms } from "./model-capabilities"
 import { createHash } from "crypto"
 import type { HypothesisObject } from "./agents/hypo-planner-agent"
@@ -42,6 +44,7 @@ export interface ExecutionContract {
   hypothesis_id: string | null
   candidate_id: string
   candidate_spec_sha256: string
+  experiment_constraints_sha256?: string
   expected: Record<string, unknown>
 }
 
@@ -59,6 +62,7 @@ export function buildExecutionContract(
     hypothesis_id: candidate.hypothesisID ?? null,
     candidate_id: candidate.id,
     candidate_spec_sha256: digest(payload),
+    experiment_constraints_sha256: digest(hypothesisConstraints(task.id, candidate.hypothesisID)),
     expected: {
       input_length: task.taskSpec.contextLength,
       head_input_width: spec.representation?.latentDim ?? Math.min(Number(task.taskSpec.contextLength), 64),
@@ -95,6 +99,7 @@ export function validateCandidateAgainstHypothesis(
   const mismatches: ContractMismatch[] = []
   const add = (path: string, expected: unknown, actual: unknown) =>
     mismatches.push({ path, expected, actual: actual ?? null, source: "hypothesis_candidate_gate" })
+  if (hypothesis.experimentContract) mismatches.push(...checkExperimentConstraints(hypothesis.experimentContract, spec, comparisonRecipe(candidate.taskID, hypothesis.experimentContract.comparisonRunID)))
   const mechanisms = candidateMechanisms(spec)
   for (const required of hypothesis.requiredMechanisms ?? [])
     if (!mechanisms.includes(required)) add(`requiredMechanisms.${required}`, true, false)
@@ -185,7 +190,31 @@ export function verifyExecutionRecords(
         mismatches.push({ path, expected, actual: actual ?? null })
     }
   }
-  if (verified && verified.status !== "verified")
-    mismatches.push({ path: "verification.status", expected: "verified", actual: verified.status ?? null })
+  // CV folds can interleave their output. A proof from one fold cannot cover
+  // another fold, and a later valid proof cannot hide an earlier invalid one.
+  const scopes = new Map<string, { manifest: number; proof: number }>()
+  for (const [index, record] of records.entries()) {
+    if (record?.event !== "executed_model_manifest" && record?.event !== "execution_contract_verified") continue
+    const scope = record.cv_fold_index === undefined ? "standard" : `fold:${record.cv_fold_index}`
+    const state = scopes.get(scope) ?? { manifest: -1, proof: -1 }
+    if (record.event === "executed_model_manifest") state.manifest = index
+    else {
+      state.proof = index
+      for (const [field, expected] of Object.entries({
+        candidate_id: contract.candidate_id,
+        candidate_spec_sha256: contract.candidate_spec_sha256,
+        contract_digest: digest(contract),
+        status: "verified",
+      }))
+        if (record[field] !== expected)
+          mismatches.push({ path: `verification.${field}`, expected, actual: record[field] ?? null })
+      if (state.manifest < 0)
+        mismatches.push({ path: `verification.${scope}`, expected: "preceding manifest in the same scope", actual: null })
+    }
+    scopes.set(scope, state)
+  }
+  for (const [scope, state] of scopes)
+    if (state.manifest >= 0 && state.proof < state.manifest)
+      mismatches.push({ path: `verification.${scope}`, expected: "proof after the final manifest in this scope", actual: null })
   return mismatches
 }

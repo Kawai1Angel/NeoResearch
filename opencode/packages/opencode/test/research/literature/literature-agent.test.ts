@@ -4,6 +4,7 @@ import { tmpdir } from "os"
 import path from "path"
 import { LiteratureAgent, type ParserSummary } from "../../../src/research/literature/literature-agent"
 import { FixtureExtractionModel } from "../../../src/research/literature/extraction-model"
+import { EVIDENCE_VALIDATION_VERSION } from "../../../src/research/literature/evidence-verifier"
 import { candidate, chunk, document } from "./fixtures"
 
 test("fixture model produces deterministic auditable run artifacts", async () => {
@@ -33,30 +34,30 @@ test("fixture model produces deterministic auditable run artifacts", async () =>
     documentParser: async () => parserSummary,
   })
   try {
-    const result = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }] })
+    const result = await agent.runLegacyAudit({ sources: [{ kind: "catalog_paper", paperID: document().paperID }] })
     expect(result.summary).toMatchObject({ paperCount: 1, acceptedCardCount: 1, paperBackedCount: 1, failedCount: 0 })
     expect(result.processed[0].status).toBe("completed")
     const runRoot = path.join(knowledgeRoot, "runs", result.runIDs[0])
     expect(await readFile(path.join(runRoot, "accepted_cards.jsonl"), "utf8")).toContain("paper_backed")
     expect(await readFile(path.join(runRoot, "review.md"), "utf8")).toContain("p.3")
     expect(await readFile(path.join(knowledgeRoot, "exports", "knowledge_cards.jsonl"), "utf8")).toContain("knowledge_card_v1")
-    const repeated = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }] })
+    const repeated = await agent.runLegacyAudit({ sources: [{ kind: "catalog_paper", paperID: document().paperID }] })
     expect(repeated.runIDs).toEqual(result.runIDs)
-    expect(agent.validate().cardCount).toBe(1)
+    expect(agent.validateLegacyAudit().cardCount).toBe(1)
     const originalExtract = model.extractCandidates.bind(model)
     model.extractCandidates = async () => [
       ...Array.from({ length: 30 }, (_, index) => candidate({ candidateID: `unsupported-${index}`, claim: "The method reduces MSE by 99% on ETTh1." })),
       candidate({ candidateID: "late-valid" }),
     ]
-    const budgeted = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }], options: { force: true, maxCardsPerPaper: 1 } })
+    const budgeted = await agent.runLegacyAudit({ sources: [{ kind: "catalog_paper", paperID: document().paperID }], options: { force: true, maxCardsPerPaper: 1 } })
     expect(budgeted.summary.acceptedCardCount).toBe(1)
     const budgetManifest = JSON.parse(await readFile(path.join(knowledgeRoot, "runs", budgeted.runIDs[0]!, "run_manifest.json"), "utf8"))
     expect(budgetManifest.counters.candidateCount).toBe(31)
     expect(budgetManifest.counters.qualityRejectedCount).toBe(30)
-    expect(await readFile(path.join(knowledgeRoot, "runs", budgeted.runIDs[0]!, "card_validation.jsonl"), "utf8")).toContain("evidence_validation_v3")
+    expect(await readFile(path.join(knowledgeRoot, "runs", budgeted.runIDs[0]!, "card_validation.jsonl"), "utf8")).toContain(EVIDENCE_VALIDATION_VERSION)
     model.extractCandidates = originalExtract
     model.verifyEvidence = async () => { throw new Error("fixture verifier format error") }
-    const failed = await agent.run({ sources: [{ kind: "catalog_paper", paperID: document().paperID }], options: { force: true } })
+    const failed = await agent.runLegacyAudit({ sources: [{ kind: "catalog_paper", paperID: document().paperID }], options: { force: true } })
     expect(failed.processed[0]!.status).toBe("partial")
     const failedRoot = path.join(knowledgeRoot, "runs", failed.runIDs[0]!)
     const rejected = JSON.parse((await readFile(path.join(failedRoot, "rejected_candidates.jsonl"), "utf8")).trim())
@@ -80,7 +81,7 @@ test("one source failure does not roll back another source", async () => {
     documentParser: async () => { calls += 1; throw new Error(`fixture failure ${calls}`) },
   })
   try {
-    const result = await agent.run({ sources: [{ kind: "catalog_paper", paperID: "one" }, { kind: "catalog_paper", paperID: "two" }] })
+    const result = await agent.runLegacyAudit({ sources: [{ kind: "catalog_paper", paperID: "one" }, { kind: "catalog_paper", paperID: "two" }] })
     expect(result.processed).toHaveLength(2)
     expect(result.summary.failedCount).toBe(2)
     expect(result.processed[0]!.error).toContain("fixture failure")

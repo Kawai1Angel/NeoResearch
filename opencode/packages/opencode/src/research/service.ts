@@ -1,6 +1,15 @@
-import { projectTaskEvidence } from "./retrieve/evidence-handoff"
+import { finalMetrics, finalEvaluationRecords } from "./runner-evidence"
+import { ExperimentConstraints, conflictingMechanismRequirements } from "./experiment-constraints"
+import { DesignUnavailable, DesignHistoryRequest, designTaskSpec, schemaRemovalUnavailable, frequencyModeUnavailable, mechanismRequirementsUnavailable, formatDesignValidationIssue } from "./design-feedback"
+import { comparisonRecipe } from "./comparison-run"
+import { readDesignHistory } from "./design-history"
+import { KnowledgeValidationDraftSchema } from "./literature/knowledge-confidence"
+import { confirmKnowledgeExperiment, readReflectionKnowledge } from "./literature/knowledge-feedback"
+import { ExperienceDraftSchema, experienceFromMemory, experiencePromptRecord } from "./experience"
+import { captureExperienceContext, readExperiences, writeExperience } from "./experience-store"
+import { projectTaskEvidence, citableTaskEvidence } from "./retrieve/evidence-handoff"
 import { timedEffect } from "@/util/runtime-timing"
-import { extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure, type TrainingCurvePoint } from "./runner-evidence"
+import { extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure, reflectionExecutionEvidence, type TrainingCurvePoint } from "./runner-evidence"
 import { supersedeIntentCheckpoints } from "./taskspec-store"
 import { taskExecutionRoot, taskSessionModel, validateTaskRuntimePaths } from "./task-isolation"
 import { readSelectedSessionModel, resolveSessionModel } from "./session-model"
@@ -19,7 +28,7 @@ import { abortable } from "./abortable"
 import { EffectBridge } from "@/effect"
 import { recoverLiteratureReceipt } from "./literature-session-receipt"
 import { createLiteraturePhase, bindLiteratureSession, type LiteraturePhase } from "./literature-phase-executor"
-import { KnowledgeStore } from "./literature/knowledge-store"
+import { KnowledgeV2Store } from "./literature/knowledge-v2-store"
 import { buildExecutionContract, digest, validateCandidateAgainstHypothesis, verifyExecutionRecords, type ExecutionContract, type ContractMismatch } from "./execution-contract"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Context, Effect, Layer, Schema, Stream, Semaphore } from "effect"
@@ -103,7 +112,7 @@ import {
 } from "./schema"
 import { MODEL_CAPABILITIES, validMechanisms, unsupportedMechanisms } from "./model-capabilities"
 import { Event } from "./event"
-import { addHypothesisToPool, bindTaskEvidenceToSession, loadTaskEvidenceForTask } from "./hypothesis-store"
+import { addHypothesisToPool, updateHypothesisInPool, bindTaskEvidenceToSession, loadTaskEvidenceForTask } from "./hypothesis-store"
 import {
   type DomainCandidateProposal,
   DomainRunPlan as DomainRunPlanSchema,
@@ -157,7 +166,6 @@ import {
   buildHypoPlannerResult,
   buildHypothesesYaml,
   extractEvidenceSummary,
-  generateHypotheses,
   validateHypothesisEvidence,
   referenceBaselineOptions,
   parseNextExperiment,
@@ -334,6 +342,9 @@ export const ApprovalRequiredError = NamedError.create(
     kind: z.string(),
   }),
 )
+
+const DesignUnavailableError = NamedError.create("ResearchDesignUnavailable", z.object({ report: DesignUnavailable }))
+const DesignPlanningStopped = NamedError.create("ResearchDesignPlanningStopped", z.object({ reason: z.string() }))
 
 export const PipelineBlockedError = NamedError.create(
   "ResearchPipelineBlockedError",
@@ -594,23 +605,7 @@ function runnerLineHasFiniteValidationLoss(line: string) {
 }
 
 function metricsFromRecords(records: Record<string, unknown>[], stage?: DomainRunStage) {
-  const metrics: Record<string, number> = {}
-  for (const record of records) {
-    for (const [key, value] of Object.entries(record)) {
-      const acceptsStageMetric =
-        stage === "ref_test"
-          ? key.startsWith("ref_test_")
-          : stage === undefined
-            ? key.startsWith("val_") || key.startsWith("ref_test_")
-            : stage === "smoke"
-              ? key.startsWith("val_")
-              : key.startsWith("cv_") || key.startsWith("val_")
-      if (acceptsStageMetric && typeof value === "number") {
-        metrics[key] = value
-      }
-    }
-  }
-  return metrics
+  return finalMetrics(records, stage)
 }
 
 function objectiveMetricName(objective: ResearchTask["objective"]) {
@@ -812,6 +807,7 @@ function mapHypothesisRow(row: ResearchHypothesisRow): HypothesisObject {
     expectedOutcome: row.expected_outcome,
     suggestedBackbones: Array.isArray(row.suggested_backbones) ? (row.suggested_backbones as string[]) : [],
     suggestedPreprocessing: Array.isArray(row.suggested_preprocessing) ? (row.suggested_preprocessing as string[]) : [],
+    ...(row.experiment_contract ? { experimentContract: ExperimentConstraints.parse(row.experiment_contract) } : {}),
     requiredMechanisms: validMechanisms(row.required_mechanisms) ? row.required_mechanisms : [],
     risk: row.risk,
     testable: row.testable,
@@ -1035,27 +1031,6 @@ function candidateActionSummary(candidateSpec: ResearchCandidate["candidateSpec"
     if (value !== undefined) summary[key] = value
   }
   return summary
-}
-
-function runCandidateMemorySummary(
-  candidate: ResearchCandidate | undefined,
-  run: ResearchRun,
-  extra: Record<string, unknown>,
-) {
-  const summary: Record<string, unknown> = {
-    ...(candidate === undefined ? {} : { candidateID: candidate.id }),
-    runID: run.id,
-    stage: run.stage,
-    ...extra,
-  }
-  if (candidate !== undefined) {
-    const recipeID = candidateRecipeID(candidate.candidateSpec)
-    if (recipeID !== undefined) summary.recipeID = recipeID
-    summary.candidateSpec = candidate.candidateSpec
-    const actions = candidateActionSummary(candidate.candidateSpec)
-    if (Object.keys(actions).length > 0) summary.candidateActions = actions
-  }
-  return summary as JsonRecord
 }
 
 function candidateUsesNativeDomainAction(candidateSpec: ResearchCandidate["candidateSpec"]) {
@@ -2140,42 +2115,6 @@ function buildHypoPlannerSystemPrompt(): string {
   return PROMPT_RESEARCH_HYPO_PLANNER
 }
 
-const MODEL_RECIPE_LIBRARY = {
-  description: "NeoResearch TSF ModelRecipe components available for hypothesis design.",
-  preferences: [
-    "Prefer dlinear or linear as low-variance baselines before committing to higher-capacity backbones.",
-    "Use series_decomposition or instance_norm preprocessing when seasonality or trend strength is detected.",
-    "Patch embedding works well with transformer and mlp backbones; avoid patch with dlinear/tcn/nbeats/timesnet_lite.",
-    "Channel-mixing fusion (feature_mlp, variate_attention, temporal_then_feature) tests cross-variate dependencies.",
-    "For missing data, place missing_mask first and use cross-variable fusion so its appended channels affect forecasts.",
-    "sample_reweighting is useful under distribution shift but should be validated against time-ordered splits.",
-    "If a candidate's training curve is unstable (loss spikes, oscillation, or NaN), prefer hypotheses that adjust training.learning_rate (lower it) or add training.warmup_ratio (e.g. 0.1-0.3) before concluding the architecture/preprocessing choice itself is the problem.",
-  ],
-  backbones: {
-    diagonal_ssm: "Real diagonal state-space recurrence with stable ZOH discretization; explicit sequence readout.",
-    timesblock_encoder: "Sample-local FFT period selection and Inception 2D TimesBlock; not native TimesNet.",
-    mamba: "Mamba-1 selective state-space encoder with CPU torch_reference backend; CUDA not verified.",
-    linear: "Shared or per-variable linear encoder; the prediction head owns the horizon projection.",
-    mlp: "Multi-layer perceptron; moderate capacity, patch-friendly.",
-    transformer: "Self-attention over patch tokens; high capacity, requires sufficient data.",
-    dlinear: "Decomposed linear (trend + seasonal split); strong on ETT-style benchmarks.",
-    tcn: "Temporal convolutional network; effective for local temporal patterns.",
-    nbeats: "Basis expansion with interpretable blocks; strong for seasonal/trend decomposition.",
-    timesnet_lite: "Paper-derived FFT period selection and compact 2D convolution; not a full TimesNet reproduction.",
-    rnn: "Recurrent sequence model; handles irregular sampling but slower to train.",
-    gated_depthwise_conv: "Gated depthwise temporal convolution; no state recurrence or selective scan, not an SSM.",
-    mixer: "MLP-Mixer over time and channel dimensions; fast channel-mixing alternative.",
-  },
-  preprocessing: {
-    none: "No preprocessing; suitable for already-normalized inputs.",
-    last_value_centering: "Explicit subtract-last and restore-last transform for an NLinear-style baseline.",
-    instance_norm: "Per-instance normalization; reduces distribution shift within a sequence.",
-    series_decomposition: "Independent trainable linear trend branch plus recipe residual encoder/head; not combined with DLinear.",
-    seasonal_differencing: "Removes periodic trend via seasonal differencing; phase2+.",
-    missing_mask: "Binary mask features for missing values; required when missingRate > 0.",
-    sample_reweighting: "Reweight training samples by recency or quality; phase2+.",
-  },
-}
 
 function buildTaskDefinition(task: ResearchTask): Record<string, unknown> {
   const spec = recordValue(task.taskSpec)
@@ -2250,76 +2189,25 @@ function buildRetrieveTaskContext(task: ResearchTask): RetrieveTaskContext {
 function buildHypoPlannerUserPrompt(
   task: ResearchTask,
   dataAnalysisSummary: string,
-  runs: readonly ResearchRun[],
-  memory: readonly ResearchMemory[],
   existingHypotheses: readonly { id?: string; statement: string; status: string }[],
-  latestReflection: LatestReflectionSummary,
-  llmSearchPreferences?: string[],
   abandonedHypotheses?: readonly { statement: string }[],
   taskEvidence?: TaskEvidenceBundle,
   opts?: {
     sessionMode?: boolean
     baselineOptions?: readonly { recipeID: string; description: string }[]
-    experimentHistory?: readonly unknown[]
+    requestedHistory?: readonly unknown[]
   },
 ): string {
-  const primaryMetricName = typeof (task.objective as Record<string, unknown>)?.primaryMetric === "string"
-    ? (task.objective as Record<string, unknown>).primaryMetric as string
-    : "cv_avg_mse"
-  const recentMemoryLessons = memory.slice(-8).map((m) => {
-    const cs = recordValue(m.candidateSummary)
-    const actions = recordValue(cs.candidateActions)
-    return {
-      outcome: m.outcome,
-      lesson: m.lesson,
-      ...(Object.keys(actions).length > 0 ? { modelDesign: actions } : {}),
-      ...(typeof cs.primaryMetric === "number" ? { primaryMetric: cs.primaryMetric } : {}),
-      ...(typeof cs.recipeID === "string" ? { recipeID: cs.recipeID } : {}),
-    }
-  })
-  // In session mode the agent fetches reflection and run results via tools (read_reflection,
-  // experiment_results) — omit those fields from the prompt to avoid redundancy.
-  const includeInlineContext = !opts?.sessionMode
-  const triedConfigurations = includeInlineContext
-    ? runs
-        .filter((r) => r.status === "succeeded" || r.status === "failed")
-        .map((r) => {
-          const metrics = r.metrics as Record<string, unknown> | null | undefined
-          const metricVal = metrics ? metrics[primaryMetricName] : undefined
-          return {
-            runID: r.id,
-            status: r.status,
-            ...(typeof metricVal === "number" ? { [primaryMetricName]: metricVal } : {}),
-            ...(r.error ? { error: r.error.slice(0, 120) } : {}),
-          }
-        })
-    : undefined
   return JSON.stringify(
-    compactPromptContext({
-      taskSpec: task.taskSpec,
+    {
+      taskSpec: designTaskSpec(task.taskSpec),
       taskDefinition: buildTaskDefinition(task),
+      designFeedback: recordValue(task.taskSpec.metadata).designFeedback ?? null,
       modelCapabilities: MODEL_CAPABILITIES,
-      experimentHistory: opts?.experimentHistory ?? null,
+      ...(opts?.requestedHistory?.length ? { requestedHistory: opts.requestedHistory } : {}),
+      historyAccess: { tool: "experiment_results", filters: ["runID", "candidateID", "hypothesisID", "limit", "offset"], directMode: "Return {status:history_request,request:{runID:...}} to retrieve a comparison before planning." },
       searchProgress: recordValue(task.taskSpec.metadata).searchProgress ?? null,
       dataAnalysis: dataAnalysisSummary,
-      methodLibrary: llmSearchPreferences && llmSearchPreferences.length > 0
-        ? { ...MODEL_RECIPE_LIBRARY, preferences: llmSearchPreferences }
-        : MODEL_RECIPE_LIBRARY,
-      ...(includeInlineContext
-        ? {
-            previousReflection: latestReflection
-              ? {
-                  decision: latestReflection.decision,
-                  decisionReason: latestReflection.decisionReason,
-                  reflectionNotes: buildReflectionPlanningMarkdown(latestReflection),
-                }
-              : null,
-          }
-        : {}),
-      memoryLessons: recentMemoryLessons.length > 0 ? recentMemoryLessons : null,
-      ...(includeInlineContext && triedConfigurations && triedConfigurations.length > 0
-        ? { triedConfigurations }
-        : {}),
       existingHypotheses: existingHypotheses.length > 0
         ? existingHypotheses.map((h) => ({ id: h.id, statement: h.statement, status: h.status }))
         : null,
@@ -2333,8 +2221,9 @@ function buildHypoPlannerUserPrompt(
         ? { baselineOptions: opts.baselineOptions }
         : {}),
       instruction:
-        "If previousReflection is null (first iteration), generate a fresh list of exactly 2-3 hypotheses grounded in dataAnalysis — do not add more. " +
-        "Otherwise, identify the single existingHypothesis most recently tested (the one triedConfigurations/previousReflection refers to) and act on that one only: " +
+        "If designFeedback is present, handle it before ordinary reflection maintenance: the named hypothesis was NOT tested. Inspect the exact conflicts and regenerate a feasible hypothesis (or explicitly revise the original), then select it. Do not repeat an unchanged unavailable hypothesis or mark its mechanism refuted. A control need not contain the treatment mechanism. If no useful feasible experiment remains, select stop. " +
+        "If existingHypotheses is empty and designFeedback is absent (first iteration), generate a fresh list of exactly 2-3 hypotheses grounded in dataAnalysis — do not add more. " +
+        "When designFeedback is absent and hypotheses exist, identify the single existingHypothesis most recently tested (identify it from requested experiment history/reflection) and act on that one only: " +
         "refine its statement/expectedOutcome if reflection provides new evidence, or drop it if reflection confirms it is exhausted or refuted. " +
         "If you drop it (it is now abandoned), add exactly one new replacement hypothesis exploring a different idea/direction so the active hypothesis count does not shrink. " +
         "Leave every other existingHypothesis unchanged — they have not been tested yet and there is no new evidence about them. " +
@@ -2343,14 +2232,14 @@ function buildHypoPlannerUserPrompt(
         "Set expectedOutcome to a concrete, metric-referenced prediction. " +
         "Choose the next experiment yourself from the entire open pool, considering exploration, local plateau and completed results; no priority field controls scheduling. " +
         (opts?.sessionMode ? "Finish by calling hypothesis_select exactly once, with an open hypoID and an evidence-based rationale, or action=stop if no useful experiment remains. " : "Return hypotheses plus nextExperiment={action:experiment,hypothesisID,rationale} or {action:stop,rationale} in one JSON object. ") +
-        "Include requiredMechanisms for the mechanisms the hypothesis claims to test. Use modelCapabilities actual implementations; unsupported mechanisms cannot be inferred from backbone names. " +
+        "Include requiredMechanisms only for the candidate arm being generated, not all mechanisms discussed in the scientific hypothesis. A control that omits the treatment mechanism must not require it; requiredMechanisms and forbiddenMechanisms must not overlap. Use modelCapabilities actual implementations; unsupported mechanisms cannot be inferred from backbone names. " +
         "Only cite cardID/revision/role combinations supplied in taskEvidence; relevance is not truth confidence. " +
         "Use evidenceLevel=data_only with empty literatureEvidence when no eligible entry exists. " +
         "Treat expectedOutcome as a prediction, surface contradictions in risk/applicabilityAssumptions, and provide at least one falsificationCriteria item per non-baseline hypothesis." +
         (opts?.baselineOptions && opts.baselineOptions.length > 0
           ? " After the hypothesis pool is updated, call pick_baseline exactly once to choose the single reference baseline from baselineOptions, citing specific dataAnalysis evidence."
           : ""),
-    }),
+    },
     null,
     2,
   )
@@ -2359,10 +2248,16 @@ function buildHypoPlannerUserPrompt(
 function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
   const rec = recordValue(raw)
   if (Object.keys(rec).length === 0) return undefined
+  const experimentContract = rec.experimentContract === undefined ? undefined : ExperimentConstraints.safeParse(rec.experimentContract)
+  if (!experimentContract?.success) return undefined
   const id = typeof rec.id === "string" && rec.id.trim() ? rec.id.trim() : undefined
   const statement = typeof rec.statement === "string" && rec.statement.trim() ? rec.statement.trim() : undefined
   if (!id || !statement) return undefined
   if (rec.requiredMechanisms !== undefined && !validMechanisms(rec.requiredMechanisms)) return undefined
+  if (conflictingMechanismRequirements({
+    requiredMechanisms: validMechanisms(rec.requiredMechanisms) ? rec.requiredMechanisms : [],
+    experimentContract: experimentContract.data,
+  }).length) return undefined
   const filterStrings = (value: unknown) =>
     Array.isArray(value)
       ? (value as unknown[]).filter((s): s is string => typeof s === "string" && s.trim().length > 0)
@@ -2401,6 +2296,7 @@ function validateLLMHypothesisItem(raw: unknown): HypothesisObject | undefined {
     expectedOutcome,
     suggestedBackbones,
     suggestedPreprocessing,
+    ...(experimentContract?.success ? { experimentContract: experimentContract.data } : {}),
     requiredMechanisms: validMechanisms(rec.requiredMechanisms) ? rec.requiredMechanisms : [],
     risk,
     testable,
@@ -2454,16 +2350,11 @@ function parseLLMHypothesesResult(
 async function generateLLMHypotheses(
   task: ResearchTask,
   dataAnalysisSummary: string,
-  runs: readonly ResearchRun[],
-  memory: readonly ResearchMemory[],
-  draftHypotheses: readonly HypothesisObject[],
   workspaceRoot: string,
   onDelta?: (delta: string) => void,
   existingHypotheses?: readonly { id?: string; statement: string; status: string }[],
-  latestReflection?: LatestReflectionSummary,
   abandonedHypotheses?: readonly { statement: string }[],
   taskEvidence?: TaskEvidenceBundle,
-  experimentHistory?: readonly unknown[],
 ): Promise<{ hypotheses: readonly HypothesisObject[]; nextExperiment: NextExperimentDecision; usage: import("./llm-proposal").LLMTokenUsage } | undefined> {
   try {
     const runtime = recordValue(recordValue(task.taskSpec).runtime)
@@ -2483,19 +2374,30 @@ async function generateLLMHypotheses(
         ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
       }
     }
-    const llmSearchPreferences = await loadLLMSearchPreferences(workspaceRoot, task.id)
-    const system = buildHypoPlannerSystemPrompt() + "\nDirect mode: no tool calls. Return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms."
-    const user = buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses ?? [], latestReflection ?? null, llmSearchPreferences, abandonedHypotheses ?? [], taskEvidence, { experimentHistory })
-    const llmPromise = onDelta
-      ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
-      : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
-    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 120_000))
-    const result = await Promise.race([llmPromise, timeoutPromise])
-    if (!result) {
-      recordResearchEvent(workspaceRoot, "research.llm.fallback", { taskID: task.id, stage: "generateLLMHypotheses", reason: "timeout" })
-      return undefined
+    const system = buildHypoPlannerSystemPrompt() + "\nDirect mode: no native tool calls. To read historical facts return {status:history_request,request:{runID:...}} first; the coordinator returns the requested history. Otherwise return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms."
+    const requestedHistory: unknown[] = []
+    let validationFeedback: string | undefined
+    let repairAttempts = 0
+    for (let historyRound = 0; historyRound <= 5; historyRound++) {
+      const user = JSON.stringify({ ...JSON.parse(buildHypoPlannerUserPrompt(task, dataAnalysisSummary, existingHypotheses ?? [], abandonedHypotheses ?? [], taskEvidence, { requestedHistory })), ...(validationFeedback ? { validationFeedback } : {}) })
+      const llmPromise = onDelta
+        ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
+        : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const result = await Promise.race([llmPromise, new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 120_000) })]).finally(() => clearTimeout(timer))
+      if (!result) return undefined
+      const request = DesignHistoryRequest.safeParse(extractJsonObject(result.text))
+      if (request.success) {
+        if (historyRound === 5) return undefined
+        requestedHistory.push({ request: request.data.request, result: await readDesignHistory(task.id, request.data.request) })
+        continue
+      }
+      const parsed = parseLLMHypothesesResult(result.text, result.usage)
+      if (parsed) return parsed
+      if (++repairAttempts > 1) return undefined
+      validationFeedback = "Previous response was invalid. Return hypotheses with a valid predeclared experimentContract for EACH hypothesis, requiredMechanisms for its candidate arm, id and statement, plus nextExperiment selecting one of these IDs or explicitly stopping. Never require and forbid the same mechanism; a control removing decomposition must not require decomposition. Do not silently change a controlled hypothesis into exploration. Retrieve the comparison run if needed."
     }
-    return parseLLMHypothesesResult(result.text, result.usage)
+    return undefined
   } catch (error) {
     recordResearchEvent(workspaceRoot, "research.llm.fallback", { taskID: task.id, stage: "generateLLMHypotheses", error: String(error) })
     return undefined
@@ -2520,6 +2422,9 @@ interface ReflectionLLMContext {
   readonly recentMemories: readonly string[]
   /** Lesson from the memory entry that recorded the all-time best metric. */
   readonly bestMemoryLesson?: string
+  readonly sourceRuns?: readonly unknown[]
+  readonly experiences?: readonly unknown[]
+  readonly literatureKnowledge?: Awaited<ReturnType<typeof readReflectionKnowledge>>
 }
 
 function buildReflectionLLMSystemPrompt(): string {
@@ -2558,13 +2463,16 @@ function buildReflectionSessionUserPrompt(
         latestDelta: analysis.latestDelta ?? null,
         succeededRuns: analysis.succeededRuns,
         inconclusiveRuns: analysis.inconclusiveRuns,
+        hypothesisTestedRuns: analysis.hypothesisTestedRuns,
+        unattributableRuns: analysis.unattributableRuns,
         failedRuns: analysis.failedRuns,
         rejectedRuns: analysis.rejectedRuns,
         plateauStreak: analysis.plateauStreak,
       },
       instruction:
         "Follow the 4-step tool workflow in the system prompt (experiment_results → read_reflection → " +
-        "read_training_curve → read_memory_lessons), then output the 7-key JSON analysis object.",
+        "read_training_curve → read_memory_lessons). Read structured experience with read_experiences when helpful. " +
+        "Optionally call write_experience for useful findings. Read literature using read_knowledge_cards and confirm_knowledge only when current experiment facts validate a supplied claim; then output the 7-key JSON analysis object.",
     }),
     null,
     2,
@@ -2573,7 +2481,7 @@ function buildReflectionSessionUserPrompt(
 
 function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: ReflectionLLMContext): string {
   return JSON.stringify(
-    compactPromptContext({
+    { ...recordValue(compactPromptContext({
       taskSpec: context.taskSpec,
       taskObjective: context.taskObjective,
       maxIterations: context.maxIterations,
@@ -2590,6 +2498,8 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
         latestDelta: analysis.latestDelta ?? null,
         succeededRuns: analysis.succeededRuns,
         inconclusiveRuns: analysis.inconclusiveRuns,
+        hypothesisTestedRuns: analysis.hypothesisTestedRuns,
+        unattributableRuns: analysis.unattributableRuns,
         failedRuns: analysis.failedRuns,
         rejectedRuns: analysis.rejectedRuns,
         plateauStreak: analysis.plateauStreak,
@@ -2619,9 +2529,13 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
         recentLessons: context.recentMemories,
         bestResultLesson: context.bestMemoryLesson ?? null,
       },
+      sourceRuns: context.sourceRuns ?? [],
+      experiences: context.experiences ?? [],
+      experienceWriteSchema: z.toJSONSchema(ExperienceDraftSchema),
+      knowledgeValidationSchema: z.toJSONSchema(KnowledgeValidationDraftSchema),
       decision: analysis.decision,
       decisionReason: analysis.decisionReason,
-    }),
+    })), literatureKnowledge: context.literatureKnowledge },
     null,
     2,
   )
@@ -2652,6 +2566,12 @@ function parseReflectionLLMStructured(text: string): ReflectionLLMAnalysis | und
       modelDesignReflection,
       nextStepRecommendation,
       distillableMemory,
+      ...(parsed.knowledgeValidations === undefined ? {} : {
+        knowledgeValidations: z.array(KnowledgeValidationDraftSchema).max(3).parse(parsed.knowledgeValidations),
+      }),
+      ...(parsed.experienceWrites === undefined ? {} : {
+        experienceWrites: z.array(ExperienceDraftSchema).max(3).parse(parsed.experienceWrites),
+      }),
     }
   } catch {
     return undefined
@@ -2733,18 +2653,6 @@ async function generateLLMReflectionSynthesis(
   } catch {
     return { ...result, llm: { status: "failed" } }
   }
-}
-
-function buildReflectionMemoryLesson(result: ReflectionAgentResult): string {
-  const a = result.analysis
-  const parts: string[] = [`[reflection] ${a.decision}: ${a.decisionReason}`]
-  if (a.bestMetric !== undefined) parts.push(`best ${a.primaryMetricName}=${a.bestMetric}`)
-  if (result.llm.status === "used" && result.llm.structured) {
-    parts.push(`memory: ${result.llm.structured.distillableMemory.slice(0, 400)}`)
-  } else if (result.llm.status === "used" && result.llm.text) {
-    parts.push(`llm: ${result.llm.text.slice(0, 300)}`)
-  }
-  return parts.join(" | ")
 }
 
 function buildDatasetAnalysisReports(
@@ -3253,30 +3161,6 @@ function resolveDatasetSplitRows(config: NonNullable<ReturnType<typeof tsfDatase
   return splitRows
 }
 
-function datasetSourceKey(dataset: Record<string, unknown>) {
-  if (typeof dataset.path === "string" && dataset.path.trim().length > 0) {
-    const absolutePath = path.resolve(dataset.path)
-    const hash = hashFilePrefix(absolutePath)
-    return hash === undefined ? absolutePath : `${absolutePath}#sha256_1mb=${hash}`
-  }
-  if (typeof dataset.loaderID === "string" && dataset.loaderID.length > 0) return `loader:${dataset.loaderID}`
-  return "unknown"
-}
-
-function hashFilePrefix(filePath: string) {
-  let fd: number | undefined
-  try {
-    fd = openSync(filePath, "r")
-    const buffer = Buffer.alloc(1024 * 1024)
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0)
-    return createHash("sha256").update(buffer.subarray(0, bytesRead)).digest("hex").slice(0, 16)
-  } catch {
-    return undefined
-  } finally {
-    if (fd !== undefined) closeSync(fd)
-  }
-}
-
 function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectRoot: string) {
   const config = tsfDatasetPreparationConfig(task)
   if (!config) {
@@ -3311,12 +3195,15 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectR
     args.push("--target-cols", config.targetCols.join(","))
     if (config.observedPastCovariates.length > 0)
       args.push("--observed-past-covariates", config.observedPastCovariates.join(","))
-    if (config.knownFutureCovariates.length > 0)
+    // Availability metadata can describe the absence of future covariates.
+    // Only pass it to the runner when there are actual future columns.
+    if (config.knownFutureCovariates.length > 0) {
       args.push("--known-future-covariates", config.knownFutureCovariates.join(","))
+      if (config.knownFutureSource) args.push("--known-future-source", config.knownFutureSource)
+      if (config.knownFutureAvailable !== undefined)
+        args.push("--known-future-available", String(config.knownFutureAvailable))
+    }
     if (config.staticCovariates.length > 0) args.push("--static-covariates", config.staticCovariates.join(","))
-    if (config.knownFutureSource) args.push("--known-future-source", config.knownFutureSource)
-    if (config.knownFutureAvailable !== undefined)
-      args.push("--known-future-available", String(config.knownFutureAvailable))
     if (config.experimentScope) args.push("--experiment-scope", config.experimentScope)
   }
   if (config.contextLength !== undefined) args.push("--input-len", String(config.contextLength))
@@ -3913,6 +3800,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 suggested_backbones: [...h.suggestedBackbones],
                 suggested_preprocessing: [...h.suggestedPreprocessing],
                 priority: "medium",
+                experiment_contract: h.experimentContract ?? null,
                 required_mechanisms: [...(h.requiredMechanisms ?? [])],
                 risk: h.risk,
                 testable: h.testable,
@@ -4188,6 +4076,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const baselineHypothesis = task.domainID === "tsf"
           ? yield* Effect.promise(() => addHypothesisToPool(task.id, {
               statement: proposal.rationale,
+              experimentContract: ExperimentConstraints.parse({ mode: "baseline", requiredValues: Object.entries(proposal.candidateSpec).filter(([key]) => ["preprocessing", "embedding", "backbone", "representation", "composition", "fusion", "predictionHead", "trainingStrategy"].includes(key)).map(([path, value]) => ({ path, value })) }),
               motivation: ["Establish a reference baseline under the task evaluation protocol."],
               expectedOutcome: "Produce a reproducible metric floor for subsequent hypothesis tests.",
               suggestedBackbones: [String(recordValue(proposal.candidateSpec.backbone).type)],
@@ -4613,6 +4502,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       yield* ensureRunApprovalGates(task, candidate, input.stage)
       const time = nowTime()
       const activeCycle = yield* db((d) => d.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.active_task, input.taskID)).get())
+      const experienceContext = yield* Effect.promise(() => captureExperienceContext(task))
       const row = yield* db((d) =>
         d
           .insert(ResearchRunTable)
@@ -4623,7 +4513,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             stage: input.stage,
             status,
             metrics: status === "invalid" ? {} : input.metrics ?? {},
-            resource_usage: { ...input.resourceUsage, ...(activeCycle ? { cycleID: activeCycle.id } : {}) },
+            resource_usage: { ...input.resourceUsage, experienceContext, ...(activeCycle ? { cycleID: activeCycle.id } : {}) } as JsonRecord,
             artifact_refs: input.artifactRefs ? [...input.artifactRefs] : [],
             time_created: time.created,
             time_updated: time.updated,
@@ -4644,7 +4534,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         yield* updateTaskStatus({ taskID: task.id, status: "researching" })
       }
       if (run.status === "succeeded") yield* evaluateSucceededRun(run)
-      if (run.status === "failed" || run.status === "rejected") yield* recordFailedRunMemory(run)
       return run
     })
 
@@ -5013,7 +4902,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         candidateID: candidate.id,
         stage,
         status: "queued",
-        resourceUsage: { ...(input.seed === undefined ? {} : { seed: input.seed }), ...(interrupted ? { retry_of: interrupted.id } : {}) },
+        resourceUsage: { ...(input.seed === undefined ? {} : { seed: input.seed }), ...(interrupted ? { retry_of: interrupted.id } : {}),
+          hypothesisSnapshot: JSON.parse(JSON.stringify((yield* listHypotheses(task.id)).find((h) => h.id === candidate.hypothesisID) ?? null)),
+        },
       })
 
       const root = runnerPath(Instance.directory, ".neo-research/run-plans")
@@ -5122,7 +5013,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (!run.candidateID) return
       if (task.domainID === "tsf" && (!((run.resourceUsage as any).executionContract?.status === "verified") || run.stage !== "full")) return
       const candidate = yield* getCandidateForTask(task.id, run.candidateID)
-      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
       const evaluation =
         DomainRegistry.evaluateRun(task.domainID, { task, candidate, run }) ?? fallbackRunEvaluation(task, run)
       const metricName = evaluation.primaryMetricName
@@ -5214,56 +5104,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         })
       }
 
-      const evalDataset = recordValue(recordValue(task.taskSpec).dataset)
-      const evalSourceCsv = datasetSourceKey(evalDataset)
-      yield* createMemory({
-        taskID: task.id,
-        domainID: task.domainID,
-        fingerprintSummary: {
-          ...taskFingerprint,
-          taskID: task.id,
-          domainID: task.domainID,
-          primaryMetricName: metricName,
-          direction,
-          sourceCsv: evalSourceCsv,
-        },
-        candidateSummary: runCandidateMemorySummary(candidate, run, {
-          primaryMetric: comparisonMetric,
-          championUpdated,
-          ...(Object.keys(seedGate).length === 0 ? {} : { seedGate }),
-          ...(championStandoff === undefined ? {} : { championStandoff }),
-        }),
-        outcome: championUpdated ? "accepted" : "rejected",
-        lesson: championUpdated
-          ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} became champion on ${metricName}=${comparisonMetric}.`
-          : championStandoff !== undefined
-            ? `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} champion standoff on ${metricName}=${comparisonMetric}; ${championStandoff.secondaryMetricName} regressed versus ${championStandoff.championCandidateID}.`
-          : `[dataset:${evalSourceCsv}] Candidate ${run.candidateID} did not improve champion on ${metricName}=${comparisonMetric}.`,
-      })
-    })
-
-    const recordFailedRunMemory = Effect.fn("Research.recordFailedRunMemory")(function* (run: ResearchRun) {
-      const task = yield* getTask(run.taskID)
-      const taskFingerprint = DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) })
-      const candidate = run.candidateID === undefined ? undefined : yield* getCandidateForTask(task.id, run.candidateID)
-      const failedDataset = recordValue(recordValue(task.taskSpec).dataset)
-      const failedSourceCsv = datasetSourceKey(failedDataset)
-      yield* createMemory({
-        taskID: task.id,
-        domainID: task.domainID,
-        fingerprintSummary: {
-          ...taskFingerprint,
-          taskID: task.id,
-          domainID: task.domainID,
-          status: run.status,
-          sourceCsv: failedSourceCsv,
-        },
-        candidateSummary: runCandidateMemorySummary(candidate, run, {
-          status: run.status,
-        }),
-        outcome: "failed",
-        lesson: `[dataset:${failedSourceCsv}] Candidate ${run.candidateID} failed during ${run.stage}: ${run.error ?? run.status}`,
-      })
+      // Preserve the evaluation decision as a run fact, independently of optional experience curation.
+      const evaluated = yield* db((d) => d.update(ResearchRunTable).set({
+        resource_usage: { ...run.resourceUsage, evaluationDecision: {
+          primaryMetricName: metricName, primaryMetric: comparisonMetric, championUpdated,
+          ...(Object.keys(seedGate).length ? { seedGate } : {}),
+          ...(championStandoff ? { championStandoff } : {}),
+        } } as JsonRecord,
+      }).where(eq(ResearchRunTable.id, run.id)).returning().get())
+      if (evaluated) yield* bus.publish(Event.RunUpdated, { run: mapRun(evaluated) })
     })
 
     const executePreparedRun = logPhaseMethod("executePreparedRun", Effect.fn("Research.executePreparedRun")(function* (
@@ -5462,6 +5311,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const reproducibility = succeeded
         ? yield* Effect.promise(() => buildReproducibilitySeal(task, prepared.runPlan, Instance.directory))
         : undefined
+      const cvEvidence = yield* Effect.promise(async () => {
+        for (const directory of artifactDirsFromRecords(execution.records)) {
+          try {
+            const value = JSON.parse(await readFile(path.join(directory, "cv_metrics.json"), "utf8"))
+            if (value?.schema_version === "cv_metrics.v1") return value as JsonRecord
+          } catch { /* Absent for fixed-split evaluation; never invent fold evidence. */ }
+        }
+        return null
+      })
       const run = yield* updateRunStatus({
         runID: running.id,
         status: contractInvalid ? "invalid" : duplicateRunning ? "rejected" : succeeded ? "succeeded" : "failed",
@@ -5474,6 +5332,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           exitCode: execution.exitCode,
           executionContract: contract ? { status: duplicateRunning ? "not_executed" : contractInvalid ? "invalid" : "verified", contractDigest: digest(contract), candidateID: contract.candidate_id, manifest: execution.records.findLast((record) => record.event === "executed_model_manifest"), verified: execution.records.findLast((record) => record.event === "execution_contract_verified") } : undefined,
           runnerID: prepared.runPlan.runnerID,
+          modelResources: execution.records.findLast((record) => record.event === "resource_summary"),
+          evaluationEvidence: { finalEvents: finalEvaluationRecords(execution.records), protocol: task.taskSpec.evaluation ?? null, cv: cvEvidence },
           ...(reproducibility === undefined ? {} : { reproducibility }),
         } as ResearchRun["resourceUsage"],
         artifactRefs,
@@ -6006,7 +5866,29 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       let modelDesignerRawText: string | undefined
       let modelDesignerCallPath: "session" | "direct" | undefined
       if (!candidate) {
-        const memory = yield* listRelatedMemory(task)
+        if (selectedHypothesis?.experimentContract && task.domainID === "tsf") {
+          const conflict = mechanismRequirementsUnavailable({
+            hypothesisID: selectedHypothesis.id,
+            requiredMechanisms: selectedHypothesis.requiredMechanisms,
+            experimentContract: selectedHypothesis.experimentContract,
+          })
+          if (conflict) throw new DesignUnavailableError({ report: conflict })
+          const comparison = comparisonRecipe(task.id, selectedHypothesis.experimentContract.comparisonRunID)
+          const frequencyConflict = frequencyModeUnavailable({
+            hypothesisID: selectedHypothesis.id,
+            contract: selectedHypothesis.experimentContract,
+            comparison,
+          })
+          if (frequencyConflict) throw new DesignUnavailableError({ report: frequencyConflict })
+          const unavailable = schemaRemovalUnavailable({
+            hypothesisID: selectedHypothesis.id,
+            contract: selectedHypothesis.experimentContract,
+            comparison,
+            validate: (candidateSpec) => DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec }),
+          })
+          if (unavailable) throw new DesignUnavailableError({ report: unavailable })
+        }
+        const memory: ResearchMemory[] = []
         const champion = yield* getChampion(task.id)
         const proposalContext = {
           taskSpec: task.taskSpec,
@@ -6026,6 +5908,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               metrics: run.metrics,
             })),
           memory: memory.map((item) => ({
+            id: item.id,
+            taskID: item.taskID,
             scope: item.taskID === task.id ? ("task" as const) : ("domain" as const),
             outcome: item.outcome,
             lesson: item.lesson,
@@ -6042,17 +5926,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                   utility: champion.utility,
                 },
         }
-        const dataAnalysisMarkdown = buildDatasetAnalysisReportMarkdown({
-          task,
-          fingerprint: taskFingerprintWithExploration,
-        })
-        const hypoPlanMarkdown = hypothesisPlan !== undefined
-          ? buildHypothesesYaml(hypothesisPlan)
-          : undefined
-        const previousReflectionMarkdown: string | undefined =
-          previousReflectionNotesMarkdown && previousReflectionNotesMarkdown.length > 0
-            ? previousReflectionNotesMarkdown
-            : undefined
         const authJsonKey = yield* Effect.promise(() => resolveApiKeyFromAuthJson())
         const modelDesignerRuntime = recordValue(recordValue(task.taskSpec).runtime)
         const modelDesignerNeoCastRoot =
@@ -6065,14 +5938,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         ))
         let proposal: DomainCandidateProposal | undefined
         let validationFeedback = recovery?.feedback
+        const requestedHistory: unknown[] = []
+        let historyRequests = 0
         const maxModelDesignerAttempts = 3
         for (let attempt = 1; attempt <= maxModelDesignerAttempts; attempt++) {
           const promptInput = {
             task,
             proposalContext,
-            dataAnalysisMarkdown,
-            ...(hypoPlanMarkdown ? { hypoPlanMarkdown } : {}),
-            ...(previousReflectionMarkdown ? { previousReflectionMarkdown } : {}),
+            requestedHistory,
             ...(validationFeedback ? { validationFeedback } : {}),
           }
           const modelDesignerSessionAttempt = yield* requestViaSession({
@@ -6108,12 +5981,27 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 }),
               )
           llmMetadata = { ...llmResult.metadata, llmAttempt: attempt }
+          if (llmResult.historyRequest) {
+            if (++historyRequests > 5) throw new DesignPlanningStopped({ reason: "ModelDesigner exceeded the bounded history-request budget without proposing an experiment." })
+            const result = yield* Effect.promise(() => readDesignHistory(task.id, llmResult.historyRequest!))
+            requestedHistory.push({ request: llmResult.historyRequest, result })
+            attempt -= 1
+            continue
+          }
+          if (llmResult.unavailable) {
+            if (!selectedHypothesis || llmResult.unavailable.hypothesisID !== selectedHypothesis.id) {
+              validationFeedback = { attempt, issues: [{ path: "hypothesisID", message: "Unavailable report must name the selected hypothesis ID." }] }
+              continue
+            }
+            throw new DesignUnavailableError({ report: llmResult.unavailable })
+          }
+
           if (!llmResult.proposal) {
+            validationFeedback = {
+              attempt,
+              issues: llmProposalValidationIssues(llmResult.metadata),
+            }
             if (modelDesignerSessionAttempt && attempt < maxModelDesignerAttempts) {
-              validationFeedback = {
-                attempt,
-                issues: llmProposalValidationIssues(llmResult.metadata),
-              }
               continue
             }
             break
@@ -6127,6 +6015,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             ? validateCandidateAgainstHypothesis(
                 selectedHypothesis,
                 {
+                  taskID: task.id,
                   hypothesisID: selectedHypothesis.id,
                   candidateSpec: llmResult.proposal.candidateSpec,
                 } as ResearchCandidate,
@@ -6156,7 +6045,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           llmMetadata = {
             ...llmMetadata,
             llmStatus: "invalid",
-            llmError: issues.map((item) => `${item.path}: ${item.message}`).join("; ").slice(0, 1000),
+            llmError: issues.map(formatDesignValidationIssue).join("; ").slice(0, 1000),
             llmValidationIssues: issues,
           }
         }
@@ -6167,7 +6056,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           proposal = selectedHypothesis && task.domainID === "tsf"
             ? rankings.find((ranking) => DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec: ranking.candidateSpec }).ok && validateCandidateAgainstHypothesis(
                 selectedHypothesis,
-                { hypothesisID: selectedHypothesis.id, candidateSpec: ranking.candidateSpec } as ResearchCandidate,
+                { taskID: task.id, hypothesisID: selectedHypothesis.id, candidateSpec: ranking.candidateSpec } as ResearchCandidate,
                 ranking.candidateSpec,
                 task.taskSpec,
               ).length === 0)
@@ -6177,7 +6066,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             const fallbackMismatches = fallback && selectedHypothesis && task.domainID === "tsf"
               ? validateCandidateAgainstHypothesis(
                   selectedHypothesis,
-                  { hypothesisID: selectedHypothesis.id, candidateSpec: fallback.candidateSpec } as ResearchCandidate,
+                  { taskID: task.id, hypothesisID: selectedHypothesis.id, candidateSpec: fallback.candidateSpec } as ResearchCandidate,
                   undefined,
                   task.taskSpec,
                 )
@@ -6188,7 +6077,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         if (!proposal) {
           const issueText = validationFeedback?.issues.length
             ? validationFeedback.issues
-                .map((item) => `${item.path}: ${item.message}`)
+                .map(formatDesignValidationIssue)
                 .join("\n")
             : "No candidate compatible with the selected hypothesis was available."
           yield* ensurePendingApproval({
@@ -6276,8 +6165,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const topRankedRecipeID = topRanking === undefined ? undefined : rankingRecipeID(topRanking)
       const selectedRecipeID = candidateRecipeID(candidate.candidateSpec)
       const designSummary = proposalCreated
-        ? "Designed a new candidate from task fingerprint, run history, champion, and memory."
+        ? "Designed a new candidate from the selected hypothesis, task evidence, capabilities, and requested history."
         : "Selected an approved candidate already queued in the frontier."
+      if (recordValue(task.taskSpec.metadata).designFeedback) {
+        const current = yield* getTask(task.id)
+        yield* db((d) => d.update(ResearchTaskTable).set({
+          task_spec: { ...current.taskSpec, metadata: { ...recordValue(current.taskSpec.metadata), designFeedback: null } },
+          time_updated: Date.now(),
+        }).where(eq(ResearchTaskTable.id, task.id)).run())
+      }
       const modelDesignerResult = buildModelDesignerResult({
         taskID: task.id,
         candidate,
@@ -6425,6 +6321,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           champion: currentChampion,
         })
         verifierReportForTrainEval = verReport
+        yield* db((d) => d.update(ResearchRunTable).set({ resource_usage: { ...executed.run.resourceUsage, verification: { status: verReport.status, checks: JSON.parse(JSON.stringify(verReport.results)), eligibleForRanking: verReport.eligibleForRanking } } as JsonRecord }).where(eq(ResearchRunTable.id, executed.run.id)).run())
         const evalMarkdown = buildEvaluationResultMarkdown({
           task,
           run: executed.run,
@@ -6454,7 +6351,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             accepted: verReport.accepted,
             rejectReason: verReport.rejectReason ?? null,
             verifierCount: verReport.results.length,
-            rejectedVerifiers: verReport.results.filter((r) => !r.accepted).map((r) => r.name),
+            rejectedVerifiers: verReport.results.filter((r) => r.status === "failed").map((r) => r.name),
           },
         })
         const decisionArtifact = yield* createArtifact({
@@ -6471,7 +6368,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             verifierCount: decisionRecord.checks.length,
           },
         })
-        if (!verReport.accepted) {
+        if (verReport.status === "failed") {
           finalRun = yield* updateRunStatus({
             runID: executed.run.id,
             status: "rejected",
@@ -6500,7 +6397,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             status: "completed",
             metadata: {
               runID: executed.run.id,
-              accepted: true,
+              accepted: verReport.accepted,
+              verificationStatus: verReport.status,
               verifierCount: verReport.results.length,
             },
           })
@@ -6508,8 +6406,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         managerTrace.push(
           managerStep(
             "verifier",
-            verReport.accepted ? "completed" : "blocked",
-            verReport.accepted
+            verReport.status === "failed" ? "blocked" : "completed",
+            verReport.status === "insufficient_evidence" ? "VerifierAgent retained the observation with incomplete verification; missing checks did not pass." : verReport.accepted
               ? "VerifierAgent accepted the run after all checks passed."
               : `VerifierAgent rejected the run: ${verReport.rejectReason}`,
             {
@@ -6517,7 +6415,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               selectedCandidateID: candidate.id,
               verifierAccepted: verReport.accepted,
               ...(verReport.rejectReason !== undefined ? { rejectReason: verReport.rejectReason } : {}),
-              rejectedVerifiers: verReport.results.filter((r) => !r.accepted).map((r) => r.name),
+              rejectedVerifiers: verReport.results.filter((r) => r.status === "failed").map((r) => r.name),
             },
           ),
         )
@@ -6585,10 +6483,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       managerTrace.push(
         managerStep(
           "librarian",
-          memory.length > 0 ? "completed" : "skipped",
-          memory.length > 0
-            ? "Recorded the latest run lesson in research memory."
-            : "No memory entry was recorded for this run.",
+          memoryWriteOutcome === "recorded" ? "completed" : "skipped",
+          memoryWriteOutcome === "recorded"
+            ? "Recorded explicitly selected research experience."
+            : "Run facts are preserved; ReflectionAgent decides whether to save a reusable experience.",
           {
             selectedCandidateID: candidate.id,
             runID: executed.run.id,
@@ -6640,6 +6538,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       input: AutonomousIterationInput,
     ) {
       const maxAttempts = 2
+      let designReplans = 0
       let feedback: ContractRecoveryState["feedback"]
       let hypothesisID: string | undefined
       const recoveryArtifacts: ResearchArtifact[] = []
@@ -6657,7 +6556,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }).where(eq(ResearchArtifactTable.id, artifact.id)).run())
         }
       })
-      for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+      for (let attempt = 0; attempt <= maxAttempts;) {
         const outcome = yield* runAutonomousIterationAttempt(input).pipe(
           Effect.provideService(ContractRecovery, { taskID: input.taskID, attempt, maxAttempts, feedback, hypothesisID }),
           Effect.map((result) => ({ result, cause: undefined })),
@@ -6669,6 +6568,32 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         }
         const cause = outcome.cause!
         const error = Cause.squash(cause)
+        if (DesignUnavailableError.isInstance(error)) {
+          const current = yield* getTask(input.taskID)
+          const unavailable = error.data.report
+          const hypothesis = (yield* listHypotheses(input.taskID)).find((h) => h.id === unavailable.hypothesisID)
+          const designFeedback = { ...unavailable, hypothesisSnapshot: JSON.parse(JSON.stringify(hypothesis ?? null)), replanAttempt: ++designReplans }
+          yield* Effect.promise(() => updateHypothesisInPool(input.taskID, unavailable.hypothesisID, { testable: false }))
+          const dir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID, "design-feedback")
+          const file = path.join(dir, `${Date.now()}-${designReplans}.json`)
+          yield* Effect.promise(async () => { await mkdir(dir, { recursive: true }); await writeFile(file, JSON.stringify(designFeedback, null, 2) + "\n") })
+          yield* createArtifact({ taskID: input.taskID, kind: "model_design_unavailable_json", uri: `file://${file}`, metadata: { hypothesisID: unavailable.hypothesisID } })
+          yield* db((d) => d.update(ResearchTaskTable).set({
+            task_spec: { ...current.taskSpec, metadata: { ...recordValue(current.taskSpec.metadata), designFeedback, nextExperiment: null } },
+            time_updated: Date.now(),
+          }).where(eq(ResearchTaskTable.id, input.taskID)).run())
+          recordResearchEvent(Instance.directory, "research.design.unavailable", { taskID: input.taskID, ...designFeedback })
+          yield* finishRecovery("failed")
+          recoveryArtifacts.length = 0
+          feedback = undefined
+          hypothesisID = undefined
+          if (designReplans > 3) throw new DesignPlanningStopped({ reason: "Three hypothesis regenerations still produced unavailable designs; no proxy experiment was submitted." })
+          const replanned = yield* runHypoPlannerAgent({ taskID: input.taskID })
+          if (replanned.llm.status !== "used" || replanned.plan.nextExperiment?.action !== "experiment")
+            throw new DesignPlanningStopped({ reason: "HypoPlanner could not select a feasible replacement after ModelDesigner feedback." })
+          yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
+          continue
+        }
         if (!PipelineBlockedError.isInstance(error) || error.data.reason !== "execution_contract_violation" || attempt >= maxAttempts) {
           yield* finishRecovery("failed")
           return yield* Effect.failCause(cause)
@@ -6697,6 +6622,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           taskID: input.taskID, agent: "ModelDesignerAgent", candidateID: candidate.id,
           blockerArtifactID: blocker.id, attempt: attempt + 1, maxAttempts, feedback,
         })
+        attempt += 1
       }
       throw new Error("Execution contract recovery exhausted")
     }))
@@ -6816,8 +6742,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         if (nextDecision?.action === "stop") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" })
         const description =
           input.description === undefined ? undefined : `${input.description} (iteration ${index + 1})`
-        chargeIteration(cycle.id)
-        completedIterations += 1
         const iterationResult = yield* runAutonomousIteration({
           taskID: input.taskID,
           stage,
@@ -6827,6 +6751,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           Effect.map((iteration) => ({ status: "iteration" as const, iteration })),
           Effect.catchCause((cause) => {
             const error = Cause.squash(cause)
+            if (DesignPlanningStopped.isInstance(error)) {
+              recordResearchEvent(Instance.directory, "research.design.planning_stopped", { taskID: task.id, reason: error.data.reason })
+              return finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" }).pipe(
+                Effect.map((result) => ({ status: "stopped" as const, result })),
+              )
+            }
             if (ApprovalRequiredError.isInstance(error)) {
               return finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "approval_required" }).pipe(
                 Effect.map((result) => ({ status: "stopped" as const, result })),
@@ -6841,6 +6771,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }),
         )
         if (iterationResult.status === "stopped") return iterationResult.result
+        chargeIteration(cycle.id)
+        completedIterations += 1
         iterations.push(iterationResult.iteration)
         if (iterationResult.iteration.run.resourceUsage.duplicateExperiment === true) {
           duplicateStreak += 1
@@ -6922,7 +6854,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .set({
             status: input.status,
             metrics: input.status === "invalid" ? {} : input.metrics ?? existingRow.metrics,
-            resource_usage: input.resourceUsage ?? existingRow.resource_usage,
+            resource_usage: input.resourceUsage ? { ...input.resourceUsage,
+              ...(existingRow.resource_usage.experienceContext ? { experienceContext: existingRow.resource_usage.experienceContext } : {}),
+            } : existingRow.resource_usage,
             artifact_refs: input.artifactRefs ? [...input.artifactRefs] : existingRow.artifact_refs,
             error,
             time_updated: now,
@@ -6938,9 +6872,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       yield* bus.publish(Event.RunUpdated, { run })
       if (input.status === "succeeded" && existingRow.status !== "succeeded") {
         yield* evaluateSucceededRun(run)
-      }
-      if ((input.status === "failed" || input.status === "rejected") && existingRow.status !== input.status) {
-        yield* recordFailedRunMemory(run)
       }
       return run
     })
@@ -8280,27 +8211,28 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const result = yield* Effect.promise(() => phase.validate(receipt))
         if (result.taskID !== task.id) throw new Error(`Quantitative report task mismatch: expected ${task.id}, received ${result.taskID}`)
         const paperTitles = new Map(phase.snapshot.index.documents.map((paper) => [paper.paperID, paper.title]))
-        const selectedCards = new Map(result.taskEvidence.entries.map((entry) => [entry.cardID, entry]))
-        const acceptedCardIDs = [...new Set(result.literatureResults.flatMap((paper) => paper.acceptedCardIDs))]
+        const sourceEntries = citableTaskEvidence(result.taskEvidence)
+        const selectedCards = new Map(sourceEntries.map((entry) => [entry.cardID, entry]))
+        const acceptedCardIDs = [...new Set([...result.literatureResults.flatMap((paper) => paper.acceptedCardIDs), ...sourceEntries.map((e) => e.cardID)])]
         const cardSummaries = (() => {
-          if (acceptedCardIDs.length === 0) return result.taskEvidence.entries.map((entry) => ({ cardID: entry.cardID,
-            paperID: entry.paperID, cardType: entry.cardType, claim: entry.claim, selected: true }))
+          if (acceptedCardIDs.length === 0) return sourceEntries.map((entry) => ({ cardID: entry.cardID,
+            paperID: entry.paperID, cardType: entry.cardType, claim: entry.claim, confidence: entry.knowledge?.confidence ?? null, selected: true }))
           try {
-            const knowledge = new KnowledgeStore(path.join(neoCastRoot, ".neo-cast", "literature-knowledge", "knowledge.db"))
+            const knowledge = new KnowledgeV2Store(path.join(neoCastRoot, ".neo-cast", "literature-knowledge", "knowledge.db"))
             try {
               return acceptedCardIDs.map((cardID) => {
                 const card = knowledge.getCard(cardID)
                 const selected = selectedCards.get(cardID)
                 return selected ? { cardID, paperID: selected.paperID, cardType: selected.cardType,
-                  claim: selected.claim, selected: true } : card ? { cardID, paperID: card.paperID,
-                  cardType: card.cardType, claim: card.claim, selected: false } : undefined
+                  claim: selected.claim, confidence: selected.knowledge?.confidence ?? null, selected: true } : card ? { cardID, paperID: card.paperID,
+                  cardType: "transferable_principle", claim: card.principle, confidence: card.confidence, selected: false } : undefined
               }).filter((card) => card !== undefined)
             } finally {
               knowledge.close()
             }
           } catch {
-            return result.taskEvidence.entries.map((entry) => ({ cardID: entry.cardID,
-              paperID: entry.paperID, cardType: entry.cardType, claim: entry.claim, selected: true }))
+            return sourceEntries.map((entry) => ({ cardID: entry.cardID,
+              paperID: entry.paperID, cardType: entry.cardType, claim: entry.claim, confidence: entry.knowledge?.confidence ?? null, selected: true }))
           }
         })()
         const displayMetadata = {
@@ -8333,10 +8265,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           uri: `file://${path.join(neoCastRoot, ".neo-cast", "literature-retrieval", "runs", result.retrieveRunID, "task_evidence_bundle.json")}`,
           metadata: {
             format: "json",
-            schemaVersion: "task_evidence_bundle_v1",
+            schemaVersion: result.taskEvidence.schemaVersion,
             retrieveRunID: result.retrieveRunID,
             readiness: result.taskEvidence.readiness,
-            selectedEntryCount: result.taskEvidence.summary.selectedEntryCount,
+            selectedEntryCount: sourceEntries.length,
             uncoveredMustCoverIntentCount: result.taskEvidence.summary.uncoveredMustCoverIntentCount,
           },
         }))
@@ -8349,7 +8281,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             callPath, sessionID: attempt?.sessionID ?? null, summary: result.summary, gapCount: result.taskEvidence.gaps.length,
             reason: directReason,
             ...displayMetadata,
-            readiness: result.taskEvidence.readiness, selectedEntryCount: result.taskEvidence.summary.selectedEntryCount,
+            readiness: result.taskEvidence.readiness, selectedEntryCount: sourceEntries.length,
             uncoveredMustCoverIntentCount: result.taskEvidence.summary.uncoveredMustCoverIntentCount },
           time_updated: Date.now(),
         }).where(eq(ResearchArtifactTable.id, taskEvidenceArtifact.id)).run())
@@ -8372,7 +8304,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             taskEvidenceArtifactID: taskEvidenceArtifact.id, readiness: result.taskEvidence.readiness,
             callPath, reason: directReason, sessionID: attempt?.sessionID ?? null, ...result.summary,
             ...displayMetadata,
-            selectedEntryCount: result.taskEvidence.summary.selectedEntryCount, gapCount: result.taskEvidence.gaps.length },
+            selectedEntryCount: sourceEntries.length, gapCount: result.taskEvidence.gaps.length },
         })
         return result
       }).pipe(
@@ -8411,6 +8343,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         return yield* Effect.promise(() => readFile(filePath, "utf8").catch(() => ""))
       })
 
+    const loadPlanningDataFacts = (taskID: ResearchTaskID) => Effect.gen(function* () {
+      const artifact = (yield* listArtifacts(taskID)).find((a) => a.kind === "dataset_quantitative_analysis_json")
+      if (!artifact?.uri.startsWith("file://")) return "No quantitative data artifact available; inspect the dataset analysis files if needed."
+      return yield* Effect.promise(() => readFile(artifact.uri.slice(7), "utf8"))
+    })
+
     const loadTaskEvidenceBundle = (taskID: ResearchTaskID, artifactID?: ResearchArtifactID) =>
       Effect.promise(() => loadTaskEvidenceForTask(taskID, artifactID))
 
@@ -8430,47 +8368,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	      return yield* Effect.gen(function* () {
 	        const task = yield* getTask(input.taskID)
 	        const runs = yield* listRuns(input.taskID)
-	        const memory = yield* listMemory(input.taskID)
-	        const plannerCandidates = yield* listCandidates(input.taskID)
-        const experimentHistory = runs.map((run) => ({
-          runID: run.id, candidateID: run.candidateID,
-          hypothesisID: plannerCandidates.find((c) => c.id === run.candidateID)?.hypothesisID,
-          stage: run.stage, status: run.status, metrics: run.metrics,
-          independentEvidence: run.resourceUsage.duplicateExperiment !== true && run.resourceUsage.independentEvidence !== false,
-          executedModel: recordValue(recordValue(run.resourceUsage.executionContract).manifest).actual,
-          error: run.error,
-        }))
+	        const memory: ResearchMemory[] = []
         const existingHypothesesRaw = yield* db((d) =>
 	          d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.task_id, input.taskID)).all(),
 	        )
 	        const existingHypotheses = existingHypothesesRaw.map((r) => ({ id: r.hypo_id, statement: r.statement, status: r.status }))
         const abandonedHypotheses = abandonedHypothesesFromMetadata(recordValue(task.taskSpec.metadata))
-	        const latestReflection = yield* Effect.promise(async () => {
-	          try {
-	            const sessionsDir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID)
-	            const entries = await readdir(sessionsDir, { withFileTypes: true })
-	            const reflectDirs = entries
-	              .filter((e) => e.isDirectory() && e.name.startsWith("reflect_"))
-	              .map((e) => e.name)
-	              .sort()
-	              .reverse()
-	            for (const dirName of reflectDirs) {
-	              try {
-	                const raw = await readFile(path.join(sessionsDir, dirName, "reflection_result.json"), "utf8")
-	                return JSON.parse(raw) as {
-		                  reflectionNotesMarkdown: string
-	                  decision: string
-	                  decisionReason: string
-	                  llm?: ReflectionAgentResult["llm"]
-	                }
-	              } catch { continue }
-	            }
-	          } catch { /* no sessions dir yet */ }
-	          return null
-	        })
-	        const dataAnalysisSummary = yield* loadDataAnalysisSummary(input.taskID)
+	        const dataAnalysisSummary = yield* loadPlanningDataFacts(input.taskID)
 	        const taskEvidence = yield* loadTaskEvidenceBundle(input.taskID, input.taskEvidenceArtifactID)
-	        const draftHypotheses = generateHypotheses({ task, dataAnalysisSummary, runs, memory, taskEvidence })
 	        const onDeltaHypo = (delta: string): void => {
 	          void Effect.runPromise(
 	            bus.publish(Event.HypoPlannerAgentStreamDelta, {
@@ -8488,8 +8393,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const hypoConfig = hypoLLMContext?.config ?? (yield* Effect.promise(() =>
 	          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: hypoNeoCastRoot }),
 	        ))
-	        const hypoSearchPreferences = yield* Effect.promise(() => loadLLMSearchPreferences(Instance.directory, task.id))
-	        const isFirstHypoPlannerCall = runs.length === 0 && memory.length === 0
+	        const isFirstHypoPlannerCall = runs.length === 0 && existingHypotheses.length === 0
 	        // referenceBaseline is only ever picked on the first call (see comment on
 	        // ExperimentPlan.referenceBaseline) — only compute/offer options then.
 	        const baselineOptions = isFirstHypoPlannerCall
@@ -8512,7 +8416,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          agent: "research-hypo-planner",
 	          stageLabel: "HypoPlanner",
 	          taskID: task.id,
-	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, runs, memory, existingHypotheses, latestReflection, hypoSearchPreferences, abandonedHypotheses, taskEvidence, { sessionMode: true, baselineOptions, experimentHistory }),
+	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, existingHypotheses, abandonedHypotheses, taskEvidence, { sessionMode: true, baselineOptions }),
 	          modelRef: mapToModelRef(hypoConfig),
 	          onDelta: (delta) => bus.publish(Event.HypoPlannerAgentStreamDelta, { taskID: task.id, agent: "HypoPlannerAgent", delta }),
           onPartUpdated: (part) => {
@@ -8549,7 +8453,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const llmHypothesesResult = hypoSessionAttempt
 	          ? undefined
 	          : yield* Effect.promise(() =>
-	              generateLLMHypotheses(task, dataAnalysisSummary, runs, memory, draftHypotheses, Instance.directory, onDeltaHypo, existingHypotheses, latestReflection, abandonedHypotheses, taskEvidence, experimentHistory),
+	              generateLLMHypotheses(task, dataAnalysisSummary, Instance.directory, onDeltaHypo, existingHypotheses, abandonedHypotheses, taskEvidence),
 	            )
 	        const llmHypoUsage = hypoSessionAttempt ? hypoSessionAttempt.usage : llmHypothesesResult?.usage
 	        // Session mode: agent used hypothesis_* tools to write to DB; read current pool state.
@@ -8689,7 +8593,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          // Direct mode: replace unbound proposals, retaining candidate-bound snapshots.
 	          const nextHypothesisStatements = new Set(result.plan.hypotheses.map((h) => h.statement))
 	          const newlyAbandoned = existingHypotheses
-	            .filter((h) => !nextHypothesisStatements.has(h.statement))
+	            .filter((h) => !nextHypothesisStatements.has(h.statement) && h.id !== recordValue(recordValue(task.taskSpec.metadata).designFeedback).hypothesisID)
 	            .map((h) => ({ statement: h.statement }))
 	          const mergedAbandoned = [...abandonedHypotheses, ...newlyAbandoned]
 	            .filter((h, index, all) => all.findIndex((other) => other.statement === h.statement) === index)
@@ -8952,7 +8856,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const champion = yield* getChampion(input.taskID)
 	        const artifacts = yield* listArtifacts(input.taskID)
 	        const memories = yield* listMemory(input.taskID)
-	        const evidenceRuns = yield* Effect.promise(() => Promise.all(runs.map(async (run) => {
+	        const evidenceRuns = yield* Effect.promise(() => Promise.all(runs.map(async (storedRun) => {
+	          const run = reflectionExecutionEvidence(storedRun, objectiveMetricName(task.objective))
 	          if (run.status === "succeeded") return run
 	          const artifact = artifacts.find((a) => a.runID === run.id && a.kind === "runner_execution_log_json")
 	          if (!artifact) return run
@@ -8985,6 +8890,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const reflectionConfig = reflectionLLMContext?.config ?? (yield* Effect.promise(() =>
 	          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: reflectionNeoCastRoot }),
 	        ))
+            const reflectionKnowledge = yield* Effect.promise(() => readReflectionKnowledge(task.id))
 	        const reflectionSessionAttempt = yield* requestViaSession({
 	          rootSessionID: task.sessionID,
 	          agent: "research-reflection",
@@ -9019,7 +8925,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "Reflection", path: reflectionCallPath })
 	        // Direct-path fallback: lazily build full LLM context (training curve + memories) for
 	        // the non-session code path that calls the LLM API directly without tool access.
-	        const result = reflectionSessionAttempt
+	        const synthesis = reflectionSessionAttempt
 	          ? buildReflectionResultFromText(baseResult, reflectionConfig.model, reflectionSessionAttempt.text, reflectionSessionAttempt.usage)
 	          : yield* Effect.promise(async () => {
 	              const progressArtifact = latestRunForContext
@@ -9063,11 +8969,56 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	                recentMemories: recentLessons,
 	                bestMemoryLesson: bestMemory && bestMemory.id !== sortedMemories[0]?.id && bestMemory.id !== sortedMemories[1]?.id
 	                  ? bestMemory.lesson : undefined,
+                  sourceRuns: (await readDesignHistory(task.id, { limit: 20 }, { forReflection: true })).runs,
+                  experiences: readExperiences(task.id, { limit: 12 }).map(experiencePromptRecord),
+                  literatureKnowledge: reflectionKnowledge,
 	              }
 	              return generateLLMReflectionSynthesis(task, baseResult, llmContext).catch(() => ({
 	                ...baseResult, llm: { status: 'failed' as const },
 	              }))
 	            })
+            const experienceWriteResults: { saved: boolean; id?: string; error?: string }[] = []
+            if (reflectionSessionAttempt) {
+              const previousIDs = new Set(memories.map((memory) => memory.id))
+              for (const memory of readExperiences(task.id, { scope: "task", limit: 100 })) {
+                if (!previousIDs.has(memory.id)) experienceWriteResults.push({ saved: true, id: memory.id })
+              }
+            }
+            if (!reflectionSessionAttempt && synthesis.llm.status === "used") {
+              for (const draft of synthesis.llm.structured?.experienceWrites ?? []) {
+                const written = yield* Effect.promise(async () => {
+                  try {
+                    const result = await writeExperience(task.id, draft)
+                    return { saved: true, id: result.memory.id }
+                  } catch (error) {
+                    return { saved: false, error: error instanceof Error ? error.message : String(error) }
+                  }
+                })
+                experienceWriteResults.push(written)
+              }
+            }
+            const knowledgeValidationResults: NonNullable<ReflectionAgentResult["knowledgeValidationResults"]>[number][] = []
+            if (!reflectionSessionAttempt && synthesis.llm.status === "used") {
+              for (const draft of synthesis.llm.structured?.knowledgeValidations ?? []) {
+                knowledgeValidationResults.push(yield* Effect.promise(async () => {
+                  try {
+                    const confirmed = await confirmKnowledgeExperiment(task.id, draft)
+                    return { saved: true, cardID: draft.cardID, updated: confirmed.updated, confidence: confirmed.confidence }
+                  } catch (error) {
+                    return { saved: false, cardID: draft.cardID, error: error instanceof Error ? error.message : String(error) }
+                  }
+                }))
+              }
+            } else if (reflectionSessionAttempt) {
+              const previous = new Set(reflectionKnowledge.entries.flatMap((e) => e.knowledge.experimentValidations.map((v) => v.validationID)))
+              const current = yield* Effect.promise(() => readReflectionKnowledge(task.id))
+              for (const entry of current.entries) {
+                if (entry.knowledge.experimentValidations.some((v) => v.taskID === task.id && v.runID === latestRun?.id && !previous.has(v.validationID))) {
+                  knowledgeValidationResults.push({ saved: true, cardID: entry.cardID, updated: true, confidence: entry.confidence })
+                }
+              }
+            }
+            const result: ReflectionAgentResult = { ...synthesis, experienceWriteResults, knowledgeValidationResults }
 	        const reflectRunId = `reflect_${Date.now()}`
 	        const directory = input.outputDir
 	          ? path.join(runnerPath(Instance.directory, input.outputDir), task.id, reflectRunId)
@@ -9098,6 +9049,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              failureLogMarkdown: result.failureLogMarkdown,
 	              maxIterations: result.maxIterations,
 	              llm: result.llm,
+                  experienceWriteResults: result.experienceWriteResults,
+                  knowledgeValidationResults: result.knowledgeValidationResults,
 	            }, null, 2),
 	            "utf8",
 	          )
@@ -9137,38 +9090,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            failureLogArtifactID: failureLogArtifact.id,
 	          },
 	        })
-	        // Persist reflection insights into experience memory so future iterations can learn from them.
-	        yield* createMemory({
-	          taskID: task.id,
-	          domainID: task.domainID,
-	          fingerprintSummary: {
-	            ...DomainRegistry.summarizeTask(task.domainID, task.taskSpec, { taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory) }),
-	            taskID: task.id,
-	            domainID: task.domainID,
-	            primaryMetricName: result.analysis.primaryMetricName,
-	            direction: result.analysis.direction,
-	          },
-	          candidateSummary: {
-	            role: "reflection",
-	            decision: result.analysis.decision,
-	            decisionReason: result.analysis.decisionReason,
-	            plateauStreak: result.analysis.plateauStreak,
-	            succeededRuns: result.analysis.succeededRuns,
-	            failedRuns: result.analysis.failedRuns,
-	            bestMetric: result.analysis.bestMetric ?? null,
-	            failureCategories: result.analysis.failures.map((f) => f.category),
-	            ...(result.llm.status === "used" && result.llm.text
-	              ? { llmNarrative: result.llm.text }
-	              : {}),
-	          },
-	          outcome:
-	            result.analysis.effectiveChanges.length > 0
-	              ? "accepted"
-	              : result.analysis.decision === "request_human"
-	                ? "failed"
-	                : "rejected",
-	          lesson: buildReflectionMemoryLesson(result),
-	        }).pipe(Effect.catchCause(() => Effect.void))
 	        return result
 	      }).pipe(
 	        Effect.catchCause((cause) =>
@@ -9554,7 +9475,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             return recoverHypoPlannerResultFromPlan({ task, dataAnalysisSummary, plan, taskEvidence })
           }
           const runs = yield* listRuns(input.taskID)
-          const memory = yield* listMemory(input.taskID)
+          const memory: ResearchMemory[] = []
           return buildHypoPlannerResult({ task, dataAnalysisSummary, runs, memory, taskEvidence })
         })
 
@@ -10087,6 +10008,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const createMemory = Effect.fn("Research.createMemory")(function* (input: CreateMemoryInput) {
       yield* getTask(input.taskID)
+      if (input.candidateSummary.experience !== undefined) throw new Error("Structured experience must use write_experience so its evidence is validated")
       const time = nowTime()
       const row = yield* db((d) =>
         d
@@ -10124,25 +10046,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     })
 
     const listRelatedMemory = Effect.fn("Research.listRelatedMemory")(function* (task: ResearchTask) {
-      const projectTaskRows = yield* db((d) =>
-        d
-          .select({ id: ResearchTaskTable.id })
-          .from(ResearchTaskTable)
-          .where(and(eq(ResearchTaskTable.project_id, Instance.project.id), eq(ResearchTaskTable.domain_id, task.domainID)))
-          .all(),
-      )
-      const taskIDs = projectTaskRows.map((row) => row.id)
-      if (taskIDs.length === 0) return []
-      const rows = yield* db((d) =>
-        d
-          .select()
-          .from(ResearchMemoryTable)
-          .where(and(eq(ResearchMemoryTable.domain_id, task.domainID), inArray(ResearchMemoryTable.task_id, taskIDs)))
-          .orderBy(desc(ResearchMemoryTable.time_updated))
-          .limit(100)
-          .all(),
-      )
-      return rows.map(mapMemory)
+      // Only deliberately saved, evidence-backed experiences transfer between tasks.
+      return yield* Effect.sync(() => readExperiences(task.id, { limit: 100 }))
     })
 
     const setChampion = Effect.fn("Research.setChampion")(function* (input: SetChampionInput) {

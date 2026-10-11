@@ -858,6 +858,7 @@ def train_models(
             return 5
     num_params = sum(param.numel() for model in models.values() for param in model.parameters())
     num_params_m = num_params / 1e6
+    emit("resource_summary", num_params_M=num_params_m, parameter_count_scope="sum_of_independent_horizon_models", horizons=list(models))
     param_budget_m = float(constraints["param_budget_m"])
 
     if num_params_m > param_budget_m:

@@ -1,9 +1,62 @@
 # RetrieveAgent
 
+New mainline runs now add automatic **broad card recall → conditional architecture
+extraction → independent source review → bounded semantic revision and fresh review → usefulness curation** before planner/designer
+handoff. See [architecture-knowledge.md](./architecture-knowledge.md) for budgets,
+contracts, artifacts and failure behavior. The architecture packet is authoritative for
+new downstream citations; the intent-based entries described below remain source audit
+and legacy-bundle compatibility data.
+
+Default search/reading budgets are 40 source candidates per intent, 8 new papers per
+intent, and 12 new papers total. Existing paper/intent coverage is removed before
+allocating reading quotas. Architecture recall separately considers up to 128 cards
+and reads up to 40, including source-verified v2 runtime archives, before selecting up
+to 12 useful decisions. These counts are separate ceilings and do not require filling
+quotas. Progress distinguishes new reading, reuse, source reading and final decisions.
+
 `RetrieveAgent` consumes `dataset_quantitative_analysis_v1`, performs deterministic
 evidence-to-concept mapping, runs two local BM25 queries per retrieval intent, and
 sends deduplicated local-PDF candidates to `LiteratureAgent` in strict integrated
 mode (`includeAgentInference=false`, exact evidence spans required).
+
+A third route, `knowledge_store`, matches reviewed v2 principles to the current task's
+scientific and method intents. It reads the shared KnowledgeV2Store directly, so
+reusing reviewed evidence requires neither an exported JSONL nor an available PDF.
+The default shared root is `<neoCastRoot>/.neo-cast/literature-knowledge`; callers
+can explicitly supply `knowledgeRoot`. This scope is shared across tasks using
+that root, not across unrelated installations automatically.
+
+Recalled candidates record `recallScore`, card/revision and source extraction ID
+in their reasons. Their BM25 score is zero because they use card/intent matching.
+Both shared-card recall and final evidence-budget selection use
+`0.9 * relevance + 0.1 * confidence`. Applicability conflicts and implementation
+compatibility gates take precedence over this score. Relevance remains separately
+reported, and selection reasons show the confidence contribution. Reflection's
+experiment-backed confidence revisions participate in the retrieval cache digest.
+`reused_knowledge` results pin `cardRevisions` and are counted separately from
+papers sent to LiteratureAgent. A paper whose selected intents already have
+usable stored evidence does not require another extraction. Reused cards pass
+the normal source, review-version, applicability and evidence-role gates. Known
+unsupported card operations and source-hash-bound compatibility reviews are also
+checked; reuse cannot bypass the ModelRecipe screen. Unknown implementation
+mappings remain unresolved and do not imply an available registry operator.
+
+Condition matching uses the complete quantitative diagnosis, including known
+future inputs and point/probabilistic objectives. Retrieved concepts do not create
+task facts. Missing optional diagnostics or unrecognized conditions remain
+uncertain; an absent scientific detection does not prove its opposite. Explicit
+condition violations yield `conflicted`, which carries warning roles rather than
+positive mechanism support. Free-text compound conditions and source boundaries remain unknown pending explicit assessment.
+Matching and task handoff leave the original card intact. Every entry embeds its
+complete `knowledge_card_v2` in `knowledge`, including experiments, assertion/source
+bindings, contrary evidence, epistemic status and proposed validation. v1 fragments
+and their export files are excluded; archived v1 bundles require fresh retrieval.
+
+The retrieval cache includes the shared card/relation snapshot and matching
+versions as well as the target report and context. Revisions and withdrawals
+invalidate future retrieval; already-written task evidence retains its original
+snapshot. A run that creates knowledge may therefore have a different ID on its
+next retrieval; subsequent unchanged reads reuse that new snapshot's cache.
 
 The source-catalog route searches ordinary indexed papers. The classic-library
 route searches the reviewed identity list in `config/classic-papers.v1.json`
@@ -62,20 +115,19 @@ outputs are written beneath `.neo-cast/literature-retrieval/`. The full pipeline
 `data_analysis → literature → hypo_planning`; retrieval and evidence assembly are
 internal steps of the literature phase.
 
-`retrieve_result_v2` embeds a `task_evidence_bundle_v1`. The same bundle is written
+`retrieve_result_v2` embeds a `task_evidence_bundle_v2`. The same bundle is written
 to `task_evidence_bundle.json` and registered as `task_evidence_bundle_json`.
 `task_evidence_excluded.jsonl` and `report.md` expose selection reasons, gaps,
 applicability warnings, and conflicts. Task context and mapping version participate
 in cache identity. Legacy results remain readable through `AnyRetrieveResultSchema`,
 but workflow recovery requires v2 and rebuilds invalid results with `force: true`.
 
-For model-search handoff, an empirical finding or domain prior without an
-explicit ModelRecipe action mapping is excluded as
-`non_actionable_observation`. Such claims can remain in the knowledge store as
-scoped observations, but they do not occupy task evidence slots or support a
-model-design hypothesis merely because they describe a hard dataset regime.
-New literature extractions also require the verifier to identify a source-backed,
-testable intervention before accepting an empirical finding or domain prior.
+Every active entry has type `transferable_principle`. The card's required
+intervention and complete mechanism replace separate mechanism/limitation cards.
+Known unsupported operations require a source-hash-bound compatibility review;
+unknown implementation mappings remain unresolved. No cross-paper equivalence
+or independent corroboration is inferred from a shared method name. Whole-paper
+v2 consolidation occurs before independent verification and publication.
 
 HypoPlanner consumes the registered bundle without querying KnowledgeStore. Each
 hypothesis carries dataset paths, card IDs/revisions/roles, applicability assumptions,
@@ -84,7 +136,7 @@ level. Direct responses, session tools, and recovered plans validate these refer
 The hypothesis database migration preserves these fields and defaults historical
 rows to empty evidence arrays and `data_only`.
 
-Empty catalogs and lack of eligible cards produce an auditable `ready_data_only`
+Lack of eligible cards in both shared knowledge and paper retrieval produces an auditable `ready_data_only`
 bundle. Missing optional statistics are skipped; corrupt contracts or provenance
 fail validation. No online paper API, vector retrieval, query expansion, or RRF is
 introduced. Matching rules live in `config/tsf-task-evidence.v1.json`.

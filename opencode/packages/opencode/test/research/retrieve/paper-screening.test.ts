@@ -12,6 +12,20 @@ function result(title: string, rank: number, introduction = ""): BM25SearchResul
       fields: { title, abstract: "", introduction, method: "", results: "", limitations: "", knowledgeCard: "" } } }
 }
 
+test("reused paper-intent pairs leave per-intent and global quotas for new papers", () => {
+  const intent = fixture().intents.find((item) => item.intentID.includes("structural_break"))!
+  const results = [1, 2, 3, 4].map((rank) => result("Time Series Forecasting under Structural Breaks", rank))
+  const covered = new Set([1, 2].map((rank) => `paper-${rank}\0${intent.intentID}`))
+  const candidates = buildRetrievalCandidates(intent, results, 2, false, [], covered)
+  expect(candidates.filter((c) => c.decision === "reuse_knowledge")).toHaveLength(2)
+  expect(selectBridgeCandidates(candidates, { maxLiteraturePapersTotal: 2 }).map((p) => p.paperID)).toEqual(["paper-3", "paper-4"])
+  const onlyReusedClassic = results.map((item, index) => ({ ...item, recallRoute: index === 0 ? "classic_library" as const : "source_catalog" as const }))
+  expect(selectBridgeCandidates(buildRetrievalCandidates(intent, onlyReusedClassic, 2, false, [], covered),
+    { maxLiteraturePapersTotal: 2 }).map((p) => p.paperID)).toEqual(["paper-3", "paper-4"])
+  // Force supplies an empty reuse set and still refreshes the original best-ranked papers.
+  expect(selectBridgeCandidates(buildRetrievalCandidates(intent, results, 2), { maxLiteraturePapersTotal: 2 }).map((p) => p.paperID)).toEqual(["paper-1", "paper-2"])
+})
+
 test("partial structural match cannot pass the scientific screen", () => {
   expect(includesPhrase("Patch-wise Structural Loss", "structural breaks")).toBe(false)
   const intent = fixture().intents.find((item) => item.intentID.includes("structural_break"))!
@@ -53,8 +67,8 @@ test("supported feature fusion outranks background mentions while correlation at
   const values = buildRetrievalCandidates(intent, [...papers,
     result("Variable Correlation Transformer with Inherent Lagged Correlation", 10),
     result("Lead-lag Relationship Feature Fusion for Forecasting", 11)], 1)
-  expect(values.find((item) => item.paperID === "paper-10")!.decision).toBe("unsupported_model_recipe")
-  expect(selectBridgeCandidates(values, { maxLiteraturePapersTotal: 1 })[0]!.paperID).toBe("paper-11")
+  expect(values.find((item) => item.paperID === "paper-10")!.decision).toBe("send_to_literature_agent")
+  expect(selectBridgeCandidates(values, { maxLiteraturePapersTotal: 1 })[0]!.paperID).toBe("paper-10")
 })
 
 test("conformal change-point work is auxiliary for point forecasting", () => {
@@ -64,15 +78,15 @@ test("conformal change-point work is auxiliary for point forecasting", () => {
   expect(buildRetrievalCandidates(intent, [paper], 5, true)[0]!.decision).toBe("send_to_literature_agent")
 })
 
-test("known unimplemented core mechanism is filtered during fine screening with an audit reason", () => {
+test("known unavailable paper operator is recorded without vetoing transferable family discovery", () => {
   const intent = fixture().intents[0]!
   const original = result("TimeXer: Empowering Transformers for Time Series Forecasting with Exogenous Variables", 1)
   const paper = { ...original, paper: { ...original.paper, paperID: "timexer" } }
   const candidates = buildRetrievalCandidates(intent, [{ ...paper, recallRoute: "classic_library" }], 5)
-  expect(candidates[0]!.decision).toBe("unsupported_model_recipe")
+  expect(candidates[0]!.decision).toBe("send_to_literature_agent")
   expect(candidates[0]!.recallRoute).toBe("classic_library")
   expect(candidates[0]!.decisionReasons.join(" ")).toContain("exogenous_cross_attention")
-  expect(selectBridgeCandidates(candidates, { maxLiteraturePapersTotal: 5 })).toHaveLength(0)
+  expect(selectBridgeCandidates(candidates, { maxLiteraturePapersTotal: 5 })).toHaveLength(1)
   expect(unsupportedModelRecipeMechanisms(result("PatchTST: patch forecasting", 2).paper)).toHaveLength(0)
 })
 
@@ -84,9 +98,9 @@ test("source-hash-bound compatibility review retains transferable knowledge with
   const paper = { ...original, paper: { ...original.paper, sourceSha256: "paper-sha" } }
   const review = { paperID: paper.paper.paperID, sourceSha256: "paper-sha", verdict: "adaptable" as const,
     reason: "Lagged variable interactions can inform existing variate fusion." }
-  expect(buildRetrievalCandidates(intent, [paper], 2)[0]!.decision).toBe("unsupported_model_recipe")
+  expect(buildRetrievalCandidates(intent, [paper], 2)[0]!.decision).toBe("send_to_literature_agent")
   expect(buildRetrievalCandidates(intent, [paper], 2, false, [{ ...review, sourceSha256: "stale-sha" }])[0]!.decision)
-    .toBe("unsupported_model_recipe")
+    .toBe("send_to_literature_agent")
   const reviewed = buildRetrievalCandidates(intent, [paper], 2, false, [review])[0]!
   expect(reviewed.decision).toBe("send_to_literature_agent")
   expect(reviewed.decisionReasons.join(" ")).toContain("exact lagged_correlation_attention remains unavailable")

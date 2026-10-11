@@ -49,6 +49,7 @@ export class RetrieveStore {
       atomicWrite(path.join(runRoot, "selected_candidates.jsonl"), jsonl(input.selectedCandidates)),
       atomicWrite(path.join(runRoot, "literature_bridge_results.json"), json({ retrieveRunID: input.result.retrieveRunID, papers: input.result.literatureResults })),
       atomicWrite(path.join(runRoot, "task_evidence_bundle.json"), json(input.result.taskEvidence)),
+      ...(input.result.taskEvidence.architectureKnowledge ? [atomicWrite(path.join(runRoot, "architecture_knowledge.json"), json(input.result.taskEvidence.architectureKnowledge))] : []),
       atomicWrite(path.join(runRoot, "task_evidence_excluded.jsonl"), jsonl(input.result.taskEvidence.excluded)),
       atomicWrite(path.join(runRoot, "retrieve_result.json"), json(input.result)),
       atomicWrite(path.join(runRoot, "report.md"), renderRetrieveReport(input.result)),

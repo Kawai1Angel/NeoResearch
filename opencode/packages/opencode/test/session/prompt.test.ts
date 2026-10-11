@@ -315,6 +315,21 @@ const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
     })
   })
 
+const waitForShellOutput = Effect.fn("test.waitForShellOutput")(function* (sessionID: SessionID, marker: string) {
+  const sessions = yield* Session.Service
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const messages = yield* sessions.messages({ sessionID })
+    const ready = messages.some((message) => message.parts.some((part) =>
+      part.type === "tool" && part.tool === "bash" &&
+      (part.state.status === "running" || part.state.status === "completed") &&
+      typeof part.state.metadata?.output === "string" && part.state.metadata.output.includes(marker),
+    ))
+    if (ready) return
+    yield* Effect.sleep(20)
+  }
+  throw new Error(`Shell did not produce expected output: ${marker}`)
+})
+
 const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   const config = yield* Config.Service
   const prompt = yield* SessionPrompt.Service
@@ -1340,9 +1355,9 @@ unix(
             const { prompt, run, chat } = yield* boot()
 
             const sh = yield* prompt
-              .shell({ sessionID: chat.id, agent: "build", command: "sleep 30" })
+              .shell({ sessionID: chat.id, agent: "build", command: "printf 'shell ready\\n'; sleep 30" })
               .pipe(Effect.forkChild)
-            yield* Effect.sleep(50)
+            yield* waitForShellOutput(chat.id, "shell ready")
 
             yield* prompt.cancel(chat.id)
 
@@ -1352,7 +1367,7 @@ unix(
             expect(Exit.isSuccess(busy)).toBe(true)
 
             const exit = yield* Fiber.await(sh)
-            expect(Exit.isSuccess(exit)).toBe(true)
+            expect(Exit.isSuccess(exit), Exit.isFailure(exit) ? Cause.pretty(exit.cause) : undefined).toBe(true)
             if (Exit.isSuccess(exit)) {
               expect(exit.value.info.role).toBe("assistant")
               const tool = completedTool(exit.value.parts)
@@ -1377,14 +1392,14 @@ unix(
             const { prompt, chat } = yield* boot()
 
             const sh = yield* prompt
-              .shell({ sessionID: chat.id, agent: "build", command: "trap '' TERM; sleep 30" })
+              .shell({ sessionID: chat.id, agent: "build", command: "trap '' TERM; printf 'shell ready\\n'; sleep 30" })
               .pipe(Effect.forkChild)
-            yield* Effect.sleep(50)
+            yield* waitForShellOutput(chat.id, "shell ready")
 
             yield* prompt.cancel(chat.id)
 
             const exit = yield* Fiber.await(sh)
-            expect(Exit.isSuccess(exit)).toBe(true)
+            expect(Exit.isSuccess(exit), Exit.isFailure(exit) ? Cause.pretty(exit.cause) : undefined).toBe(true)
             if (Exit.isSuccess(exit)) {
               expect(exit.value.info.role).toBe("assistant")
               const tool = completedTool(exit.value.parts)
@@ -1429,11 +1444,11 @@ unix(
 
           const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
           yield* llm.wait(1)
-          yield* Effect.sleep(150)
+          yield* waitForShellOutput(chat.id, "03999")
           yield* prompt.cancel(chat.id)
 
           const exit = yield* Fiber.await(run)
-          expect(Exit.isSuccess(exit)).toBe(true)
+          expect(Exit.isSuccess(exit), Exit.isFailure(exit) ? Cause.pretty(exit.cause) : undefined).toBe(true)
           if (Exit.isFailure(exit)) return
 
           const tool = completedTool(exit.value.parts)
@@ -1459,9 +1474,9 @@ unix(
           const { prompt, chat } = yield* boot()
 
           const sh = yield* prompt
-            .shell({ sessionID: chat.id, agent: "build", command: "sleep 30" })
+            .shell({ sessionID: chat.id, agent: "build", command: "printf 'shell ready\\n'; sleep 30" })
             .pipe(Effect.forkChild)
-          yield* Effect.sleep(50)
+          yield* waitForShellOutput(chat.id, "shell ready")
 
           const loop = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
           yield* Effect.sleep(50)
@@ -1469,7 +1484,7 @@ unix(
           yield* prompt.cancel(chat.id)
 
           const exit = yield* Fiber.await(loop)
-          expect(Exit.isSuccess(exit)).toBe(true)
+          expect(Exit.isSuccess(exit), Exit.isFailure(exit) ? Cause.pretty(exit.cause) : undefined).toBe(true)
 
           yield* Fiber.await(sh)
         }),

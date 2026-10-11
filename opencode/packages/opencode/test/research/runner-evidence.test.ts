@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { tmpdir } from "../fixture/fixture"
-import { buildExperimentResultEvidence, extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure } from "../../src/research/runner-evidence"
+import { buildExperimentResultEvidence, extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure, reflectionExecutionEvidence } from "../../src/research/runner-evidence"
 
 test("interleaved folds and horizons retain separate endpoints when sampled", async () => {
   await using tmp = await tmpdir()
@@ -81,4 +81,35 @@ test("reflection evidence includes executed optimizer settings and never exposes
   const cached = buildExperimentResultEvidence({ ...input, independentEvidence: false })
   expect(cached.evidence_disposition).toBe("duplicate")
   expect(cached.evaluationIssue).toBeUndefined()
+})
+
+test("reflection drops evaluation judgments while preserving genuine execution failures and duplicates", () => {
+  const rejected = { status: "rejected", error: "Baseline regression", metrics: { cv_avg_mse: 0.7 },
+    resourceUsage: { executionContract: { status: "verified" },
+      verification: { status: "failed", eligibleForRanking: false, checks: [{ accepted: false }] } } }
+  const raw = reflectionExecutionEvidence(rejected, "cv_avg_mse")
+  expect(raw.status).toBe("succeeded")
+  expect(raw.error).toBeUndefined()
+  expect(raw.metrics).toEqual(rejected.metrics)
+  expect(raw.resourceUsage).not.toHaveProperty("verification")
+  expect(rejected.resourceUsage).toHaveProperty("verification")
+  const result = buildExperimentResultEvidence({ ...raw, runID: "evaluated", stage: "full",
+    primaryMetric: "cv_avg_mse", executionVerified: true })
+  expect(result.metricValidity).toBe("observed")
+  expect(result).toHaveProperty("cv_avg_mse", 0.7)
+  expect(result).not.toHaveProperty("verification")
+  for (const variant of [
+    { ...rejected, status: "failed", error: "CUDA out of memory" },
+    { ...rejected, status: "invalid", error: "Execution contract mismatch" },
+    { ...rejected, resourceUsage: { ...rejected.resourceUsage, executionContract: { status: "failed" } } },
+    { ...rejected, metrics: { val_avg_mse: 0.01 } },
+    { ...rejected, metrics: { cv_avg_mse: Number.NaN } },
+    { ...rejected, resourceUsage: { ...rejected.resourceUsage, independentEvidence: false } },
+    { ...rejected, resourceUsage: { ...rejected.resourceUsage, duplicateExperiment: true } },
+  ]) {
+    const evidence = reflectionExecutionEvidence(variant, "cv_avg_mse")
+    expect(evidence.status).toBe(variant.status)
+    expect(evidence.error).toBe(variant.error)
+    expect(evidence.resourceUsage).not.toHaveProperty("verification")
+  }
 })

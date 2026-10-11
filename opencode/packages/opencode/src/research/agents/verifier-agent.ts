@@ -64,10 +64,11 @@ export function evaluateRun(input: VerifierAgentInput): VerifierAgentResult {
 export function verifierAgentMetadata(result: VerifierAgentResult): JsonRecord {
   return {
     accepted: result.report.accepted,
+    status: result.report.status,
     rejectReason: result.report.rejectReason ?? null,
     verifierCount: result.report.results.length,
     rejectedVerifiers: result.report.results
-      .filter((r) => !r.accepted)
+      .filter((r) => r.status === "failed")
       .map((r) => r.name),
     failureCategory: result.verifierDecision.failure?.category ?? null,
     recoveryAction: result.verifierDecision.failure?.recoveryAction.type ?? null,

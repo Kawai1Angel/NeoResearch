@@ -39,11 +39,14 @@ function run(input: {
 
 function report(accepted: boolean): VerifierReport {
   return {
+    status: accepted ? "passed" : "failed",
+    eligibleForRanking: accepted,
     accepted,
     rejectReason: accepted ? undefined : "[metric_verifier] regression",
     results: [
       {
         name: "metric_verifier",
+        status: accepted ? "passed" : "failed",
         accepted,
         reason: accepted ? "metric present" : "regression",
         evidence: {},

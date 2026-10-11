@@ -1,3 +1,4 @@
+import { ReadKnowledgeCardsTool, ConfirmKnowledgeTool } from "./research-knowledge"
 import { LiteratureRunTool, LiteratureListIntentsTool, LiteratureSearchTool, LiteratureReadPaperTool, LiteratureGetResultsTool } from "./research-literature"
 import { PlanExitTool } from "./plan"
 import { Session } from "../session"
@@ -32,6 +33,7 @@ import { ApplyPatchTool } from "./apply_patch"
 import { HypothesisAddTool, HypothesisAbandonTool, HypothesisListTool, HypothesisUpdateTool, HypothesisSelectTool } from "./research-hypothesis"
 import { BaselinePickTool, BaselineLoadTool } from "./research-baseline"
 import { ReadReflectionTool, ExperimentResultsTool, ReadTrainingCurveTool, ReadMemoryLessonsTool } from "./research-context"
+import { ReadExperiencesTool, WriteExperienceTool } from "./research-experience"
 import { AnalyzeDatasetTool } from "./research-data-analysis"
 import { ReadTaskspecTool, UpdateTaskspecTool, CheckTaskspecTool, AskUserTool } from "./research-taskspec"
 import { Glob } from "@opencode-ai/core/util/glob"
@@ -132,6 +134,10 @@ export const layer: Layer.Layer<
     const experimentResults = yield* ExperimentResultsTool
     const readTrainingCurve = yield* ReadTrainingCurveTool
     const readMemoryLessons = yield* ReadMemoryLessonsTool
+    const readExperiences = yield* ReadExperiencesTool
+    const writeExperience = yield* WriteExperienceTool
+    const readKnowledgeCards = yield* ReadKnowledgeCardsTool
+    const confirmKnowledge = yield* ConfirmKnowledgeTool
     const literatureRun = yield* LiteratureRunTool
     const literatureListIntents = yield* LiteratureListIntentsTool
     const literatureSearch = yield* LiteratureSearchTool
@@ -242,6 +248,10 @@ export const layer: Layer.Layer<
           experimentResults: Tool.init(experimentResults),
           readTrainingCurve: Tool.init(readTrainingCurve),
           readMemoryLessons: Tool.init(readMemoryLessons),
+          readExperiences: Tool.init(readExperiences),
+          writeExperience: Tool.init(writeExperience),
+          readKnowledgeCards: Tool.init(readKnowledgeCards),
+          confirmKnowledge: Tool.init(confirmKnowledge),
           literatureRun: Tool.init(literatureRun),
           literatureListIntents: Tool.init(literatureListIntents),
           literatureSearch: Tool.init(literatureSearch),
@@ -285,6 +295,10 @@ export const layer: Layer.Layer<
             tool.experimentResults,
             tool.readTrainingCurve,
             tool.readMemoryLessons,
+            tool.readExperiences,
+            tool.writeExperience,
+            tool.readKnowledgeCards,
+            tool.confirmKnowledge,
             tool.literatureRun,
             tool.literatureListIntents,
             tool.literatureSearch,

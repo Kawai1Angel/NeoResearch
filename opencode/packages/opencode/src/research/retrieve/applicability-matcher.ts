@@ -1,6 +1,9 @@
 import taskEvidenceConfig from "./config/tsf-task-evidence.v1.json" with { type: "json" }
+import type { KnowledgeCardV2 } from "../literature/knowledge-v2-contract"
 import type { KnowledgeCard } from "../literature/contract"
 import { normalizeRetrievalTokens } from "./bm25-search"
+import { extractDatasetEvidence } from "./dataset-evidence"
+import { mapScientificConcepts } from "./scientific-concept-mapper"
 import type { DatasetQuantitativeAnalysis, RetrieveTaskContext, TaskEvidenceEntry } from "./contract"
 
 export type ApplicabilityResult = TaskEvidenceEntry["applicability"]
@@ -34,17 +37,20 @@ function condition(input: { label: string; values: readonly string[]; actual: re
     : { matched: [], violated: input.values.map((item) => `${input.label}:${item}`), uncertain: [] }
 }
 
-function taskFacts(report: DatasetQuantitativeAnalysis, context: RetrieveTaskContext, conceptIDs: readonly string[]) {
+function taskFacts(report: DatasetQuantitativeAnalysis, context: RetrieveTaskContext) {
   const dataScale = scale(report.profile.rowCount)
   const temporalColumns = new Set([
     ...report.dataset.targetColumns, ...report.dataset.observedPastCovariates,
     ...report.dataset.knownFutureCovariates,
   ].map((value) => value.trim()).filter(Boolean))
   return {
-    taskTypes: [context.taskType],
+    taskTypes: [context.taskType, context.objective.probabilistic ? "probabilistic_forecasting" : "point_forecasting"],
     domains: [context.domain, report.domain],
     dataFeatures: [
-      ...conceptIDs,
+      // Recompute from the complete diagnosis, never from a retrieved paper or the bound intent.
+      ...mapScientificConcepts(report, extractDatasetEvidence(report)).map((item) => item.conceptID),
+      ...(report.dataset.knownFutureCovariates.length > 0 ? ["known_future_covariates"] : []),
+      context.objective.probabilistic ? "probabilistic_forecasting" : "point_forecasting",
       ...(temporalColumns.size > 1 ? ["multivariate"] : temporalColumns.size === 1 ? ["univariate"] : []),
       report.profile.irregularIntervalRatio < 0.05 ? "regular_sampling" : "irregular_sampling",
       report.forecast.horizonContextRatio >= 1 ? "long_horizon" : "short_horizon",
@@ -58,27 +64,38 @@ function taskFacts(report: DatasetQuantitativeAnalysis, context: RetrieveTaskCon
   }
 }
 
+function featureKnown(feature: string, facts: ReturnType<typeof taskFacts>) {
+  if (facts.dataFeatures.some((actual) => equivalent(feature, actual))) return true
+  if (["multivariate", "univariate"].some((value) => equivalent(feature, value))) return facts.dimensionalityKnown
+  // These predicates have explicit measurements. Absence of a scientific detection
+  // (e.g. a spectral peak) alone does not establish that a phenomenon is absent.
+  return ["regular_sampling", "irregular_sampling", "long_horizon", "short_horizon",
+    "known_future_covariates", "covariate_conditioning", "point_forecasting", "probabilistic_forecasting"]
+    .some((value) => equivalent(feature, value))
+}
+
 export function matchApplicability(input: {
   readonly card: KnowledgeCard
   readonly report: DatasetQuantitativeAnalysis
   readonly taskContext: RetrieveTaskContext
   readonly conceptIDs: readonly string[]
 }): ApplicabilityResult {
-  const facts = taskFacts(input.report, input.taskContext, input.conceptIDs)
+  const facts = taskFacts(input.report, input.taskContext)
+  const sourced = ["author_statement", "author_experiment"].includes(input.card.applicability.basis)
   const checks = [
-    condition({ label: "taskType", values: input.card.applicability.taskTypes, actual: facts.taskTypes, known: true }),
-    condition({ label: "domain", values: input.card.applicability.domains, actual: facts.domains, known: true }),
+    condition({ label: "taskType", values: input.card.applicability.taskTypes, actual: facts.taskTypes, known: sourced }),
+    condition({ label: "domain", values: input.card.applicability.domains, actual: facts.domains, known: sourced }),
     ...input.card.applicability.dataFeatures.map((feature) => condition({
       label: "dataFeature", values: [feature], actual: facts.dataFeatures,
-      known: /^(multi|uni)variate$/.test(normalized(feature)) ? facts.dimensionalityKnown : true,
+      known: sourced && featureKnown(feature, facts),
     })),
-    condition({ label: "dataScale", values: input.card.applicability.dataScale, actual: facts.dataScale, known: true }),
-    condition({ label: "horizonProfile", values: input.card.applicability.horizonProfile.map((value) => value === "long" ? "long_horizon" : value === "short" ? "short_horizon" : value), actual: facts.horizonProfile, known: true }),
+    condition({ label: "dataScale", values: input.card.applicability.dataScale, actual: facts.dataScale, known: sourced && input.report.profile.rowCount > 0 }),
+    condition({ label: "horizonProfile", values: input.card.applicability.horizonProfile.map((value) => value === "long" ? "long_horizon" : value === "short" ? "short_horizon" : value), actual: facts.horizonProfile, known: sourced }),
     condition({
       label: "computeProfile",
       values: input.card.applicability.computeProfile,
       actual: facts.computeProfile,
-      known: input.taskContext.constraints.computeProfile !== "unknown",
+      known: sourced && input.taskContext.constraints.computeProfile !== "unknown",
     }),
   ]
   const matchedConditions = checks.flatMap((item) => item.matched)
@@ -91,10 +108,10 @@ export function matchApplicability(input: {
     ...facts.horizonProfile,
     ...facts.computeProfile,
   ].map(normalized))
-  let conflicted = false
+  let conflicted = violatedConditions.length > 0
   for (const raw of input.card.notApplicableWhen) {
     const predicate = normalized(raw)
-    if (!controlled.has(predicate as (typeof taskEvidenceConfig.controlledPredicates)[number])) {
+    if (!controlled.has(predicate as (typeof taskEvidenceConfig.controlledPredicates)[number]) && !featureKnown(raw, facts)) {
       uncertainConditions.push(`notApplicableWhen:${raw}`)
       continue
     }
@@ -102,7 +119,7 @@ export function matchApplicability(input: {
       uncertainConditions.push(`notApplicableWhen:${raw}`)
       continue
     }
-    if (taskPredicates.has(predicate)) {
+    if ([...taskPredicates].some((actual) => equivalent(raw, actual))) {
       violatedConditions.push(`notApplicableWhen:${raw}`)
       conflicted = true
     }
@@ -122,4 +139,26 @@ export function matchApplicability(input: {
     violatedConditions: [...new Set(violatedConditions)].toSorted(),
     uncertainConditions: [...new Set(uncertainConditions)].toSorted(),
   }
+}
+
+export const APPLICABILITY_MATCHER_VERSION = "task_applicability_v2"
+
+export function matchPrincipleApplicability(input: {
+  card: KnowledgeCardV2; report: DatasetQuantitativeAnalysis; taskContext: RetrieveTaskContext
+}): ApplicabilityResult {
+  const facts = taskFacts(input.report, input.taskContext)
+  const matchedConditions: string[] = [], violatedConditions: string[] = [], uncertainConditions: string[] = []
+  for (const condition of input.card.conditions) {
+    const statement = input.card.assertions.find((item) => item.assertionID === condition.assertionID)!.statement
+    const actual = [...facts.taskTypes, ...facts.dataFeatures, ...facts.domains, ...facts.dataScale, ...facts.horizonProfile, ...facts.computeProfile]
+    if (actual.some((value) => equivalent(statement, value))) matchedConditions.push(statement)
+    else if (featureKnown(statement, facts)) violatedConditions.push(statement)
+    else uncertainConditions.push(statement)
+  }
+  // Boundaries are source statements, not automatically executable exclusion predicates.
+  if (input.card.boundaries.status === "reported") {
+    for (const boundary of input.card.boundaries.items) uncertainConditions.push(`Boundary requires assessment: ${input.card.assertions.find((a) => a.assertionID === boundary.assertionID)!.statement}`)
+  }
+  return { status: violatedConditions.length ? "conflicted" : uncertainConditions.length ?
+    (matchedConditions.length ? "partial" : "unknown") : "matched", matchedConditions, violatedConditions, uncertainConditions }
 }

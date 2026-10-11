@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { validateCandidateEvidence, verifyCandidate } from "../../../src/research/literature/evidence-verifier"
 import { FixtureExtractionModel } from "../../../src/research/literature/extraction-model"
-import { candidate, chunk, document } from "./fixtures"
+import { candidate, candidateScope, chunk, document, evidenceText, scopeText } from "./fixtures"
 
 test("exact source spans and numeric results are accepted", async () => {
   const result = await verifyCandidate({
@@ -9,6 +9,27 @@ test("exact source spans and numeric results are accepted", async () => {
   })
   expect(result.ok).toBe(true)
   if (result.ok) expect(result.evidence[0].verification).toBe("exact_span")
+})
+
+test("scope needs both literal source evidence and independent semantic approval", async () => {
+  const value = candidate({ scope: candidateScope() })
+  const source = chunk({ text: `${evidenceText}\n${scopeText}` })
+  const verification = { verdict: "supported" as const, supportedScope: "ETTh1", unsupportedParts: [],
+    evidenceDirectness: "direct" as const, confidence: 1, cardTypeVerdict: "correct" as const,
+    mechanismVerdict: "not_applicable" as const, contributionVerdict: "own_method" as const,
+    actionabilityVerdict: "testable_intervention" as const }
+  for (const scopeVerdict of [undefined, "unsupported", "not_applicable"] as const) {
+    const rejected = await verifyCandidate({ candidate: value, chunks: [source], requireExactEvidenceSpan: true,
+      model: new FixtureExtractionModel({}, { ...verification, scopeVerdict }) })
+    expect(rejected.ok).toBe(false)
+  }
+  const model = new FixtureExtractionModel({}, { ...verification, scopeVerdict: "supported" })
+  const accepted = await verifyCandidate({ candidate: value, chunks: [source], requireExactEvidenceSpan: true, model })
+  expect(accepted.ok).toBe(true)
+  if (accepted.ok) expect(accepted.evidence.some((item) => item.evidenceSpan === scopeText)).toBe(true)
+  const fabricated = await verifyCandidate({ candidate: value, chunks: [chunk()], requireExactEvidenceSpan: true, model })
+  expect(fabricated.ok).toBe(false)
+  if (!fabricated.ok) expect(fabricated.rejection.reason).toBe("no_locatable_evidence")
 })
 
 test("supported difficulty observation is rejected without a testable intervention", async () => {

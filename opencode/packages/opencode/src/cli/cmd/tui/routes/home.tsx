@@ -1,7 +1,7 @@
 import { DialogResearchHistory } from "@tui/component/dialog-research-history"
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { useLocal } from "@tui/context/local"
 import { DialogProvider as ProviderAuthDialog } from "@tui/component/dialog-provider"
@@ -59,7 +59,6 @@ function useOptionalLocal() {
 
 export function Home() {
   let input: TextareaRenderable | undefined
-  let focusTimer: ReturnType<typeof setTimeout> | undefined
   let promptedForApiKey = false
   const command = useCommandDialog()
   const dialog = useDialog()
@@ -200,7 +199,7 @@ export function Home() {
   }
 
   onMount(() => {
-    focusTimer = setTimeout(() => input?.focus(), 0)
+    input?.focus()
   })
 
   createEffect(() => {
@@ -211,10 +210,6 @@ export function Home() {
       if (!needsApiKey()) return
       if (!openProviderDialog()) showApiKeyHelp()
     }, 0)
-  })
-
-  onCleanup(() => {
-    if (focusTimer) clearTimeout(focusTimer)
   })
 
   command.register(() => [

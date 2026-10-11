@@ -17,16 +17,12 @@ function sourceQuality(publicationStatus: string, verification?: string) {
 }
 
 function transferability(candidate: CandidateClaim) {
-  if (candidate.evidenceType === "agent_inference") return 0.35
-  const datasetSignals = candidate.claim.match(/\b(?:ETT\w*|Electricity|Traffic|Weather|Exchange|ILI|PEMS\w*|dataset)s?\b/gi) ?? []
-  return datasetSignals.length >= 3 ? 0.8 : datasetSignals.length >= 1 ? 0.55 : 0.4
-}
-
-function applicabilityBasis(candidate: CandidateClaim): KnowledgeCard["applicability"]["basis"] {
-  if (candidate.evidenceType === "agent_inference") return "agent_inference"
-  if (["author_experiment", "ablation_result"].includes(candidate.evidenceType)) return "author_experiment"
-  if (["author_definition", "author_argument", "limitation_statement"].includes(candidate.evidenceType)) return "author_statement"
-  return "unknown"
+  // A conservative ranking prior, not a probability of success on a new task.
+  const scope = candidate.scope
+  if (candidate.evidenceType === "agent_inference" || scope?.applicability.basis === "agent_inference") return 0.2
+  if (!scope || scope.applicability.basis === "unknown") return 0.25
+  const constrained = Object.values(scope.applicability).some((value) => Array.isArray(value) && value.length > 0)
+  return constrained ? (candidate.mechanism ? 0.6 : 0.5) : 0.25
 }
 
 export function normalizeCandidate(input: {
@@ -45,12 +41,18 @@ export function normalizeCandidate(input: {
   readonly now: string
 }) {
   const candidate = input.candidate
+  if (candidate.scope && input.verification.scopeVerdict !== "supported") {
+    throw new Error("Cannot normalize unverified knowledge scope")
+  }
   const normalizedClaim = {
     subject: normalizeClaimPart(candidate.subject, input.taxonomy),
     predicate: normalizeClaimPart(candidate.predicate, input.taxonomy),
     object: normalizeClaimPart(candidate.object, input.taxonomy),
   }
-  const key = `${candidate.paperID}|${normalizedClaim.subject}|${normalizedClaim.predicate}|${normalizedClaim.object}`
+  const scope = candidate.scope
+  const scopeKey = scope ? JSON.stringify({ applicability: scope.applicability,
+    experimentalContext: scope.experimentalContext, notApplicableWhen: scope.notApplicableWhen, limitations: scope.limitations }) : ""
+  const key = `${candidate.paperID}|${normalizedClaim.subject}|${normalizedClaim.predicate}|${normalizedClaim.object}${scopeKey ? `|${scopeKey}` : ""}`
   const cardID = `kc_${digest(key, 12)}`
   const evidence = input.evidence.map((item) => ({
     evidenceID: `ev_${digest(`${cardID}|${item.chunk.chunkID}|${item.evidenceSpan}`, 12)}`,
@@ -79,16 +81,13 @@ export function normalizeCandidate(input: {
     normalizedClaim,
     ...(candidate.problem === undefined ? {} : { problem: candidate.problem }),
     ...(candidate.mechanism === undefined ? {} : { mechanism: candidate.mechanism }),
-    applicability: {
-      taskTypes: candidate.claim.toLowerCase().includes("forecast") ? ["forecasting"] : [],
-      dataFeatures: Object.keys(input.taxonomy.data_features).filter((term) => candidate.claim.toLowerCase().includes(term.replaceAll("_", " "))),
-      domains: [], dataScale: [],
-      horizonProfile: /\blong[- ](?:term|range|horizon)\b/i.test(candidate.claim) ? ["long_horizon"] : [],
-      computeProfile: [], basis: applicabilityBasis(candidate),
+    applicability: scope ? structuredClone(scope.applicability) : {
+      taskTypes: [], dataFeatures: [], domains: [], dataScale: [], horizonProfile: [], computeProfile: [], basis: "unknown",
     },
-    notApplicableWhen: [],
+    ...(scope?.experimentalContext === undefined ? {} : { experimentalContext: structuredClone(scope.experimentalContext) }),
+    notApplicableWhen: [...(scope?.notApplicableWhen ?? [])],
     evidence,
-    limitations: [],
+    limitations: [...(scope?.limitations ?? [])],
     confidence: {
       sourceQuality: sourceQuality(input.publicationStatus, input.publicationVerification),
       extractionConfidence: candidate.extractorConfidence,

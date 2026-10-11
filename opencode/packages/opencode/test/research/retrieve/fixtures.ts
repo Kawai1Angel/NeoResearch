@@ -1,3 +1,5 @@
+import { principleFixture } from "../literature/principle-fixtures"
+import { buildPrincipleTaskEvidence } from "../../../src/research/retrieve/principle-evidence"
 import { card } from "../literature/fixtures"
 import type { CardRelation, KnowledgeCard } from "../../../src/research/literature/contract"
 import {
@@ -5,7 +7,7 @@ import {
   DatasetQuantitativeAnalysisSchema,
   buildConceptTransformations,
   buildRetrievalIntents,
-  buildTaskEvidence,
+  buildLegacyTaskEvidence,
   extractDatasetEvidence,
   mapScientificConcepts,
   normalizeRetrieveTaskContext,
@@ -132,7 +134,7 @@ export function fixture(input?: {
     candidates: candidateValues,
     literatureResults,
     taskContext,
-    build: () => buildTaskEvidence({
+    build: () => buildLegacyTaskEvidence({
       semanticGroups: input?.semanticGroups,
       paperTitles: { "paper-frequency": "Frequency Study" },
       retrieveRunID: "retrieve_fixture",
@@ -150,4 +152,13 @@ export function fixture(input?: {
       budgets: { ...DEFAULT_RETRIEVAL_BUDGETS, ...input?.budgets },
     }),
   }
+}
+
+export function activeFixture(empty = false) {
+  const data = fixture()
+  const { card } = principleFixture((c) => { c.paperID = data.literatureResults[0]!.paperID })
+  const literatureResults = data.literatureResults.map((p, i) => ({ ...p, acceptedCardIDs: empty || i ? [] : [card.knowledgeID] }))
+  return buildPrincipleTaskEvidence({ ...data, report: data.quantitative, literatureResults,
+    retrieveRunID: "retrieve_fixture", quantitativeReportArtifactID: "artifact_fixture",
+    knowledgeSource: { getCard: (id) => id === card.knowledgeID ? card : undefined }, budgets: DEFAULT_RETRIEVAL_BUDGETS })
 }

@@ -15,3 +15,5 @@ export * from "./retrieve-agent"
 export * from "./card-intent-binder"
 export * from "./applicability-matcher"
 export * from "./task-evidence-builder"
+
+export { buildPrincipleTaskEvidence as buildTaskEvidence } from "./principle-evidence"

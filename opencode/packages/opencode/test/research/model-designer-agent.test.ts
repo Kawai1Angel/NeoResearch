@@ -436,7 +436,7 @@ test("design selection follows explicit planner choice regardless of priority or
   expect(fingerprint.selectedHypothesis).toEqual({ ...pivot })
 })
 
-test("final design prompt carries refined hypothesis criteria and concrete reflection advice", () => {
+test("final design prompt keeps refined hypothesis criteria and retrieves reflections on demand", () => {
   const selected = hypothesisForDesign({
     id: "repair_mamba",
     suggestedBackbones: ["mamba"],
@@ -456,9 +456,9 @@ test("final design prompt carries refined hypothesis criteria and concrete refle
     }),
   )
   expect(prompt.taskFingerprint.selectedHypothesis).toEqual(selected)
-  expect(prompt.previousSessionReflection).toContain("warmup_steps=5")
-  expect(prompt.previousSessionReflection).toContain("grad_clip=1 already enabled")
-  expect(prompt.instruction).toContain("concrete recipe fields")
+  expect(prompt.previousSessionReflection).toBeUndefined()
+  expect(prompt.historyAccess.tool).toBe("experiment_results")
+  expect(prompt.instruction).toContain("return unavailable")
 })
 
 test("explicit planner choice never falls back to another hypothesis", () => {

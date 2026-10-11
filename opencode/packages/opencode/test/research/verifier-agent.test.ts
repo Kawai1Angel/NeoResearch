@@ -11,7 +11,7 @@ function task(extraObjective: Record<string, unknown> = {}): ResearchTask {
     domainID: "tsf",
     mode: "autonomous",
     status: "searching",
-    taskSpec: {},
+    taskSpec: { evaluation: { protocol: "fixed_split" } },
     objective: { primaryMetric: "val_avg_mse", direction: "minimize", ...extraObjective },
     budget: {},
     time: { created: 1, updated: 1 },
@@ -81,7 +81,7 @@ test("metric_verifier rejects when primary metric is absent", () => {
   expect(report.accepted).toBe(false)
 })
 
-test("metric_verifier rejects when metric value is non-positive", () => {
+test("metric_verifier rejects a negative error metric", () => {
   const report = runVerifiers(ctx({
     run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: -0.1 } }),
   }))
@@ -89,12 +89,12 @@ test("metric_verifier rejects when metric value is non-positive", () => {
   expect(result.accepted).toBe(false)
 })
 
-test("metric_verifier rejects diverged training (metric > 1e6)", () => {
+test("metric_verifier accepts a finite error without assuming the target units", () => {
   const report = runVerifiers(ctx({
     run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: 2_000_000 } }),
   }))
   const result = report.results.find((r) => r.name === "metric_verifier")!
-  expect(result.accepted).toBe(false)
+  expect(result.accepted).toBe(true)
 })
 
 // --- baseline_comparison_verifier ---
@@ -102,7 +102,8 @@ test("metric_verifier rejects diverged training (metric > 1e6)", () => {
 test("baseline_comparison_verifier accepts the first run with no history", () => {
   const report = runVerifiers(ctx({ previousRuns: [] }))
   const result = report.results.find((r) => r.name === "baseline_comparison_verifier")!
-  expect(result.accepted).toBe(true)
+  expect(result.accepted).toBe(false)
+  expect(result.status).toBe("skipped")
 })
 
 test("baseline_comparison_verifier accepts when current is better than previous", () => {
@@ -133,7 +134,8 @@ test("horizon_verifier skips when only one horizon is present", () => {
     run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: 0.3, val_mse_96: 0.2 } }),
   }))
   const result = report.results.find((r) => r.name === "horizon_verifier")!
-  expect(result.accepted).toBe(true)
+  expect(result.accepted).toBe(false)
+  expect(result.status).toBe("insufficient_evidence")
   expect(result.evidence["skipped"]).toBeUndefined()
 })
 
@@ -182,13 +184,13 @@ test("cost_perf_verifier rejects when model exceeds param budget", () => {
 
 // --- overfitting_verifier ---
 
-test("overfitting_verifier rejects suspiciously small val MSE", () => {
+test("overfitting_verifier does not reject small MSE without a comparable training loss", () => {
   const report = runVerifiers(ctx({
     run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: 0.000001 } }),
   }))
   const result = report.results.find((r) => r.name === "overfitting_verifier")!
   expect(result.accepted).toBe(false)
-  expect(result.reason).toContain("suspiciously small")
+  expect(result.status).toBe("insufficient_evidence")
 })
 
 test("overfitting_verifier rejects when val/train ratio exceeds 3x", () => {
@@ -207,9 +209,9 @@ test("overfitting_verifier rejects when val/train ratio exceeds 3x", () => {
 // --- full report + markdown ---
 
 test("runVerifiers returns accepted=true when all checks pass", () => {
-  const prev = run({ id: "prev", status: "succeeded", metrics: { val_avg_mse: 0.5 } })
+  const prev = run({ id: "prev", status: "succeeded", metrics: { val_avg_mse: 0.5, params_M: 1 } })
   const report = runVerifiers(ctx({
-    run: run({ id: "curr", status: "succeeded", metrics: { val_avg_mse: 0.4 } }),
+    run: run({ id: "curr", status: "succeeded", metrics: { val_avg_mse: 0.4, train_avg_mse: 0.3, val_h96_mse: 0.3, val_h720_mse: 0.5, params_M: 1 } }),
     previousRuns: [prev],
   }))
   expect(report.accepted).toBe(true)
@@ -230,7 +232,7 @@ test("buildEvaluationResultMarkdown renders verdict and verifier sections", () =
     report,
   })
   expect(md).toContain("# Evaluation Result")
-  expect(md).toContain("ACCEPTED")
+  expect(md).toContain("INSUFFICIENT_EVIDENCE")
   expect(md).toContain("metric_verifier")
   expect(md).toContain("horizon_verifier")
 })
@@ -306,7 +308,8 @@ test("data_leakage_verifier skips non-succeeded runs", () => {
     run: run({ id: "r_fail", status: "failed", metrics: {} }),
   }))
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
-  expect(result.accepted).toBe(true)
+  expect(result.accepted).toBe(false)
+  expect(result.status).toBe("skipped")
   expect(result.evidence).toMatchObject({ skipped: true })
 })
 
@@ -331,7 +334,8 @@ test("data_leakage_verifier accepts ordered expanding-window CV", () => {
     run: run({ id: "r_cv", status: "succeeded", metrics: { cv_avg_mse: 0.4, val_avg_mse: 0.42 } }),
   }))
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
-  expect(result.accepted).toBe(true)
+  expect(result.accepted).toBe(false)
+  expect(result.status).toBe("insufficient_evidence")
 })
 
 test("data_leakage_verifier accepts a prediction length longer than the context", () => {
@@ -343,11 +347,12 @@ test("data_leakage_verifier accepts a prediction length longer than the context"
     } as unknown as typeof task extends () => infer T ? T : never,
   }))
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
-  expect(result.accepted).toBe(true)
+  expect(result.accepted).toBe(false)
+  expect(result.status).toBe("insufficient_evidence")
   expect(result.evidence).toMatchObject({ contextLength: 336, maxHorizon: 720 })
 })
 
-test("data_leakage_verifier rejects suspiciously low val/train ratio", () => {
+test("data_leakage_verifier marks a low val/train ratio inconclusive", () => {
   const report = runVerifiers(ctx({
     run: run({
       id: "r_ratio",
@@ -365,9 +370,10 @@ test("data_leakage_verifier rejects suspiciously low val/train ratio", () => {
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
   expect(result.accepted).toBe(false)
   expect(result.reason).toContain("Val/train")
+  expect(result.status).toBe("insufficient_evidence")
 })
 
-test("data_leakage_verifier rejects horizon MSE strong inversion", () => {
+test("data_leakage_verifier marks horizon MSE inversion inconclusive", () => {
   const report = runVerifiers(ctx({
     run: run({
       id: "r_inv",
@@ -384,9 +390,10 @@ test("data_leakage_verifier rejects horizon MSE strong inversion", () => {
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
   expect(result.accepted).toBe(false)
   expect(result.reason).toContain("inversion")
+  expect(result.status).toBe("insufficient_evidence")
 })
 
-test("data_leakage_verifier rejects horizon MSE collapse", () => {
+test("data_leakage_verifier marks horizon MSE uniformity inconclusive", () => {
   const val = 0.342_100
   const report = runVerifiers(ctx({
     run: run({
@@ -404,9 +411,10 @@ test("data_leakage_verifier rejects horizon MSE collapse", () => {
   const result = report.results.find((r) => r.name === "data_leakage_verifier")!
   expect(result.accepted).toBe(false)
   expect(result.reason).toContain("collapse")
+  expect(result.status).toBe("insufficient_evidence")
 })
 
-test("data_leakage_verifier decision record maps to audit_split_boundaries", () => {
+test("data_leakage_verifier diagnostics produce an inconclusive decision without confirmed failure", () => {
   const report = runVerifiers(ctx({
     run: run({
       id: "r_leak",
@@ -423,8 +431,8 @@ test("data_leakage_verifier decision record maps to audit_split_boundaries", () 
     candidate: candidate(),
     report,
   })
-  expect(record.failure?.category).toBe("data_leakage")
-  expect(record.failure?.recoveryAction.type).toBe("audit_split_boundaries")
+  expect(record.decision).toBe("inconclusive")
+  expect(record.failure).toBeNull()
 })
 
 test("cost_perf_verifier uses absolute parameter counts from the execution contract", () => {
@@ -442,5 +450,5 @@ test("cost_perf_verifier does not turn a textual size preference into a hard lim
     ...ctx(), task: { ...task(), taskSpec: { metadata: { parameterBudgetEnforcement: "preference_only" } }, budget: { parameterBudget: "prefer under 5M when possible" } },
     run: run({ id: "r", status: "succeeded", metrics: { val_avg_mse: 0.3, params_M: 20 } }),
   })
-  expect(report.results.find((r) => r.name === "cost_perf_verifier")!.accepted).toBe(true)
+  expect(report.results.find((r) => r.name === "cost_perf_verifier")!.accepted).toBe(false)
 })

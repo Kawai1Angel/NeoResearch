@@ -1,3 +1,4 @@
+import { knowledgeSelectionScore } from "../literature/knowledge-confidence"
 import { hasCompleteMechanism } from "../literature/contract"
 import { isTaskEvidenceVerifierVersion } from "../literature/validation-versions"
 import { createHash } from "crypto"
@@ -26,6 +27,7 @@ import {
 export type TaskEvidenceKnowledgeSource = {
   getCard(cardID: string): KnowledgeCard | undefined
   listRelations(): CardRelation[]
+  listCards?(): KnowledgeCard[]
 }
 
 function stableJson(value: unknown): string {
@@ -89,13 +91,15 @@ function statusRank(status: TaskEvidenceEntry["cardStatus"]) {
 }
 
 function entryQualityRank(left: TaskEvidenceEntry, right: TaskEvidenceEntry) {
-  return right.relevance.score - left.relevance.score ||
+  const score = (entry: TaskEvidenceEntry) => entry.knowledge ? knowledgeSelectionScore(entry.relevance.score, entry.knowledge.confidence) : entry.relevance.score
+  return Number(left.applicability.status === "conflicted") - Number(right.applicability.status === "conflicted") ||
+    score(right) - score(left) ||
     Number(right.relevance.reasons.some((reason) => reason.startsWith("refines:"))) -
       Number(left.relevance.reasons.some((reason) => reason.startsWith("refines:"))) ||
     statusRank(right.cardStatus) - statusRank(left.cardStatus) ||
     right.evidenceRefs.filter((item) => item.directness === "direct" && item.verification === "exact_span").length -
       left.evidenceRefs.filter((item) => item.directness === "direct" && item.verification === "exact_span").length ||
-    right.confidence.transferability - left.confidence.transferability
+    (right.confidence?.transferability ?? 0) - (left.confidence?.transferability ?? 0)
 }
 
 function entryRank(left: TaskEvidenceEntry, right: TaskEvidenceEntry) {
@@ -119,12 +123,12 @@ function addRole(entry: TaskEvidenceEntry, role: TaskEvidenceRole): TaskEvidence
   return TaskEvidenceEntrySchema.parse({ ...entry, roles: unique([...entry.roles, role]) })
 }
 
-function coversIntent(entry: TaskEvidenceEntry, intent: RetrievalIntent) {
+export function coversIntent(entry: TaskEvidenceEntry, intent: RetrievalIntent) {
   return entry.linkage.intentIDs.includes(intent.intentID) &&
     (!/how|mechanism|address/i.test(intent.question) || entry.roles.includes("supports_mechanism"))
 }
 
-function selectEntries(input: {
+export function selectEntries(input: {
   readonly entries: readonly TaskEvidenceEntry[]
   readonly intents: readonly RetrievalIntent[]
   readonly budgets: RetrievalBudgets
@@ -174,7 +178,7 @@ function selectEntries(input: {
   }
 }
 
-function gapReason(input: {
+export function gapReason(input: {
   readonly intent: RetrievalIntent
   readonly candidates: readonly RetrievalCandidate[]
   readonly literatureResults: readonly RetrieveLiteratureBridgeResult["papers"][number][]
@@ -184,7 +188,7 @@ function gapReason(input: {
 }) {
   const intentCandidates = input.candidates.filter((item) => item.intentID === input.intent.intentID)
   if (intentCandidates.length === 0) return "no_candidate" as const
-  if (!intentCandidates.some((item) => item.localPDF)) return "no_local_pdf" as const
+  if (!intentCandidates.some((item) => item.localPDF || item.recallRoute === "knowledge_store")) return "no_local_pdf" as const
   const papers = input.literatureResults.filter((item) => item.intentIDs.includes(input.intent.intentID))
   if (papers.some((item) => item.status === "failed" || item.status === "partial") &&
       !input.eligibleBeforeBudget.some((entry) => entry.linkage.intentIDs.includes(input.intent.intentID))) {
@@ -196,7 +200,7 @@ function gapReason(input: {
   return undefined
 }
 
-export function buildTaskEvidence(input: {
+export function buildLegacyTaskEvidence(input: {
   readonly componentRelations?: TaskEvidenceBundle["mechanismRelations"]
   readonly consolidation?: TaskEvidenceBundle["consolidation"]
   readonly paperTitles?: Readonly<Record<string, string>>
@@ -225,13 +229,15 @@ export function buildTaskEvidence(input: {
   const excluded: ExcludedTaskEvidence[] = []
   const eligible: TaskEvidenceEntry[] = []
 
-  for (const literature of input.literatureResults.toSorted((left, right) => left.paperID.localeCompare(right.paperID))) {
+  for (const literature of input.literatureResults.toSorted((left, right) => left.paperID.localeCompare(right.paperID) ||
+    Number(left.status === "reused_knowledge") - Number(right.status === "reused_knowledge"))) {
     for (const cardID of unique(literature.acceptedCardIDs)) {
-      acceptedIDs.add(cardID)
       const priorPaper = acceptedPaper.get(cardID)
       if (priorPaper && priorPaper !== literature.paperID) {
         throw new Error(`Accepted card ${cardID} is referenced by multiple papers: ${priorPaper}, ${literature.paperID}`)
       }
+      if (acceptedIDs.has(cardID)) continue
+      acceptedIDs.add(cardID)
       acceptedPaper.set(cardID, literature.paperID)
       const card = input.knowledgeSource.getCard(cardID)
       if (!card) {
@@ -240,6 +246,10 @@ export function buildTaskEvidence(input: {
       }
       if (card.paperID !== literature.paperID) {
         excluded.push(exclude(cardID, literature.paperID, "paper_mismatch", `KnowledgeCard paperID is ${card.paperID}.`))
+        continue
+      }
+      if (literature.status === "reused_knowledge" && literature.cardRevisions?.[cardID] !== card.revision) {
+        excluded.push(exclude(cardID, card.paperID, "card_validation_required", "Recalled card revision changed; retrieve again before using it."))
         continue
       }
       loadedIDs.add(cardID)
@@ -314,6 +324,7 @@ export function buildTaskEvidence(input: {
         paperTitle: input.paperTitles?.[card.paperID],
         problem: card.problem,
         mechanism: card.mechanism,
+        experimentalContext: card.experimentalContext,
         linkage: {
           intentIDs,
           candidateIDs,
@@ -402,6 +413,7 @@ export function buildTaskEvidence(input: {
         claim: member.claim, problem: member.problem, mechanism: member.mechanism,
         rationale: group.rationale,
         applicability: a.applicability,
+        experimentalContext: a.experimentalContext,
         evidenceRefs: a.evidence.filter((item) => item.directness === "direct" && item.verification === "exact_span")
           .map(({ evidenceID, chunkID, evidenceSpan, section, pageStart, pageEnd }) => ({ evidenceID, chunkID, evidenceSpan, section, pageStart, pageEnd })),
       }, ...(member.mergedSources ?? [])]
@@ -517,3 +529,6 @@ export function buildTaskEvidence(input: {
     },
   })
 }
+
+// The public builder follows the active format; v1 is explicitly audit-only.
+export { buildPrincipleTaskEvidence as buildTaskEvidence } from "./principle-evidence"

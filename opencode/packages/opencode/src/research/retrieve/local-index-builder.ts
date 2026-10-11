@@ -3,10 +3,10 @@ import { createHash } from "crypto"
 import { access, mkdir, readFile, readdir, rename, writeFile } from "fs/promises"
 import path from "path"
 import { Database } from "bun:sqlite"
-import { KnowledgeCardSchema } from "../literature/contract"
+import { reviewedPrinciple } from "./principle-evidence"
 
 export const RETRIEVAL_TOKENIZER_VERSION = "unicode_word_v2"
-export const RETRIEVAL_INDEX_SCHEMA_VERSION = "local_retrieval_index_v1"
+export const RETRIEVAL_INDEX_SCHEMA_VERSION = "local_retrieval_index_v2"
 
 export type IndexedPaper = {
   readonly paperID: string
@@ -240,14 +240,14 @@ export async function collectIndexedPapers(input: {
     papers.set(paperID, paper)
   }
 
-  const cardsPath = path.join(knowledgeRoot, "exports", "knowledge_cards.jsonl")
+  const cardsPath = path.join(knowledgeRoot, "exports", "knowledge_cards_v2.jsonl")
   if (await exists(cardsPath)) sourceDigests[path.relative(neoCastRoot, cardsPath)] = digestText(await readFile(cardsPath, "utf8"))
   for (const value of await readJsonl(cardsPath)) {
-    const card = KnowledgeCardSchema.safeParse(value)
-    if (!card.success) continue
-    const paper = papers.get(card.data.paperID) ?? emptyPaper(card.data.paperID)
-    appendField(paper, "knowledgeCard", [card.data.claim, card.data.mechanism?.principle, ...card.data.applicability.dataFeatures].filter(Boolean).join(" "))
-    if (["paper_backed", "corroborated"].includes(card.data.status)) paper.hasPaperBackedCard = true
+    const card = reviewedPrinciple(value)
+    if (!card) continue
+    const paper = papers.get(card.paperID) ?? emptyPaper(card.paperID)
+    appendField(paper, "knowledgeCard", [card.principle, card.mechanism.explanatoryPath, ...card.assertions.map((a) => a.statement)].filter(Boolean).join(" "))
+    paper.hasPaperBackedCard = true
     papers.set(paper.paperID, paper)
   }
 
@@ -330,7 +330,7 @@ export async function buildLocalIndex(input: {
     indexDigest,
     sourceDigests,
     catalogSha256: Object.entries(sourceDigests).find(([sourcePath]) => sourcePath.endsWith("catalog/papers.jsonl"))?.[1],
-    knowledgeCardExportDigest: Object.entries(sourceDigests).find(([sourcePath]) => sourcePath.endsWith("exports/knowledge_cards.jsonl"))?.[1],
+    knowledgeCardExportDigest: Object.entries(sourceDigests).find(([sourcePath]) => sourcePath.endsWith("exports/knowledge_cards_v2.jsonl"))?.[1],
     tokenizerVersion: RETRIEVAL_TOKENIZER_VERSION,
     bm25: { k1: 1.2, b: 0.75, fieldWeights: { title: 4, abstract: 3, knowledgeCard: 3, method: 2, introduction: 1.5, results: 1.5, limitations: 1 } },
     taxonomyVersion: input.taxonomyVersion ?? "literature_taxonomy_v1",

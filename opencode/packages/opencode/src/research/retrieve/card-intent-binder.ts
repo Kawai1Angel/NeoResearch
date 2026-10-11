@@ -1,4 +1,5 @@
 import taskEvidenceConfig from "./config/tsf-task-evidence.v1.json" with { type: "json" }
+import type { KnowledgeCardV2 } from "../literature/knowledge-v2-contract"
 import type { KnowledgeCard } from "../literature/contract"
 import { normalizeRetrievalTokens } from "./bm25-search"
 import type { ConceptTransformation, RetrievalIntent } from "./contract"
@@ -26,7 +27,12 @@ function phrases(values: readonly string[]) {
   return [...output]
 }
 
-function cardVocabulary(card: KnowledgeCard, scope: "semantic" | "task" | "domain") {
+function cardVocabulary(card: KnowledgeCard | KnowledgeCardV2, scope: "semantic" | "task" | "domain") {
+  if (card.schemaVersion === "knowledge_card_v2") {
+    const statements = card.assertions.map((item) => item.statement)
+    return phrases([card.principle, card.transferableInsight, card.intervention.operation,
+      ...card.intervention.necessaryComponents, card.mechanism.input, card.mechanism.operation, card.mechanism.explanatoryPath, ...statements])
+  }
   const semantic = [
     card.claim,
     card.problem ?? "",
@@ -60,7 +66,8 @@ function matches(vocabulary: readonly string[], terms: readonly string[]) {
   return [...new Set(matched)]
 }
 
-function roleCompatible(card: KnowledgeCard, intent: RetrievalIntent) {
+function roleCompatible(card: KnowledgeCard | KnowledgeCardV2, intent: RetrievalIntent) {
+  if (card.schemaVersion === "knowledge_card_v2") return true
   const question = intent.question.toLowerCase()
   if (card.cardType === "limitation") return true
   if (card.cardType === "evaluation_protocol") return /evaluat|metric|benchmark/.test(question)
@@ -69,7 +76,7 @@ function roleCompatible(card: KnowledgeCard, intent: RetrievalIntent) {
 }
 
 export function bindCardToIntents(input: {
-  readonly card: KnowledgeCard
+  readonly card: KnowledgeCard | KnowledgeCardV2
   readonly intentIDs: readonly string[]
   readonly intents: readonly RetrievalIntent[]
   readonly transformations: readonly ConceptTransformation[]
@@ -93,7 +100,7 @@ export function bindCardToIntents(input: {
       const taskType = matches(taskVocabulary, [input.taskType, ...intent.paperLanguageQuery.taskTerms])
       const domain = matches(domainVocabulary, [input.domain, ...intent.paperLanguageQuery.domainTerms])
       const compatible = roleCompatible(input.card, intent)
-      if (input.card.cardType === "evaluation_protocol" && !compatible) return []
+      if (input.card.schemaVersion === "knowledge_card_v1" && input.card.cardType === "evaluation_protocol" && !compatible) return []
       if (scientific.length === 0 && method.length === 0) return []
       const score =
         (scientific.length > 0 ? taskEvidenceConfig.weights.scientific : 0) +
@@ -107,7 +114,7 @@ export function bindCardToIntents(input: {
         ...(method.length > 0 ? [`method/mechanism match: ${method.join(", ")}`] : []),
         ...(taskType.length > 0 ? [`task match: ${taskType.join(", ")}`] : []),
         ...(domain.length > 0 ? [`domain match: ${domain.join(", ")}`] : []),
-        ...(compatible ? [`card type ${input.card.cardType} is compatible with the intent question`] : []),
+        ...(compatible ? [`card type ${input.card.schemaVersion === "knowledge_card_v2" ? "transferable_principle" : input.card.cardType} is compatible with the intent question`] : []),
       ]
       return [{
         intentID: intent.intentID,
@@ -119,4 +126,4 @@ export function bindCardToIntents(input: {
     .toSorted((left, right) => right.score - left.score || left.intentID.localeCompare(right.intentID))
 }
 
-export const TASK_EVIDENCE_MAPPING_VERSION = `${taskEvidenceConfig.schemaVersion}:binding_v5`
+export const TASK_EVIDENCE_MAPPING_VERSION = `${taskEvidenceConfig.schemaVersion}:binding_v7`

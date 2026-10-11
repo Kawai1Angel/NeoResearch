@@ -8,8 +8,9 @@ import { unsupportedModelRecipeMechanisms } from "./model-recipe-screen"
 
 export const CLASSIC_COMPONENT_MAPPING_VERSION = "classic_component_mapping_v1"
 export const PDF_IDENTITY_SCREEN_VERSION = "pdf_title_identity_screen_v1"
-export const COMPATIBILITY_REVIEW_VERSION = "model_recipe_compatibility_review_v1"
+export const COMPATIBILITY_REVIEW_VERSION = "model_recipe_family_compatibility_review_v2"
 export const PAPER_SCOPE_SCREEN_VERSION = "paper_scope_screen_v1"
+export const PAPER_SELECTION_VERSION = "family_discovery_reuse_before_quota_v3"
 
 const DOMAIN_TITLE_PATTERNS = [
   /\b(?:stock|equity|portfolio|financial market|stock returns?)\b/i,
@@ -73,6 +74,7 @@ export function buildRetrievalCandidates(
   maxLiteraturePapersPerIntent: number,
   probabilistic = false,
   compatibilityReviews: readonly ModelRecipeCompatibilityReview[] = [],
+  coveredPaperIntents: ReadonlySet<string> = new Set(),
 ): RetrievalCandidate[] {
   const phenomenon = normalized(intent.paperLanguageQuery.phenomenonTerms)
   const methods = normalized(intent.paperLanguageQuery.methodTerms)
@@ -101,13 +103,14 @@ export function buildRetrievalCandidates(
     b.relevance - a.relevance || a.result.rank - b.result.rank)
   const eligibleBasic = (item: typeof reviewed[number]) => item.result.paper.localPDF &&
     (item.titleMatches.length > 0 || item.sourceMatches.length > 0 || item.componentMatches.length > 0) &&
-    !item.auxiliary && !item.identityMismatch && !item.rejectedByReview &&
-    (item.unsupported.length === 0 || item.transferable)
+    !item.auxiliary && !item.identityMismatch && !item.rejectedByReview
   const generalAvailable = reviewed.some((item) => item.scope === "general" && eligibleBasic(item))
   const eligible = (item: typeof reviewed[number]) => eligibleBasic(item) &&
     (item.scope === "general" || !generalAvailable)
-  const sourceAvailable = reviewed.some((item) => eligible(item) && item.result.recallRoute !== "classic_library")
-  const classicAvailable = reviewed.some((item) => eligible(item) && item.result.recallRoute === "classic_library")
+  const needsReading = (item: typeof reviewed[number]) => eligible(item) &&
+    !coveredPaperIntents.has(`${item.result.paper.paperID}\0${intent.intentID}`)
+  const sourceAvailable = reviewed.some((item) => needsReading(item) && item.result.recallRoute !== "classic_library")
+  const classicAvailable = reviewed.some((item) => needsReading(item) && item.result.recallRoute === "classic_library")
   let selectedSource = 0
   let selectedClassic = 0
   return reviewed.map(({ result, titleMatches, sourceMatches, componentMatches, auxiliary, scope, identityMismatch, unsupported, compatibility, transferable, rejectedByReview }) => {
@@ -118,8 +121,8 @@ export function buildRetrievalCandidates(
     decisionReasons.push(`screening_v2: title matches [${titleMatches.join(", ")}]; source matches [${sourceMatches.join(", ")}]`)
     if (componentMatches.length) decisionReasons.push(`ModelRecipe component matches [${componentMatches.join(", ")}]`)
     if (compatibility) decisionReasons.push(`source-hash-bound compatibility review ${compatibility.verdict}: ${compatibility.reason}`)
-    if (unsupported.length && transferable) decisionReasons.push(...unsupported.map((item) =>
-      `exact ${item.mechanism} remains unavailable in ModelRecipe; retained for transferable knowledge`))
+    if (unsupported.length && !rejectedByReview) decisionReasons.push(...unsupported.map((item) =>
+      `exact ${item.mechanism} remains unavailable in ModelRecipe; retained for source-reviewed mechanism-family knowledge; operator availability is not paper eligibility`))
     if (result.paper.previewError) decisionReasons.push(`preview unavailable: ${result.paper.previewError}`)
     if (auxiliary) decisionReasons.push("auxiliary: interval/calibration objective differs from point forecasting")
     if (identityMismatch) {
@@ -127,10 +130,7 @@ export function buildRetrievalCandidates(
       decisionReasons.push("local PDF identity mismatch: its first-page text does not match the catalog title")
     } else if (rejectedByReview) {
       decision = "unsupported_model_recipe"
-      decisionReasons.push("compatibility review found no transferable ModelRecipe mechanism or task evaluation lesson")
-      decisionReasons.push(...unsupported.map((item) => `ModelRecipe has no equivalent ${item.missingAction} action for ${item.mechanism}`))
-    } else if (unsupported.length && !transferable) {
-      decision = "unsupported_model_recipe"
+      decisionReasons.push("compatibility review found no transferable ModelRecipe mechanism family")
       decisionReasons.push(...unsupported.map((item) => `ModelRecipe has no equivalent ${item.missingAction} action for ${item.mechanism}`))
     } else if (!result.paper.localPDF) {
       decision = "skipped_pdf_unavailable"
@@ -144,6 +144,9 @@ export function buildRetrievalCandidates(
     } else if (scope === "domain_specific" && generalAvailable) {
       decision = "domain_specific"
       decisionReasons.push("domain-specific paper deferred because an eligible general forecasting paper covers this intent")
+    } else if (coveredPaperIntents.has(`${result.paper.paperID}\0${intent.intentID}`)) {
+      decision = "reuse_knowledge"
+      decisionReasons.push("Existing source knowledge covers this paper/intent; does not consume new-paper reading quota")
     } else if (selected < maxLiteraturePapersPerIntent &&
       (maxLiteraturePapersPerIntent === 1 || (classic
         ? selectedClassic < maxLiteraturePapersPerIntent - (sourceAvailable ? 1 : 0)

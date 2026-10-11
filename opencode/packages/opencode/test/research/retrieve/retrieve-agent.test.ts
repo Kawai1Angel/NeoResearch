@@ -4,7 +4,8 @@ import path from "path"
 import { tmpdir } from "../../fixture/fixture"
 import type { LiteratureAgentInput, LiteratureAgentResult } from "../../../src/research/literature/contract"
 import { card, document, chunk } from "../literature/fixtures"
-import { KnowledgeStore } from "../../../src/research/literature/knowledge-store"
+import { KnowledgeV2Store } from "../../../src/research/literature/knowledge-v2-store"
+import { principleFixture } from "../literature/principle-fixtures"
 import {
   DatasetQuantitativeAnalysisSchema,
   RetrieveAgent,
@@ -113,41 +114,26 @@ test("RetrieveAgent performs one BM25 recall per intent and bridges each paper o
   await writeFile(path.join(catalogRoot, "papers.jsonl"), `${records.map((item) => JSON.stringify(item)).join("\n")}\n`)
 
   const calls: LiteratureAgentInput[] = []
-  const knowledge = new KnowledgeStore(path.join(neoCastRoot, ".neo-cast", "literature-knowledge", "knowledge.db"))
+  const knowledge = new KnowledgeV2Store(path.join(neoCastRoot, ".neo-cast", "literature-knowledge", "knowledge.db"))
+  let withdraw = false
   const literatureAgent = {
     async run(input: LiteratureAgentInput): Promise<LiteratureAgentResult> {
       calls.push(input)
-      knowledge.transaction(() => {
-        knowledge.saveDocument({ document: { ...document(), paperID: "paper-frequency" },
-          chunks: [chunk({ paperID: "paper-frequency" })], documentPath: path.join(tmp.path, "document.json"), parseStatus: "parsed" })
-        knowledge.saveCard(knowledgeCard)
-      })
+      if (withdraw) knowledge.publish([], knowledgeContext, true)
+      else if (!knowledge.getCard(knowledgeCard.knowledgeID)) knowledge.publish([knowledgeCard], knowledgeContext, true)
       return {
         agent: "LiteratureAgent",
         runIDs: ["lerun_fixture"],
         processed: [{
           paperID: "paper-frequency", documentID: "doc_fixture", status: "completed",
-          acceptedCardIDs: ["kc_123456789abc"], rejectedCandidateCount: 0, warningCount: 0,
+          acceptedCardIDs: withdraw ? [] : [knowledgeCard.knowledgeID], rejectedCandidateCount: 0, warningCount: 0,
           reviewPath: path.join(tmp.path, "review.md"),
         }],
         summary: { paperCount: 1, acceptedCardCount: 1, paperBackedCount: 1, agentInferenceCount: 0, duplicateCount: 0, failedCount: 0 },
       }
     },
   }
-  const knowledgeCard = card({
-    paperID: "paper-frequency",
-    claim: "Frequency-domain modeling captures multiple seasonalities in forecasting.",
-    normalizedClaim: { subject: "multiple_seasonalities", predicate: "uses", object: "frequency_domain_modeling" },
-    implementation: { recipeConcepts: ["frequency modeling"], registryMappings: ["embedding.frequency"],
-      estimatedComplexity: "medium", notes: ["Compare with a time-domain baseline"] },
-    mechanism: {
-      mechanismID: "mechanism_frequency",
-      name: "frequency multi-scale modeling",
-      principle: "Model multiple periodic structures in the frequency domain.",
-      components: ["spectral peaks", "multi-period aggregation"],
-    },
-    tags: ["multiple_seasonalities", "frequency_multiscale"],
-  })
+  const { card: knowledgeCard, context: knowledgeContext } = principleFixture((c) => { c.paperID = "paper-frequency" })
   const agent = new RetrieveAgent({
     neoCastRoot,
     workspaceRoot: tmp.path,
@@ -161,7 +147,7 @@ test("RetrieveAgent performs one BM25 recall per intent and bridges each paper o
   expect(result.intents.every((item) => typeof item.paperLanguageQuery.queryText === "string")).toBe(true)
   expect(result.candidates.some((item) => item.paperID === "paper-no-pdf" && item.decision === "skipped_pdf_unavailable")).toBe(true)
   expect(result.candidates.some((item) => item.paperID === "paper-domain" && item.decision === "domain_only" && item.evidenceLevel === "metadata_only")).toBe(true)
-  expect(result.literatureResults.find((item) => item.paperID === "paper-frequency")?.acceptedCardIDs).toEqual(["kc_123456789abc"])
+  expect(result.literatureResults.find((item) => item.paperID === "paper-frequency")?.acceptedCardIDs).toEqual([knowledgeCard.knowledgeID])
   expect(result.literatureResults.find((item) => item.paperID === "paper-frequency")!.intentIDs.length).toBeGreaterThan(1)
   expect(result.summary.paperBackedCardCount).toBe(1)
   expect(result.schemaVersion).toBe("retrieve_result_v2")
@@ -169,15 +155,20 @@ test("RetrieveAgent performs one BM25 recall per intent and bridges each paper o
   const old = { ...legacy, schemaVersion: "retrieve_result_v1" }
   expect(AnyRetrieveResultSchema.safeParse(old).success).toBe(true)
   expect(RetrieveResultV2Schema.safeParse(old).success).toBe(false)
-  expect(result.taskEvidence.schemaVersion).toBe("task_evidence_bundle_v1")
-  expect(result.taskEvidence.entries[0]?.cardID).toBe("kc_123456789abc")
+  expect(result.taskEvidence.schemaVersion).toBe("task_evidence_bundle_v2")
+  expect(result.taskEvidence.entries[0]?.cardID).toBe(knowledgeCard.knowledgeID)
   const runRoot = path.join(neoCastRoot, ".neo-cast", "literature-retrieval", "runs", result.retrieveRunID)
   expect(JSON.parse(await readFile(path.join(runRoot, "task_evidence_bundle.json"), "utf8"))).toEqual(result.taskEvidence)
-  expect(await readFile(path.join(runRoot, "report.md"), "utf8")).toContain("kc_123456789abc")
+  expect(await readFile(path.join(runRoot, "report.md"), "utf8")).toContain(knowledgeCard.knowledgeID)
   expect(await readFile(path.join(runRoot, "task_evidence_excluded.jsonl"), "utf8")).toBeDefined()
   const repeated = await agent.run({ quantitativeReport: report() })
-  expect(repeated.retrieveRunID).toBe(result.retrieveRunID)
-  expect(calls).toHaveLength(1)
+  // The first run added knowledge. The next run incorporates that new store snapshot.
+  expect(repeated.retrieveRunID).not.toBe(result.retrieveRunID)
+  expect(repeated.candidates.some((candidate) => candidate.recallRoute === "knowledge_store")).toBe(true)
+  expect(repeated.taskEvidence.entries[0]?.knowledge).toEqual(knowledge.getCard(knowledgeCard.knowledgeID))
+  const callCount = calls.length
+  expect((await agent.run({ quantitativeReport: report() })).retrieveRunID).toBe(repeated.retrieveRunID)
+  expect(calls).toHaveLength(callCount)
   const reRegistered = await agent.run({ quantitativeReport: report(), quantitativeReportArtifactID: "artifact_new" })
   expect(reRegistered.retrieveRunID).not.toBe(result.retrieveRunID)
   expect(reRegistered.taskEvidence.quantitativeReportArtifactID).toBe("artifact_new")
@@ -187,7 +178,11 @@ test("RetrieveAgent performs one BM25 recall per intent and bridges each paper o
   expect(differentContext.retrieveRunID).not.toBe(result.retrieveRunID)
   const manifest = JSON.parse(await readFile(path.join(neoCastRoot, ".neo-cast", "literature-retrieval", "runs", differentContext.retrieveRunID, "run_manifest.json"), "utf8"))
   expect(JSON.stringify(manifest)).toContain("research_task")
-  expect(knowledge.getCard(knowledgeCard.cardID)).not.toHaveProperty("taskEvidence")
+  expect(knowledge.getCard(knowledgeCard.knowledgeID)).not.toHaveProperty("taskEvidence")
+  withdraw = true
+  const superseded = await agent.run({ quantitativeReport: report(), force: true })
+  expect(superseded.taskEvidence.entries).toEqual([])
+  expect(superseded.literatureResults.some((paper) => paper.status === "reused_knowledge")).toBe(false)
   agent.close()
   knowledge.close()
 })

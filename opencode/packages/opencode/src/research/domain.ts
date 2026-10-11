@@ -109,6 +109,8 @@ export type DomainProposalContext = {
     readonly metrics: JsonRecord
   }[]
   readonly memory: readonly {
+    readonly id?: string
+    readonly taskID?: string
     readonly scope?: "task" | "domain"
     readonly outcome: string
     readonly lesson: string

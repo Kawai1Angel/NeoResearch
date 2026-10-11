@@ -20,23 +20,59 @@
   "backbones": {
     "linear": {
       "mechanisms": [],
-      "implementation": "Context-to-latent linear encoder plus shared horizon head."
+      "implementation": "Context-to-latent affine encoder. Explicit shared=true uses one Linear across channels; shared=false uses a separate Linear per channel (legacy schema default false). Neither implies cross-channel mixing. The prediction head is separately shared. bias is supported here and in dlinear, with schema default true; omission does not disable bias."
     },
     "dlinear": {
       "mechanisms": [
         "moving_average_decomposition"
       ],
-      "implementation": "Moving-average split with learned trend/residual context-to-latent maps plus shared horizon head."
+      "implementation": "Fixed moving-average kernel (odd kernel_size), then learned trend and residual context-to-latent projections summed. Explicit individual=false shares those projections across channels; individual=true uses per-channel projections. No learned decomposition kernel. Requires embedding=none; do not also add series_decomposition. bias is supported here and in linear, with schema default true; preserve its comparison value in a matched control."
     },
     "nbeats": {
       "mechanisms": [
         "learned_residual_backcast"
       ],
-      "implementation": "Generic learned MLP backcast/latent-forecast blocks; neither interpretable-basis N-BEATS nor N-HiTS."
+      "implementation": "Generic learned MLP residual backcast and latent-forecast blocks. hidden_dim, n_blocks and n_layers set capacity. Requires embedding=none. No interpretable polynomial/Fourier basis and no N-HiTS multirate pooling."
     },
     "timesnet_lite": {
       "mechanisms": [],
-      "implementation": "Paper-derived periodic convolution proxy, not full TimesNet."
+      "implementation": "Paper-derived FFT-period convolution proxy; hidden_dim, n_layers, top_k, kernel_size and dropout. Requires embedding=none. Not native/full TimesNet."
+    },
+    "mlp": {
+      "mechanisms": [],
+      "implementation": "With embedding=none, Linear(context_length,hidden_dim) reads the whole history, followed by nonlinear hidden layers and a latent projection: already a global temporal receptive field, not a pointwise time MLP. With an embedding, residual MLP blocks act on individual embedding tokens before readout; no complex FreMLP or inverse FFT. depth, hidden_dim, activation and dropout control the network."
+    },
+    "transformer": {
+      "mechanisms": [],
+      "implementation": "Self-attention encoder over the selected embedding tokens; d_model must divide by n_heads. Token meaning depends on embedding (patch=time patches, invert=variable tokens). Head projects latent to horizon; not automatically a specific published Transformer architecture."
+    },
+    "tcn": {
+      "mechanisms": [],
+      "implementation": "Stacked temporal convolutions mapped to latent features; hidden_dim, n_layers, kernel_size, activation and dropout. Requires embedding=none. Not a state-space recurrence."
+    },
+    "rnn": {
+      "mechanisms": [],
+      "implementation": "GRU/LSTM/vanilla RNN over regularly sampled input tokens (cell, hidden_dim, num_layers, dropout). No irregular-time handling merely from choosing RNN. Tokenization changes the sequence being modeled."
+    },
+    "gated_depthwise_conv": {
+      "mechanisms": [],
+      "implementation": "Gated depthwise temporal convolution blocks with hidden_dim/depth/kernel_size/dropout. No recurrent state or selective scan; not Mamba/SSM."
+    },
+    "mixer": {
+      "mechanisms": [],
+      "implementation": "Token/time and feature MLP mixing inside the backbone (temporal_mixing/channel_mixing), controlled by hidden_dim/depth/dropout. Internal feature dimensions are not automatically target-variable mixing."
+    },
+    "diagonal_ssm": {
+      "mechanisms": [],
+      "implementation": "Real stable diagonal state-space recurrence with ZOH discretization. d_model<=512, state_dim<=512, depth<=8. embedding=none and explicit sequence_latent or channel_sequence representation/readout; not Mamba selective scanning."
+    },
+    "timesblock_encoder": {
+      "mechanisms": [],
+      "implementation": "Sample-local FFT period selection and Inception 2D TimesBlock encoder. d_model<=512, d_ff<=2048, depth<=8, top_k<=min(16,floor(context_length/2)), num_kernels<=8. embedding=none, sequence readout required. Not full TimesNet."
+    },
+    "mamba": {
+      "mechanisms": [],
+      "implementation": "Mamba-1 selective state-space encoder with torch_reference backend. d_model<=512,d_state<=512,d_conv<=32,expand<=4,depth<=8. embedding=none and sequence readout required. No verified CUDA backend fallback."
     }
   },
   "preprocessing": {
@@ -54,5 +90,92 @@
     "fixed_seasonal_basis",
     "multirate_sampling",
     "direct_horizon_forecast"
-  ]
+  ],
+  "component_semantics": {
+    "preprocessing": {
+      "none": "Identity action.",
+      "last_value_centering": "Subtract each channel's last observed value, then restore it to predictions. Input-dependent centering, not trend decomposition; required explicitly for an NLinear-style experiment.",
+      "instance_norm": "Normalize each instance/channel over its context window and restore scale/location on forecasts; eps numerical stability, affine optional learned scale/shift. No running-statistics batch normalization.",
+      "series_decomposition": "FIXED moving-average split using odd kernel_size (3..255); method=moving_average. Learned Linear(context,H) predicts trend; residual goes through encoder/head, then trend prediction is added back. Trainable prediction branch, NOT a learnable decomposition kernel. Do not combine with DLinear.",
+      "seasonal_differencing": "Subtract lag-period observations with seasonal_period; forecast inversion recursively restores the seasonal reference. Changes the forecasting transform; not a learned seasonal basis. Gaussian inversion unsupported without joint covariance.",
+      "missing_mask": "Append observed/missing indicator channels, first action only, mask_channel=true. Requires cross-variable fusion so masks affect target outputs; not an imputation algorithm.",
+      "sample_reweighting": "Training loss sample weights, not a forward transform. scheme=uniform gives equal weights; outlier_robust uses 1/(1+mean(abs(target))); horizon_tail uses 1+mean(abs(last quarter of target)). Normalize weights by batch mean. None reads time indices: recency weighting is unsupported."
+    },
+    "embedding": {
+      "none": "Use raw context representation required by dlinear/tcn/nbeats/timesnet_lite and sequence encoders.",
+      "patch": "Fixed-length sliding time patches (patch_len,stride), projected to d_model. Changes time-token granularity.",
+      "multiscale_patch": "Multiple patch_len/stride scales projected into tokens; more than one scale provides multiscale_patches. Not N-HiTS multirate pooling or forecast interpolation.",
+      "invert": "Variable tokens constructed from each variable's history; d_model projection. Token axis is variables rather than time.",
+      "frequency": "rFFT over each input history, retain n_freq bins, use magnitude or stacked real/imag features, then a real Linear(feature_dim,d_model). No complex-valued frequency MLP, learnable spectral split, inverse FFT or frequency-to-time reconstruction; not FreTS/FreMLP.",
+      "calendar": "Embeds explicitly available calendar fields using embed_dim; requires supplied calendar features. Does not grant access to unknown future target/covariate values."
+    },
+    "backbone": {
+      "linear": "Context-to-latent affine encoder. Explicit shared=true uses one Linear across channels; shared=false uses a separate Linear per channel (legacy schema default false). Neither implies cross-channel mixing. The prediction head is separately shared. bias is supported here and in dlinear, with schema default true; omission does not disable bias.",
+      "dlinear": "Fixed moving-average kernel (odd kernel_size), then learned trend and residual context-to-latent projections summed. Explicit individual=false shares those projections across channels; individual=true uses per-channel projections. No learned decomposition kernel. Requires embedding=none; do not also add series_decomposition. bias is supported here and in linear, with schema default true; preserve its comparison value in a matched control.",
+      "mlp": "With embedding=none, Linear(context_length,hidden_dim) reads the whole history, followed by nonlinear hidden layers and a latent projection: already a global temporal receptive field, not a pointwise time MLP. With an embedding, residual MLP blocks act on individual embedding tokens before readout; no complex FreMLP or inverse FFT. depth, hidden_dim, activation and dropout control the network.",
+      "transformer": "Self-attention encoder over the selected embedding tokens; d_model must divide by n_heads. Token meaning depends on embedding (patch=time patches, invert=variable tokens). Head projects latent to horizon; not automatically a specific published Transformer architecture.",
+      "tcn": "Stacked temporal convolutions mapped to latent features; hidden_dim, n_layers, kernel_size, activation and dropout. Requires embedding=none. Not a state-space recurrence.",
+      "nbeats": "Generic learned MLP residual backcast and latent-forecast blocks. hidden_dim, n_blocks and n_layers set capacity. Requires embedding=none. No interpretable polynomial/Fourier basis and no N-HiTS multirate pooling.",
+      "timesnet_lite": "Paper-derived FFT-period convolution proxy; hidden_dim, n_layers, top_k, kernel_size and dropout. Requires embedding=none. Not native/full TimesNet.",
+      "rnn": "GRU/LSTM/vanilla RNN over regularly sampled input tokens (cell, hidden_dim, num_layers, dropout). No irregular-time handling merely from choosing RNN. Tokenization changes the sequence being modeled.",
+      "gated_depthwise_conv": "Gated depthwise temporal convolution blocks with hidden_dim/depth/kernel_size/dropout. No recurrent state or selective scan; not Mamba/SSM.",
+      "mixer": "Token/time and feature MLP mixing inside the backbone (temporal_mixing/channel_mixing), controlled by hidden_dim/depth/dropout. Internal feature dimensions are not automatically target-variable mixing.",
+      "diagonal_ssm": "Real stable diagonal state-space recurrence with ZOH discretization. d_model<=512, state_dim<=512, depth<=8. embedding=none and explicit sequence_latent or channel_sequence representation/readout; not Mamba selective scanning.",
+      "timesblock_encoder": "Sample-local FFT period selection and Inception 2D TimesBlock encoder. d_model<=512, d_ff<=2048, depth<=8, top_k<=min(16,floor(context_length/2)), num_kernels<=8. embedding=none, sequence readout required. Not full TimesNet.",
+      "mamba": "Mamba-1 selective state-space encoder with torch_reference backend. d_model<=512,d_state<=512,d_conv<=32,expand<=4,depth<=8. embedding=none and sequence readout required. No verified CUDA backend fallback."
+    },
+    "fusion": {
+      "temporal": "channel_mode=independent leaves channels unmixed; shared is a legacy alias of feature_mlp ChannelMixer. This field controls cross-channel mixing, NOT encoder parameter sharing. Use feature_mlp explicitly.",
+      "feature_mlp": "Input ChannelMixer exchanges information between target/input channels. Independent of linear.shared and head parameter sharing.",
+      "variate_attention": "Attention across channel latent tokens after temporal encoding; number of heads must be compatible with latent width.",
+      "temporal_then_feature": "Temporal encoding followed by ordered channel-latent mixing; gate and residual are explicit options.",
+      "feature_then_temporal": "Ordered channel mixing on history before temporal encoding; gate and residual are explicit options.",
+      "graph": "Input graph channel mixing. adjacency_source=static requires topology_artifact with ordered channel_names/adjacency; correlation fits training rows only; learned learns adjacency. sparsity controls graph sparsity.",
+      "gated_hybrid": "Mix temporal latent with a feature-mixed history encoder. gate_type=learned is static learned channel weights; scalar/channel/time are input-dependent. Legacy time averages gates over history before latent mixing, not history_time_gate composition."
+    },
+    "head": {
+      "linear": "Shared per-channel Linear(latent_dim,H) point forecast. Does not set encoder sharing and does not share parameters across different H models.",
+      "residual_correction": "Shared Linear(latent,H) plus LayerNorm->Linear(correction_dim)->GELU->Dropout->Linear(H). Already a nonlinear residual MLP, not a plain linear correction. Dropout comes from backbone.dropout; DLinear has no supported dropout field.",
+      "quantile": "Shared quantile projections with strictly increasing unique levels in (0,1); loss quantiles must match exactly and use quantile loss.",
+      "gaussian": "Shared mean/positive-scale projections (variance_floor). Requires gaussian_nll and compatible inversion/fusion; does not model joint covariance."
+    },
+    "composition": {
+      "single": "One encoder and prediction path.",
+      "parallel_two_branch": "Top-level primary and secondary={backbone,embedding,representation}. No nested compositions. Both branches must satisfy embedding/layout compatibility; temporal/independent fusion only. latent_gate requires equal latent widths; history_time_gate matching sequence layout/d_model/representation; forecast_step_gate mixes forecasts per step. Forecast merges require point heads.",
+      "decomposition_two_branch": "Fixed moving-average kernel_size splits history into trend for primary and residual for secondary; forecast sum. No learned split kernel. Both branches need explicit representations; temporal/independent fusion, no nesting. Removing secondary is an architecture change."
+    },
+    "loss": {
+      "mse": "Squared point error; sensitive to residual magnitude.",
+      "mae": "Absolute point error.",
+      "huber": "Piecewise quadratic/linear point loss with delta; residual robustness, not recency weighting.",
+      "quantile": "Pinball loss at explicit sorted unique quantiles, matching quantile head.",
+      "gaussian_nll": "Gaussian likelihood loss using predicted mean and scale; matching Gaussian head required.",
+      "distillation": "Weighted supervised error and a last_value or moving_average teacher (window). supervised_weight/teacher_weight determine contributions; no external pretrained teacher implied."
+    },
+    "optimizer": {
+      "adam": "Adam with lr and coupled weight_decay.",
+      "adamw": "AdamW with lr and decoupled weight_decay.",
+      "sgd": "SGD with lr and weight_decay; no momentum field in recipe schema."
+    },
+    "scheduler": {
+      "none": "No base LR schedule (explicit warmup may still apply).",
+      "cosine": "CosineAnnealingLR over remaining epochs.",
+      "one_cycle": "OneCycleLR stepped per epoch, total_steps=max_epochs, max_lr=optimizer.lr; warmup_steps/max_epochs sets pct_start, otherwise 0.3.",
+      "plateau": "ReduceLROnPlateau on validation loss (runtime factor=0.5, patience=1; recipe only exposes type/warmup_steps).",
+      "lradj_type1": "Epoch-end base_lr*0.5^(epoch-1).",
+      "lradj_type2": "Epoch-end fixed rates at epochs 2:5e-5,4:1e-5,6:5e-6,8:1e-6,10:5e-7,15:1e-7,20:5e-8; otherwise retain LR.",
+      "lradj_type3": "Base LR until epoch 3, then base_lr*0.9^(epoch-3).",
+      "lradj_3": "Multiply base LR by 0.1 at epoch 10.",
+      "lradj_4": "Multiply base LR by 0.1 at epoch 15.",
+      "lradj_5": "Multiply base LR by 0.1 at epoch 25.",
+      "lradj_6": "Multiply base LR by 0.1 at epoch 5."
+    }
+  },
+  "experiment_contract": {
+    "sharing": "linear.shared=true corresponds to dlinear.individual=false for encoder weight sharing only. Head sharing and fusion mixing are separate. Explicitly choose these fields in both branches. For a matched dlinear-to-linear control, remove kernelSize and individual, add shared=true for individual=false, and preserve bias. Experiment constraints address normalized fields; removing a defaulted field does not disable it.",
+    "representation": "latent_dim integer 1..512. channel_latent uses readout=none. sequence_latent/channel_sequence requires mean or last readout. Encoders output latent; heads project to H. A separate model/optimizer/checkpoint trains for each H.",
+    "constraints": "System parameter budget is at most 10M summed across independently trained horizon models; smoke on one H does not establish full-budget feasibility. Unsupported known-future/static covariates; targets and observed-past only.",
+    "training": "warmup_steps means epochs, must be <max_epochs; grad_clip is gradient-norm clipping, not dropout. Module-level dropout only. Explicit seed/batch_size/max_epochs/patience/time_budget_s are experimental conditions, not interchangeable metadata.",
+    "horizon_weighting": "uniform gives equal horizon-position weights; front_heavy linearly weights 1.5 to 0.5; tail_heavy 0.5 to 1.5. learned_static currently falls back to uniform (no learned weights). All weight forecast positions, not sample time/recency."
+  }
 }

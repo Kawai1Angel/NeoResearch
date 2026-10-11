@@ -47,6 +47,7 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 export type PrincipleCall = {
   stage: PrincipleStage; attempt: number; inputHash: string; inputCharacters: number; outputHash?: string; elapsedMs: number
   response?: string
+  errorKind?: "transport_error" | "verification_error" | "output_error"
   usage?: Awaited<ReturnType<PrincipleModel["request"]>>["usage"]; error?: string
 }
 export type PrincipleExtraction = {
@@ -58,6 +59,8 @@ export type PrincipleExtraction = {
   dispositions: z.infer<typeof ConsolidationSchema>["dispositions"]
   reviews: z.infer<typeof PrincipleReviewSchema>[]
   rejected: Array<{ candidateID: string; reasons: string[] }>
+  deferred: Array<{ candidateID: string; reason: "selection_budget" }>
+  verificationErrors: Array<{ candidateID: string; phase: "initial" | "final"; error: string }>
   stagedMaterials: Array<{ gapID: string; raw: unknown; reason: string }>
   unformed: string[]; errors: string[]; calls: PrincipleCall[]
 }
@@ -104,7 +107,7 @@ export async function extractPaperPrinciples(input: {
     schemaVersion: "paper_principle_run_v1", runID: input.runID, paperID: document.paperID,
     cacheKey: knowledgeV2CacheKey({ documentSha256: document.sourceSha256, extractorModel: model.modelIdentifier,
       verifierModel: verifier.modelIdentifier, options: { ...options, chunks: chunks.map((c) => [c.chunkID, c.textSha256]), parser: document.parser } }),
-    status: "partial", stagedMaterials: [], plans: [], candidates: [], finalCandidates: [], cards: [], dispositions: [], reviews: [], rejected: [], unformed: [], errors: [], calls: [],
+    status: "partial", stagedMaterials: [], plans: [], candidates: [], finalCandidates: [], cards: [], dispositions: [], reviews: [], rejected: [], deferred: [], verificationErrors: [], unformed: [], errors: [], calls: [],
   }
   async function call<T>(stage: PrincipleStage, schema: z.ZodType<T>, payload: Record<string, unknown>, check?: (value: T) => void, wire?: { schema: z.ZodType; decode: (value: unknown) => unknown }): Promise<T> {
     let repair: Record<string, unknown> = {}
@@ -131,6 +134,7 @@ export async function extractPaperPrinciples(input: {
       } catch (error) {
         input.signal?.throwIfAborted()
         record.error = String(error)
+        record.errorKind = response === undefined ? "transport_error" : stage === "verify" ? "verification_error" : "output_error"
         // Transport failures are not JSON repair requests.
         if (response === undefined || attempt === 1) throw error
         repair = { repair: { previousResponse: response, error: String(error), instruction: "Correct structural/reference errors using only supplied sources. This is not an acceptance verdict." } }
@@ -365,7 +369,15 @@ export async function extractPaperPrinciples(input: {
         result.dispositions.push({ originalCandidateID: candidate.candidateID, finalCandidateIDs: [], action: "rejected", rationale: "Unresolved analysis material affects this contribution" })
         continue
       }
-      const review = await verify(candidate, synthesized.candidates, "initial")
+      let review: z.infer<typeof PrincipleReviewSchema>
+      try { review = await verify(candidate, synthesized.candidates, "initial") }
+      catch (error) {
+        input.signal?.throwIfAborted()
+        generationIncomplete = true
+        result.verificationErrors.push({ candidateID: candidate.candidateID, phase: "initial", error: String(error) })
+        result.errors.push(`verification_error:${candidate.candidateID}: ${String(error)}`)
+        continue
+      }
       if (review.verdict === "needs_revision") {
         try {
           const revised = await call("revise", RevisionSchema, { candidate: projectCandidate(candidate), review,
@@ -428,7 +440,15 @@ export async function extractPaperPrinciples(input: {
         result.rejected.push({ candidateID: candidate.candidateID, reasons: ["material_evidence_gap", ...gaps.map((g) => g.gapID)] })
         continue
       }
-      const review = await verify(candidate, consolidated.candidates, "final")
+      let review: z.infer<typeof PrincipleReviewSchema>
+      try { review = await verify(candidate, consolidated.candidates, "final") }
+      catch (error) {
+        input.signal?.throwIfAborted()
+        generationIncomplete = true
+        result.verificationErrors.push({ candidateID: candidate.candidateID, phase: "final", error: String(error) })
+        result.errors.push(`verification_error:${candidate.candidateID}: ${String(error)}`)
+        continue
+      }
       const errors = validatePrincipleReview(candidate, review, availableSourceIDs)
       if (errors.length) { result.rejected.push({ candidateID: candidate.candidateID, reasons: [...errors, ...review.reasons] }); continue }
       result.cards.push(finalizeKnowledgeCandidate({ candidate, review, context, availableSourceIDs, provenance: {
@@ -442,8 +462,8 @@ export async function extractPaperPrinciples(input: {
   } catch (error) {
     input.signal?.throwIfAborted()
     result.errors.push(String(error))
-    // Partial results are audit-only; publication is atomic at paper granularity.
-    result.cards = []
+    // Keep only already finalized, source-reviewed cards. A later provider error
+    // must not erase independent evidence; partial publication never retires old cards.
   }
   return result
 }

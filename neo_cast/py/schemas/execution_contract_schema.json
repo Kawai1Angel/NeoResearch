@@ -32,6 +32,10 @@
       "type": "string",
       "pattern": "^[a-f0-9]{64}$"
     },
+    "experiment_constraints_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
     "expected": {
       "type": "object",
       "additionalProperties": false,

@@ -10,6 +10,7 @@ from execution_contract import (
     compare,
     describe_model,
     digest,
+    load_contract,
     verify_models,
 )
 from factory.build_model import build_model
@@ -50,9 +51,49 @@ class ExecutionContractTests(unittest.TestCase):
             "expected": {
                 key: value
                 for key, value in describe_model(self.model).items()
-                if key not in {"model_class", "backbone_module_class", "num_parameters"}
+                if key in {
+                    "runtime_semantics_revision", "recipe_version", "preprocessing",
+                    "embedding", "backbone", "fusion", "channel_mode", "prediction_head",
+                    "target_channels", "past_exogenous_channels", "future_exogenous_channels",
+                    "output_channels", "input_length", "head_input_width",
+                    "head_channel_shared", "mechanisms",
+                }
             },
         }
+
+    def test_load_contract_accepts_legacy_and_experiment_constraints_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "contract.json"
+            for extra in ({}, {"experiment_constraints_sha256": digest({"frozen": ["backbone"]})}):
+                with self.subTest(extra=extra):
+                    contract = {**self.contract, **extra}
+                    file.write_text(json.dumps(contract))
+                    self.assertEqual(load_contract(file), contract)
+
+    def test_load_contract_rejects_invalid_digest_and_unknown_fields(self):
+        from jsonschema import ValidationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "contract.json"
+            for extra in (
+                {"experiment_constraints_sha256": "not-a-digest"},
+                {"experiment_constraints_sha256": "a" * 63},
+                {"experiment_constraints_sha256": None},
+                {"experiment_constraints_sha256": 123},
+                {"unknown_contract_field": "value"},
+            ):
+                with self.subTest(extra=extra):
+                    file.write_text(json.dumps({**self.contract, **extra}))
+                    with self.assertRaises(ValidationError):
+                        load_contract(file)
+
+    def test_experiment_constraints_digest_is_bound_to_manifest(self):
+        self.contract["experiment_constraints_sha256"] = digest({"frozen": ["backbone"]})
+        manifests, mismatches = self.verify()
+        self.assertEqual(mismatches, [])
+        self.contract["experiment_constraints_sha256"] = digest({"frozen": ["embedding"]})
+        self.assertTrue(any(item["path"] == "contract_digest"
+                            for item in compare(self.contract, manifests[0])))
 
     def verify(self, model=None, recipe=None):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,6 +211,7 @@ class ExecutionContractTests(unittest.TestCase):
         candidate["model_config"] = self.config
         candidate["model_family"] = "recipe_factory"
         candidate["smoke_config"]["horizon"] = 8
+        self.contract["experiment_constraints_sha256"] = digest({"frozen": ["backbone"]})
         self.model.model = nn.Sequential(nn.Linear(32, 8), nn.GELU(), nn.Linear(8, 8))
         with tempfile.TemporaryDirectory() as directory:
             candidate_file = Path(directory) / "candidate.json"
@@ -197,6 +239,11 @@ class ExecutionContractTests(unittest.TestCase):
             self.assertTrue(
                 any(r["event"] == "execution_contract_violation" for r in records)
             )
+            self.assertTrue(any(
+                mismatch["path"] == "backbone"
+                for record in records if record["event"] == "execution_contract_violation"
+                for mismatch in record["mismatches"]
+            ))
             self.assertFalse(
                 any(
                     r["event"] in {"epoch_end", "smoke_eval_done", "eval_done"}

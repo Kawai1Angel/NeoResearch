@@ -1540,18 +1540,18 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "candidate 1/2")
+      await waitForFrame(app, "Candidate 1/2")
       await app.mockInput.typeText("/candidate next")
       await app.renderOnce()
       app.mockInput.pressEnter()
-      await waitForFrame(app, "candidate 2/2")
+      await waitForFrame(app, "Candidate 2/2")
 
       reverseCandidates = true
       events.emit({ type: "research.candidate.updated", properties: { candidate: second } })
 
-      const frame = await waitForFrame(app, "candidate 1/2")
+      const frame = await waitForFrame(app, "Candidate 1/2")
       expect(candidateFetchesAfterReverse).toBeGreaterThan(0)
-      expect(frame).toContain("candidate 1/2")
+      expect(frame).toContain("Candidate 1/2")
     } finally {
       app.renderer.destroy()
     }
@@ -2571,9 +2571,9 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("session task_neo")
       expect(frame).toMatch(/~[0-9,]+ \(research est\.\)/)
       expect(frame).toContain("research cand=1/1 runs=1 ok=1")
-      expect(frame).toContain("Research Agent: 当前研究 Neo-Cast Autonomous TSF")
-      expect(frame).toContain("candidate 1/1")
-      expect(frame).toContain("latest smoke succeeded")
+      expect(frame).toContain("Task 1/1 · Candidate 1/1")
+      expect(frame).toContain("Candidate 1/1")
+      expect(frame).toContain("smoke succeeded")
       expect(frame).not.toContain("Forecaster")
       expect(frame).not.toContain("Critic waiting")
       expect(frame).not.toContain("Artifacts ")
@@ -2640,9 +2640,9 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={onboardingFetch} />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "Socratic onboarding")
+      const frame = await waitForFrame(app, "等待 IntentAgent 启动")
 
-      expect(frame).toContain("Socratic onboarding")
+      expect(frame).toContain("等待 IntentAgent 启动")
       expect(frame).toContain("Confirm requirements")
       expect(frame).toContain("确认需求后进入 Data Analysis")
       expect(frame).toContain("→ Intent Agent")
@@ -2687,13 +2687,13 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={onboardingFetch} />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "Companion onboarding")
+      const frame = await waitForFrame(app, "Review new dataset")
 
       // No fetch in this test ever creates the task through the cockpit, so the live
       // IntentAgent session was never kicked off — the static 15-slot checklist is gone
       // (per specs/research/intent-agent-tui-streaming.md §3.5), replaced by a "waiting for
       // the session to start" placeholder instead.
-      expect(frame).toContain("Companion onboarding")
+      expect(frame).toContain("Review new dataset")
       expect(frame).toContain("等待 IntentAgent 启动")
       expect(frame).not.toContain("交互模式: companion")
       expect(frame).not.toContain("→ 预测对象")
@@ -2707,14 +2707,14 @@ describe("ResearchCockpit render", () => {
     }
   })
 
-  test("routes Socratic chat input to slot-fill (intent/answer) instead of chat model", async () => {
+  test("routes Socratic clarification replies to the existing IntentAgent session", async () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
     const intentAnswerPosts: Array<{ path: string; body: unknown }> = []
     const onboardingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const reqPath = requestURL(input).pathname
-      if (reqPath === "/research/tasks/task_new_socratic/intent/answer" && init?.method === "POST") {
+      if (reqPath === "/research/tasks/task_new_socratic/intent/modify" && init?.method === "POST") {
         intentAnswerPosts.push({ path: reqPath, body: JSON.parse(init.body as string) })
         return Promise.resolve(response({}))
       }
@@ -2726,7 +2726,7 @@ describe("ResearchCockpit render", () => {
               title: "Forecast new dataset",
               domainID: "tsf",
               mode: "autonomous",
-              status: "idle",
+              status: "intent_gathering",
               taskSpec: { metadata: { interactionMode: "socratic" }, runtime: { neoCastProjectRoot: "/tmp/neo-cast" } },
               objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
               budget: { maxRuns: 8 },
@@ -2745,7 +2745,7 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "Socratic onboarding")
+      await waitForFrame(app, "等待 IntentAgent 启动")
       await app.mockInput.typeText("预测对象是 ETTh2 的 OT")
       await app.renderOnce()
       app.mockInput.pressEnter()
@@ -2757,14 +2757,15 @@ describe("ResearchCockpit render", () => {
         await Bun.sleep(20)
       }
 
-      // Input must have been routed to slot fill, not chat model
+      // The existing IntentAgent session receives the complete user reply.
       expect(intentAnswerPosts.length).toBeGreaterThan(0)
       const post = intentAnswerPosts[0]!
-      expect(post.path).toBe("/research/tasks/task_new_socratic/intent/answer")
+      expect(post.path).toBe("/research/tasks/task_new_socratic/intent/modify")
+      expect(post.body).toEqual({ message: "预测对象是 ETTh2 的 OT" })
 
       // Socratic onboarding context must still be visible
       const frame = app.captureCharFrame()
-      expect(frame).toContain("Socratic onboarding")
+      expect(frame).toContain("等待 IntentAgent 启动")
     } finally {
       app.renderer.destroy()
     }
@@ -3238,8 +3239,10 @@ describe("ResearchCockpit render", () => {
 
     const runnerRoot = "/tmp/neo-cast-progress-profile"
     await prepareNeoCastRunnerRoot(runnerRoot)
+    const datasetRoot = path.join("/tmp/neo-cast-research", ".neo-research", "workspaces", "task_progress_profile", ".neo-cast")
+    await mkdir(datasetRoot, { recursive: true })
     await writeFile(
-      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      path.join(datasetRoot, "dataset_spec.json"),
       JSON.stringify({
         source_csv: "/tmp/ETTh1.csv",
         input_len: 96,
@@ -3314,7 +3317,7 @@ describe("ResearchCockpit render", () => {
           ]),
         )
       }
-      if (path === "/research/tasks/task_progress_profile/candidates") return Promise.resolve(response([candidateFixture(1)]))
+      if (path === "/research/tasks/task_progress_profile/candidates") return Promise.resolve(response([{ ...candidateFixture(1), taskID: task.id }]))
       if (path === "/research/tasks/task_progress_profile/artifacts") return Promise.resolve(response([]))
       if (path === "/research/tasks/task_progress_profile/approvals") return Promise.resolve(response([]))
       if (path === "/research/tasks/task_progress_profile/champion") return Promise.resolve(response(null))
@@ -3347,8 +3350,10 @@ describe("ResearchCockpit render", () => {
 
     const runnerRoot = "/tmp/neo-cast-progress-seeded"
     await prepareNeoCastRunnerRoot(runnerRoot)
+    const datasetRoot = path.join("/tmp/neo-cast-research", ".neo-research", "workspaces", "task_progress_seeded", ".neo-cast")
+    await mkdir(datasetRoot, { recursive: true })
     await writeFile(
-      path.join(runnerRoot, ".neo-cast", "dataset_spec.json"),
+      path.join(datasetRoot, "dataset_spec.json"),
       JSON.stringify({
         source_csv: "/tmp/ETTh1.csv",
         input_len: 96,
@@ -3922,10 +3927,9 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "Companion onboarding")
+      await waitForFrame(app, "Recent TSF Task")
       command?.trigger("research.task.next")
-      await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await waitForFrame(app, "Older TSF Task")
 
       expect(frame).toContain("Task 2/2")
     } finally {

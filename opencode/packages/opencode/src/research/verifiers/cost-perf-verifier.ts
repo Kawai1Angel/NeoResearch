@@ -1,15 +1,8 @@
 import type { VerifierContext, VerifierResult } from "./types"
-import { metricOf, paramsM } from "./types"
+import { comparablePreviousRuns, metricOf, objectiveMetricName, paramsM } from "./types"
 
 const MAX_PARAMS_M_WITHOUT_GAIN = 50
 const MIN_GAIN_PER_EXTRA_PARAM_M = 0.001
-
-function objectiveMetricName(task: VerifierContext["task"]): string {
-  const o = task.objective as Record<string, unknown>
-  if (typeof o.primaryMetric === "string") return o.primaryMetric
-  if (typeof o.metric === "string") return o.metric
-  return "val_avg_mse"
-}
 
 function objectiveDirection(task: VerifierContext["task"]): "minimize" | "maximize" {
   return (task.objective as Record<string, unknown>).direction === "maximize" ? "maximize" : "minimize"
@@ -24,12 +17,13 @@ function paramBudgetM(task: VerifierContext["task"]): number | undefined {
   if (metadata?.parameterBudgetEnforcement === "preference_only") return undefined
   if (typeof constraints?.maxParams === "number") return constraints.maxParams / 1_000_000
   const budget = task.budget as Record<string, unknown>
-  const raw = budget.parameterBudget ?? budget.maxParams ?? budget.maxParamsM
-  if (typeof raw === "number" && Number.isFinite(raw)) return raw
+  const raw = budget.parameterBudget ?? budget.maxParams
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw / 1_000_000
   if (typeof raw === "string") {
-    const match = raw.match(/(\d+(?:\.\d+)?)\s*[Mm]/)
-    if (match) return Number(match[1])
+    const match = raw.trim().match(/^(\d+(?:\.\d+)?)\s*([MmKk])?$/)
+    if (match) return Number(match[1]) * (match[2]?.toLowerCase() === "m" ? 1 : match[2]?.toLowerCase() === "k" ? 0.001 : 0.000001)
   }
+  if (typeof budget.maxParamsM === "number" && Number.isFinite(budget.maxParamsM)) return budget.maxParamsM
   return undefined
 }
 
@@ -43,7 +37,8 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
   if (currentMetric === undefined || ctx.run.status !== "succeeded") {
     return {
       name,
-      accepted: true,
+      accepted: false,
+      status: "skipped",
       reason: "Skipped: run did not succeed or metric is absent.",
       evidence: { skipped: true },
     }
@@ -54,6 +49,7 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
     return {
       name,
       accepted: false,
+      status: "failed",
       reason: `Model has ${currentParams.toFixed(2)}M parameters, exceeding user budget of ${budgetM}M.`,
       evidence: { currentParamsM: currentParams, budgetM },
     }
@@ -62,14 +58,14 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
   if (ctx.previousRuns.length === 0 || currentParams === undefined) {
     return {
       name,
-      accepted: true,
+      accepted: false,
+      status: "insufficient_evidence",
       reason: "No previous runs or param count unavailable; skipping cost-perf ratio check.",
       evidence: { skipped: true },
     }
   }
 
-  const bestPreviousRun = ctx.previousRuns
-    .filter((r) => r.status === "succeeded")
+  const bestPreviousRun = comparablePreviousRuns(ctx)
     .reduce<{ metric: number; params: number | undefined } | undefined>((best, r) => {
       const m = metricOf(r, metricName)
       if (m === undefined) return best
@@ -81,22 +77,22 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
   if (bestPreviousRun === undefined || bestPreviousRun.params === undefined) {
     return {
       name,
-      accepted: true,
-      reason: "Insufficient data to compute cost-perf ratio; accepting by default.",
+      accepted: false,
+      status: "insufficient_evidence",
+      reason: "Insufficient data to compute cost-perf ratio; comparison not evaluated.",
       evidence: { skipped: true },
     }
   }
 
   const metricGain =
-    direction === "minimize"
-      ? bestPreviousRun.metric - currentMetric
-      : currentMetric - bestPreviousRun.metric
+    direction === "minimize" ? bestPreviousRun.metric - currentMetric : currentMetric - bestPreviousRun.metric
   const extraParams = currentParams - bestPreviousRun.params
 
   if (extraParams > MAX_PARAMS_M_WITHOUT_GAIN && metricGain <= 0) {
     return {
       name,
       accepted: false,
+      status: "failed",
       reason: `Model added ${extraParams.toFixed(2)}M extra params (${bestPreviousRun.params.toFixed(2)}M → ${currentParams.toFixed(2)}M) with no metric improvement (delta=${metricGain.toFixed(6)}).`,
       evidence: {
         currentParamsM: currentParams,
@@ -114,6 +110,7 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
       return {
         name,
         accepted: false,
+        status: "failed",
         reason: `Metric gain (${metricGain.toFixed(6)}) per extra param-M (${extraParams.toFixed(2)}M) = ${gainPerParam.toFixed(6)} is below minimum threshold ${MIN_GAIN_PER_EXTRA_PARAM_M}.`,
         evidence: {
           currentParamsM: currentParams,
@@ -130,6 +127,7 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
   return {
     name,
     accepted: true,
+    status: "passed",
     reason:
       currentParams !== undefined
         ? `Cost-perf acceptable: ${currentParams.toFixed(2)}M params, metric=${Number(currentMetric.toFixed(6))}.`

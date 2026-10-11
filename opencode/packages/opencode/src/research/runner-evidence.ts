@@ -1,3 +1,4 @@
+import { assessAttribution } from "./attribution"
 import { readFile } from "node:fs/promises"
 
 export interface TrainingCurvePoint {
@@ -13,6 +14,22 @@ function finite(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
+/** Present execution facts to reflection without the post-training evaluation decision. */
+export function reflectionExecutionEvidence<T extends {
+  status: string
+  error?: string | null
+  metrics: Record<string, unknown>
+  resourceUsage: Record<string, unknown>
+}>(run: T, primaryMetric: string): T {
+  const { verification, ...resourceUsage } = run.resourceUsage
+  const report = verification as { status?: string } | undefined
+  const contract = resourceUsage.executionContract as { status?: string } | undefined
+  const evaluated = run.status === "rejected" && report?.status === "failed" &&
+    contract?.status === "verified" && finite(run.metrics[primaryMetric]) !== undefined &&
+    resourceUsage.independentEvidence !== false && resourceUsage.duplicateExperiment !== true
+  return { ...run, resourceUsage, ...(evaluated ? { status: "succeeded", error: undefined } : {}) }
+}
+
 export function buildExperimentResultEvidence(input: {
   readonly runID: string
   readonly stage: string
@@ -23,12 +40,20 @@ export function buildExperimentResultEvidence(input: {
   readonly candidateSpec?: Record<string, unknown>
   readonly hypothesisID?: string
   readonly independentEvidence?: boolean
+  readonly executionVerified?: boolean
+  readonly hypothesisSnapshot?: Record<string, unknown>
+  readonly comparisonSpec?: Record<string, unknown>
+  readonly evaluationEvidence?: unknown
 }) {
   const value = finite(input.metrics[input.primaryMetric])
   const duplicate = input.independentEvidence === false
   const complete = !duplicate && input.status === "succeeded" && value !== undefined
   const missingMetric = !duplicate && input.status === "succeeded" && input.stage === "full" && value === undefined
   return {
+    metricValidity: complete ? "observed" : duplicate ? "duplicate" : "inconclusive",
+    attribution: assessAttribution({ executionVerified: input.executionVerified === true, proposedModel: input.candidateSpec, hypothesisSnapshot: input.hypothesisSnapshot }, input.comparisonSpec ? { proposedModel: input.comparisonSpec } : undefined),
+    metrics: complete ? input.metrics : {},
+    evaluationEvidence: input.evaluationEvidence,
     runID: input.runID,
     stage: input.stage,
     status: input.status,
@@ -106,4 +131,18 @@ export async function recoverRunnerFailure(filePath: string, fallback?: string):
   } catch {
     return fallback
   }
+}
+
+
+const FINAL_METRIC_EVENTS = new Set(["eval_done", "smoke_eval_done", "cv_eval_done", "ref_test_done", "ref_test_eval_done"])
+export function finalEvaluationRecords(records: readonly Record<string, unknown>[]) {
+  return records.filter((r) => FINAL_METRIC_EVENTS.has(String(r.event)))
+}
+export function finalMetrics(records: readonly Record<string, unknown>[], stage?: string) {
+  const metrics: Record<string, number> = {}
+  for (const record of finalEvaluationRecords(records)) for (const [key, value] of Object.entries(record)) {
+    const allowed = stage === "ref_test" ? key.startsWith("ref_test_") : stage === "smoke" ? key.startsWith("val_") : /^(cv_|val_|train_)/.test(key)
+    if (allowed && /_(mse|mae|loss|rmse|mape|smape|r2|crps|coverage|width)$/.test(key) && typeof value === "number" && Number.isFinite(value)) metrics[key] = value
+  }
+  return metrics
 }

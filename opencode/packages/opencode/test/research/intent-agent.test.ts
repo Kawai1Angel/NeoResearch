@@ -99,6 +99,26 @@ test("socratic intent spec uses expanded slots and asks one focused question", (
   expect(result.intentSpecMarkdown).toContain("Data split ratios (train/validation/test): 7, 1, 2")
 })
 
+test("observed-past covariates do not require future availability to complete TSF intent", () => {
+  const result = analyzeIntentTask({
+    task: task({
+      taskSpec: {
+        dataset: {
+          path: "/tmp/etth1.csv",
+          targetCols: ["OT"],
+          observedPastCovariates: ["HUFL", "HULL"],
+          knownFutureCovariates: [],
+        },
+      },
+    }),
+  })
+
+  expect(result.intentSpec.exogenous_variables).toEqual(["HUFL", "HULL"])
+  expect(result.intentSpec.future_covariate_availability).toBeUndefined()
+  expect(result.missingFields).toEqual([])
+  expect(result.clarifyingQuestions).toEqual([])
+})
+
 test("intent agent reads explicit row-range split settings", () => {
   const result = analyzeIntentTask({
     task: task({

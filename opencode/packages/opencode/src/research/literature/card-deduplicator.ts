@@ -47,16 +47,19 @@ export function deduplicateCard(card: KnowledgeCard, existing: readonly Knowledg
   const relations: CardRelation[] = []
   for (const item of existing) {
     const samePaper = item.paperID === card.paperID
+    const scope = (value: KnowledgeCard) => JSON.stringify([value.applicability, value.notApplicableWhen,
+      value.experimentalContext, value.limitations])
+    const sameScope = scope(item) === scope(card)
     const sameTriple = claimKey(item) === claimKey(card)
     const sameClaim = normalizedText(item.claim) === normalizedText(card.claim)
     const sharedEvidence = item.evidence.some((a) => card.evidence.some((b) => a.chunkID === b.chunkID))
     const sameMechanism = item.mechanism && card.mechanism &&
       normalizedText(item.mechanism.principle) === normalizedText(card.mechanism.principle) &&
       item.mechanism.components.map(normalizedText).sort().join("|") === card.mechanism.components.map(normalizedText).sort().join("|")
-    if (samePaper && item.cardType === card.cardType && (sameMechanism || sameTriple || sameClaim || (sharedEvidence && tokenSimilarity(item.claim, card.claim) >= 0.9))) {
+    if (samePaper && sameScope && item.cardType === card.cardType && (sameMechanism || sameTriple || sameClaim || (sharedEvidence && tokenSimilarity(item.claim, card.claim) >= 0.9))) {
       return { action: "merge", card, duplicateOf: item, relations: [relation(card, item, "duplicates", "deterministic normalized claim/evidence match", 1)] }
     }
-    if (!samePaper && sameClaim) {
+    if (!samePaper && sameScope && sameClaim) {
       relations.push(relation(card, item, "supports", "independent papers express the same normalized claim", 0.9))
       continue
     }
@@ -86,7 +89,7 @@ export function mergeCardEvidence(existing: KnowledgeCard, incoming: KnowledgeCa
       sourceQuality: Math.max(existing.confidence.sourceQuality, incoming.confidence.sourceQuality),
       extractionConfidence: Math.max(existing.confidence.extractionConfidence, incoming.confidence.extractionConfidence),
       evidenceDirectness: Math.max(existing.confidence.evidenceDirectness, incoming.confidence.evidenceDirectness),
-      transferability: Math.max(existing.confidence.transferability, incoming.confidence.transferability),
+      transferability: incoming.confidence.transferability,
     },
     provenance: { ...incoming.provenance, createdAt: existing.provenance.createdAt, updatedAt: now, extractionRunID: incoming.provenance.extractionRunID },
   }

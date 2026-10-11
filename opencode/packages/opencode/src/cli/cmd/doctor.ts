@@ -30,10 +30,10 @@ export function discoverNeoCastRoot() {
   )
 }
 
-function run(command: string, args: string[]) {
+function run(command: string, args: string[], timeout = 15_000) {
   return spawnSync(command, args, {
     encoding: "utf8",
-    timeout: 15_000,
+    timeout,
   })
 }
 
@@ -65,7 +65,7 @@ function checkPython(python: string): Check {
 }
 
 function checkPythonImports(python: string): Check {
-  const result = run(python, ["-c", "import numpy; import torch; print('numpy+torch import ok')"])
+  const result = run(python, ["-c", "import numpy; import torch; print('numpy+torch import ok')"], 60_000)
   if (result.error) {
     return {
       name: "python-imports",
@@ -165,8 +165,9 @@ function formatChecks(checks: Check[]) {
 }
 
 export function runDoctor(input: { python?: string } = {}) {
-  const python = input.python ?? process.env.PYTHON ?? "python3"
   const neoCastRoot = discoverNeoCastRoot()
+  const runtimePython = neoCastRoot && path.join(neoCastRoot, ".neo-cast", "runtime", ".venv", "bin", "python")
+  const python = input.python ?? process.env.PYTHON ?? (runtimePython && existsSync(runtimePython) ? runtimePython : "python3")
   return [
     checkNeoCastRoot(neoCastRoot),
     checkPython(python),
@@ -192,11 +193,11 @@ export const DoctorCommand = cmd({
       }),
   handler: (args) => {
     const checks = runDoctor({ python: args.python })
+    if (checks.some((check) => check.status === "fail")) process.exitCode = 1
     if (args.format === "json") {
       console.log(JSON.stringify({ ok: checks.every((check) => check.status !== "fail"), checks }, null, 2))
       return
     }
     console.log(formatChecks(checks))
-    if (checks.some((check) => check.status === "fail")) process.exitCode = 1
   },
 })

@@ -2,6 +2,15 @@ import { resolver } from "hono-openapi"
 import z from "zod"
 import { NotFoundError } from "../storage"
 
+export function researchErrorStatus(name: string): 400 | 500 {
+  return [
+    "ResearchTaskSpecValidationError",
+    "ResearchCandidateValidationError",
+    "ResearchBudgetExceededError",
+    "ResearchApprovalRequiredError",
+  ].includes(name) ? 400 : 500
+}
+
 export const ERRORS = {
   400: {
     description: "Bad request",

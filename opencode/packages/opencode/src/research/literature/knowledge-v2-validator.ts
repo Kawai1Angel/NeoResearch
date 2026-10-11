@@ -140,6 +140,16 @@ export function validatePrincipleReview(candidate: KnowledgeCandidateV2, value: 
   // Coverage is audit metadata, not an acceptance threshold. An independently
   // supported claim does not require a second review of every attached span.
   if (review.reviewedSourceIDs.some((id) => !sourceIDs.has(id))) errors.push("unknown_review_source")
+  // Every positively supported assertion must have at least one actually reviewed,
+  // bound source. Reading no sources is never evidence of acceptance.
+  const reviewed = new Set(review.reviewedSourceIDs)
+  for (const assessment of review.assertionReviews.filter(isSourceSupportedAssertion)) {
+    const bindings = [...candidate.conditions, ...candidate.observedScope, ...(candidate.boundaries.status === "reported" ? candidate.boundaries.items : [])]
+    const ids = [...candidate.support.filter((s) => s.assertionIDs.includes(assessment.assertionID) && s.relation !== "refutes").flatMap((s) => s.sourceIDs),
+      ...bindings.filter((s) => s.assertionID === assessment.assertionID).flatMap((s) => s.sourceIDs)]
+    if (!ids.some((id) => reviewed.has(id))) errors.push("assertion_evidence_unreviewed")
+  }
+
   return errors
 }
 
@@ -147,7 +157,7 @@ export function validatePrincipleReview(candidate: KnowledgeCandidateV2, value: 
 // not a scientific rejection. The caller may request one bounded output repair.
 export function validatePrincipleReviewEnvelope(candidate: KnowledgeCandidateV2, review: PrincipleReview, availableSourceIDs: readonly string[] = []): string[] {
   const errors = validatePrincipleReview(candidate, review, availableSourceIDs).filter((error) =>
-    ["invalid_review_schema", "stale_review", "assertion_review_incomplete", "unknown_review_source"].includes(error))
+    ["invalid_review_schema", "stale_review", "assertion_review_incomplete", "unknown_review_source", "assertion_evidence_unreviewed"].includes(error))
   if (review.verdict !== "accepted" && !review.reasons.length && Object.values(review.checks).every(Boolean)
     && review.assertionReviews.every(isSourceSupportedAssertion)) errors.push("contradictory_review_verdict")
   return errors
@@ -189,4 +199,19 @@ export function finalizeKnowledgeCandidate(input: {
     ...input.candidate, schemaVersion: "knowledge_card_v2", knowledgeID: `kn_${identity}`, revision: 1,
     review: input.review, provenance: input.provenance,
   })
+}
+
+/** Recheck the review seal and content identity when loading snapshots for downstream use. */
+export function validateKnowledgeCardSeal(value: unknown): string[] {
+  const parsed = KnowledgeCardV2Schema.safeParse(value)
+  if (!parsed.success) return ["invalid_card_schema"]
+  const { schemaVersion, knowledgeID, revision, review, provenance, confidence, experimentValidations, ...fields } = parsed.data
+  const candidate = KnowledgeCandidateSchema.parse({ ...fields, schemaVersion: "knowledge_candidate_v2" })
+  const errors = validatePrincipleReview(candidate, review, review.reviewedSourceIDs)
+  const identity = createHash("sha256").update(canonical({ documentSha256: provenance.documentSha256,
+    candidateHash: knowledgeCandidateHash(candidate) })).digest("hex").slice(0, 24)
+  if (knowledgeID !== `kn_${identity}`) errors.push("knowledge_identity_mismatch")
+  if (provenance.synthesisVersion !== KNOWLEDGE_V2_VERSIONS.synthesis || provenance.verifierVersion !== KNOWLEDGE_V2_VERSIONS.verifier) errors.push("provenance_version_mismatch")
+  if (parsed.data.sources.some((source) => source.paperID !== parsed.data.paperID || source.documentSha256 !== provenance.documentSha256)) errors.push("source_identity_mismatch")
+  return errors
 }

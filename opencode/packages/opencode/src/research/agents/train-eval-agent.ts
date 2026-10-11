@@ -11,7 +11,7 @@ export interface TrainEvalResult {
   readonly primaryMetric?: number
   readonly metrics: JsonRecord
   readonly trainingLogSummary: string
-  readonly verifierDecision: "accepted" | "rejected" | "skipped"
+  readonly verifierDecision: "accepted" | "rejected" | "skipped" | "inconclusive"
   readonly verifierRejectReason?: string
 }
 
@@ -21,14 +21,14 @@ function finiteMetric(metrics: ResearchRun["metrics"], key: string) {
 }
 
 function trainEvalStatus(run: ResearchRun, verifierReport: VerifierReport | undefined): TrainEvalResult["status"] {
-  if (run.status === "rejected" || verifierReport?.accepted === false) return "rejected"
+  if (run.status === "rejected" || verifierReport?.status === "failed") return "rejected"
   if (run.status === "succeeded") return "succeeded"
   return "failed"
 }
 
 function verifierDecision(verifierReport: VerifierReport | undefined): TrainEvalResult["verifierDecision"] {
   if (verifierReport === undefined) return "skipped"
-  return verifierReport.accepted ? "accepted" : "rejected"
+  return verifierReport.status === "insufficient_evidence" ? "inconclusive" : verifierReport.accepted ? "accepted" : "rejected"
 }
 
 function buildTrainingLogSummary(input: {
@@ -42,7 +42,7 @@ function buildTrainingLogSummary(input: {
   const verifierText =
     input.verifierReport === undefined
       ? "verifier=skipped"
-      : input.verifierReport.accepted
+      : input.verifierReport.status === "insufficient_evidence" ? "verifier=inconclusive (missing evidence)" : input.verifierReport.accepted
         ? "verifier=accepted"
         : `verifier=rejected (${input.verifierReport.rejectReason ?? "no reason"})`
   const errorText = input.run.error === undefined ? "" : ` error=${input.run.error}`

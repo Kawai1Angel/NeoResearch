@@ -12,7 +12,7 @@ import { bindTaskEvidenceToSession } from "../../src/research/hypothesis-store"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
 import { testEffect } from "../lib/effect"
-import { fixture } from "./retrieve/fixtures"
+import { activeFixture } from "./retrieve/fixtures"
 
 afterEach(resetDatabase)
 const it = testEffect(CrossSpawnSpawner.defaultLayer)
@@ -27,7 +27,7 @@ it.live("session tools preserve evidence through add/update/list and reject inva
       objective: { primaryMetric: "val_avg_mse", direction: "minimize" }, budget: { maxRuns: 2 } })
     yield* Effect.promise(() => writeFile(path.join(directory, "quantitative.json"), "{}"))
     const q = yield* svc.createArtifact({ taskID: task.id, kind: "dataset_quantitative_analysis_json", uri: `file://${directory}/quantitative.json`, metadata: {} })
-    const bundle = { ...fixture().build(), taskID: task.id, quantitativeReportArtifactID: q.id }
+    const bundle = { ...activeFixture(), taskID: task.id, quantitativeReportArtifactID: q.id }
     const bundlePath = path.join(directory, "evidence.json")
     yield* Effect.promise(() => writeFile(bundlePath, JSON.stringify(bundle)))
     const artifact = yield* svc.createArtifact({ taskID: task.id, kind: "task_evidence_bundle_json", uri: `file://${bundlePath}`, metadata: { retrieveRunID: bundle.retrieveRunID } })
@@ -36,6 +36,7 @@ it.live("session tools preserve evidence through add/update/list and reject inva
       suggestedBackbones: ["dlinear"], suggestedPreprocessing: [], requiredMechanisms: ["moving_average_decomposition"], risk: "Transfer uncertainty", testable: true,
       datasetEvidencePaths: entry.linkage.datasetEvidencePaths,
       literatureEvidence: [{ cardID: entry.cardID, cardRevision: entry.cardRevision, role: entry.roles[0]! }],
+      experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
       applicabilityAssumptions: ["Stable seasonal structure"], falsificationCriteria: ["MSE fails to improve"], evidenceLevel: "paper_supported" as const }
     const ctx = { sessionID: SessionID.make(task.sessionID!), messageID: MessageID.make("msg_evidence"),
       agent: "build", abort: AbortSignal.any([]), messages: [], metadata: () => Effect.void, ask: () => Effect.void }
@@ -61,10 +62,13 @@ it.live("session tools preserve evidence through add/update/list and reject inva
       expect((yield* update.execute({ hypoID, ...patch }, ctx)).output).toContain("Invalid hypothesis evidence")
     }
     expect(JSON.parse((yield* list.execute({}, ctx)).output)).toEqual(rows)
+    yield* Effect.promise(() => writeFile(bundlePath, JSON.stringify({ ...bundle, schemaVersion: "task_evidence_bundle_v1" })))
+    expect((yield* update.execute({ hypoID, risk: "Legacy evidence must not be reused" }, ctx)).output).toContain("Legacy task evidence requires")
+    yield* Effect.promise(() => writeFile(bundlePath, JSON.stringify(bundle)))
     const release = bindTaskEvidenceToSession(ctx.sessionID, task.id, artifact.id)
     yield* Effect.gen(function* () {
       const nextPath = path.join(directory, "next.json")
-      const next = { ...fixture({ cards: [] }).build(), taskID: task.id, quantitativeReportArtifactID: q.id, retrieveRunID: "retrieve_new" }
+      const next = { ...activeFixture(true), taskID: task.id, quantitativeReportArtifactID: q.id, retrieveRunID: "retrieve_new" }
       yield* Effect.promise(() => writeFile(nextPath, JSON.stringify(next)))
       yield* svc.createArtifact({ taskID: task.id, kind: "task_evidence_bundle_json", uri: `file://${nextPath}`, metadata: { retrieveRunID: next.retrieveRunID } })
       expect((yield* update.execute({ hypoID, risk: "Pinned evidence remains available" }, ctx)).output).toContain("Updated hypothesis")

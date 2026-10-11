@@ -1,3 +1,5 @@
+import { writeExperience } from "../../src/research/experience-store"
+import { experienceFromMemory } from "../../src/research/experience"
 import { NAS_DEFAULT_MAX_NO_IMPROVE } from "../../src/research/defaults"
 import { existsSync } from "node:fs"
 import { afterEach, describe, expect, test } from "bun:test"
@@ -17,6 +19,14 @@ import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
 import { addHypothesisToPool, selectNextExperimentInPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
 import { validateCandidateAgainstHypothesis } from "../../src/research/execution-contract"
+import { readDesignHistory } from "../../src/research/design-history"
+
+function saveExperimentFact(taskID: Research.ResearchTaskID, runID: string) {
+  return writeExperience(taskID, { level: "experiment_fact", polarity: "mixed", claimType: "observation",
+    statement: "Preserve the selected experiment for comparison.", conditions: [], intervention: "Run the recorded model",
+    observation: "See the authoritative run metrics and execution manifest.", boundaries: [], unknowns: [],
+    evidence: [{ runID, relation: "supports" }] })
+}
 
 function runResearch<A, E>(fx: Effect.Effect<A, E, Research.Service>) {
   return Effect.runPromise(fx.pipe(Effect.provide(Research.defaultLayer)))
@@ -364,6 +374,12 @@ async function writePrepareDataNeoCastRunner(root: string) {
 const path = require("path")
 const args = process.argv.slice(2)
 if (args[0] !== "prepare-data") process.exit(9)
+for (const flag of ["--known-future-covariates", "--static-covariates", "--known-future-source", "--known-future-available"]) {
+  if (args.includes(flag)) {
+    console.error("UNSUPPORTED_COVARIATE: " + flag + " is unavailable")
+    process.exit(1)
+  }
+}
 function value(flag) {
   const index = args.indexOf(flag)
   return index === -1 ? undefined : args[index + 1]
@@ -578,7 +594,7 @@ function installPlannerFixture() {
       distillableMemory: "Fixture workflow result.",
     }
     if (system.startsWith("You are the NeoResearch HypoPlanner")) {
-      const h = { id: "H_fixture_search", statement: "Test the declared architecture families under the shared protocol.",
+      const h = { experimentContract: { mode: "exploratory" }, id: "H_fixture_search", statement: "Test the declared architecture families under the shared protocol.",
         motivation: ["Workflow fixture with explicit experiment selection."], expectedOutcome: "Improve the primary metric",
         suggestedBackbones: ["linear", "mlp", "transformer", "dlinear", "nbeats", "rnn", "freq_mixer"],
         suggestedPreprocessing: [], requiredMechanisms: [], risk: "May underfit", testable: true,
@@ -587,11 +603,12 @@ function installPlannerFixture() {
       const progress = user.searchProgress
       // Reuse the exact execution binding for incomplete runs; no age/order
       // rule decides which hypothesis should be retried.
-      const lastRun = user.experimentHistory?.find((run: any) => run.stage !== "smoke") ?? user.experimentHistory?.[0]
+      const history = user.requestedHistory?.flatMap((entry: any) => entry.result.runs)
+      const lastRun = history?.find((run: any) => run.stage !== "smoke") ?? history?.[0]
       const failedID = lastRun?.status === "failed" ? lastRun.hypothesisID : undefined
       const failedRow = failedID ? Database.use((d) => d.select().from(ResearchHypothesisTable).where(eq(ResearchHypothesisTable.hypo_id, failedID)).get()) : undefined
       const failed = failedRow ? (await listHypothesesInPool(failedRow.task_id)).find((item) => item.id === failedID) : undefined
-      result = { hypotheses: failed ? [failed] : [h], nextExperiment: progress?.globalPlateauObserved
+      result = !history ? { status: "history_request", request: { limit: 5 } } : { hypotheses: failed ? [failed] : [h], nextExperiment: progress?.globalPlateauObserved
         ? { action: "stop", rationale: "Fixture planner stops after the configured plateau." }
         : { action: "experiment", hypothesisID: failed?.id ?? h.id, rationale: "Explicit workflow fixture decision." } }
     }
@@ -1788,6 +1805,67 @@ describe("Research service", () => {
     })
   })
 
+  test.each([
+    { source: "不可用", availableAtPredictionTime: false },
+    { source: "not available" },
+    { availableAtPredictionTime: false },
+  ] as Research.JsonRecord[])("prepare dataset ignores unused known-future availability metadata %j", async (availability) => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = await writeProfileDataset()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writePrepareDataNeoCastRunner(fakeNeoCastRoot)
+        const spec = validTsfTaskSpec({ bridgeOnly: true, neoCastProjectRoot: fakeNeoCastRoot })
+        const task = await runResearch(Research.Service.use((svc) => svc.createTask({
+          title: "Prepare observed-past covariates",
+          domainID: "tsf",
+          mode: "autonomous",
+          taskSpec: {
+            ...spec,
+            contextLength: 12,
+            predictionLengths: [8],
+            dataset: {
+              loaderID: "local_csv",
+              path: datasetPath,
+              targetCols: ["a"],
+              observedPastCovariates: ["b", "c"],
+              knownFutureCovariates: [],
+            },
+            metadata: {
+              ...spec.metadata,
+              knownFutureAvailability: availability,
+              experimentScope: "past_covariates_only",
+            },
+          },
+          objective: {},
+          budget: {},
+        })))
+
+        const prepared = await runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id })))
+        expect(prepared.datasetSpec).toMatchObject({
+          target_columns: ["a"],
+          observed_past_covariates: ["b", "c"],
+          known_future_covariates: [],
+        })
+        const payload = JSON.parse(await readFile(prepared.path, "utf8"))
+        expect(payload.command.args).not.toContain("--known-future-source")
+        expect(payload.command.args).not.toContain("--known-future-available")
+        expect(payload.command.args).toContain("past_covariates_only")
+        const candidate = await createCandidate({ taskID: task.id })
+        const run = await runResearch(Research.Service.use((svc) => svc.prepareRun({
+          taskID: task.id,
+          candidateID: candidate.id,
+          stage: "smoke",
+        })))
+        expect(run.run.stage).toBe("smoke")
+        expect(run.run.candidateID).toBe(candidate.id)
+      },
+    })
+  })
+
   test("prepare dataset reports missing target columns instead of silently dropping them", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const datasetPath = await writeProfileDataset()
@@ -1996,7 +2074,7 @@ describe("Research service", () => {
     })
   })
 
-  test("research memory keys distinguish same-basename datasets by path and file hash", async () => {
+  test("explicit experience facts distinguish same-basename datasets by full content hash", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -2013,17 +2091,21 @@ describe("Research service", () => {
 
         const taskA = await createTSFTask("Dataset A", { datasetPath: pathA })
         const candidateA = await createCandidate({ taskID: taskA.id })
-        await createRun({ taskID: taskA.id, candidateID: candidateA.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+        const runA = await createRun({ taskID: taskA.id, candidateID: candidateA.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+        await saveExperimentFact(taskA.id, runA.id)
 
         const taskB = await createTSFTask("Dataset B", { datasetPath: pathB })
         const candidateB = await createCandidate({ taskID: taskB.id })
-        await createRun({ taskID: taskB.id, candidateID: candidateB.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+        const runB = await createRun({ taskID: taskB.id, candidateID: candidateB.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+        await saveExperimentFact(taskB.id, runB.id)
 
         const [memoryA] = await runResearch(Research.Service.use((svc) => svc.listMemory(taskA.id)))
         const [memoryB] = await runResearch(Research.Service.use((svc) => svc.listMemory(taskB.id)))
-        expect(memoryA?.fingerprintSummary.sourceCsv).not.toBe(memoryB?.fingerprintSummary.sourceCsv)
-        expect(String(memoryA?.fingerprintSummary.sourceCsv)).toContain(path.resolve(pathA))
-        expect(String(memoryB?.fingerprintSummary.sourceCsv)).toContain(path.resolve(pathB))
+        const factA = experienceFromMemory(memoryA!)!.facts[0]!
+        const factB = experienceFromMemory(memoryB!)!.facts[0]!
+        expect(factA.dataset.identity).not.toBe(factB.dataset.identity)
+        expect(factA.dataset.specification.path).toBe(pathA)
+        expect(factB.dataset.specification.path).toBe(pathB)
       },
     })
   })
@@ -2172,7 +2254,7 @@ describe("Research service", () => {
     })
   })
 
-  test("records reusable candidate recipes in run memory", async () => {
+  test("stores factual model recipes only after an explicit experience write", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
     await Instance.provide({
@@ -2192,20 +2274,17 @@ describe("Research service", () => {
             }),
           ),
         )
-        await createRun({
+        const run = await createRun({
           taskID: task.id, candidateID: candidate.id, status: "succeeded",
           metrics: { val_avg_mse: 0.12 },
         })
 
-        const memory = await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))
-        expect(memory[0]?.candidateSummary).toMatchObject({
+        expect(await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))).toEqual([])
+        const { memory } = await saveExperimentFact(task.id, run.id)
+        expect(experienceFromMemory(memory)!.facts[0]).toMatchObject({
           candidateID: candidate.id,
-          recipeID: "benchmark_accepted_invert_rnn",
-          candidateSpec: {
-            recipeID: "benchmark_accepted_invert_rnn",
-            embedding: { type: "invert" },
-            backbone: { type: "rnn" },
-          },
+          proposedModel: { recipeID: "benchmark_accepted_invert_rnn", embedding: { type: "invert" }, backbone: { type: "rnn" } },
+          primaryValue: 0.12,
         })
       },
     })
@@ -2321,25 +2400,12 @@ describe("Research service", () => {
           primaryMetric: 0.2,
         })
 
-        const memory = await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))
-        expect(memory[0]).toMatchObject({
-          outcome: "rejected",
-          candidateSummary: {
-            runID: challengerRun.id,
-            primaryMetric: 0.19,
-            championUpdated: false,
-            championStandoff: {
-              status: "secondary_metric_regressed",
-              primaryMetricName: "val_avg_mse",
-              secondaryMetricName: "val_h720_mse",
-              challengerPrimary: 0.19,
-              championPrimary: 0.2,
-              challengerSecondary: 0.92,
-              championSecondary: 0.31,
-            },
-          },
+        expect(await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))).toEqual([])
+        const updated = (await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).find((run) => run.id === challengerRun.id)!
+        expect(updated.resourceUsage.evaluationDecision).toMatchObject({
+          primaryMetric: 0.19, championUpdated: false,
+          championStandoff: { status: "secondary_metric_regressed", challengerSecondary: 0.92, championSecondary: 0.31 },
         })
-        expect(memory[0]?.lesson).toContain("champion standoff")
       },
     })
   })
@@ -3208,15 +3274,7 @@ describe("Research service", () => {
         expect(champion?.primaryMetric).toBe(0.101)
 
         const memory = await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))
-        expect(memory[0]!.outcome).toBe("accepted")
-        expect(memory[0]!.fingerprintSummary).toMatchObject({
-          targetCount: 1,
-          contextLength: 96,
-          maxPredictionLength: 24,
-          horizonContextRatio: 0.25,
-          bridgeOnly: true,
-        })
-        expect(memory[0]!.candidateSummary.primaryMetric).toBe(0.101)
+        expect(memory).toEqual([])
       },
     })
   })
@@ -3481,6 +3539,57 @@ fi
     })
   })
 
+  test("reflection receives raw execution observations without evaluation verdicts in either history or its prompt", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    installPlannerFixture()
+    const fixtureFetch = globalThis.fetch
+    const prompts: Record<string, any>[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      expect(body.messages[0].content).not.toMatch(/\bverifier\b|\bverification\b/i)
+      prompts.push(JSON.parse(body.messages[1].content))
+      return fixtureFetch(input, init)
+    }) as typeof fetch
+    try {
+      await Instance.provide({ directory: tmp.path, fn: async () => {
+        const task = await createTSFTask("independent reflection")
+        const candidate = await createCandidate({ taskID: task.id })
+        await executeFixtureSmoke(task.id, candidate.id)
+        const evaluated = await createRun({ taskID: task.id, candidateID: candidate.id,
+          status: "succeeded", metrics: { val_avg_mse: 0.7, train_avg_mse: 0.01 },
+          resourceUsage: { verification: { status: "failed", checks: [{ name: "overfitting_verifier", accepted: false }] } } })
+        await runResearch(Research.Service.use((svc) => svc.updateRunStatus({
+          runID: evaluated.id, status: "rejected", error: "Overfit ratio exceeds 3",
+        })))
+        const failed = await createRun({ taskID: task.id, candidateID: candidate.id, stage: "full", status: "queued" })
+        await runResearch(Research.Service.use((svc) => svc.updateRunStatus({
+          runID: failed.id, status: "failed", error: "CUDA out of memory while training",
+        })))
+        // Native experiment_results and direct sourceRuns share this history projection.
+        const history = await readDesignHistory(task.id, { limit: 20 }, { forReflection: true })
+        expect((await readDesignHistory(task.id, { runID: evaluated.id })).runs[0]?.status).toBe("rejected")
+        const observation = history.runs.find((r) => r.runID === evaluated.id)!
+        expect(observation.status).toBe("succeeded")
+        expect(observation.metrics).toEqual({ val_avg_mse: 0.7, train_avg_mse: 0.01 })
+        expect(observation).not.toHaveProperty("error")
+        expect(JSON.stringify(history)).not.toMatch(/verification|overfitting_verifier|Overfit ratio/)
+        const reflection = await runResearch(Research.Service.use((svc) => svc.runReflectionAgent({ taskID: task.id })))
+        expect(reflection.llm.status).toBe("used")
+        expect(reflection.analysis.succeededRuns).toBe(1)
+        expect(reflection.analysis.rejectedRuns).toBe(0)
+        expect(reflection.analysis.failures[0]?.category).toBe("oom")
+        expect(prompts).toHaveLength(1)
+        expect(prompts[0]!.sourceRuns.find((r: any) => r.runID === evaluated.id).metrics.train_avg_mse).toBe(0.01)
+        expect(prompts[0]!.experimentResults.rejectedRuns).toBe(0)
+        expect(JSON.stringify(prompts)).not.toMatch(/verification|overfitting_verifier|Overfit ratio/)
+        expect((await runResearch(Research.Service.use((svc) => svc.listRuns(task.id))))
+          .find((r) => r.id === evaluated.id)?.status).toBe("rejected")
+      } })
+    } finally {
+      globalThis.fetch = fixtureFetch
+    }
+  })
+
   test("writes verifier decision and failure log artifacts for the review loop", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 
@@ -3489,6 +3598,7 @@ fi
       fn: async () => {
         const task = await createTSFTask("verification reflection artifacts")
         const candidate = await createCandidate({ taskID: task.id })
+        await executeFixtureSmoke(task.id, candidate.id)
         const run = await createRun({
           taskID: task.id,
           candidateID: candidate.id,
@@ -3512,8 +3622,8 @@ fi
         expect(decision).toMatchObject({
           schemaVersion: "neo-research.verifier_decision.v1",
           runID: run.id,
-          accepted: true,
-          decision: "accept",
+          accepted: false,
+          decision: "inconclusive",
         })
 
         const failedRun = await createRun({
@@ -4240,7 +4350,7 @@ fi
             runID: iteration.run.id,
             stage: "low_fidelity",
             status: "succeeded",
-            verifierDecision: "accepted",
+            verifierDecision: "inconclusive",
           },
         })
       },
@@ -4836,7 +4946,7 @@ fi
           version: "tsf_profile_learned_memory_ranker_v1",
           featureSource: "taskFingerprint.datasetProfile",
           rankingCount: selectionRecord.rankings.length,
-          memoryEvidenceCount: 3,
+          memoryEvidenceCount: 0,
           benchmarkEvidenceCount: 0,
         })
         expect(selectionRecord.rankings[0].predictorVersion).toBe("tsf_profile_learned_memory_ranker_v1")
@@ -4847,12 +4957,12 @@ fi
           bridgeOnly: false,
 	          historyRunCount: 6,
 	          historyMetricRunCount: 6,
-	          historyMemoryCount: 3,
-	          learnedRankerTrainingExamples: 10,
-	          learnedRankerPositiveExamples: 5,
-	          learnedRankerNegativeExamples: 5,
+	          historyMemoryCount: 0,
+	          learnedRankerTrainingExamples: 7,
+	          learnedRankerPositiveExamples: 4,
+	          learnedRankerNegativeExamples: 3,
 	          hasChampion: true,
-	          memoryEvidenceCount: 3,
+	          memoryEvidenceCount: 0,
           benchmarkEvidenceCount: 0,
           datasetProfileSignals: {
             source: "dataset.path",
@@ -4905,7 +5015,7 @@ fi
           managerTraceRecord.managerTrace.find((step: { role: string }) => step.role === "librarian").metadata,
         ).toMatchObject({
           selectedCandidateID: iteration.candidate.id,
-          memoryWriteOutcome: "recorded",
+          memoryWriteOutcome: "skipped",
         })
       },
     })
@@ -5043,8 +5153,8 @@ fi
           const retryPrompt = JSON.parse(retryBody.messages[1].content)
           expect(retryPrompt.taskFingerprint.selectedHypothesis.statement).toContain("declared architecture families")
           expect(retryPrompt.taskFingerprint.selectedHypothesis.motivation).toContain("Exercise search ranking and stopping policy.")
-          expect(retryPrompt.previousSessionReflection).toContain("training_strategy.optimizer.lr=0.001")
-          expect(retryPrompt.previousSessionReflection).toContain("grad_clip=1 is already enabled")
+          expect(retryPrompt.previousSessionReflection).toBeUndefined()
+          expect(retryPrompt.historyAccess.tool).toBe("experiment_results")
           expect(retryPrompt.candidateValidationFeedback).toMatchObject({
             attempt: 1,
             issues: [{ path: "notes" }],
@@ -5071,7 +5181,7 @@ fi
     }
   })
 
-  test("uses same-domain benchmark memory for autonomous proposal ranking", async () => {
+  test("does not transfer legacy benchmark labels without structured evidence", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const datasetPath = await writeProfileDataset()
 
@@ -5157,21 +5267,19 @@ fi
         expect(selectionRecord.rankPredictor.version).toBe("tsf_profile_learned_memory_ranker_v1")
         expect(iteration.selectionArtifact!.metadata).toMatchObject({
           rankPredictorVersion: "tsf_profile_learned_memory_ranker_v1",
-          historyDomainMemoryCount: 1,
-          historyTaskMemoryCount: 3,
+          historyDomainMemoryCount: 0,
+          historyTaskMemoryCount: 0,
         })
         expect(selectionRecord.rankings[0].features).toMatchObject({
-          historyDomainMemoryCount: 1,
-	          learnedRankerTrainingExamples: 11,
-	          learnedRankerPositiveExamples: 6,
-	          learnedRankerNegativeExamples: 5,
+          historyDomainMemoryCount: 0,
+	          learnedRankerTrainingExamples: 7,
+	          learnedRankerPositiveExamples: 4,
+	          learnedRankerNegativeExamples: 3,
 	        })
         expect(selectionRecord.rankings[0].reasons.some((reason: string) => reason.includes("benchmark memory"))).toBe(
-          true,
+          false,
         )
-        expect(
-          selectionRecord.rankings[0].reasons.some((reason: string) => reason.includes("learned memory ranker")),
-        ).toBe(true)
+        expect(selectionRecord.rankPredictor.metricEvidenceCount).toBeGreaterThan(0)
       },
     })
   })
@@ -5523,7 +5631,8 @@ test("HypoPlanner chooses an untested direction at plateau and hard iteration li
       const spec = validTsfCandidateSpec()
       const previous = await createCandidate({ taskID: task.id, candidateSpec: { ...spec, recipeID: "historical_best", trainingStrategy: { ...(spec.trainingStrategy as any), optimizer: { ...((spec.trainingStrategy as any).optimizer), lr: 0.0003 } } } })
       await createRun({ taskID: task.id, candidateID: previous.id, stage: "full", status: "succeeded", metrics: { val_avg_mse: 0.05 } })
-      const draft = { statement: "Compare independent temporal representations", motivation: ["Validation best is 0.05"],
+      const draft = { experimentContract: { mode: "exploratory" as const, changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
+        statement: "Compare independent temporal representations", motivation: ["Validation best is 0.05"],
         expectedOutcome: "Lower val_avg_mse", suggestedPreprocessing: [], risk: "Overfit", testable: true,
         falsificationCriteria: ["No improvement in full-run val_avg_mse"] }
       const h1 = await addHypothesisToPool(task.id, { ...draft, id: "H1", suggestedBackbones: ["linear"] })
@@ -5542,7 +5651,7 @@ test("HypoPlanner chooses an untested direction at plateau and hard iteration li
         if (system.startsWith("You are the NeoResearch HypoPlanner")) {
           plannerCalls++
           plannerContext = JSON.parse(body.messages[1].content)
-          result = { hypotheses: [h1, h2], nextExperiment: { action: "experiment", hypothesisID: h2.id,
+          result = { hypotheses: [h1, h2].map((h) => ({ ...h, experimentContract: { mode: "exploratory" } })), nextExperiment: { action: "experiment", hypothesisID: h2.id,
             rationale: "The linear direction plateaued; test the untouched nonlinear representation." } }
         } else {
           result = { experimentSummary: "Completed linear trial", metricAssessment: "MSE 0.101 did not beat 0.05",
@@ -5564,8 +5673,9 @@ test("HypoPlanner chooses an untested direction at plateau and hard iteration li
       expect(loop.iterations.map((iteration) => iteration.candidate.hypothesisID)).toEqual([h1.id, h2.id])
       expect(plannerCalls).toBe(1)
       expect(plannerContext.searchProgress).toMatchObject({ noImproveStreak: 1, remainingIterations: 1 })
-      expect(plannerContext.experimentHistory.some((run: any) => run.hypothesisID === h1.id && run.stage === "full")).toBe(true)
-      expect(plannerContext.modelCapabilities.backbones.nbeats.implementation).toContain("neither interpretable-basis")
+      expect(plannerContext.experimentHistory).toBeUndefined()
+      expect(plannerContext.historyAccess.tool).toBe("experiment_results")
+      expect(plannerContext.modelCapabilities.backbones.nbeats.implementation).toContain("No interpretable polynomial/Fourier basis")
     } })
   } finally {
     globalThis.fetch = previousFetch
@@ -5580,7 +5690,8 @@ test("the first experiment follows the planner choice despite baseline and candi
     const root = path.join(tmp.path, "runner")
     await writeFakeNeoCastRunner(root)
     const task = await createTSFTask("explicit first experiment", { bridgeOnly: true, neoCastProjectRoot: root, pythonExecutable: "bash" }, "autonomous")
-    const selected = await addHypothesisToPool(task.id, { id: "H_explicit_first", statement: "Test an MLP representation first.",
+    const selected = await addHypothesisToPool(task.id, { id: "H_explicit_first", experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
+        statement: "Test an MLP representation first.",
       motivation: ["Explicit planner decision"], expectedOutcome: "Improve the validation metric", suggestedBackbones: ["mlp"],
       suggestedPreprocessing: [], risk: "May overfit", testable: true })
     const spec = validTsfCandidateSpec() as Record<string, any>

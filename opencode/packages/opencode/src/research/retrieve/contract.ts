@@ -1,4 +1,7 @@
+import { validateKnowledgeCardSeal } from "../literature/knowledge-v2-validator"
+import { KnowledgeCardV2Schema } from "../literature/knowledge-v2-contract"
 import z from "zod"
+import { ArchitecturePacketSchema } from "./architecture-packet"
 import { CARD_TYPES, MechanismSchema, KnowledgeCardSchema } from "../literature/contract"
 
 const FiniteNumber = z.number().finite()
@@ -152,7 +155,8 @@ export const RetrievalCandidateSchema = z.object({
   paperID: z.string().min(1),
   intentID: z.string().min(1),
   queryText: z.string().min(1),
-  recallRoute: z.enum(["source_catalog", "classic_library"]).optional(),
+  recallRoute: z.enum(["source_catalog", "classic_library", "knowledge_store"]).optional(),
+  recallScore: FiniteNumber.min(0).max(1).optional(),
   bm25: z.object({
     rank: z.number().int().positive(),
     score: FiniteNumber.nonnegative(),
@@ -163,7 +167,7 @@ export const RetrievalCandidateSchema = z.object({
   localPDF: z.boolean(),
   publicationStatus: z.string(),
   paperScope: z.enum(["general", "domain_specific"]).optional(),
-  decision: z.enum(["send_to_literature_agent", "retain_candidate", "domain_only", "domain_specific", "skipped_pdf_unavailable", "unsupported_model_recipe"]),
+  decision: z.enum(["send_to_literature_agent", "reuse_knowledge", "retain_candidate", "domain_only", "domain_specific", "skipped_pdf_unavailable", "unsupported_model_recipe"]),
   decisionReasons: z.array(z.string()),
 }).strict()
 export type RetrievalCandidate = z.infer<typeof RetrievalCandidateSchema>
@@ -178,6 +182,7 @@ export const RetrieveLiteratureBridgeInputSchema = z.object({
     bm25Score: FiniteNumber.nonnegative(),
   }).strict()),
   literatureOptions: z.object({
+    force: z.boolean().optional(),
     includeAgentInference: z.literal(false),
     requireExactEvidenceSpan: z.literal(true),
     maxCardsPerPaper: z.number().int().positive(),
@@ -191,7 +196,8 @@ export const RetrieveLiteratureBridgeResultSchema = z.object({
     paperID: z.string().min(1),
     intentIDs: z.array(z.string()),
     candidateIDs: z.array(z.string()),
-    status: z.enum(["completed", "partial", "failed", "skipped_pdf_unavailable"]),
+    status: z.enum(["completed", "partial", "failed", "skipped_pdf_unavailable", "reused_knowledge"]),
+    cardRevisions: z.record(z.string(), z.number().int().positive()).optional(),
     literatureRunID: z.string().optional(),
     acceptedCardIDs: z.array(z.string()),
     rejectedCandidateCount: z.number().int().nonnegative(),
@@ -228,20 +234,23 @@ export const TASK_EVIDENCE_EXCLUSION_REASONS = [
 
 export const TaskEvidenceEntrySchema = z.object({
   evidenceEntryID: z.string().regex(/^te_[a-f0-9]{16}$/),
-  cardID: z.string().regex(/^kc_[a-f0-9]{12}$/),
+  cardID: z.string().regex(/^(kc_[a-f0-9]{12}|kn_[a-f0-9]{24})$/),
   cardRevision: z.number().int().positive(),
   paperID: z.string().min(1),
-  cardType: z.enum(CARD_TYPES),
+  cardType: z.enum([...CARD_TYPES, "transferable_principle"]),
+  knowledge: KnowledgeCardV2Schema.optional(),
   cardStatus: z.enum(["paper_backed", "corroborated", "contradicted"]),
   claim: z.string().min(1),
   paperTitle: z.string().optional(),
   problem: z.string().optional(),
-  mechanism: MechanismSchema.optional(),
+  mechanism: MechanismSchema.extend({ principle: z.string().trim().min(1) }).optional(),
+  experimentalContext: KnowledgeCardSchema.shape.experimentalContext,
   mergedSources: z.array(z.object({
     cardID: z.string(), cardRevision: z.number().int().positive(),
     claim: z.string(), problem: z.string().optional(), mechanism: MechanismSchema.optional(),
     rationale: z.string(),
     applicability: KnowledgeCardSchema.shape.applicability.optional(),
+    experimentalContext: KnowledgeCardSchema.shape.experimentalContext,
     evidenceRefs: z.array(z.object({
       evidenceID: z.string(), chunkID: z.string(), evidenceSpan: z.string(),
       section: z.string(), pageStart: z.number(), pageEnd: z.number(),
@@ -289,7 +298,7 @@ export const TaskEvidenceEntrySchema = z.object({
     extractionConfidence: FiniteNumber.min(0).max(1),
     evidenceDirectness: FiniteNumber.min(0).max(1),
     transferability: FiniteNumber.min(0).max(1),
-  }).strict(),
+  }).strict().optional(),
 }).strict()
 export type TaskEvidenceEntry = z.infer<typeof TaskEvidenceEntrySchema>
 
@@ -302,7 +311,8 @@ export const ExcludedTaskEvidenceSchema = z.object({
 export type ExcludedTaskEvidence = z.infer<typeof ExcludedTaskEvidenceSchema>
 
 export const TaskEvidenceBundleSchema = z.object({
-  schemaVersion: z.literal("task_evidence_bundle_v1"),
+  architectureKnowledge: ArchitecturePacketSchema.optional(),
+  schemaVersion: z.enum(["task_evidence_bundle_v1", "task_evidence_bundle_v2"]),
   retrieveRunID: z.string(),
   taskID: z.string(),
   quantitativeReportArtifactID: z.string(),
@@ -339,6 +349,14 @@ export const TaskEvidenceBundleSchema = z.object({
     conflictCount: z.number().int().nonnegative(),
   }).strict(),
 }).strict().superRefine((bundle, ctx) => {
+  if (bundle.schemaVersion === "task_evidence_bundle_v2") {
+    for (const entry of bundle.entries) {
+      if (!entry.knowledge || validateKnowledgeCardSeal(entry.knowledge).length || entry.cardType !== "transferable_principle" || entry.cardID !== entry.knowledge.knowledgeID ||
+        entry.cardRevision !== entry.knowledge.revision || entry.paperID !== entry.knowledge.paperID || entry.claim !== entry.knowledge.principle) {
+        ctx.addIssue({ code: "custom", message: "V2 task evidence requires the complete revision-bound knowledge card" })
+      }
+    }
+  }
   const selected = new Set(bundle.entries.map((entry) => entry.cardID))
   const excluded = new Set(bundle.excluded.map((entry) => entry.cardID))
   const accepted = new Set([...selected, ...excluded])
@@ -351,7 +369,8 @@ export const TaskEvidenceBundleSchema = z.object({
       bundle.summary.uncoveredMustCoverIntentCount !== bundle.gaps.filter((gap) => gap.mustCover).length) {
     issue("Task evidence summary does not match its contents")
   }
-  if ((bundle.readiness === "ready_data_only") !== (bundle.entries.length === 0)) issue("Task evidence readiness does not match selected entries")
+  const usableCount = bundle.architectureKnowledge ? bundle.architectureKnowledge.decisions.length : bundle.entries.length
+  if ((bundle.readiness === "ready_data_only") !== (usableCount === 0)) issue("Task evidence readiness does not match selected entries")
   for (const conflict of bundle.conflicts) {
     if (!accepted.has(conflict.sourceCardID) || !accepted.has(conflict.targetCardID)) issue("Conflict references unknown card provenance")
   }
@@ -370,6 +389,8 @@ const RetrieveResultBaseSchema = z.object({
     intentCount: z.number().int().nonnegative(),
     bm25CandidateCount: z.number().int().nonnegative(),
     literaturePaperCount: z.number().int().nonnegative(),
+    architectureDecisionCount: z.number().int().nonnegative().optional(),
+    architectureSourceCardCount: z.number().int().nonnegative().optional(),
     paperBackedCardCount: z.number().int().nonnegative(),
     missingPDFCount: z.number().int().nonnegative(),
     failedPaperCount: z.number().int().nonnegative(),
@@ -402,8 +423,8 @@ export type RetrievalBudgets = {
 
 export const DEFAULT_RETRIEVAL_BUDGETS: RetrievalBudgets = {
   maxIntents: 6,
-  maxCandidatesPerIntent: 20,
-  maxLiteraturePapersPerIntent: 5,
+  maxCandidatesPerIntent: 40,
+  maxLiteraturePapersPerIntent: 8,
   maxLiteraturePapersTotal: 12,
   maxTaskEvidenceEntries: 12,
   maxTaskEvidencePerIntent: 3,

@@ -7,7 +7,8 @@ export type LiteratureView = {
 }
 export function literatureSummary(meta: Record<string, unknown>) {
   const summary = (meta.summary ?? meta) as Record<string, unknown>
-  return `[LiteratureAgent] 完成 · ${summary.literaturePaperCount ?? 0} papers / ${summary.paperBackedCardCount ?? 0} cards / ${meta.selectedEntryCount ?? 0} selected / ${meta.gapCount ?? meta.uncoveredMustCoverIntentCount ?? 0} gaps · ${meta.readiness ?? "unknown"} · ${meta.callPath ?? "direct"}${meta.reason ? ` (${meta.reason})` : ""}`
+  const architecture = summary.architectureDecisionCount === undefined ? "" : ` / ${summary.architectureDecisionCount} architecture decisions`
+  return `[LiteratureAgent] 完成 · ${summary.literaturePaperCount ?? 0} papers / ${summary.paperBackedCardCount ?? 0} cards / ${meta.selectedEntryCount ?? 0} selected${architecture} / ${meta.gapCount ?? meta.uncoveredMustCoverIntentCount ?? 0} gaps · ${meta.readiness ?? "unknown"} · ${meta.callPath ?? "direct"}${meta.reason ? ` (${meta.reason})` : ""}`
 }
 
 export function literatureResultRows(meta: Record<string, unknown>) {

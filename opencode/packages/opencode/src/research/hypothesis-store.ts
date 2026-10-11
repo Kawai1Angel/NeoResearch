@@ -1,3 +1,4 @@
+import { ExperimentConstraints, conflictingMechanismRequirements } from "./experiment-constraints"
 import { timedAsync, startTiming } from "@/util/runtime-timing"
 import { and, desc, eq, Database } from "@/storage"
 import { Bus } from "@/bus"
@@ -37,6 +38,7 @@ function mapRow(row: ResearchHypothesisRow): HypothesisObject {
     expectedOutcome: row.expected_outcome,
     suggestedBackbones: Array.isArray(row.suggested_backbones) ? (row.suggested_backbones as string[]) : [],
     suggestedPreprocessing: Array.isArray(row.suggested_preprocessing) ? (row.suggested_preprocessing as string[]) : [],
+    ...(row.experiment_contract ? { experimentContract: ExperimentConstraints.parse(row.experiment_contract) } : {}),
     requiredMechanisms: validMechanisms(row.required_mechanisms) ? row.required_mechanisms : [],
     risk: row.risk,
     testable: row.testable,
@@ -69,6 +71,13 @@ function normalizedEvidence(hypothesis: Partial<HypothesisEvidenceFields>): Hypo
     falsificationCriteria: hypothesis.falsificationCriteria ?? [],
     evidenceLevel: hypothesis.evidenceLevel ?? "data_only",
   }
+}
+
+function assertConsistentMechanisms(hypothesis: Pick<HypothesisObject, "requiredMechanisms" | "experimentContract">) {
+  const conflicts = conflictingMechanismRequirements(hypothesis)
+  if (conflicts.length) throw new Error(
+    `The candidate arm cannot both require and forbid mechanisms: ${conflicts.join(", ")}. requiredMechanisms describes the generated arm, not the treatment in its comparison.`,
+  )
 }
 
 function publishChanged(taskID: ResearchTaskID, action: "add" | "update" | "abandon", hypothesis: HypothesisObject) {
@@ -137,6 +146,8 @@ export async function addHypothesisToPool(
   taskID: ResearchTaskID,
   hypothesis: HypothesisDraft,
 ): Promise<HypothesisObject> {
+  const experimentContract = hypothesis.experimentContract ? ExperimentConstraints.parse(hypothesis.experimentContract) : undefined
+  assertConsistentMechanisms(hypothesis)
   const now = Date.now()
   const id = ResearchHypothesisID.ascending()
   const hypoID = hypothesis.id?.trim() || id
@@ -154,6 +165,7 @@ export async function addHypothesisToPool(
         suggested_backbones: [...hypothesis.suggestedBackbones],
         suggested_preprocessing: [...hypothesis.suggestedPreprocessing],
         priority: "medium",
+        experiment_contract: experimentContract ?? null,
         required_mechanisms: [...(hypothesis.requiredMechanisms ?? [])],
         risk: hypothesis.risk,
         testable: hypothesis.testable,
@@ -171,6 +183,7 @@ export async function addHypothesisToPool(
   const { priority, ...definition } = hypothesis
   const created: HypothesisObject = {
     ...definition,
+    ...(experimentContract ? { experimentContract } : {}),
     ...evidence,
     requiredMechanisms: [...(hypothesis.requiredMechanisms ?? [])],
     id: hypoID,
@@ -194,6 +207,8 @@ export async function updateHypothesisInPool(
   )
   if (!existingRow) throw new HypothesisNotFoundError(hypoID)
 
+  if (patch.requiredMechanisms !== undefined || patch.experimentContract !== undefined)
+    assertConsistentMechanisms({ ...mapRow(existingRow), ...patch })
   const status = patch.status && VALID_STATUSES.includes(patch.status) ? patch.status : undefined
   Database.use((d) =>
     d
@@ -206,6 +221,7 @@ export async function updateHypothesisInPool(
         ...(patch.suggestedPreprocessing !== undefined
           ? { suggested_preprocessing: [...patch.suggestedPreprocessing] }
           : {}),
+        ...(patch.experimentContract !== undefined ? { experiment_contract: ExperimentConstraints.parse(patch.experimentContract) } : {}),
         ...(patch.requiredMechanisms !== undefined ? { required_mechanisms: [...patch.requiredMechanisms] } : {}),
         ...(patch.risk !== undefined ? { risk: patch.risk } : {}),
         ...(patch.testable !== undefined ? { testable: patch.testable } : {}),
@@ -290,6 +306,7 @@ export async function loadTaskEvidenceForTask(
   const bundle = (() => {
     try {
       const value = TaskEvidenceBundleSchema.parse(JSON.parse(content))
+      if (value.schemaVersion !== "task_evidence_bundle_v2") throw new Error("Legacy task evidence requires source-based v2 retrieval before planning")
       finish("completed")
       return value
     } catch (error) {
@@ -351,6 +368,7 @@ export async function selectNextExperimentInPool(taskID: ResearchTaskID, decisio
     const hypothesis = (await listHypothesesInPool(taskID)).find((h) => h.id === decision.hypothesisID)
     if (!hypothesis || !isOpenHypothesis(hypothesis))
       throw new Error(`Hypothesis ${decision.hypothesisID} is not open and testable`)
+    assertConsistentMechanisms(hypothesis)
     const unsupported = unsupportedMechanisms(hypothesis.requiredMechanisms ?? [])
     if (unsupported.length)
       throw new Error(

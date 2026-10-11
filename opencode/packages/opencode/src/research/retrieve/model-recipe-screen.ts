@@ -1,6 +1,6 @@
 import type { IndexedPaper } from "./local-index-builder"
 
-export const MODEL_RECIPE_SCREEN_VERSION = "model_recipe_mechanism_screen_v5"
+export const MODEL_RECIPE_SCREEN_VERSION = "model_recipe_family_discovery_v8"
 
 // Match only distinctive mechanisms that the current ModelRecipe schema and runtime
 // cannot express. A generic Transformer, patch, frequency, or mixer mention is not
@@ -42,6 +42,15 @@ const unsupported = [
   { id: "sparse_cross_period_linear", field: "backbone", pattern: /^SparseTSF:/i, titleOnly: true },
   { id: "series_core_fusion", field: "fusion", pattern: /^SOFTS:/i, titleOnly: true },
 ] as const
+
+// A reviewed card already identifies its own operation, so inspect that operation
+// directly rather than treating the entire source paper as the transferred method.
+export function unsupportedCardMechanisms(mechanism: { name: string; principle: string; components: string[] } | undefined) {
+  if (!mechanism) return []
+  const operation = [mechanism.name, mechanism.principle, ...mechanism.components].join("\n")
+  return unsupported.filter((item) => !("titleOnly" in item) && item.pattern.test(operation))
+    .map((item) => ({ mechanism: item.id, missingAction: item.field }))
+}
 
 export function unsupportedModelRecipeMechanisms(paper: Pick<IndexedPaper, "title" | "fields">) {
   // The title is an author claim about the central method. For other text require

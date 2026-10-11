@@ -20,12 +20,18 @@ test("direct reflection synthesizes inline evidence without requesting session t
   expect(prompt).toContain("historicalExperimentMemory")
   expect(prompt).toContain("lacks a finite task primary metric")
   expect(prompt).toContain("training_strategy.scheduler.warmup_steps")
-  expect(prompt).toContain("EXACTLY these 7 keys")
+  expect(prompt).toContain("these 7 analysis keys, optionally followed by experienceWrites")
+  expect(prompt).toContain("Omit it or return [] when nothing merits saving")
   expect(prompt).not.toContain("Call `experiment_results")
   expect(prompt).not.toContain("After completing the four tool calls")
   expect(prompt).not.toContain("Before EVERY tool call")
   // Session mode retains its original tool workflow.
   expect(REFLECTION_PROMPT).toContain("Call `experiment_results")
+  for (const system of [REFLECTION_PROMPT, prompt]) {
+    expect(system).not.toMatch(/\bverifier\b|\bverification\b/i)
+    expect(system).toContain("Independently assess training health, overfitting and model usefulness")
+    expect(system).toContain("attribution")
+  }
 })
 
 function task(extraSpec: Record<string, unknown> = {}): ResearchTask {
@@ -126,6 +132,23 @@ test("analyzeReflection requests human review after consecutive failures", () =>
   expect(analysis.failedRuns).toBe(3)
   expect(analysis.failures.map((item) => item.category)).toEqual(["oom", "oom", "nan"])
   expect(analysis.decision).toBe("request_human")
+})
+
+test("reflection evaluates completed observations independently of post-training rejection", () => {
+  const rejected = {
+    ...run({ id: "evaluated", status: "rejected", metric: 0.7, error: "Overfit ratio exceeds 3", created: 2 }),
+    resourceUsage: { executionContract: { status: "verified" }, verification: { status: "failed" } },
+  }
+  const analysis = analyzeReflection({ task: task(), candidates: [], runs: [
+    run({ id: "baseline", status: "succeeded", metric: 0.5, created: 1 }), rejected,
+  ] })
+  expect(analysis.succeededRuns).toBe(2)
+  expect(analysis.rejectedRuns).toBe(0)
+  expect(analysis.failures).toEqual([])
+  expect(analysis.ineffectiveChanges[0]?.metricValue).toBe(0.7)
+  expect(analysis.decision).toBe("continue")
+  expect(rejected.status).toBe("rejected")
+  expect(rejected.resourceUsage.verification.status).toBe("failed")
 })
 
 test("summarizeReflectionAgent emits both reflection_notes and next_experiment_plan markdown", () => {

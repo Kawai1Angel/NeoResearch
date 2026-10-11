@@ -1,13 +1,11 @@
 import type { LiteratureProgress } from "../literature-phase-executor"
 import { createHash } from "crypto"
 import path from "path"
-import { mkdir, writeFile } from "node:fs/promises"
-import { consolidateMechanisms, SEMANTIC_CONSOLIDATION_VERSION } from "../literature/semantic-consolidator"
-import type { KnowledgeCard } from "../literature/contract"
-import { EVIDENCE_VALIDATION_VERSION } from "../literature/evidence-verifier"
+import { KNOWLEDGE_V2_VERSIONS } from "../literature/knowledge-v2-contract"
+import type { PrincipleModel } from "../literature/principle-model"
+import { buildPrincipleTaskEvidence, reviewedPrinciple, type PrincipleKnowledgeSource } from "./principle-evidence"
 import { LiteratureAgent } from "../literature/literature-agent"
-import type { LiteratureExtractionModel } from "../literature/extraction-model"
-import { KnowledgeStore } from "../literature/knowledge-store"
+import { KnowledgeV2Store } from "../literature/knowledge-v2-store"
 import {
   DEFAULT_RETRIEVAL_BUDGETS,
   RetrieveResultSchema,
@@ -31,12 +29,18 @@ import { RetrieveStore } from "./retrieve-store"
 import { mapScientificConcepts, SCIENTIFIC_CONCEPT_MAPPING_VERSION } from "./scientific-concept-mapper"
 import { searchBM25 } from "./bm25-search"
 import {
-  buildTaskEvidence,
   normalizeRetrieveTaskContext,
   taskContextDigest,
-  type TaskEvidenceKnowledgeSource,
 } from "./task-evidence-builder"
 import { TASK_EVIDENCE_MAPPING_VERSION } from "./card-intent-binder"
+import { APPLICABILITY_MATCHER_VERSION } from "./applicability-matcher"
+import { KNOWLEDGE_RECALL_VERSION, recallKnowledge } from "./knowledge-recall"
+import { ARCHITECTURE_KNOWLEDGE_VERSION, architectureKnowledgePrompt } from "./architecture-knowledge"
+import { MODEL_CAPABILITIES } from "../model-capabilities"
+import { ARCHITECTURE_SELECTION_POLICY } from "./architecture-eligibility"
+import { ARCHITECTURE_LIMITS, distillArchitectureKnowledge } from "./architecture-distiller"
+import { loadArchitectureCorpus } from "./architecture-corpus"
+import { PAPER_SELECTION_VERSION } from "./candidate-selector"
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`
@@ -45,6 +49,12 @@ function stableJson(value: unknown): string {
 }
 
 function digest(value: unknown) { return createHash("sha256").update(stableJson(value)).digest("hex") }
+
+function knowledgeSnapshot(source: PrincipleKnowledgeSource) {
+  const cards = (source.listCards?.() ?? []).map(reviewedPrinciple).filter((card) => !!card).toSorted((a, b) => a.knowledgeID.localeCompare(b.knowledgeID))
+  const hash = digest({ versions: KNOWLEDGE_V2_VERSIONS, cards })
+  return { cards, hash }
+}
 
 function validatedBudgets(value: Partial<RetrievalBudgets> | undefined): RetrievalBudgets {
   const budgets = { ...DEFAULT_RETRIEVAL_BUDGETS, ...value }
@@ -87,8 +97,8 @@ export class RetrieveAgent {
   private readonly store: RetrieveStore
   private readonly literatureAgent: LiteratureAgentBridgeTarget
   private readonly ownedLiteratureAgent?: LiteratureAgent
-  private readonly knowledgeSource: TaskEvidenceKnowledgeSource
-  private readonly ownedKnowledgeSource?: KnowledgeStore
+  private readonly knowledgeSource: PrincipleKnowledgeSource
+  private readonly ownedKnowledgeSource?: KnowledgeV2Store
 
   constructor(private readonly config: {
     readonly onProgress?: (progress: LiteratureProgress) => Promise<void>
@@ -97,8 +107,9 @@ export class RetrieveAgent {
     readonly retrievalRoot?: string
     readonly knowledgeRoot?: string
     readonly literatureAgent?: LiteratureAgentBridgeTarget
-    readonly literatureModel?: LiteratureExtractionModel
-    readonly knowledgeSource?: TaskEvidenceKnowledgeSource
+    readonly principleModel?: PrincipleModel
+    readonly signal?: AbortSignal
+    readonly knowledgeSource?: PrincipleKnowledgeSource
   }) {
     this.retrievalRoot = path.resolve(config.retrievalRoot ?? path.join(config.neoCastRoot, ".neo-cast", "literature-retrieval"))
     this.store = new RetrieveStore(this.retrievalRoot)
@@ -109,7 +120,7 @@ export class RetrieveAgent {
         neoCastRoot: config.neoCastRoot,
         workspaceRoot: config.workspaceRoot,
         onProgress: config.onProgress,
-        ...(config.literatureModel === undefined ? {} : { model: config.literatureModel }),
+        principleModel: config.principleModel, signal: config.signal,
         ...(config.knowledgeRoot === undefined ? {} : { knowledgeRoot: config.knowledgeRoot }),
       })
       this.literatureAgent = this.ownedLiteratureAgent
@@ -118,7 +129,7 @@ export class RetrieveAgent {
       this.knowledgeSource = config.knowledgeSource
     } else {
       const knowledgeRoot = path.resolve(config.knowledgeRoot ?? path.join(config.neoCastRoot, ".neo-cast", "literature-knowledge"))
-      this.ownedKnowledgeSource = new KnowledgeStore(path.join(knowledgeRoot, "knowledge.db"))
+      this.ownedKnowledgeSource = new KnowledgeV2Store(path.join(knowledgeRoot, "knowledge.db"))
       this.knowledgeSource = this.ownedKnowledgeSource
     }
   }
@@ -149,10 +160,18 @@ export class RetrieveAgent {
     const sourceDocuments = index.documents.filter((paper) => classicPaperName(paper) === undefined)
     const reportDigest = digest(report)
     const quantitativeReportArtifactID = input.quantitativeReportArtifactID ?? report.sourceArtifactIDs[0] ?? "unregistered_quantitative_report"
+    const { cards: storedCards, hash: knowledgeDigest } = knowledgeSnapshot(this.knowledgeSource)
+    const architectureCorpus = await loadArchitectureCorpus({ activeCards: storedCards,
+      neoCastRoot: this.config.neoCastRoot, knowledgeRoot: this.config.knowledgeRoot })
     const runDigest = digest({
       reportDigest,
       quantitativeReportArtifactID,
       indexDigest: index.indexDigest,
+      knowledgeDigest,
+      architectureKnowledge: { version: ARCHITECTURE_KNOWLEDGE_VERSION, corpusDigest: architectureCorpus.digest, limits: ARCHITECTURE_LIMITS,
+        selectionPolicy: ARCHITECTURE_SELECTION_POLICY, modelCapabilities: MODEL_CAPABILITIES,
+        prompts: (["recall", "extract", "review", "revise", "curate"] as const).map(architectureKnowledgePrompt) },
+      paperSelection: PAPER_SELECTION_VERSION,
       classicLibrary: { version: CLASSIC_LIBRARY_VERSION, papers: CLASSIC_PAPERS },
       classicComponentMapping: CLASSIC_COMPONENT_MAPPING_VERSION,
       compatibilityReview: { version: COMPATIBILITY_REVIEW_VERSION, reviews: input.compatibilityReviews ?? [] },
@@ -162,21 +181,18 @@ export class RetrieveAgent {
       budgets,
       taskContextDigest: contextDigest,
       maxCardsPerPaper,
-      literatureModel: this.config.literatureModel
-        ? {
-            model: this.config.literatureModel.modelIdentifier,
-            candidatePrompt: this.config.literatureModel.candidatePromptVersion,
-            verifierPrompt: this.config.literatureModel.verifierPromptVersion,
-          }
+      literatureModel: this.config.principleModel
+        ? { model: this.config.principleModel.modelIdentifier, ...KNOWLEDGE_V2_VERSIONS }
         : this.config.literatureAgent ? "external_bridge" : "disabled",
       versions: {
-        evidenceValidation: EVIDENCE_VALIDATION_VERSION,
+        evidenceValidation: KNOWLEDGE_V2_VERSIONS.verifier,
         scientific: SCIENTIFIC_CONCEPT_MAPPING_VERSION,
         method: METHOD_CONCEPT_MAPPING_VERSION,
         paperLanguage: PAPER_LANGUAGE_MAPPING_VERSION,
         taskEvidence: TASK_EVIDENCE_MAPPING_VERSION,
-        semanticConsolidation: SEMANTIC_CONSOLIDATION_VERSION,
-        semanticReviewer: this.config.literatureModel?.reviewMechanisms ? this.config.literatureModel.modelIdentifier : "unavailable",
+        applicability: APPLICABILITY_MATCHER_VERSION,
+        knowledgeRecall: KNOWLEDGE_RECALL_VERSION,
+        knowledgeCard: KNOWLEDGE_V2_VERSIONS,
       },
     })
     const retrieveRunID = `retrieve_${runDigest.slice(0, 16)}`
@@ -184,6 +200,8 @@ export class RetrieveAgent {
     const mappings = mapScientificConcepts(report, datasetEvidence)
     const transformations = buildConceptTransformations(report, mappings)
     const intents = buildRetrievalIntents(transformations, budgets.maxIntents)
+    const recalled = recallKnowledge({ cards: storedCards, report, taskContext: normalizedTaskContext.context,
+      transformations, intents, budgets, compatibilityReviews: input.compatibilityReviews })
     const candidates = intents.flatMap((intent) => buildRetrievalCandidates(
       intent,
       [
@@ -195,55 +213,55 @@ export class RetrieveAgent {
       budgets.maxLiteraturePapersPerIntent,
       normalizedTaskContext.context.objective.probabilistic,
       input.compatibilityReviews,
+      input.force ? new Set() : recalled.coveredPaperIntents,
     ))
     const selectedCandidates = selectBridgeCandidates(candidates, budgets)
+    candidates.push(...recalled.candidates)
     return { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
       reportDigest, quantitativeReportArtifactID, runDigest, retrieveRunID, datasetEvidence,
-      mappings, transformations, intents, candidates, selectedCandidates }
+      mappings, transformations, intents, candidates, selectedCandidates, recalled, knowledgeDigest, architectureCorpus }
   }
 
   async run(input: RetrieveAgentInput, prepared?: Awaited<ReturnType<RetrieveAgent["prepare"]>>): Promise<RetrieveResult> {
     const { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
       reportDigest, quantitativeReportArtifactID, runDigest, retrieveRunID, datasetEvidence,
-      transformations, intents, candidates, selectedCandidates } = prepared ?? await this.prepare(input)
+      transformations, intents, candidates, selectedCandidates, recalled, knowledgeDigest, architectureCorpus } = prepared ?? await this.prepare(input)
+    if (prepared && knowledgeSnapshot(this.knowledgeSource).hash !== knowledgeDigest) {
+      throw new Error("Knowledge snapshot changed after retrieval preparation; prepare again before using cached evidence.")
+    }
+    this.config.signal?.throwIfAborted()
     if (!input.force) {
       const existing = await this.store.loadResult(retrieveRunID)
-      if (existing) {
+      if (existing && existing.taskEvidence.schemaVersion === "task_evidence_bundle_v2" && (existing.taskEvidence.architectureKnowledge?.status === "completed" ||
+        (!this.config.principleModel && existing.taskEvidence.architectureKnowledge?.status === "unavailable"))) {
         await this.config.onProgress?.({ step: "assemble_evidence", status: "completed", cached: true })
         return existing
       }
     }
     await this.config.onProgress?.({ step: "prepare_intents", status: "completed", counts: { intents: intents.length } })
-    await this.config.onProgress?.({ step: "search", status: "completed", counts: { candidates: candidates.length } })
-    await this.config.onProgress?.({ step: "select", status: "completed", counts: { papers: selectedCandidates.length } })
+    await this.config.onProgress?.({ step: "search", status: "completed", counts: { candidates: candidates.length,
+      unique_papers: new Set(candidates.map((c) => c.paperID)).size, architecture_pool_cards: architectureCorpus.cards.length } })
+    await this.config.onProgress?.({ step: "select", status: "completed", counts: { new_papers: selectedCandidates.length,
+      reused_papers: recalled.papers.length, reused_cards: new Set(recalled.papers.flatMap((p) => p.acceptedCardIDs)).size } })
     const bridge = await runLiteratureBridge(this.literatureAgent, {
       retrieveRunID,
       candidates: selectedCandidates,
       literatureOptions: {
+        force: input.force,
         includeAgentInference: false,
         requireExactEvidenceSpan: true,
         maxCardsPerPaper,
       },
     })
-    const literatureResults = [...bridge.papers, ...skippedPapers(candidates)]
+    // A completed extraction supersedes the pre-run snapshot, including a valid zero-card result.
+    const completedPapers = new Set(bridge.papers.filter((paper) => paper.status === "completed").map((paper) => paper.paperID))
+    const reused = recalled.papers.filter((paper) => !completedPapers.has(paper.paperID))
+    const recalledPapers = new Set(reused.map((paper) => paper.paperID))
+    const literatureResults = [...bridge.papers, ...reused,
+      ...skippedPapers(candidates).filter((paper) => !recalledPapers.has(paper.paperID))]
       .toSorted((left, right) => left.paperID.localeCompare(right.paperID))
     await this.config.onProgress?.({ step: "assemble_evidence", status: "running" })
-    const cards = [...new Set(literatureResults.flatMap((paper) => paper.acceptedCardIDs))]
-      .map((id) => this.knowledgeSource.getCard(id)).filter((card): card is KnowledgeCard => !!card)
-    const semanticReview = await consolidateMechanisms(cards,
-      this.config.literatureModel?.reviewMechanisms?.bind(this.config.literatureModel))
-    const reviewDirectory = path.join(this.retrievalRoot, "runs", retrieveRunID)
-    await mkdir(reviewDirectory, { recursive: true })
-    await writeFile(path.join(reviewDirectory, "semantic_consolidation.json"), JSON.stringify(semanticReview, null, 2))
-    const taskEvidence = buildTaskEvidence({
-      semanticGroups: semanticReview.groups,
-      componentRelations: semanticReview.papers.flatMap((paper) => paper.review?.componentRelations ?? []),
-      consolidation: {
-        version: semanticReview.version,
-        reviewedPapers: semanticReview.papers.filter((paper) => paper.status === "reviewed").map((paper) => paper.paperID),
-        failedPapers: semanticReview.papers.filter((paper) => paper.status === "failed").map((paper) => paper.paperID),
-        unavailablePapers: semanticReview.papers.filter((paper) => paper.status === "unavailable").map((paper) => paper.paperID),
-      },
+    const sourceEvidence = buildPrincipleTaskEvidence({
       paperTitles: Object.fromEntries(index.documents.map((document) => [document.paperID, document.title])),
       retrieveRunID,
       quantitativeReportArtifactID,
@@ -254,8 +272,26 @@ export class RetrieveAgent {
       candidates,
       literatureResults,
       knowledgeSource: this.knowledgeSource,
+      compatibilityReviews: input.compatibilityReviews,
       budgets,
     })
+    // Broad source reading precedes any downstream use of the old intent-limited selection.
+    const corpusCards = new Map(architectureCorpus.cards.filter((c) => architectureCorpus.historicalCardIDs.includes(c.knowledgeID)).map((c) => [c.knowledgeID, c]))
+    const currentCards = knowledgeSnapshot(this.knowledgeSource).cards
+    for (const card of currentCards) corpusCards.set(card.knowledgeID, card)
+    const historicalCardIDs = architectureCorpus.historicalCardIDs.filter((id) => !currentCards.some((c) => c.knowledgeID === id))
+    const architectureKnowledge = await distillArchitectureKnowledge({
+      corpus: { cards: [...corpusCards.values()], historicalCardIDs, warnings: architectureCorpus.warnings,
+        digest: digest({ cards: [...corpusCards.values()], historicalCardIDs }) },
+      model: this.config.principleModel, task: { quantitativeReport: report, taskContext: normalizedTaskContext.context },
+      datasetEvidencePaths: datasetEvidence.map((e) => e.path), maxDecisions: budgets.maxTaskEvidenceEntries,
+      auditRoot: path.join(this.store.runRoot(retrieveRunID), "architecture-audit"),
+      signal: this.config.signal, onProgress: this.config.onProgress,
+    })
+    const taskEvidence = { ...sourceEvidence, architectureKnowledge,
+      readiness: !architectureKnowledge.decisions.length ? "ready_data_only" as const
+        : architectureKnowledge.status === "partial" || architectureKnowledge.decisions.some((d) => d.taskFit === "conditional")
+          ? "partial_evidence" as const : "ready_with_evidence" as const }
     const result = RetrieveResultSchema.parse({
       schemaVersion: "retrieve_result_v2",
       retrieveRunID,
@@ -268,14 +304,16 @@ export class RetrieveAgent {
       taskEvidence,
       summary: {
         intentCount: intents.length,
-        bm25CandidateCount: candidates.length,
+        bm25CandidateCount: candidates.filter((item) => item.recallRoute !== "knowledge_store").length,
         literaturePaperCount: bridge.papers.length,
-        paperBackedCardCount: bridge.papers.reduce((sum, paper) => sum + paper.acceptedCardIDs.length, 0),
+        architectureDecisionCount: architectureKnowledge.decisions.length,
+        architectureSourceCardCount: architectureKnowledge.sourceCards.length,
+        paperBackedCardCount: new Set(literatureResults.flatMap((paper) => paper.acceptedCardIDs)).size,
         missingPDFCount: literatureResults.filter((paper) => paper.status === "skipped_pdf_unavailable").length,
         failedPaperCount: literatureResults.filter((paper) => paper.status === "failed").length,
       },
     })
-    const status = result.summary.failedPaperCount > 0 || result.summary.missingPDFCount > 0 ? "completed_with_warnings" : "completed"
+    const status = result.summary.failedPaperCount > 0 || result.summary.missingPDFCount > 0 || architectureKnowledge.status !== "completed" ? "completed_with_warnings" : "completed"
     await this.store.save({
       result,
       runInput: { ...input, quantitativeReport: report },
@@ -287,6 +325,11 @@ export class RetrieveAgent {
         runDigest,
         reportDigest,
         indexDigest: index.indexDigest,
+        knowledgeDigest,
+        architectureKnowledge: { version: architectureKnowledge.version, status: architectureKnowledge.status,
+          corpusDigest: architectureKnowledge.corpusDigest, consideredCardCount: architectureKnowledge.consideredCardCount,
+          readCardCount: architectureKnowledge.readCardCount, decisionCount: architectureKnowledge.decisions.length },
+        reusedKnowledge: recalled.papers,
         classicLibraryVersion: CLASSIC_LIBRARY_VERSION,
         classicLibraryPapers: CLASSIC_PAPERS,
         modelRecipeScreenVersion: MODEL_RECIPE_SCREEN_VERSION,
@@ -295,27 +338,24 @@ export class RetrieveAgent {
           method: METHOD_CONCEPT_MAPPING_VERSION,
           paperLanguage: PAPER_LANGUAGE_MAPPING_VERSION,
           taskEvidence: TASK_EVIDENCE_MAPPING_VERSION,
-        semanticConsolidation: SEMANTIC_CONSOLIDATION_VERSION,
-        semanticReviewer: this.config.literatureModel?.reviewMechanisms ? this.config.literatureModel.modelIdentifier : "unavailable",
+          applicability: APPLICABILITY_MATCHER_VERSION,
+          knowledgeRecall: KNOWLEDGE_RECALL_VERSION,
+          knowledgeCard: KNOWLEDGE_V2_VERSIONS,
         },
         taskContext: normalizedTaskContext.context,
         taskContextDigest: contextDigest,
         taskContextSource: normalizedTaskContext.source,
         llm: {
-          used: this.config.literatureModel?.available ?? false,
+          used: !!this.config.principleModel,
           managedExternally: this.config.literatureAgent !== undefined,
-          ...(this.config.literatureModel === undefined ? {} : {
-            model: this.config.literatureModel.modelIdentifier,
-            candidatePromptVersion: this.config.literatureModel.candidatePromptVersion,
-            verifierPromptVersion: this.config.literatureModel.verifierPromptVersion,
-          }),
+          ...(this.config.principleModel === undefined ? {} : { model: this.config.principleModel.modelIdentifier, ...KNOWLEDGE_V2_VERSIONS }),
         },
         queries: intents.map((intent) => ({ intentID: intent.intentID, queryText: intent.paperLanguageQuery.queryText })),
         budgets,
         literatureOptions: { includeAgentInference: false, requireExactEvidenceSpan: true, maxCardsPerPaper },
         literatureRunIDs: bridge.papers.flatMap((paper) => paper.literatureRunID ? [paper.literatureRunID] : []),
         status,
-        warnings: literatureResults.filter((paper) => paper.status !== "completed").map((paper) => `${paper.paperID}: ${paper.status}`),
+        warnings: [...literatureResults.filter((paper) => !["completed", "reused_knowledge"].includes(paper.status)).map((paper) => `${paper.paperID}: ${paper.status}`), ...architectureKnowledge.warnings],
         errors: literatureResults.flatMap((paper) => paper.status === "failed"
           ? [{ paperID: paper.paperID, error: "error" in paper ? paper.error : undefined }]
           : []),

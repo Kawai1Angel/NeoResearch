@@ -1,7 +1,7 @@
 import { createHash } from "crypto"
 import type { DocumentChunk } from "../../../src/research/literature/contract"
 import { KnowledgeCandidateSchema, type KnowledgeCandidateV2 } from "../../../src/research/literature/knowledge-v2-contract"
-import { knowledgeCandidateHash } from "../../../src/research/literature/knowledge-v2-validator"
+import { finalizeKnowledgeCandidate, knowledgeCandidateHash } from "../../../src/research/literature/knowledge-v2-validator"
 
 // Synthetic source: contract tests, not scientific validation of any real paper.
 export const text = "When the period is stable, group equal-phase observations and share a predictor across periods. This aligns recurring phases and reduces the number of independent weights. The derivation concerns parameter count, not prediction accuracy."
@@ -43,4 +43,25 @@ export function review(c = candidate()) {
     assertionReviews: c.assertions.map((x) => ({ assertionID: x.assertionID, verdict: "supported", reason: "Synthetic fixture source supports the scoped statement" })),
     reasons: [], explanation: "Synthetic review fixture", reviewedSourceIDs: c.sources.map((s) => s.sourceID),
   }
+}
+
+/** Synthetic reviewed card for active-path tests, never evidence about a real method. */
+export function principleFixture(edit?: (c: KnowledgeCandidateV2) => void) {
+  const c = candidate()
+  c.principle = "Frequency-domain modeling captures multiple seasonalities in time series forecasting when future covariates are known."
+  c.assertions.find((a) => a.assertionID === "p")!.statement = c.principle
+  c.assertions.find((a) => a.assertionID === "c")!.statement = "known_future_covariates"
+  c.mechanism.input = "multiple seasonalities in time series forecasting"
+  c.intervention.operation = "frequency-domain multi-scale modeling"
+  c.intervention.necessaryComponents = ["spectral peaks", "multi-period aggregation"]
+  edit?.(c)
+  const sourceText = [c.principle, ...c.assertions.map((a) => a.statement), c.intervention.operation, c.mechanism.explanatoryPath].join(" ")
+  const sha = createHash("sha256").update(sourceText).digest("hex")
+  const source = { ...chunk, paperID: c.paperID, text: sourceText, textSha256: sha }
+  c.sources = [{ ...c.sources[0], paperID: c.paperID, quote: sourceText, documentSha256: sha, chunkSha256: sha }]
+  const ctx = { ...context, paperID: c.paperID, documentSha256: sha, chunks: [source] }
+  const card = finalizeKnowledgeCandidate({ candidate: c, review: review(c), context: ctx,
+    provenance: { documentSha256: sha, analysisHash: sha, extractionRunID: "fixture_run", extractorModel: "fixture", verifierModel: "fixture",
+      synthesisVersion: "paper_principle_v8", verifierVersion: "principle_verifier_v11", createdAt: "2026-10-09T00:00:00.000Z" } })
+  return { card, context: ctx }
 }

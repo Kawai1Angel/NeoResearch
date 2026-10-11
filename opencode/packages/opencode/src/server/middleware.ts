@@ -10,6 +10,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { basicAuth } from "hono/basic-auth"
 import { cors } from "hono/cors"
 import { compress } from "hono/compress"
+import { researchErrorStatus } from "./error"
 
 const log = Log.create({ service: "server" })
 
@@ -22,10 +23,7 @@ export const ErrorMiddleware: ErrorHandler = (err, c) => {
     if (err instanceof NotFoundError) status = 404
     else if (err instanceof Provider.ModelNotFoundError) status = 400
     else if (err.name === "ProviderAuthValidationFailed") status = 400
-    else if (err.name === "ResearchTaskSpecValidationError") status = 400
-    else if (err.name === "ResearchCandidateValidationError") status = 400
-    else if (err.name === "ResearchBudgetExceededError") status = 400
-    else if (err.name === "ResearchApprovalRequiredError") status = 400
+    else if (researchErrorStatus(err.name) === 400) status = 400
     else if (err.name.startsWith("Worktree")) status = 400
     else status = 500
     return c.json(err.toObject(), { status })

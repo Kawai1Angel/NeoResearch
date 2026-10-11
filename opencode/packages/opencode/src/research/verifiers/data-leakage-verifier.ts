@@ -1,36 +1,20 @@
 import type { VerifierContext, VerifierResult } from "./types"
-import { finiteNum } from "./types"
+import { finiteNum, horizonMetrics } from "./types"
 
-// Val MSE this much better than train loss is suspicious (possible leakage).
+// Val MSE this much better than comparable train MSE is suspicious (possible leakage).
 const LEAKAGE_VAL_TRAIN_RATIO = 0.4
 
 // Longest-horizon MSE this much below shortest-horizon MSE is suspicious.
-// Normally MSE should increase (or stay flat) as horizon grows.
+// This is a diagnostic heuristic, not a necessary property of leak-free forecasts.
 const HORIZON_INVERSION_RATIO = 0.5
 
 // All per-horizon MSEs within this relative spread → collapse (suspicious uniformity).
 const HORIZON_COLLAPSE_CV = 0.005
 
-const KNOWN_HORIZONS = [96, 192, 336, 720]
-
-function extractHorizonMSEs(metrics: Record<string, unknown>): { horizon: number; mse: number }[] {
-  const results: { horizon: number; mse: number }[] = []
-  for (const h of KNOWN_HORIZONS) {
-    for (const key of [`val_h${h}_mse`, `val_mse_${h}`, `val_mse_h${h}`, `mse_${h}`]) {
-      const v = finiteNum(metrics[key])
-      if (v !== undefined) {
-        results.push({ horizon: h, mse: v })
-        break
-      }
-    }
-  }
-  return results.sort((a, b) => a.horizon - b.horizon)
-}
-
-function extractTrainMetric(metrics: Record<string, unknown>): number | undefined {
-  for (const key of ["train_avg_mse", "train_mse", "train_loss", "final_train_loss"]) {
-    const v = finiteNum(metrics[key])
-    if (v !== undefined && v > 0) return v
+function extractTrainMetric(metrics: Record<string, unknown>, scope: string): number | undefined {
+  for (const key of scope === "cv" ? ["cv_train_avg_mse"] : ["train_avg_mse", "train_mse"]) {
+    const value = finiteNum(metrics[key])
+    if (value !== undefined && value > 0) return value
   }
   return undefined
 }
@@ -62,16 +46,17 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
   if (ctx.run.status !== "succeeded") {
     return {
       name,
-      accepted: true,
+      accepted: false,
+      status: "skipped",
       reason: "Skipped: run did not succeed.",
       evidence: { skipped: true },
     }
   }
 
   const metrics = ctx.run.metrics as Record<string, unknown>
-  const valAvgMse = finiteNum(metrics["val_avg_mse"])
-  const horizonMSEs = extractHorizonMSEs(metrics)
-  const trainMetric = extractTrainMetric(metrics)
+  const { scope, values: horizonMSEs } = horizonMetrics(ctx)
+  const valAvgMse = finiteNum(metrics[`${scope}_avg_mse`])
+  const trainMetric = extractTrainMetric(metrics, scope)
   const contextLength = taskContextLength(ctx.task)
   const predictionLengths = taskPredictionLengths(ctx.task)
   const protocol = evaluationProtocol(ctx.task)
@@ -82,23 +67,25 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
     return {
       name,
       accepted: false,
+      status: "failed",
       reason: `Evaluation protocol '${protocol}' is not a supported leak-safe time-ordered protocol.`,
       evidence: { protocol, expected: ["fixed_split", "expanding_window_ratio"] },
     }
   }
 
-  // Check 2: Val MSE suspiciously better than train loss.
-  // A model that generalises much better on val than train usually indicates
-  // val targets or context bled into the training objective.
+  // Check 2: Val MSE suspiciously better than comparable train MSE.
+  // Easier validation data or training regularization can also explain this gap.
   if (valAvgMse !== undefined && trainMetric !== undefined) {
     const ratio = valAvgMse / trainMetric
     if (ratio < LEAKAGE_VAL_TRAIN_RATIO) {
       return {
         name,
         accepted: false,
-        reason: `Val/train MSE ratio ${ratio.toFixed(3)} is below ${LEAKAGE_VAL_TRAIN_RATIO} (val_avg_mse=${valAvgMse.toFixed(6)}, train=${trainMetric.toFixed(6)}). Val is suspiciously better than training, suggesting data leakage.`,
+        status: "insufficient_evidence",
+        reason: `Val/train MSE ratio ${ratio.toFixed(3)} is below ${LEAKAGE_VAL_TRAIN_RATIO} (${scope}_avg_mse=${valAvgMse.toFixed(6)}, train=${trainMetric.toFixed(6)}). Audit split boundaries; a metric gap alone does not establish leakage.`,
         evidence: {
           valAvgMse,
+          scope,
           trainMetric,
           ratio,
           threshold: LEAKAGE_VAL_TRAIN_RATIO,
@@ -108,8 +95,7 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
   }
 
   // Check 3: Per-horizon MSE monotonicity.
-  // Longer horizons should generally be harder (higher MSE). A strong inversion —
-  // where the longest horizon is much better than the shortest — is a leakage signal.
+  // Horizon inversion may reflect different horizon models or predictable periods.
   if (horizonMSEs.length >= 2) {
     const shortest = horizonMSEs[0]!
     const longest = horizonMSEs[horizonMSEs.length - 1]!
@@ -120,9 +106,11 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
         return {
           name,
           accepted: false,
-          reason: `Horizon-MSE inversion: val_h${longest.horizon}_mse=${longest.mse.toFixed(6)} is only ${inversionRatio.toFixed(3)}x of val_h${shortest.horizon}_mse=${shortest.mse.toFixed(6)} (threshold ${HORIZON_INVERSION_RATIO}x). Long horizons performing far better than short horizons suggests future-context leakage.`,
+          status: "insufficient_evidence",
+          reason: `Horizon-MSE inversion: ${scope}_h${longest.horizon}_mse=${longest.mse.toFixed(6)} is only ${inversionRatio.toFixed(3)}x of ${scope}_h${shortest.horizon}_mse=${shortest.mse.toFixed(6)} (threshold ${HORIZON_INVERSION_RATIO}x). Audit evaluation boundaries; inversion alone does not establish leakage.`,
           evidence: {
             shortestHorizon: shortest.horizon,
+            scope,
             shortestMse: shortest.mse,
             longestHorizon: longest.horizon,
             longestMse: longest.mse,
@@ -135,8 +123,7 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
     }
 
     // Check 4: Horizon MSE collapse (all horizons nearly identical).
-    // Indicates the model ignores horizon length, typically due to target leakage
-    // (val targets visible during context construction).
+    // A constant/noise-dominated process can have legitimate horizon-invariant error.
     const mseValues = horizonMSEs.map((h) => h.mse)
     const mean = mseValues.reduce((a, b) => a + b, 0) / mseValues.length
     if (mean > 0) {
@@ -146,9 +133,11 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
         return {
           name,
           accepted: false,
-          reason: `Per-horizon MSE collapse detected: CV=${cv.toExponential(2)} across ${horizonMSEs.length} horizons (threshold ${HORIZON_COLLAPSE_CV}). Horizon-invariant MSE suggests the model sees future target values during evaluation.`,
+          status: "insufficient_evidence",
+          reason: `Per-horizon MSE collapse diagnostic: CV=${cv.toExponential(2)} across ${horizonMSEs.length} horizons (threshold ${HORIZON_COLLAPSE_CV}). Audit evaluation boundaries; uniform errors alone do not establish leakage.`,
           evidence: {
             allHorizons: horizonMSEs,
+            scope,
             mean,
             cv,
             threshold: HORIZON_COLLAPSE_CV,
@@ -158,14 +147,25 @@ export function runDataLeakageVerifier(ctx: VerifierContext): VerifierResult {
     }
   }
 
+  const missing = [
+    ...(protocol === undefined ? ["evaluation protocol"] : []),
+    ...(valAvgMse === undefined || trainMetric === undefined ? ["comparable train/validation MSE"] : []),
+    ...(predictionLengths.some((h) => !horizonMSEs.some((metric) => metric.horizon === h)) ? ["per-horizon MSE"] : []),
+  ]
   return {
     name,
-    accepted: true,
-    reason: "No data leakage signals detected (protocol, val/train ratio, horizon monotonicity all pass).",
+    accepted: missing.length === 0,
+    status: missing.length ? "insufficient_evidence" : "passed",
+    reason: missing.length
+      ? `No signal in available checks; not evaluated: ${missing.join(", ")}.`
+      : "Available protocol and metric diagnostics passed; this is not proof of absence of leakage.",
     evidence: {
+      scope,
       ...(protocol !== undefined ? { protocol } : {}),
       ...(valAvgMse !== undefined ? { valAvgMse } : {}),
-      ...(trainMetric !== undefined ? { trainMetric, valTrainRatio: +(valAvgMse! / trainMetric).toFixed(4) } : {}),
+      ...(trainMetric !== undefined && valAvgMse !== undefined
+        ? { trainMetric, valTrainRatio: +(valAvgMse! / trainMetric).toFixed(4) }
+        : {}),
       ...(horizonMSEs.length > 0 ? { horizonMSEs } : {}),
       ...(contextLength !== undefined ? { contextLength } : {}),
       ...(maxHorizon !== undefined ? { maxHorizon } : {}),

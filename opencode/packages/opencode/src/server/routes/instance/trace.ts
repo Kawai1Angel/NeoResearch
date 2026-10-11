@@ -6,6 +6,7 @@ import { Instance } from "@/project/instance"
 import { Research } from "@/research"
 import { ResearchOperations } from "@/research/operation"
 import { AppRuntime } from "@/effect/app-runtime"
+import { researchErrorStatus } from "../../error"
 
 type AppEnv = Parameters<typeof AppRuntime.runPromise>[0] extends Effect.Effect<any, any, infer R> ? R : never
 
@@ -141,7 +142,7 @@ export async function jsonRequest<C extends Context, A, E>(
     {
       const operation = await ResearchOperations.wait(scope, taskID, started.operation.id)
       if (operation?.status === "completed") return c.json(operation.result)
-      if (operation?.error) return c.json(operation.error, 500)
+      if (operation?.error) return c.json(operation.error, researchErrorStatus(operation.error.name))
       return c.json({ name: "ResearchOperationCanceled", message: "Research operation canceled" }, 409)
     }
   }

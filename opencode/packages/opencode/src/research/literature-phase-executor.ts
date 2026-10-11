@@ -4,9 +4,10 @@ import path from "node:path"
 import z from "zod"
 import { RetrieveAgent, type RetrieveAgentInput } from "./retrieve/retrieve-agent"
 import { RetrieveResultSchema, TaskEvidenceBundleSchema } from "./retrieve/contract"
-import { ConfiguredLLMExtractionModel } from "./literature/extraction-model"
+import { ConfiguredPrincipleModel } from "./literature/principle-model"
 import { LiteratureAgent } from "./literature/literature-agent"
 import { DocumentChunkSchema } from "./literature/contract"
+import { citableTaskEvidence } from "./retrieve/evidence-handoff"
 
 export function literatureDigest(value: unknown): string {
   // Receipts describe JSON artifacts. Normalize first so optional undefined
@@ -24,13 +25,11 @@ export const LiteratureReceiptSchema = z.object({
   resultDigest: z.string().regex(/^[a-f0-9]{64}$/),
   readiness: z.enum(["ready_with_evidence", "ready_data_only", "partial_evidence", "evidence_conflict"]),
   cached: z.boolean(),
-  summary: z.object({ intentCount: z.number().int().nonnegative(), bm25CandidateCount: z.number().int().nonnegative(),
-    literaturePaperCount: z.number().int().nonnegative(), paperBackedCardCount: z.number().int().nonnegative(),
-    missingPDFCount: z.number().int().nonnegative(), failedPaperCount: z.number().int().nonnegative() }).strict(),
+  summary: RetrieveResultSchema.shape.summary,
   selectedEntryCount: z.number().int().nonnegative(), gapCount: z.number().int().nonnegative(),
 }).strict()
 export type LiteratureReceipt = z.infer<typeof LiteratureReceiptSchema>
-export type LiteratureProgress = { step: "prepare_intents" | "search" | "select" | "parse" | "extract" | "verify" | "assemble_evidence"; paperID?: string; status: string; cached?: boolean; counts?: Record<string, number> }
+export type LiteratureProgress = { step: "prepare_intents" | "search" | "select" | "parse" | "extract" | "verify" | "assemble_evidence" | "recall_architecture" | "distill_architecture" | "review_architecture"; paperID?: string; status: string; cached?: boolean; counts?: Record<string, number> }
 
 // Serialize writers sharing a KnowledgeStore, including different tasks/runs.
 const writers = new Map<string, Promise<unknown>>()
@@ -46,9 +45,9 @@ export async function createLiteraturePhase(input: {
   onProgress?: (progress: LiteratureProgress) => Promise<void>
 }) {
   const config = { neoCastRoot: input.neoCastRoot, workspaceRoot: input.workspaceRoot }
-  const literatureModel = await ConfiguredLLMExtractionModel.create(config)
+  const principleModel = await ConfiguredPrincipleModel.create(config)
   let snapshot = await serialize(path.resolve(input.neoCastRoot), async () => {
-    const agent = new RetrieveAgent({ ...config, literatureModel })
+    const agent = new RetrieveAgent({ ...config, principleModel })
     return agent.prepare(input.run).finally(() => agent.close())
   })
   if (snapshot.report.taskID !== input.taskID) throw new Error("Quantitative report task mismatch")
@@ -60,7 +59,7 @@ export async function createLiteraturePhase(input: {
     if (execution) return
     await serialize(path.resolve(input.neoCastRoot), async () => {
       if (execution) return
-      const reader = new RetrieveAgent({ ...config, literatureModel })
+      const reader = new RetrieveAgent({ ...config, principleModel })
       snapshot = await reader.prepare({ ...input.run, quantitativeReport: snapshot.report }).finally(() => reader.close())
     })
   }
@@ -69,6 +68,7 @@ export async function createLiteraturePhase(input: {
     const result = RetrieveResultSchema.parse(JSON.parse(await readFile(path.join(runRoot(), "retrieve_result.json"), "utf8")))
     const bundle = TaskEvidenceBundleSchema.parse(JSON.parse(await readFile(path.join(runRoot(), "task_evidence_bundle.json"), "utf8")))
     const manifest = JSON.parse(await readFile(path.join(runRoot(), "run_manifest.json"), "utf8"))
+    if (bundle.schemaVersion !== "task_evidence_bundle_v2") throw new Error("Legacy evidence requires v2 retrieval")
     if (receipt.taskID !== input.taskID || receipt.quantitativeReportArtifactID !== snapshot.quantitativeReportArtifactID
       || receipt.retrieveRunID !== snapshot.retrieveRunID || result.taskID !== input.taskID
       || result.quantitativeReportArtifactID !== snapshot.quantitativeReportArtifactID
@@ -78,7 +78,7 @@ export async function createLiteraturePhase(input: {
       || manifest.runDigest !== snapshot.runDigest || manifest.reportDigest !== snapshot.reportDigest
       || manifest.taskContextDigest !== snapshot.contextDigest || manifest.indexDigest !== snapshot.index.indexDigest
       || receipt.readiness !== bundle.readiness || receipt.gapCount !== bundle.gaps.length
-      || receipt.selectedEntryCount !== bundle.summary.selectedEntryCount || literatureDigest(receipt.summary) !== literatureDigest(result.summary)
+      || receipt.selectedEntryCount !== citableTaskEvidence(bundle).length || literatureDigest(receipt.summary) !== literatureDigest(result.summary)
       || literatureDigest(result.taskEvidence) !== literatureDigest(bundle) || literatureDigest(result) !== receipt.resultDigest) {
       throw new Error("Literature receipt/bundle provenance mismatch")
     }
@@ -88,7 +88,7 @@ export async function createLiteraturePhase(input: {
     signal?.throwIfAborted()
     started = true
     let cached = false
-    const runner = new RetrieveAgent({ ...config, literatureModel, onProgress: async (progress) => {
+    const runner = new RetrieveAgent({ ...config, principleModel, signal, onProgress: async (progress) => {
       signal?.throwIfAborted()
       if (progress.cached) cached = true
       await input.onProgress?.(progress)
@@ -103,7 +103,7 @@ export async function createLiteraturePhase(input: {
     const receipt = LiteratureReceiptSchema.parse({ schemaVersion: "literature_tool_receipt_v1", taskID: input.taskID,
       quantitativeReportArtifactID: snapshot.quantitativeReportArtifactID, retrieveRunID: result.retrieveRunID,
       resultDigest: literatureDigest(result), cached, summary: result.summary, readiness: result.taskEvidence.readiness,
-      selectedEntryCount: result.taskEvidence.summary.selectedEntryCount, gapCount: result.taskEvidence.gaps.length })
+      selectedEntryCount: citableTaskEvidence(result.taskEvidence).length, gapCount: result.taskEvidence.gaps.length })
     await validate(receipt)
     signal?.throwIfAborted()
     return receipt

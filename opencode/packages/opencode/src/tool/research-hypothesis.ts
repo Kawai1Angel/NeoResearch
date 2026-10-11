@@ -1,3 +1,4 @@
+import { ExperimentConstraints } from "@/research/experiment-constraints"
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import {
@@ -47,6 +48,7 @@ const NOT_IN_RESEARCH_SESSION =
   "This tool can only be used inside a research task session — could not resolve the current research task."
 
 const AddParameters = Schema.Struct({
+  experimentContract: Schema.optional(Schema.Unknown).annotate({ description: "Structured experiment: mode=baseline|exploratory|controlled; controlled requires comparisonRunID, changes [{operation:set|add|remove,path,before,after}], frozenPaths, requiredValues [{path,value}], forbiddenMechanisms. Paths and recipe object values use normalized camelCase (embedding.nFreq/dModel/complexMode, trainingStrategy), not wire snake_case. Introducing frequency requires an explicit complexMode: magnitude or real_imag. All other recipe fields are frozen automatically." }),
   statement: Schema.String.annotate({ description: "The hypothesis statement, stated as a testable claim." }),
   motivation: StringArray.annotate({ description: "Evidence/observations motivating this hypothesis." }),
   expectedOutcome: Schema.optional(Schema.String).annotate({
@@ -91,6 +93,7 @@ export const HypothesisAddTool = Tool.define(
           }
         }
         const hypothesis = {
+          ...(args.experimentContract === undefined ? {} : { experimentContract: ExperimentConstraints.parse(args.experimentContract) }),
           statement: args.statement,
           motivation: args.motivation ?? [],
           expectedOutcome: args.expectedOutcome ?? "",
@@ -107,6 +110,7 @@ export const HypothesisAddTool = Tool.define(
         }
         const result = yield* Effect.promise(() =>
           safe(async () => {
+            if (!hypothesis.experimentContract) throw new Error("New hypotheses require an explicit experimentContract; read the comparison run before defining controlled changes.")
             if (!validMechanisms(hypothesis.requiredMechanisms)) throw new Error("Unknown required mechanism")
             const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
             validateHypothesisEvidence([{ id: "pending", status: "pending", ...hypothesis }], taskEvidence)
@@ -131,6 +135,7 @@ export const HypothesisAddTool = Tool.define(
 )
 
 const UpdateParameters = Schema.Struct({
+  experimentContract: Schema.optional(Schema.Unknown),
   hypoID: Schema.String.annotate({ description: "ID of the hypothesis to update (see hypothesis_list)." }),
   statement: Schema.optional(Schema.String),
   motivation: StringArray,
@@ -177,12 +182,13 @@ export const HypothesisUpdateTool = Tool.define(
             const candidate: HypothesisObject = {
               ...existing,
               ...rest,
+              experimentContract: rest.experimentContract === undefined ? existing.experimentContract : ExperimentConstraints.parse(rest.experimentContract),
               requiredMechanisms:
                 (rest.requiredMechanisms as HypothesisObject["requiredMechanisms"]) ?? existing.requiredMechanisms,
             }
             const taskEvidence = await loadTaskEvidenceForSession(taskID, ctx.sessionID)
             validateHypothesisEvidence([candidate], taskEvidence)
-            return updateHypothesisInPool(taskID, hypoID, { ...rest, requiredMechanisms: candidate.requiredMechanisms })
+            return updateHypothesisInPool(taskID, hypoID, { ...rest, experimentContract: candidate.experimentContract, requiredMechanisms: candidate.requiredMechanisms })
           }),
         )
         if (!result.ok) {

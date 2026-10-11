@@ -200,12 +200,19 @@ export function cancelPending(mcpName: string): void {
 export async function isPortInUse(port: number = OAUTH_CALLBACK_PORT): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = createConnection(port, "127.0.0.1")
-    socket.on("connect", () => {
+    const finish = (inUse: boolean) => {
       socket.destroy()
-      resolve(true)
+      resolve(inUse)
+    }
+    socket.setTimeout(1_000)
+    socket.on("connect", () => {
+      finish(true)
     })
     socket.on("error", () => {
-      resolve(false)
+      finish(false)
+    })
+    socket.on("timeout", () => {
+      finish(false)
     })
   })
 }

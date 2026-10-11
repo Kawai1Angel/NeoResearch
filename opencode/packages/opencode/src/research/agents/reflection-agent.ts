@@ -1,5 +1,9 @@
+import { assessAttribution } from "../attribution"
+import { reflectionExecutionEvidence } from "../runner-evidence"
+import type { KnowledgeValidationDraft } from "../literature/knowledge-confidence"
 import type { LLMTokenUsage } from "../llm-proposal"
 import { NAS_DEFAULT_MAX_ITERATIONS } from "../defaults"
+import type { ExperienceDraft } from "../experience"
 import type {
   JsonRecord,
   ResearchArtifact,
@@ -44,6 +48,8 @@ export interface ReflectionAnalysis {
   readonly latestMetric?: number
   readonly latestDelta?: number
   readonly succeededRuns: number
+  readonly hypothesisTestedRuns: number
+  readonly unattributableRuns: number
   readonly inconclusiveRuns: number
   readonly failedRuns: number
   readonly rejectedRuns: number
@@ -70,6 +76,9 @@ export interface ReflectionLLMAnalysis {
   readonly nextStepRecommendation: string
   /** Distillable memory: a self-contained summary (proposal + likely issues) for downstream agents. */
   readonly distillableMemory: string
+  /** Optional explicit writes for the direct transport, which has no session tools. */
+  readonly experienceWrites?: readonly ExperienceDraft[]
+  readonly knowledgeValidations?: readonly KnowledgeValidationDraft[]
 }
 
 export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string {
@@ -85,13 +94,28 @@ export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string
   const outputPrompt = sessionPrompt.slice(outputStart).replace(
     "After completing the four tool calls,",
     "Using the supplied inline evidence,",
-  )
+  ).replace("EXACTLY these 7 keys", "these 7 analysis keys, optionally followed by experienceWrites and knowledgeValidations")
+    .replace("Each value is a concise string", "Each analysis value is a concise string")
   return `${evidencePrompt}## Inline evidence\n` +
     "This is a direct API synthesis call. All available evidence is supplied in the user JSON. " +
     "Tools are unavailable; produce the final analysis directly. " +
     "experimentResults and experimentDesign contain the run outcome and executed recipe; " +
     "trainingCurve contains observed curves, and historicalExperimentMemory contains prior lessons. " +
-    "Treat absent evidence as unavailable and state the limitation.\n\n" + outputPrompt
+    "Treat absent evidence as unavailable and state the limitation. " +
+    "To deliberately save useful positive or negative experience, optionally include experienceWrites (at most 3 entries) " +
+    "using experienceWriteSchema in the user input. Omit it or return [] when nothing merits saving. " +
+    "experiment_fact records an observed run; conditional_experience states conditions, intervention, observation, " +
+    "boundaries and a falsifiable validationPlan. Performance experiences need verified independent full runs and " +
+    "same-task comparisonRunID evidence. validated_principle needs support from at least two distinct dataset contents. " +
+    "Use derivedFrom to refine prior experience while retaining counterevidence; cite only supplied run IDs. " +
+    "Inspect literatureKnowledge.entries and literatureKnowledge.experimentFacts to decide whether the current experiment supports the supplied literature assertions. " +
+    "Optionally include knowledgeValidations (at most 3, using knowledgeValidationSchema) only for supported claims. " +
+    "Use literatureKnowledge.currentRunID as runID, the supplied cardID/cardRevision, assertionIDs, conditionsAssessment, implementationAssessment, rationale and limitations. " +
+    "A successful run or lower metric alone cannot validate a mechanism; assess the actual implementation and preserve qualifications. " +
+    "Performance claims require comparable verified full runs; incomplete, smoke, duplicate, unverified or held-out runs cannot raise confidence. " +
+    "The coordinator adds 0.01 confidence (cap 1) with factual snapshots for each new card/experiment; retries do not add again. " +
+    "Omit knowledgeValidations or return [] when no literature claim is supported. " +
+    "The coordinator invokes the same validated writers as write_experience and confirm_knowledge; do not claim a write succeeded yourself.\n\n" + outputPrompt
 }
 
 export interface ReflectionAgentResult {
@@ -102,6 +126,8 @@ export interface ReflectionAgentResult {
   readonly nextExperimentPlanMarkdown: string
   readonly failureLogMarkdown: string
   readonly analysis: ReflectionAnalysis
+  readonly experienceWriteResults?: readonly { saved: boolean; id?: string; error?: string }[]
+  readonly knowledgeValidationResults?: readonly { saved: boolean; cardID: string; updated?: boolean; confidence?: number; error?: string }[]
   readonly llm: {
     readonly status: "disabled" | "not_configured" | "used" | "failed"
     readonly model?: string
@@ -169,7 +195,7 @@ function recoveryActionForFailure(category: ReflectionFailure["category"]) {
   if (category === "nan") return "stabilize_training"
   if (category === "not_converge") return "tune_optimization_budget"
   if (category === "script_error") return "inspect_runner_or_recipe"
-  if (category === "rejected") return "review_verifier_decision"
+  if (category === "rejected") return "inspect_execution_evidence"
   return "inspect_failure_context"
 }
 
@@ -178,7 +204,7 @@ function recoverySummaryForFailure(category: ReflectionFailure["category"]) {
   if (category === "nan") return "降低学习率、启用梯度裁剪或切换稳健损失，并检查异常值处理。"
   if (category === "not_converge") return "调整 optimizer/scheduler、训练步数或 patience，确认 loss 曲线进入下降通道。"
   if (category === "script_error") return "先修复 runner、依赖、recipe 序列化或数据路径问题，再恢复 NAS 搜索。"
-  if (category === "rejected") return "读取 verifier_decision.json，按拒绝分类决定回退、重测或进入人工审批。"
+  if (category === "rejected") return "检查原始执行记录、实验配置和缺失证据，再决定如何恢复实验。"
   return "保留上下文并人工复核 stderr、runner records 与候选定义。"
 }
 
@@ -241,7 +267,8 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
   const direction = objectiveDirection(input.task.objective)
   const candidatesByID = new Map(input.candidates.map((candidate) => [candidate.id, candidate] as const))
 
-  const ordered = [...input.runs].sort((a, b) => a.time.created - b.time.created)
+  const ordered = input.runs.map((run) => reflectionExecutionEvidence(run, primaryMetricName))
+    .sort((a, b) => a.time.created - b.time.created)
   const succeeded: { run: ResearchRun; metric: number }[] = []
   const ineffective: ReflectionIneffectiveChange[] = []
   const effective: ReflectionEffectiveChange[] = []
@@ -255,9 +282,12 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
   let latestMetric: number | undefined
   let latestDelta: number | undefined
   let inconclusiveRuns = 0
+  let hypothesisTestedRuns = 0
+  let unattributableRuns = 0
 
   for (const run of ordered) {
     if (run.status === "succeeded") {
+      if (run.stage !== "full" || run.resourceUsage.independentEvidence === false || run.resourceUsage.duplicateExperiment === true) continue
       const value = metricValue(run.metrics, primaryMetricName)
       if (value === undefined) {
         if (run.stage !== "full" || recordValue(run.resourceUsage).independentEvidence === false) continue
@@ -272,6 +302,13 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
         continue
       }
       const candidate = run.candidateID ? candidatesByID.get(run.candidateID) : undefined
+      const snapshot = recordValue(run.resourceUsage.hypothesisSnapshot)
+      const comparisonID = recordValue(snapshot.experimentContract).comparisonRunID
+      const comparison = input.runs.find((r) => r.id === comparisonID)
+      const comparisonCandidate = comparison?.candidateID ? candidatesByID.get(comparison.candidateID) : undefined
+      const assessment = assessAttribution({ executionVerified: recordValue(run.resourceUsage.executionContract).status === "verified", proposedModel: candidate?.candidateSpec, hypothesisSnapshot: snapshot }, comparisonCandidate ? { proposedModel: comparisonCandidate.candidateSpec } : undefined)
+      if (assessment.status === "eligible") hypothesisTestedRuns++
+      else unattributableRuns++
       latestMetric = value
       const delta = bestMetric === undefined ? 0 : value - bestMetric
       latestDelta = bestMetric === undefined ? 0 : delta
@@ -344,6 +381,8 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
     succeededRuns: succeededCount,
     failedRuns: failedCount,
     inconclusiveRuns,
+    hypothesisTestedRuns,
+    unattributableRuns,
     rejectedRuns: rejectedCount,
     plateauStreak,
     effectiveChanges: effective,
@@ -379,6 +418,8 @@ export function buildReflectionNotesMarkdown(input: {
     "",
     `- Succeeded runs: ${analysis.succeededRuns}`,
     `- Inconclusive runs (missing primary metric): ${analysis.inconclusiveRuns}`,
+    `- Controlled hypothesis tests: ${analysis.hypothesisTestedRuns}`,
+    `- Numerical observations without attributable hypothesis test: ${analysis.unattributableRuns}`,
     `- Failed runs: ${analysis.failedRuns}`,
     `- Rejected runs: ${analysis.rejectedRuns}`,
     `- Plateau streak: ${analysis.plateauStreak}`,

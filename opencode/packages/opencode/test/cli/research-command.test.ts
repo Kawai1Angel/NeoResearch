@@ -7,6 +7,8 @@ import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
 import type { DomainRunPlan } from "../../src/research/domain"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "../../src/research/runtime"
+import { digest, type ExecutionContract } from "../../src/research/execution-contract"
+import { addHypothesisToPool } from "../../src/research/hypothesis-store"
 import {
   ResearchCommand,
   ResearchCreateCommand,
@@ -45,12 +47,36 @@ function validTsfCandidateSpec() {
   return Research.DomainRegistry.buildBaselines("tsf", validTsfTaskSpec())[0]!.candidateSpec
 }
 
+const fakeContractEvents = `
+${process.execPath} -e '
+const fs = require("fs"), crypto = require("crypto")
+const c = JSON.parse(fs.readFileSync(process.env.NEO_CAST_EXECUTION_CONTRACT))
+const canonical = v => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v)
+const d = crypto.createHash("sha256").update(canonical(c)).digest("hex")
+const manifest = {event:"executed_model_manifest", candidate_id:c.candidate_id, candidate_spec_sha256:c.candidate_spec_sha256, contract_digest:d, actual:c.expected}
+console.log(JSON.stringify(manifest))
+console.log(JSON.stringify({event:"execution_contract_verified", status:"verified", candidate_id:c.candidate_id, candidate_spec_sha256:c.candidate_spec_sha256, contract_digest:d, manifest}))
+'
+`
+
+function workerContract(taskID: string, recipeID: string): ExecutionContract {
+  return {
+    schema_version: "research_execution_contract.v1",
+    task_id: taskID,
+    candidate_id: recipeID,
+    hypothesis_id: "H_worker",
+    candidate_spec_sha256: digest({ recipe_id: recipeID }),
+    expected: { backbone: "linear" },
+  }
+}
+
 async function writeFakeNeoCastRunner(root: string) {
   await mkdir(path.join(root, "py"), { recursive: true })
   await writeFile(
     path.join(root, "py", "validate.py"),
     `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_worker_db
 printf '{"event":"candidate_resolved"}\\n'
 printf '{"event":"smoke_eval_done","val_avg_mse":0.111,"val_avg_mae":0.222}\\n'
@@ -148,6 +174,7 @@ describe("research CLI commands", () => {
       path.join(runnerRoot, "py", "runner.sh"),
       `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 test -f .neo-cast/current_candidate.json
 mkdir -p .neo-cast/artifacts/worker_cli
 printf '{"event":"smoke_eval_done","val_avg_mse":0.321,"val_avg_mae":0.654}\\n'
@@ -163,8 +190,14 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
       stage: "smoke",
       approvalRequired: false,
       validation: { ok: true, issues: [] },
-      writes: [{ path: ".neo-cast/current_candidate.json", content: { recipe_id: "candidate_worker_once" } }],
-      command: { executable: "bash", args: ["py/runner.sh"], cwd: runnerRoot },
+      writes: [
+        { path: ".neo-cast/current_candidate.json", content: { recipe_id: "candidate_worker_once" } },
+        { path: ".neo-cast/execution_contract.json", content: workerContract("rtsk_cli_worker", "candidate_worker_once") as unknown as Research.JsonRecord },
+      ],
+      command: {
+        executable: "bash", args: ["py/runner.sh"], cwd: runnerRoot,
+        env: { NEO_CAST_EXECUTION_CONTRACT: path.join(runnerRoot, ".neo-cast/execution_contract.json") },
+      },
       expectedEvents: ["smoke_eval_done"],
       expectedMetrics: ["val_avg_mse"],
       expectedArtifacts: ["runner_artifact"],
@@ -214,6 +247,7 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
       path.join(runnerRoot, "py", "runner.sh"),
       `#!/usr/bin/env bash
 set -euo pipefail
+${fakeContractEvents}
 run_id="$(grep -m1 '"recipe_id"' .neo-cast/current_candidate.json | sed 's/.*"recipe_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/')"
 mkdir -p ".neo-cast/artifacts/$run_id"
 printf '{"event":"smoke_eval_done","val_avg_mse":0.5}\\n'
@@ -230,8 +264,14 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
         stage: "smoke",
         approvalRequired: false,
         validation: { ok: true, issues: [] },
-        writes: [{ path: ".neo-cast/current_candidate.json", content: { recipe_id: runID } }],
-        command: { executable: "bash", args: ["py/runner.sh"], cwd: runnerRoot },
+        writes: [
+          { path: ".neo-cast/current_candidate.json", content: { recipe_id: runID } },
+          { path: ".neo-cast/execution_contract.json", content: workerContract("rtsk_cli_worker_loop", runID) as unknown as Research.JsonRecord },
+        ],
+        command: {
+          executable: "bash", args: ["py/runner.sh"], cwd: runnerRoot,
+          env: { NEO_CAST_EXECUTION_CONTRACT: path.join(runnerRoot, ".neo-cast/execution_contract.json") },
+        },
         expectedEvents: ["smoke_eval_done"],
         expectedMetrics: ["val_avg_mse"],
         expectedArtifacts: ["runner_artifact"],
@@ -273,6 +313,9 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
       deadLettered: 0,
     })
     expect(await runtime.queue.lease({ workerID: "worker-after-loop", now: 300 })).toBeUndefined()
+    const artifacts = await readFile(path.join(runtimeRoot, "artifacts", "artifacts.jsonl"), "utf8")
+    expect(artifacts).toContain("rrun_loop_a")
+    expect(artifacts).toContain("rrun_loop_b")
   })
 
   test("worker-once command syncs queued prepared runs back into the research database", async () => {
@@ -299,10 +342,21 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
             }),
           ),
         )
+        const hypothesis = await addHypothesisToPool(task.id, {
+          statement: "Test the queued worker baseline architecture.",
+          motivation: ["Verify CLI worker execution and database synchronization."],
+          expectedOutcome: "Complete smoke evaluation under the declared execution contract.",
+          suggestedBackbones: ["linear"],
+          suggestedPreprocessing: [],
+          priority: "medium",
+          risk: "Fixture",
+          testable: true,
+        })
         const candidate = await runResearch(
           Research.Service.use((svc) =>
             svc.createCandidate({
               taskID: task.id,
+              hypothesisID: hypothesis.id,
               domainID: "tsf",
               candidateSpec: validTsfCandidateSpec(),
               rationale: "worker sync baseline",
@@ -367,14 +421,14 @@ printf '{"event":"artifact_ready","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/art
           runnerID: "neo-cast-python",
           stage: "smoke",
           exitCode: 0,
-          recordCount: 4,
+          recordCount: 6,
         })
         expect(syncedRun?.artifactRefs).toContain(executionLog!.id)
         const executionLogRecord = JSON.parse(await readFile(executionLog!.uri.replace("file://", ""), "utf8"))
         expect(executionLogRecord.records.map((record: { event?: string }) => record.event)).toContain("artifact_ready")
         const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(setup.task.id)))
-        expect(champion?.candidateID).toBe(setup.candidate.id)
-        expect(champion?.primaryMetric).toBe(0.111)
+        expect(champion).toBeUndefined()
+        expect(syncedRun?.resourceUsage.executionContract).toMatchObject({ status: "verified" })
       },
     })
   })

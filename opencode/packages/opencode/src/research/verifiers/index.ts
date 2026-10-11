@@ -34,7 +34,7 @@ export interface VerifierDecisionRecord {
   readonly runID: string
   readonly candidateID: string | null
   readonly accepted: boolean
-  readonly decision: "accept" | "reject"
+  readonly decision: "accept" | "reject" | "inconclusive"
   readonly rejectReason: string | null
   readonly failure: {
     readonly category: VerifierFailureCategory
@@ -47,6 +47,7 @@ export interface VerifierDecisionRecord {
   } | null
   readonly checks: Array<{
     readonly name: string
+    readonly status: VerifierResult["status"]
     readonly accepted: boolean
     readonly reason: string
     readonly evidence: Record<string, unknown>
@@ -69,13 +70,20 @@ export function runVerifiers(ctx: VerifierContext): VerifierReport {
   for (const verifier of VERIFIER_PIPELINE) {
     const result = verifier(ctx)
     results.push(result)
-    if (!result.accepted && rejectReason === undefined) {
+    if (result.status === "failed" && rejectReason === undefined) {
       rejectReason = `[${result.name}] ${result.reason}`
     }
   }
 
+  const status = rejectReason
+    ? "failed"
+    : results.some((r) => r.status === "insufficient_evidence")
+      ? "insufficient_evidence"
+      : "passed"
   return {
-    accepted: rejectReason === undefined,
+    status,
+    eligibleForRanking: !rejectReason && results.some((r) => r.name === "metric_verifier" && r.status === "passed"),
+    accepted: status === "passed",
     results,
     rejectReason,
   }
@@ -96,7 +104,7 @@ export function buildEvaluationResultMarkdown(input: {
     `- Run ID: ${run.id}`,
     `- Candidate ID: ${candidate?.id ?? "(none)"}`,
     `- Run Status: ${run.status}`,
-    `- Verdict: **${report.accepted ? "ACCEPTED ✓" : "REJECTED ✗"}**`,
+    `- Verdict: **${report.status.toUpperCase()}**`,
     ...(report.rejectReason ? [`- Reject Reason: ${report.rejectReason}`] : []),
     "",
     "## Verifier Results",
@@ -104,13 +112,7 @@ export function buildEvaluationResultMarkdown(input: {
   ]
 
   for (const result of report.results) {
-    lines.push(
-      `### ${result.name}`,
-      "",
-      `- Verdict: ${result.accepted ? "✓ Accepted" : "✗ Rejected"}`,
-      `- Reason: ${result.reason}`,
-      "",
-    )
+    lines.push(`### ${result.name}`, "", `- Verdict: ${result.status}`, `- Reason: ${result.reason}`, "")
     const entries = Object.entries(result.evidence)
     if (entries.length > 0) {
       lines.push("**Evidence:**", "")
@@ -172,7 +174,8 @@ function verifierRecoveryAction(category: VerifierFailureCategory): {
   if (category === "data_leakage") {
     return {
       type: "audit_split_boundaries",
-      summary: "立即停止该候选的晋升流程。检查 dataset_spec.json 中的 train/val/ref_test 边界、normalization fit_split 是否为 train、val context 窗口是否错误包含 ref_test 行。修复后从 smoke 阶段重新运行。",
+      summary:
+        "立即停止该候选的晋升流程。检查 dataset_spec.json 中的 train/val/ref_test 边界、normalization fit_split 是否为 train、val context 窗口是否错误包含 ref_test 行。修复后从 smoke 阶段重新运行。",
     }
   }
   return {
@@ -187,7 +190,7 @@ export function buildVerifierDecisionRecord(input: {
   readonly candidate: VerifierContext["candidate"]
   readonly report: VerifierReport
 }): VerifierDecisionRecord {
-  const rejected = input.report.results.find((result) => !result.accepted)
+  const rejected = input.report.results.find((result) => result.status === "failed")
   const category = verifierFailureCategory(rejected)
   return {
     schemaVersion: "neo-research.verifier_decision.v1",
@@ -197,7 +200,8 @@ export function buildVerifierDecisionRecord(input: {
     runID: input.run.id,
     candidateID: input.candidate?.id ?? null,
     accepted: input.report.accepted,
-    decision: input.report.accepted ? "accept" : "reject",
+    decision:
+      input.report.status === "passed" ? "accept" : input.report.status === "failed" ? "reject" : "inconclusive",
     rejectReason: input.report.rejectReason ?? null,
     failure: rejected
       ? {
@@ -209,6 +213,7 @@ export function buildVerifierDecisionRecord(input: {
       : null,
     checks: input.report.results.map((result) => ({
       name: result.name,
+      status: result.status,
       accepted: result.accepted,
       reason: result.reason,
       evidence: result.evidence as Record<string, unknown>,

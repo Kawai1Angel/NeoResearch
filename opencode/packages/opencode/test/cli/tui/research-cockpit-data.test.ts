@@ -948,9 +948,10 @@ describe("research cockpit data helpers", () => {
       missing: { strategy: "forward_fill", limit: null },
       time: { frequency: "auto", allow_irregular: true, irregular_ratio_warn: 0.01 },
     })
-    await mkdir(path.join(root, ".neo-cast", "dataset"), { recursive: true })
+    const taskRoot = path.join(root, ".neo-research", "workspaces", "dataset_cache_matches")
+    await mkdir(path.join(taskRoot, ".neo-cast", "dataset"), { recursive: true })
     await writeFile(
-      path.join(root, ".neo-cast", "dataset", "dataset_spec.json"),
+      path.join(taskRoot, ".neo-cast", "dataset", "dataset_spec.json"),
       `${JSON.stringify(
         {
           schema_version: "dataset.v1",

@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { literatureSession } from "@/research/literature-phase-executor"
+import { citableTaskEvidence } from "@/research/retrieve/evidence-handoff"
 
 export function literaturePage(offset = 0, limit = 10) {
   if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Invalid literature pagination (limit 1–20)")
@@ -86,6 +87,8 @@ export const LiteratureGetResultsTool = Tool.define("literature_get_results", Ef
       papers: page(data.literatureResults.map((paper) => ({ paperID: paper.paperID, status: paper.status,
         literatureRunID: paper.literatureRunID, acceptedCardCount: paper.acceptedCardIDs.length, acceptedCardIDs: paper.acceptedCardIDs.slice(0, 10),
         warningCount: paper.warningCount, reviewAvailable: Boolean(paper.reviewPath) }))),
-      entries: page(data.taskEvidence.entries.map(({ cardID, paperID, claim, cardStatus }) => ({ cardID, paperID, claim: claim.slice(0, 500), cardStatus }))), gaps: page(data.taskEvidence.gaps), conflicts: page(data.taskEvidence.conflicts), excluded: page(data.taskEvidence.excluded.map(({ cardID, paperID, reasons }) => ({ cardID, paperID, reasons }))) })
+      architectureKnowledge: data.taskEvidence.architectureKnowledge ? { status: data.taskEvidence.architectureKnowledge.status,
+        decisions: page(data.taskEvidence.architectureKnowledge.decisions), warnings: page(data.taskEvidence.architectureKnowledge.warnings) } : undefined,
+      entries: page(citableTaskEvidence(data.taskEvidence).map(({ cardID, paperID, claim, cardStatus }) => ({ cardID, paperID, claim: claim.slice(0, 500), cardStatus }))), gaps: page(data.taskEvidence.gaps), conflicts: page(data.taskEvidence.conflicts), excluded: page(data.taskEvidence.excluded.map(({ cardID, paperID, reasons }) => ({ cardID, paperID, reasons }))) })
   }),
 }))

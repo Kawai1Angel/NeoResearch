@@ -1,0 +1,60 @@
+// Wire recipes use snake_case; internal recipes and experiment paths use camelCase.
+const keyMap: Record<string, string> = {
+  recipe_version: "recipeVersion",
+  recipe_id: "recipeID",
+  d_model: "dModel",
+  state_dim: "stateDim",
+  d_state: "dState",
+  d_conv: "dConv",
+  d_ff: "dFf",
+  num_kernels: "numKernels",
+  latent_dim: "latentDim",
+  patch_len: "patchLen",
+  n_freq: "nFreq",
+  complex_mode: "complexMode",
+  embed_dim: "embedDim",
+  hidden_dim: "hiddenDim",
+  n_heads: "nHeads",
+  n_layers: "nLayers",
+  ffn_mult: "ffnMult",
+  num_layers: "numLayers",
+  kernel_size: "kernelSize",
+  num_blocks: "numBlocks",
+  mask_channel: "maskChannel",
+  topology_artifact: "topologyArtifact",
+  temporal_mixing: "temporalMixing",
+  channel_mixing: "channelMixing",
+  n_blocks: "nBlocks",
+  top_k: "topK",
+  channel_mode: "channelMode",
+  variate_token: "variateToken",
+  cross_attention: "crossAttention",
+  adjacency_source: "adjacencySource",
+  gate_type: "gateType",
+  prediction_head: "predictionHead",
+  share_across_horizons: "shareAcrossHorizons",
+  output_distribution: "outputDistribution",
+  horizon_specific: "horizonSpecific",
+  variance_floor: "varianceFloor",
+  base_head: "baseHead",
+  correction_dim: "correctionDim",
+  training_strategy: "trainingStrategy",
+  horizon_weighting: "horizonWeighting",
+  weight_decay: "weightDecay",
+  warmup_steps: "warmupSteps",
+  grad_clip: "gradClip",
+  max_epochs: "maxEpochs",
+  time_budget_s: "timeBudgetS",
+  batch_size: "batchSize",
+  supervised_weight: "supervisedWeight",
+  teacher_weight: "teacherWeight",
+  post_processing: "postProcessing",
+}
+
+export function normalizedRecipeKey(key: string): string {
+  return Object.hasOwn(keyMap, key) ? keyMap[key]! : key
+}
+
+export function normalizedRecipePath(path: string): string {
+  return path.split(".").map(normalizedRecipeKey).join(".")
+}

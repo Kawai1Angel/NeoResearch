@@ -1,12 +1,58 @@
 # LiteratureAgent
 
-## Transferable knowledge v2 rollout
+## Active knowledge cards: v2
 
-`knowledge-v2-contract.ts` defines separate paper analysis, conditional principle
-candidates, source-bound experiments and `knowledge_card_v2` records. The v1
-contracts below remain the current runtime path until paper-level synthesis,
-storage, downstream consumers and frozen-source replay have been upgraded.
-There is no automatic v1-to-v2 conversion.
+The research pipeline and both `build` / `build-principles` commands now publish
+`knowledge_card_v2`. `LiteratureAgent.run` uses `ConfiguredPrincipleModel` for
+whole-paper synthesis, consolidation, and independent source review. Missing model
+configuration is reported explicitly; there is no fallback to v1 extraction.
+
+One card contains a complete conditional principle: conditions, intervention,
+mechanism attribution, expected effect, bound experiments, support/refutation,
+observed scope, boundaries, unknowns, proposed falsification and implementation notes.
+`KnowledgeV2Store` stores active cards and immutable revisions in separate
+`kb_principle` / `kb_principle_revision` tables in the shared `knowledge.db`.
+Source chunks and reviews are checked before publication and again on reads.
+A complete re-extraction supersedes a paper's active set; partial runs publish
+only independently accepted cards without replacing earlier accepted principles.
+Exports go to `exports/knowledge_cards_v2.jsonl`.
+
+The active retrieval/handoff format is `task_evidence_bundle_v2`. It embeds the
+entire revision-bound card; downstream prompts retain experiments, counterevidence,
+qualifications and falsification without separating them from their method.
+Old v1 database tables, exports and helpers remain available for explicit audit
+(`runLegacyAudit`, `exportLegacyAudit`, `validateLegacyAudit`). They are excluded
+from active retrieval. Existing tasks with v1 evidence must rerun literature
+retrieval; the full pipeline rebuilds their evidence before planning. Original
+PDFs must be available for source-based re-extraction. There is no automatic
+v1-to-v2 conversion and no bulk rewrite of historical artifacts.
+
+## Confidence from current experiments
+
+Each v2 card has `confidence` in `[0, 1]`, initially `0.50`, and
+`experimentValidations`. Historical v2 cards receive these defaults on read.
+Confidence is a selection prior, not a calibrated probability. ReflectionAgent
+explicitly decides whether the current experiment supports named card assertions
+using `read_knowledge_cards` and `confirm_knowledge`, or optional direct-response
+`knowledgeValidations`. Successful execution alone never raises confidence.
+
+Each accepted validation adds `0.01`, capped at `1`. The writer captures actual
+task/run IDs, dataset content hash, proposed and executed models, training and
+evaluation settings, metrics and artifact references from the experiment store.
+Reflection supplies assertion IDs, its rationale, condition and implementation
+assessments and limitations. Only independent, execution-verified successful full
+runs with a metric and dataset hash qualify; performance claims also require a
+comparable full control run. The referenced trial must be the current task's
+latest run. Repeated validation of the same card/task/run adds no further credit.
+
+Feedback is committed atomically to `kb_principle_validation` and a new immutable
+card revision. It preserves the source assertions and independent paper review,
+refreshes the active JSONL export and invalidates future retrieval caches.
+Historical task-evidence snapshots retain their original confidence. Re-extraction
+of the same source claim preserves feedback; a changed claim receives a new identity.
+Unsupported observations produce no automatic decrease.
+
+## Transferable knowledge v2 extraction
 
 `knowledge-v2-validator.ts` checks source identity and exact quotes, assertion
 references, experiment binding and complete semantic-review coverage. Construct
@@ -27,7 +73,7 @@ The explicit `build-principles` command runs the paper-level v2 pipeline:
 ```bash
 bun run src/research/literature/dev-cli.ts build-principles \
   --neo-cast-root ../../../neo_cast --paper-id <paper-id> \
-  --output-root /absolute/separate-audit-root --max-calls 80
+  --output-root /absolute/shared-knowledge-root --max-calls 80
 ```
 
 It uses the existing configured provider. No configured model is an explicit
@@ -117,17 +163,19 @@ are not relabeled or automatically published under v10.
 Malformed materials are individually repaired once or staged. Valid siblings
 survive. `materialGaps` records affected contribution indexes; candidates tied to
 those contributions cannot pass. Unknown gap scope blocks all candidates.
-Independent verified principles can remain in a partial run's **audit output**,
-but that does not authorize active publication. Budget or later fatal execution
+Independent verified principles can remain in a partial run and are eligible
+for active publication; unverified or incomplete candidates are excluded. Budget or later fatal execution
 failure still clears the paper's publishable card list.
 
 `LiteratureAgent.runPrinciples` saves `result.json`, `review.md`,
 `knowledge_cards_v2.jsonl` and a completion manifest under `principle-runs/<runID>`.
 The result contains analysis, staged materials, plans, initial/final candidates, dispositions, reviews,
 rejections and model call audit records (response, hashes, usage when available,
-duration and repair errors). These are **audit-only** artifacts: no writes to
-legacy card tables or automatic downstream handoff. Runs have independent IDs;
-cache keys are recorded but cache reuse and active v2 publication are not enabled.
+duration and repair errors). Direct `runPrinciples` calls default to audit-only unless `publish: true` is set.
+The main run and CLI publish accepted cards to the v2 store. Completed extraction
+cache identity includes source content, parser/chunks, model, review versions and
+budgets. Retired cards are never resurrected by cache reads. `force` re-extracts.
+Legacy card tables are preserved.
 
 Tests include synthetic pipeline cases and frozen source excerpts from VCformer,
 SparseTSF and RSAP-DFM for line wraps, footers and column interleaving. They do not
@@ -168,6 +216,8 @@ Tests use `FixtureExtractionModel` for deterministic extraction.
 PDF text is untrusted. Extraction and verification prompts forbid executing
 paper instructions, and deterministic validation requires every evidence span,
 page, section, chunk, and reported number to resolve back to normalized source.
+
+### Legacy v1 audit implementation (not the active pipeline)
 
 Evidence validation v2 resolves section headings through the parsed document's
 section table (or a numbered subsection heading present in the supporting chunk).
@@ -245,7 +295,7 @@ No database migration or artifact schema version change is required.
 
 ### Mechanism quality and budgets (v3)
 
-New mechanism candidates must carry `problem` and `mechanism` (`mechanismID`, `name`, `principle`, nonempty `components`). The semantic verifier must confirm correct card type, a supported complete operation, and the paper's own method. A quotation of an experimental setting or another paper's model cannot satisfy this gate. Normalization retains these fields. Legacy v1 cards remain readable; the task-evidence bridge requires complete fields and the v3 verifier for mechanism use. Re-extract from source to upgrade; never fill missing mechanisms from general knowledge.
+New mechanism candidates must carry `problem` and `mechanism` (`mechanismID`, `name`, `principle`, nonempty `components`). The semantic verifier must confirm correct card type, a supported complete operation, and the paper's own method. A quotation of an experimental setting or another paper's model cannot satisfy this gate. Normalization retains these fields. Legacy v1 cards remain readable only through audit helpers; the active task-evidence bridge requires reviewed v2 principles. Re-extract from source to upgrade; never fill missing mechanisms from general knowledge.
 
 Candidate arrays are validated item by item with one feedback repair. `extraction_attempts.jsonl` preserves raw attempts, `candidate_claims.jsonl` preserves all parsed candidates, and `card_validation.jsonl` records accepted card revisions and the validation rule. Adjacent chunks supply context; the current chunk must also support each candidate. Verification and deduplication precede the storage budget, which favors mechanisms while reserving diversity of card types and source pages. `selection_budget` is counted separately from quality rejection and verifier failure. Exact structured operations can merge; merely sharing a mechanism name does not justify merging.
 

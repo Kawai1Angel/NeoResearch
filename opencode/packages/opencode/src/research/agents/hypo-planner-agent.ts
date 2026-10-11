@@ -2,6 +2,7 @@ import type { JsonRecord, ResearchMemory, ResearchRun, ResearchTask, ResearchTas
 import type { TaskEvidenceBundle, TaskEvidenceEntry, TaskEvidenceRole } from "../retrieve/contract"
 import type { ModelMechanism } from "../model-capabilities"
 import { NAS_DEFAULT_MAX_ITERATIONS, NAS_DEFAULT_MAX_NO_IMPROVE } from "../defaults"
+import { citableTaskEvidence } from "../retrieve/evidence-handoff"
 
 export type HypothesisStatus = "pending" | "active" | "testing" | "confirmed" | "rejected" | "abandoned"
 
@@ -14,6 +15,7 @@ export interface HypothesisObject {
   readonly suggestedPreprocessing: readonly string[]
   /** Legacy metadata only; never controls experiment selection. */
   readonly priority?: "high" | "medium" | "low"
+  readonly experimentContract?: import("../experiment-constraints").ExperimentConstraints
   readonly requiredMechanisms?: readonly ModelMechanism[]
   readonly risk: string
   readonly testable: boolean
@@ -337,6 +339,8 @@ function entrySupportsRule(entry: TaskEvidenceEntry, rule: HypothesisRule) {
 
 function evidenceForRule(rule: HypothesisRule, taskEvidence?: TaskEvidenceBundle) {
   if (!taskEvidence) return []
+  // Generic heuristic rules cannot infer which conditional architectural decision they implement.
+  if (taskEvidence.architectureKnowledge) return []
   return taskEvidence.entries
     .filter((entry) => entrySupportsRule(entry, rule))
     .toSorted((left, right) => right.relevance.score - left.relevance.score || left.cardID.localeCompare(right.cardID))
@@ -430,7 +434,7 @@ export function validateHypothesisEvidence(
   hypotheses: readonly HypothesisObject[],
   taskEvidence?: TaskEvidenceBundle,
 ): void {
-  const entries = new Map((taskEvidence?.entries ?? []).map((entry) => [entry.cardID, entry]))
+  const entries = new Map((taskEvidence ? citableTaskEvidence(taskEvidence) : []).map((entry) => [entry.cardID, entry]))
   const errors: string[] = []
   for (const hypothesis of hypotheses) {
     if (
@@ -672,6 +676,7 @@ export function buildHypothesesYaml(
           ])),
       "    applicabilityAssumptions:",
       ...yamlList(hypothesis.applicabilityAssumptions, "      "),
+      ...(hypothesis.experimentContract ? [`    experimentContract: ${JSON.stringify(hypothesis.experimentContract)}`] : []),
       "    falsificationCriteria:",
       ...yamlList(hypothesis.falsificationCriteria, "      "),
     )
@@ -745,7 +750,7 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
   const evidenceSummary = [
     extractEvidenceSummary(input.dataAnalysisSummary),
     input.taskEvidence
-      ? `Literature readiness: ${input.taskEvidence.readiness}; selected=${input.taskEvidence.summary.selectedEntryCount}; gaps=${input.taskEvidence.gaps.length}; conflicts=${input.taskEvidence.conflicts.length}.`
+      ? `Literature readiness: ${input.taskEvidence.readiness}; selected=${citableTaskEvidence(input.taskEvidence).length}; gaps=${input.taskEvidence.gaps.length}; conflicts=${input.taskEvidence.conflicts.length}.`
       : "Literature readiness: ready_data_only; no task evidence bundle was supplied.",
   ]
     .filter(Boolean)
@@ -762,7 +767,7 @@ export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResu
     }
   }
   validateHypothesisEvidence(hypotheses, input.taskEvidence)
-  const isFirstCall = input.runs.length === 0 && input.memory.length === 0
+  const isFirstCall = input.runs.length === 0 && input.memory.every((memory) => memory.taskID !== input.task.id)
   const plan = buildExperimentPlan({
     hypotheses,
     task: input.task,

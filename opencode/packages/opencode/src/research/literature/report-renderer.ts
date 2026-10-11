@@ -56,12 +56,14 @@ export function renderCardExport(cards: readonly KnowledgeCard[]) {
   return cards.map((card) => JSON.stringify(card)).join("\n") + (cards.length ? "\n" : "")
 }
 
-export function renderPrincipleReview(run: PrincipleExtraction) {
+export function renderPrincipleReview(run: PrincipleExtraction, publication: "audit_only" | "active_v2" = "audit_only") {
   const lines = [
     `# Paper principles: ${run.paperID}`, "",
-    `Run: ${run.runID}; status: ${run.status}; publication: audit_only.`, "",
+    `- Verification errors (not scientific rejections): ${run.verificationErrors?.length ?? 0}`,
+    `- Verified cards deferred by publication budget: ${run.deferred?.length ?? 0}`,
+    `Run: ${run.runID}; status: ${run.status}; publication: ${publication}.`, "",
     `Candidates: ${run.candidates.length}; final candidates: ${run.finalCandidates.length}; verified principles: ${run.cards.length}; model calls: ${run.calls.length}.`, "",
-    "These records have not been handed to downstream agents or validated by task experiments.", "",
+    publication === "active_v2" ? "Reviewed v2 principles are available for task retrieval. Task effectiveness still requires experiments." : "These audit records have not been handed to downstream agents or validated by task experiments.", "",
   ]
   for (const card of run.cards) {
     const assertions = new Map(card.assertions.map((a) => [a.assertionID, a.statement]))
@@ -87,6 +89,8 @@ export function renderPrincipleReview(run: PrincipleExtraction) {
   lines.push("## Dispositions and gaps", "", ...run.dispositions.map((d) => `- ${d.originalCandidateID}: ${d.action} → ${d.finalCandidateIDs.join(", ") || "none"}; ${d.rationale}`),
     ...run.stagedMaterials.map((m) => `- Staged material ${m.gapID}: ${m.reason}`),
     ...run.rejected.map((r) => `- ${r.candidateID}: ${r.reasons.join(", ")}`),
+    ...(run.verificationErrors ?? []).map((e) => `- Verification error ${e.candidateID} (${e.phase}): ${e.error}`),
+    ...(run.deferred ?? []).map((d) => `- Deferred ${d.candidateID}: ${d.reason}`),
     ...run.unformed.map((r) => `- Unformed: ${r}`), ...run.errors.map((e) => `- Incomplete: ${e}`), "")
   return `${lines.join("\n")}\n`
 }

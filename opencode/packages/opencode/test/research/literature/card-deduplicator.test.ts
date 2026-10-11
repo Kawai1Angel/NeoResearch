@@ -20,6 +20,18 @@ test("same claim from another paper creates support instead of erasing provenanc
   if (decision.action === "insert") expect(decision.relations[0].relationType).toBe("supports")
 })
 
+test("different experimental or applicability scopes cannot be merged or promoted by repetition", () => {
+  const original = card()
+  const changed = card({ cardID: "kc_abcdef123456", applicability: { ...original.applicability, dataFeatures: ["multivariate"] } })
+  expect(deduplicateCard(changed, [original]).action).toBe("insert")
+  const anotherPaper = deduplicateCard({ ...changed, paperID: "another-paper" }, [original])
+  expect(anotherPaper.relations.some((item) => item.relationType === "supports")).toBe(false)
+  const experimental = card({ experimentalContext: { datasets: ["ETTh2"], baselines: [], metrics: [], contextLengths: [], predictionLengths: [] } })
+  expect(deduplicateCard(experimental, [original]).action).toBe("insert")
+  const reviewed = { ...original, confidence: { ...original.confidence, transferability: 0.25 } }
+  expect(mergeCardEvidence(original, reviewed, 2, original.provenance.updatedAt).confidence.transferability).toBe(0.25)
+})
+
 test("identical structured operations merge despite paraphrased claims but distinct operations survive", () => {
   const mechanism = { mechanismID: "gru", name: "GRU encoder", principle: "Encode stock histories into hidden feature vectors using a GRU", components: ["GRU", "hidden features"] }
   const original = card({ cardType: "model_mechanism", mechanism })

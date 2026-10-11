@@ -36,7 +36,7 @@ function recoverWhitespaceSpan(text: string, quote: string) {
   return text.match(new RegExp(pattern))?.[0]
 }
 
-export const EVIDENCE_VALIDATION_VERSION = "evidence_validation_v3"
+export const EVIDENCE_VALIDATION_VERSION = "evidence_validation_v4"
 
 function numbers(value: string) {
   return [...value.matchAll(/(?<![\p{L}\p{N}])[-+]?\d+(?:\.\d+)?%?(?![\p{L}\p{N}])/gu)].map((item) => item[0])
@@ -74,7 +74,9 @@ export function validateCandidateEvidence(
 
   const evidence: EvidenceMatch[] = []
   const locations: CandidateClaim["sourceLocations"] = []
-  for (const location of candidate.sourceLocations) {
+  const uniqueLocations = new Map([...candidate.sourceLocations, ...(candidate.scope?.sourceLocations ?? [])]
+    .map((location) => [`${location.page}|${sectionToken(location.section)}|${normalized(location.evidenceSpan)}`, location]))
+  for (const location of uniqueLocations.values()) {
     const located = sourceChunks.filter((chunk) =>
       location.page >= chunk.pageStart && location.page <= chunk.pageEnd &&
       sectionMatches(location.section, chunk, options.sections ?? []),
@@ -129,6 +131,10 @@ export async function verifyCandidate(input: {
     return { ok: false as const, rejection: { candidate: input.candidate, reason: "mechanism_incomplete" as const, detail: "A mechanism requires problem, operation principle and nonempty components." } }
   }
   const verification = await input.model.verifyEvidence(request)
+  if (input.candidate.scope && verification.scopeVerdict !== "supported") {
+    return { ok: false as const, rejection: { candidate: input.candidate, reason: "card_quality_failed" as const,
+      detail: "Applicability and experimental scope require an independent supported scope verdict." } }
+  }
   if (verification.cardTypeVerdict === "mismatch" || verification.cardTypeVerdict === "uncertain" ||
       ((input.candidate.cardType === "empirical_finding" || input.candidate.cardType === "domain_prior") &&
        verification.actionabilityVerdict !== "testable_intervention") ||

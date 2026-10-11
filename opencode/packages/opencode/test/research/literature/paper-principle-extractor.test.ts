@@ -10,49 +10,8 @@ import { LiteratureAgent } from "../../../src/research/literature/literature-age
 import { principlePrompt, type PrincipleModel, type PrincipleStage } from "../../../src/research/literature/principle-model"
 import { candidate, review, chunk, digest } from "./principle-fixtures"
 
-const document: NormalizedDocument = {
-  schemaVersion: "normalized_document_v1", paperID: "paper", documentID: "doc", sourcePath: "/fixture.pdf",
-  sourceSha256: digest, parser: { name: "fixture", version: "1" }, language: "en",
-  pages: [{ pageNumber: 1, text: chunk.text, blocks: [] }], sections: [], parseWarnings: [],
-}
-function fixtureModel(override?: (stage: PrincipleStage, payload: Record<string, unknown>, value: unknown) => unknown) {
-  const requests: Array<{ stage: PrincipleStage; payload: Record<string, unknown> }> = []
-  const model: PrincipleModel = {
-    modelIdentifier: "fixture",
-    async request(stage, payload) {
-      requests.push({ stage, payload })
-      const c = candidate()
-      const value = stage === "outline" ? {
-        problem: "Efficient prediction of recurring phases", contributions: [{ statement: c.principle, sourceIDs: ["s"] }],
-        methodOutline: [{ statement: c.intervention.operation, sourceIDs: ["s"] }], unresolved: [],
-      } : stage === "collect" ? {
-        materials: [{ kind: "counterevidence", statement: "No accuracy evidence", sourceIDs: ["s"], attribution: "author_claim", contributionIndexes: [0] }],
-        unresolved: ["No performance experiment"],
-      } : stage === "repair_materials" ? { repairs: (payload.invalidItems as any[]).map((item) => ({ itemIndex: item.itemIndex, material: null, reason: "Cannot recover fixture source" })) }
-        : stage === "repair_bindings" ? { links: [], scopeReplacements: [], unresolved: ["No fixture patch"] }
-        : stage === "plan" ? { plans: [{ planID: "candidate", contributionIndexes: [0], focus: "Complete phase-sharing principle" }], unformed: [] }
-        : stage === "synthesize" ? { candidates: [c], unformed: [] }
-        : stage === "revise" ? { candidate: payload.candidate, reason: "Fixture revision" }
-        : stage === "merge" ? { candidate: (payload.originals as any[])[0], reason: "Fixture merge" }
-        : stage === "consolidate" ? { groups: (payload.candidates as any[]).map((c) => ({ candidateIDs: [c.candidateID], action: "retain", rationale: "Complete principle" })) }
-          : { ...review(), candidateID: (payload.candidate as any).candidateID, candidateHash: payload.candidateHash,
-            assertionReviews: (payload.candidate as any).assertions.map((a: any) => ({ assertionID: a.assertionID, verdict: "supported", reason: "Fixture support" })),
-            reviewedSourceIDs: (payload.candidate as any).sources }
-      const raw = override ? override(stage, payload, value) : value
-      const catalog = (payload.sourceCatalog ?? (payload.analysis as any)?.sources ?? []) as Array<{ sourceID: string }>
-      const sourceID = catalog[0]?.sourceID ?? "s"
-      const adapt = (item: any): any => {
-        if (item === "s") return sourceID
-        if (Array.isArray(item)) return item.map(adapt)
-        if (!item || typeof item !== "object") return item
-        return Object.fromEntries(Object.entries(item).filter(([key]) => !(item.schemaVersion === "knowledge_candidate_v2" && key === "principle")).map(([key, v]) => [key,
-          key === "sources" && Array.isArray(v) ? v.map((s) => adapt(typeof s === "string" ? s : s.sourceID)) : adapt(v)]))
-      }
-      return { text: JSON.stringify(adapt(raw)) }
-    },
-  }
-  return { model, requests }
-}
+import { document, fixtureModel } from "./principle-model-fixture"
+
 const run = (model: PrincipleModel, options?: Parameters<typeof extractPaperPrinciples>[0]["options"]) =>
   extractPaperPrinciples({ document, chunks: [chunk], model, runID: "run", options })
 
@@ -319,7 +278,7 @@ test("verifier receives uncited limitation chunks, not only collector summaries"
   expect(result.errors).toEqual([])
   for (const request of requests.filter((r) => r.stage === "verify")) expect(request.payload.originalChunks).toContainEqual(adverse)
 })
-test("a later verification failure removes previously accepted cards from partial output", async () => {
+test.each(["initial", "final"])("a %s verification failure preserves independently reviewed cards in partial output", async (phase) => {
   const first = candidate()
   const second = candidate()
   second.candidateID = "second"
@@ -328,14 +287,17 @@ test("a later verification failure removes previously accepted cards from partia
   const { model } = fixtureModel((stage, payload, value) => {
     if (stage === "plan") return { plans: [first, second].map((c) => ({ planID: c.candidateID, contributionIndexes: [0], focus: c.principle })), unformed: [] }
     if (stage === "synthesize") return { candidates: [(payload.focus as any).planID === "second" ? second : first], unformed: [] }
-    if (stage === "consolidate") return { groups: [first, second].map((c) => ({ candidateIDs: [c.candidateID], action: "retain", rationale: "Fixture" })) }
-    if (stage === "verify" && payload.phase === "final" && (payload.candidate as KnowledgeCandidateV2).candidateID === "second") throw new Error("provider failure")
+    if (stage === "consolidate") return { groups: (payload.candidates as KnowledgeCandidateV2[]).map((c) => ({ candidateIDs: [c.candidateID], action: "retain", rationale: "Fixture" })) }
+    if (stage === "verify" && payload.phase === phase && (payload.candidate as KnowledgeCandidateV2).candidateID === "second") throw new Error("provider failure")
     return value
   })
   const result = await run(model)
   expect(result.status).toBe("partial")
-  expect(result.cards).toEqual([])
-  expect(result.reviews).toHaveLength(3)
+  expect(result.cards).toHaveLength(1)
+  expect(result.cards[0].candidateID).toBe(first.candidateID)
+  expect(result.verificationErrors).toMatchObject([{ candidateID: "second", phase }])
+  expect(result.rejected.some((r) => r.candidateID === "second")).toBe(false)
+  expect(result.reviews).toHaveLength(phase === "initial" ? 2 : 3)
   expect(result.errors.join(" ")).toContain("provider failure")
   expect(result.calls.filter((c) => c.stage === "synthesize")).toHaveLength(2)
 })

@@ -133,7 +133,7 @@ export const Event = {
   LiteratureAgentStarted: BusEvent.define("research.agent.literature.started", ResearchAgentStageChanged),
   LiteratureAgentProgress: BusEvent.define("research.agent.literature.progress", Schema.Struct({
     taskID: ResearchTaskID, agent: Schema.String, runID: Schema.String, sessionID: Schema.optional(Schema.String),
-    step: Schema.Literals(["prepare_intents", "search", "select", "parse", "extract", "verify", "assemble_evidence"]),
+    step: Schema.Literals(["prepare_intents", "search", "select", "parse", "extract", "verify", "assemble_evidence", "recall_architecture", "distill_architecture", "review_architecture"]),
     status: Schema.String, paperID: Schema.optional(Schema.String), cached: Schema.optional(Schema.Boolean),
     counts: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
   })),

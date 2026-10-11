@@ -71,31 +71,19 @@ export function hasCompleteMechanism(value: { problem?: string; mechanism?: unkn
   return !!value.problem?.trim() && MechanismSchema.safeParse(value.mechanism).success
 }
 
-export const CandidateClaimSchema = z.object({
-  candidateID: z.string().min(1), paperID: z.string().min(1), cardType: z.enum(CARD_TYPES),
-  claim: z.string().min(8).max(2000), subject: z.string().min(1), predicate: z.string().min(1), object: z.string().min(1),
-  problem: z.string().trim().min(1).optional(), mechanism: MechanismSchema.optional(),
-  evidenceType: z.enum(EVIDENCE_TYPES), supportingChunkIDs: z.array(z.string()).min(1),
-  sourceLocations: z.array(SourceLocationSchema).min(1), extractorConfidence: z.number().min(0).max(1),
-}).strict()
-export type CandidateClaim = z.infer<typeof CandidateClaimSchema>
-
-export const EvidenceVerificationSchema = z.object({
-  verdict: z.enum(["supported", "partially_supported", "unsupported", "overstated"]),
-  actionabilityVerdict: z.enum(["testable_intervention", "observation_only", "not_applicable"]).optional(),
-  cardTypeVerdict: z.enum(["correct", "mismatch", "uncertain"]).optional(),
-  mechanismVerdict: z.enum(["supported", "incomplete", "unsupported", "not_applicable"]).optional(),
-  contributionVerdict: z.enum(["own_method", "background", "uncertain", "not_applicable"]).optional(),
-  qualityReasons: z.array(z.string()).optional(),
-  supportedScope: z.string(), unsupportedParts: z.array(z.string()), correctedClaim: z.string().optional(),
-  evidenceDirectness: z.enum(["direct", "indirect", "inferred"]), confidence: z.number().min(0).max(1),
-}).strict()
-export type EvidenceVerification = z.infer<typeof EvidenceVerificationSchema>
-
-const ApplicabilitySchema = z.object({
+export const ApplicabilitySchema = z.object({
   taskTypes: z.array(z.string()), dataFeatures: z.array(z.string()), domains: z.array(z.string()),
   dataScale: z.array(z.string()), horizonProfile: z.array(z.string()), computeProfile: z.array(z.string()),
   basis: z.enum(["author_statement", "author_experiment", "agent_inference", "unknown"]),
+}).strict()
+
+export const ExperimentalContextSchema = z.object({
+  datasets: z.array(z.string()), baselines: z.array(z.string()), metrics: z.array(z.string()),
+  contextLengths: z.array(z.number().int().positive()), predictionLengths: z.array(z.number().int().positive()),
+  reportedEffect: z.object({
+    direction: z.enum(["improved", "degraded", "mixed", "no_significant_change", "unknown"]),
+    value: z.number().optional(), unit: z.string().optional(), comparedWith: z.string().optional(),
+  }).strict().optional(),
 }).strict()
 
 const EvidenceSchema = z.object({
@@ -112,14 +100,7 @@ export const KnowledgeCardSchema = z.object({
   problem: z.string().optional(),
   mechanism: z.object({ mechanismID: z.string(), name: z.string(), principle: z.string(), components: z.array(z.string()) }).strict().optional(),
   applicability: ApplicabilitySchema, notApplicableWhen: z.array(z.string()),
-  experimentalContext: z.object({
-    datasets: z.array(z.string()), baselines: z.array(z.string()), metrics: z.array(z.string()),
-    contextLengths: z.array(z.number().int().positive()), predictionLengths: z.array(z.number().int().positive()),
-    reportedEffect: z.object({
-      direction: z.enum(["improved", "degraded", "mixed", "no_significant_change", "unknown"]),
-      value: z.number().optional(), unit: z.string().optional(), comparedWith: z.string().optional(),
-    }).strict().optional(),
-  }).strict().optional(),
+  experimentalContext: ExperimentalContextSchema.optional(),
   evidence: z.array(EvidenceSchema).min(1), limitations: z.array(z.string()),
   implementation: z.object({
     recipeConcepts: z.array(z.string()), registryMappings: z.array(z.string()),
@@ -139,6 +120,37 @@ export const KnowledgeCardSchema = z.object({
   }).strict(),
 }).strict()
 export type KnowledgeCard = z.infer<typeof KnowledgeCardSchema>
+
+export const CandidateScopeSchema = z.object({
+  applicability: ApplicabilitySchema,
+  experimentalContext: ExperimentalContextSchema.optional(),
+  notApplicableWhen: z.array(z.string()),
+  limitations: z.array(z.string()),
+  sourceLocations: z.array(SourceLocationSchema).min(1),
+}).strict()
+
+export const CandidateClaimSchema = z.object({
+  candidateID: z.string().min(1), paperID: z.string().min(1), cardType: z.enum(CARD_TYPES),
+  claim: z.string().min(8).max(2000), subject: z.string().min(1), predicate: z.string().min(1), object: z.string().min(1),
+  problem: z.string().trim().min(1).optional(), mechanism: MechanismSchema.optional(),
+  evidenceType: z.enum(EVIDENCE_TYPES), supportingChunkIDs: z.array(z.string()).min(1),
+  sourceLocations: z.array(SourceLocationSchema).min(1), extractorConfidence: z.number().min(0).max(1),
+  scope: CandidateScopeSchema.optional(),
+}).strict()
+export type CandidateClaim = z.infer<typeof CandidateClaimSchema>
+
+export const EvidenceVerificationSchema = z.object({
+  verdict: z.enum(["supported", "partially_supported", "unsupported", "overstated"]),
+  actionabilityVerdict: z.enum(["testable_intervention", "observation_only", "not_applicable"]).optional(),
+  cardTypeVerdict: z.enum(["correct", "mismatch", "uncertain"]).optional(),
+  mechanismVerdict: z.enum(["supported", "incomplete", "unsupported", "not_applicable"]).optional(),
+  contributionVerdict: z.enum(["own_method", "background", "uncertain", "not_applicable"]).optional(),
+  qualityReasons: z.array(z.string()).optional(),
+  scopeVerdict: z.enum(["supported", "unsupported", "not_applicable"]).optional(),
+  supportedScope: z.string(), unsupportedParts: z.array(z.string()), correctedClaim: z.string().optional(),
+  evidenceDirectness: z.enum(["direct", "indirect", "inferred"]), confidence: z.number().min(0).max(1),
+}).strict()
+export type EvidenceVerification = z.infer<typeof EvidenceVerificationSchema>
 
 export const CardRelationSchema = z.object({
   relationID: z.string(), sourceCardID: z.string(), targetCardID: z.string(),

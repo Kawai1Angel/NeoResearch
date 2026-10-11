@@ -2,6 +2,18 @@ import { createHash } from "crypto"
 import type { CandidateClaim, DocumentChunk, KnowledgeCard, NormalizedDocument } from "../../../src/research/literature/contract"
 
 export const evidenceText = "On ETTh1, the proposed patch encoder reduces MSE by 12% compared with DLinear."
+export const scopeText = "For forecasting, the encoder requires regular sampling and cannot process irregular sampling. We evaluated it on ETTh1 with context length 96 and prediction length 24. Missing observations were not studied."
+
+export function candidateScope(): NonNullable<CandidateClaim["scope"]> {
+  return {
+    applicability: { taskTypes: ["forecasting"], dataFeatures: ["regular_sampling"], domains: [],
+      dataScale: [], horizonProfile: [], computeProfile: [], basis: "author_statement" },
+    experimentalContext: { datasets: ["ETTh1"], baselines: ["DLinear"], metrics: ["MSE"],
+      contextLengths: [96], predictionLengths: [24] },
+    notApplicableWhen: ["irregular_sampling"], limitations: ["Missing observations were not studied."],
+    sourceLocations: [{ page: 3, section: "Results", evidenceSpan: scopeText }],
+  }
+}
 
 export function chunk(overrides: Partial<DocumentChunk> = {}): DocumentChunk {
   const text = overrides.text ?? evidenceText

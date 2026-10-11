@@ -304,7 +304,12 @@ describe("research CLI data helpers", () => {
 
   test("formats task status summary with counts and champion", () => {
     const output = formatResearchStatus({
-      task: task({ id: "researchTask_a", title: "TSF experiment", status: "researching" }),
+      task: task({
+        id: "researchTask_a",
+        title: "TSF experiment",
+        status: "researching",
+        objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+      }),
       candidates: [
         {
           id: Research.ResearchCandidateID.make("researchCandidate_a"),
