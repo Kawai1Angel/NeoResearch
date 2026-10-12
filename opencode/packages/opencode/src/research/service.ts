@@ -2459,8 +2459,6 @@ function buildReflectionSessionUserPrompt(
       modelCapabilities: MODEL_CAPABILITIES,
       currentHypothesis: currentHypothesis ?? null,
       structuralAnalysis: {
-        decision: analysis.decision,
-        decisionReason: analysis.decisionReason,
         primaryMetricName: analysis.primaryMetricName,
         direction: analysis.direction,
         bestMetric: analysis.bestMetric ?? null,
@@ -2538,8 +2536,6 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
       experiences: context.experiences ?? [],
       experienceWriteSchema: z.toJSONSchema(ExperienceDraftSchema),
       knowledgeValidationSchema: z.toJSONSchema(KnowledgeValidationDraftSchema),
-      decision: analysis.decision,
-      decisionReason: analysis.decisionReason,
     })), literatureKnowledge: context.literatureKnowledge },
     null,
     2,

@@ -3582,6 +3582,8 @@ fi
         expect(reflection.analysis.rejectedRuns).toBe(0)
         expect(reflection.analysis.failures[0]?.category).toBe("oom")
         expect(prompts).toHaveLength(1)
+        expect(prompts[0]).not.toHaveProperty("decision")
+        expect(prompts[0]).not.toHaveProperty("decisionReason")
         expect(prompts[0]!.sourceRuns.find((r: any) => r.runID === evaluated.id).metrics.train_avg_mse).toBe(0.01)
         expect(prompts[0]!.experimentResults.rejectedRuns).toBe(0)
         expect(JSON.stringify(prompts)).not.toMatch(/verification|overfitting_verifier|Overfit ratio/)
