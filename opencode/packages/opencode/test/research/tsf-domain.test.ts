@@ -501,7 +501,7 @@ describe("TSF research domain", () => {
     })
     const fingerprint = Research.DomainRegistry.summarizeTask("tsf", normalizedTask)
     const datasetProfile = asRecord(fingerprint.datasetProfile)
-    const correlationMatrix = asRecord(datasetProfile.correlationMatrix)
+    const correlations = asRecord(datasetProfile.correlations)
 
     expect(datasetProfile).toMatchObject({
       rowCount: 5_100,
@@ -510,10 +510,12 @@ describe("TSF research domain", () => {
       profiledRowCount: 5_000,
       profiledColumnCount: 20,
     })
-    expect(correlationMatrix.columns).toHaveLength(20)
-    expect((correlationMatrix.columns as string[])[0]).toBe("target_0")
-    expect((correlationMatrix.columns as string[]).at(-1)).toBe("target_320")
-    expect(correlationMatrix.values).toHaveLength(20)
+    expect(datasetProfile.profiledTargetColumns).toHaveLength(20)
+    expect((datasetProfile.profiledTargetColumns as string[])[0]).toBe("target_0")
+    expect((datasetProfile.profiledTargetColumns as string[]).at(-1)).toBe("target_320")
+    expect(datasetProfile.correlationMatrix).toBeUndefined()
+    expect(correlations).toMatchObject({ scope: "target_target", evaluatedPairCount: 190, validPairCount: 190 })
+    expect(correlations.strongestPairs).toHaveLength(8)
   })
 
   test("uses TSF dataset profiles to seed data-driven full-recipe baselines", async () => {

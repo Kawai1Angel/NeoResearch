@@ -248,7 +248,7 @@ function profileMetricEntries(value: unknown) {
     crossVarCorrelation: numericMetric(
       profile.crossVarCorrelation,
       (item) => correlationStrength(item).replaceAll("_", " "),
-      "Moderate or stronger dependence can justify sparse channel mixing; weak dependence favors channel-independent models.",
+      "Describes measured target–covariate dependence when covariates are configured, otherwise target–target dependence. Low contemporaneous linear correlation does not rule out lagged or nonlinear effects; unavailable pairs are not zero evidence.",
     ),
     distributionShift: numericMetric(
       profile.distributionShift,
@@ -298,10 +298,35 @@ export function analyzeDatasetProfileForPrompt(value: unknown) {
       ...(typeof profile.path === "string" ? { path: compactPromptString(profile.path) } : {}),
     },
     metrics: profileMetricEntries(profile),
+    ...(profile.correlations === undefined ? {} : { correlationStructure: profile.correlations }),
+    ...(Array.isArray(profile.covariateProfiles) ? {
+      covariates: profile.covariateProfiles.map((item) => ({
+        column: record(item).column,
+        role: record(item).role,
+        metrics: profileMetricEntries(item),
+      })),
+    } : {}),
     ...(profile.correlationMatrix === undefined
       ? {}
       : { correlationStructure: summarizeCorrelationMatrix(profile.correlationMatrix) }),
   }
+}
+
+export function renderCorrelationSummary(value: unknown) {
+  const summary = record(value)
+  if (!Array.isArray(summary.strongestPairs)) return ["- Target correlation diagnostics unavailable; absence is not evidence of independent covariates."]
+  return [
+    `- Scope: ${String(summary.scope)}; valid pairs: ${String(summary.validPairCount)} / ${String(summary.evaluatedPairCount)}.`,
+    `- Mean absolute correlation: ${String(summary.meanAbsCorrelation ?? "unavailable")}; maximum: ${String(summary.maxAbsCorrelation ?? "unavailable")}.`,
+    "- Only target-related pairs are evaluated; covariate–covariate pairs and a full matrix are omitted. Positive lead-lag evidence is reported separately.",
+    "",
+    "| Source | Target | Correlation |",
+    "| --- | --- | ---: |",
+    ...summary.strongestPairs.map((item) => {
+      const pair = record(item)
+      return `| ${String(pair.source)} | ${String(pair.target)} | ${String(pair.correlation)} |`
+    }),
+  ]
 }
 
 function compactPromptString(value: string) {
@@ -315,6 +340,11 @@ export function compactPromptContext(value: unknown, contextKey?: string): unkno
   if (contextKey === "taskEvidence") return value
   if (typeof value === "string") return compactPromptString(value)
   if (Array.isArray(value)) {
+    // Diagnostics already sample at most 20 covariates; retain their named
+    // evidence instead of replacing it with a collection-size placeholder.
+    if (["covariates", "observedPastCovariateAnalysis"].includes(contextKey ?? "") && value.length <= 20) {
+      return value.map((item) => compactPromptContext(item))
+    }
     if (contextKey === "trainingCurve") return summarizeTrainingCurve(value)
     if (isNumericMatrix(value)) return summarizeNumericMatrix(value)
     const numericAnalysisKey = /per.?target|(?:loss(?:es)?|errors?|residuals?|predictions?|labels?|values?|samples?|distribution)$/i.test(contextKey ?? "")

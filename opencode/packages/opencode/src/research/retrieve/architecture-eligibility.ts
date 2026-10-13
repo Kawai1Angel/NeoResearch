@@ -92,8 +92,9 @@ export function matchedTargetEvidenceIssues(value: ArchitectureEligibility, task
       return [`Input/output structure is unavailable at ${condition.path}; classify its prerequisite as unknown`]
     const crossLag = at(task, "$.quantitativeReport.statistics.crossLag")
     const missingCrossLag = !crossLag || typeof crossLag !== "object" || !Object.keys(crossLag).length
+    const measuredPairs = at(task, "$.quantitativeReport.profile.correlations.validPairCount")
     if (missingCrossLag && (condition.path === "$.quantitativeReport.statistics.crossLag" ||
-      condition.path === "$.quantitativeReport.profile.crossVarCorrelation" && actual === 0))
+      condition.path === "$.quantitativeReport.profile.crossVarCorrelation" && actual === 0 && !(typeof measuredPairs === "number" && measuredPairs > 0)))
       return [`Cross-channel diagnostics are unavailable at ${condition.path}; absence of a report is neither matched nor contradicted data-dependence evidence`]
     return actual === undefined || !isDeepStrictEqual(actual, condition.value) ? [`Target evidence does not match ${condition.path}`] : []
   })

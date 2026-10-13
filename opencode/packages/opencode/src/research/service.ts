@@ -1889,7 +1889,7 @@ function renderDatasetQualitativeAnalysis(
       "",
       `- ${dataAnalysisSignal(seasonality, 0.4, "Seasonal structure is a strong prior for candidate design.", "Seasonality is not dominant from the profile.")}`,
       `- ${dataAnalysisSignal(trend, 0.2, "Trend is present and should be handled by baseline and residual designs.", "Trend is weak enough for simple baselines to remain useful.")}`,
-      `- ${dataAnalysisSignal(crossVar, 0.5, "Cross-variate dependence is material; feature fusion or graph-style candidates are justified.", "Cross-variate dependence is limited; independent temporal candidates are acceptable.")}`,
+      `- ${dataAnalysisSignal(crossVar, 0.5, "Cross-variate dependence is material; feature fusion or graph-style candidates are justified.", "Measured contemporaneous linear dependence is low or unavailable; lagged and nonlinear covariate effects remain open hypotheses.")}`,
       `- ${dataAnalysisSignal(shift, 0.5, "Distribution shift is visible; robust loss or reweighting should be considered.", "Distribution shift is not the dominant risk.")}`,
       `- ${missing !== undefined && missing > 0 ? "Missing values are present; candidate recipes should include missing-aware preprocessing." : "Missing values are not a primary concern in the profiled targets."}`,
       "",
@@ -1897,10 +1897,10 @@ function renderDatasetQualitativeAnalysis(
       "",
       `- 字段语义: target=${Array.isArray(dataset.targetCols) ? dataset.targetCols.join(", ") : "-"}; loader=${markdownValue(dataset.loaderID)}.`,
       `- 业务机制: ${dataAnalysisSignal(seasonality, 0.4, "周期信号明显，可能对应生产节律、日历周期或批处理节奏。", "周期信号不强，业务解读应优先关注趋势和局部变化。")}`,
-      `- 外部因素: ${dataAnalysisSignal(crossVar, 0.5, "多变量联动较强，外生变量、同步扰动或共享上游驱动值得纳入建模假设。", "变量间联动较弱，外部因素更可能体现在单变量局部事件中。")}`,
+      `- 外部因素: ${dataAnalysisSignal(crossVar, 0.5, "多变量联动较强，外生变量、同步扰动或共享上游驱动值得纳入建模假设。", "同期线性相关性弱或尚未测得，不能据此排除外生变量的滞后或非线性影响。")}`,
       `- 潜在事件: change_point=${markdownValue(context.statistics.changepoint.index)} severity=${markdownValue(context.statistics.changepoint.severity)}，需要人工核对该时间段是否存在口径、设备或环境变化。`,
       `- 风险: ${dataAnalysisSignal(shift, 0.5, "存在分布漂移，离线验证和线上表现可能不一致。", "分布漂移风险较低，但仍需保留 holdout 检查。")}`,
-      `- 领域建模建议: ${context.statistics.crossLag.source ? `关注 ${context.statistics.crossLag.source}->${context.statistics.crossLag.target} 的 lag=${context.statistics.crossLag.lag} lead-lag 关系。` : "未发现稳定跨变量滞后关系，先使用简单 temporal baseline。"}`,
+      `- 领域建模建议: ${context.statistics.crossLag.source ? `关注 ${context.statistics.crossLag.source}->${context.statistics.crossLag.target} 的 lag=${context.statistics.crossLag.lag} lead-lag 关系。` : "当前未取得有效跨变量滞后诊断，不能据此判定外生变量无用。"}`,
       "",
     )
   }
@@ -1917,7 +1917,9 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
     "Start from the existing linear and patch baselines to establish a low-cost floor.",
     crossVar !== undefined && crossVar >= 0.5
       ? "Prioritize at least one cross-variate candidate because the quantitative and qualitative sub-agents both flag cross-variate structure."
-      : "Keep the first pass focused on independent temporal candidates because cross-variate evidence is limited.",
+      : datasetCovariateContext(task).observedPastCovariates.length > 0
+        ? "Include a covariate-capable control; low or unavailable contemporaneous correlation does not establish their irrelevance."
+        : "Keep simple temporal controls while evaluating the available target-dependence evidence.",
     seasonality !== undefined && seasonality >= 0.4
       ? `Include decomposition or frequency-aware variants; dominant period=${markdownValue(context.statistics.frequency.dominantPeriod)} and STL period=${markdownValue(context.statistics.decomposition.period)}.`
       : "Avoid over-indexing on frequency modules until run evidence supports them.",
@@ -2019,7 +2021,7 @@ function buildExtendedStatisticsAnalysis(context: DatasetAnalysisContext) {
       target: statistics.crossLag.target,
       lag: statistics.crossLag.lag,
       correlation: statistics.crossLag.correlation,
-      assessment: crossLagMagnitude >= 0.6 ? "strong" : crossLagMagnitude >= 0.4 ? "moderate" : crossLagMagnitude >= 0.2 ? "weak" : "very weak",
+      assessment: statistics.crossLag.correlation === undefined ? "unavailable" : crossLagMagnitude >= 0.6 ? "strong" : crossLagMagnitude >= 0.4 ? "moderate" : crossLagMagnitude >= 0.2 ? "weak" : "very weak",
       analysis: crossLagMagnitude >= 0.4
         ? "The lead-lag signal can justify sparse directional cross-variable modeling."
         : "The lead-lag signal alone does not justify complex cross-variable modeling.",
@@ -2052,11 +2054,14 @@ function buildQualitativeUserPrompt(task: ResearchTask, fingerprint: JsonRecord,
       taskSpec: task.taskSpec,
       datasetProfileAnalysis: analyzeDatasetProfileForPrompt(profile),
       extendedStatisticsAnalysis: buildExtendedStatisticsAnalysis(context),
+      observedPastCovariateAnalysis: context.covariates ?? [],
       instruction:
         "Call the analyze_dataset tool first to get authoritative statistics, then analyze the dataset " +
         "characteristics and provide qualitative domain insights for guiding TSF model search. " +
         "Important: targetCount describes forecast targets only. Do not conclude the task is exogenous-free " +
         "or production-infeasible when observedPastCovariates/knownFutureCovariates are listed above. " +
+        "Use each covariate’s own profile and statistical diagnostics. Target-only diagnostics never establish weak covariates; " +
+        "unavailable correlations are unknown, and low contemporaneous Pearson correlation does not rule out lagged or nonlinear effects. " +
         "When knownFutureCovariates are present, discuss their availability and whether the scope is a production candidate " +
         "or an oracle upper-bound. The analyzed profile/statistics below are provided only as a fallback in case the tool is unavailable.",
     }),

@@ -21,6 +21,7 @@ import {
   type ResearchDomain,
 } from "../domain"
 import type { JsonRecord } from "../schema"
+import type { CorrelationSummary, SeriesProfile } from "../retrieve/contract"
 import { createNeoCastRunnerCommand, getNeoCastRunnerManifestForTask } from "../runners/neo-cast-runner"
 
 const ACTION_REGISTRY = {
@@ -677,17 +678,18 @@ type DatasetProfile = {
   missingRate: number
   trendStrength: number
   seasonalityStrength: number
-  crossVarCorrelation: number
+  crossVarCorrelation?: number
   distributionShift: number
   outlierRate?: number
   acfMainPeriod?: number
   acfMainPeriodStrength?: number
   adfStatistic?: number
   adfStationary?: boolean
-  correlationMatrix?: {
-    columns: string[]
-    values: number[][]
-  }
+  observedPastCovariateCount?: number
+  profiledTargetColumns?: string[]
+  profiledCovariateColumns?: string[]
+  covariateProfiles?: ({ column: string; role: "observed_past" } & SeriesProfile)[]
+  correlations?: CorrelationSummary
   timestampColumn?: string
   duplicateTimestampRate?: number
   monotonicTimestamp?: boolean
@@ -696,7 +698,7 @@ type DatasetProfile = {
 type DatasetProfileWarning = {
   source: "dataset.path"
   path: string
-  code: "dataset_read_failed" | "dataset_empty" | "no_numeric_columns" | "missing_target_columns" | "unverified_training_data"
+  code: "dataset_read_failed" | "dataset_empty" | "no_numeric_columns" | "missing_target_columns" | "missing_covariate_columns" | "unverified_training_data"
   message: string
 }
 type DatasetProfileResult = {
@@ -1369,45 +1371,31 @@ function profileADF(matrix: number[][]) {
   }
 }
 
-function profileCrossCorrelation(matrix: number[][]) {
-  const width = matrix[0]?.length ?? 0
-  if (width < 2) return 0
-  const correlations: number[] = []
-  for (let left = 0; left < width; left++) {
-    for (let right = left + 1; right < width; right++) {
-      correlations.push(Math.abs(pearson(column(matrix, left), column(matrix, right))))
-    }
-  }
-  return meanFinite(correlations)
-}
-
-function profileCorrelationMatrix(matrix: number[][], columns: string[]) {
-  const width = matrix[0]?.length ?? 0
-  if (width === 0) return undefined
-  const series = Array.from({ length: width }, (_, index) => column(matrix, index))
-  const values = Array.from({ length: width }, () => Array<number>(width).fill(0))
-  for (let left = 0; left < width; left++) {
-    values[left]![left] = 1
-    for (let right = left + 1; right < width; right++) {
-      const correlation = roundProfileValue(pearson(series[left]!, series[right]!))
-      values[left]![right] = correlation
-      values[right]![left] = correlation
-    }
+function profileCorrelations(targets: { name: string; values: number[] }[], covariates: { name: string; values: number[] }[]): CorrelationSummary {
+  const scope = covariates.length ? "target_covariate" : "target_target"
+  const pairs = covariates.length
+    ? targets.flatMap((target) => covariates.map((source) => ({ source, target })))
+    : targets.flatMap((source, index) => targets.slice(index + 1).map((target) => ({ source, target })))
+  const strongestPairs: CorrelationSummary["strongestPairs"] = []
+  let validPairCount = 0
+  let absoluteSum = 0
+  let maxAbsCorrelation = 0
+  for (const { source, target } of pairs) {
+    const valid = source.values.map((value, index) => [value, target.values[index]!])
+      .filter(([left, right]) => Number.isFinite(left) && Number.isFinite(right))
+    if (valid.length < 3 || stdFinite(valid.map(([value]) => value!)) === 0 || stdFinite(valid.map(([, value]) => value!)) === 0) continue
+    const correlation = Math.max(-1, Math.min(1, pearson(source.values, target.values)))
+    validPairCount++
+    absoluteSum += Math.abs(correlation)
+    maxAbsCorrelation = Math.max(maxAbsCorrelation, Math.abs(correlation))
+    strongestPairs.push({ source: source.name, target: target.name, correlation: roundProfileValue(correlation) })
+    strongestPairs.sort((left, right) => Math.abs(right.correlation) - Math.abs(left.correlation))
+    strongestPairs.splice(8)
   }
   return {
-    columns,
-    values,
+    scope, evaluatedPairCount: pairs.length, validPairCount, strongestPairs,
+    ...(validPairCount ? { meanAbsCorrelation: roundProfileValue(absoluteSum / validPairCount), maxAbsCorrelation: roundProfileValue(maxAbsCorrelation) } : {}),
   }
-}
-
-function crossCorrelationFromMatrix(matrix: NonNullable<DatasetProfile["correlationMatrix"]>) {
-  const correlations: number[] = []
-  for (let left = 0; left < matrix.values.length; left++) {
-    for (let right = left + 1; right < matrix.values.length; right++) {
-      correlations.push(Math.abs(matrix.values[left]?.[right] ?? 0))
-    }
-  }
-  return meanFinite(correlations)
 }
 
 function profileDistributionShift(matrix: number[][]) {
@@ -1558,8 +1546,9 @@ export function resolveTSFProfileSource(task: Pick<TSFTaskSpec, "dataset">, cont
             provenance.source_sha256 !== sourceFingerprint ||
             provenance.train_sha256 !== hash(trainRaw) ||
             provenance.spec_sha256 !== hash(specRaw) ||
-            JSON.stringify(spec.target_columns) !== JSON.stringify(task.dataset.targetCols)) {
-          throw new Error("Prepared data source, content fingerprint, or target columns do not match this task")
+            JSON.stringify(spec.target_columns) !== JSON.stringify(task.dataset.targetCols) ||
+            JSON.stringify(spec.observed_past_covariates ?? []) !== JSON.stringify(task.dataset.observedPastCovariates)) {
+          throw new Error("Prepared data source, content fingerprint, or column roles do not match this task")
         }
         raw = trainRaw
         datasetPath = trainPath
@@ -1572,124 +1561,89 @@ export function resolveTSFProfileSource(task: Pick<TSFTaskSpec, "dataset">, cont
   return { raw, sourceRaw, sourceFingerprint, datasetPath, usingTrainFile, warning }
 }
 
-function profileTSFDataset(task: TSFTaskSpec, context?: DomainSummaryContext): DatasetProfileResult {
-  const input = resolveTSFProfileSource(task, context)
-  const { raw, sourceRaw, sourceFingerprint, datasetPath, warning } = input
-  if (raw === undefined || sourceRaw === undefined || sourceFingerprint === undefined || !datasetPath) return { warning }
-  const MAX_PROFILE_COLS = 20
-  const MAX_PROFILE_ROWS = 5000
-  const lines = firstNonEmptyLines(raw, MAX_PROFILE_ROWS + 1)
-  const header = lines[0] ? splitCSVLine(lines[0]) : undefined
-  if (!header || lines.length < 2) {
-    return {
-      warning: datasetProfileWarning(datasetPath, "dataset_empty", "Dataset profile requires a header and data rows."),
-    }
+// Reused by detailed per-covariate statistics so both analysis paths use the same diagnostics.
+export function profileSeries(matrix: readonly (readonly number[])[], timeAxis?: number[]): SeriesProfile {
+  const values = matrix.map((row) => [...row])
+  const width = values[0]?.length ?? 0
+  const seasonality = analyzeSeasonality(values, timeAxis)
+  const adf = profileADF(values)
+  return {
+    missingRate: roundProfileValue(values.flat().filter((value) => !Number.isFinite(value)).length / Math.max(1, values.length * width)),
+    trendStrength: roundProfileValue(profileTrend(values, timeAxis)),
+    seasonalityStrength: roundProfileValue(seasonality.strength),
+    distributionShift: roundProfileValue(profileDistributionShift(values)),
+    outlierRate: roundProfileValue(meanFinite(Array.from({ length: width }, (_, index) => profileOutlierRate(values.map((row) => [row[index]!]))))),
+    ...(seasonality.period === undefined ? {} : { acfMainPeriod: seasonality.period, acfMainPeriodStrength: roundProfileValue(seasonality.strength) }),
+    ...(adf === undefined ? {} : { adfStatistic: adf.statistic, adfStationary: adf.stationary }),
   }
-  const dataLines = lines.slice(1)
-  const totalRowCount = Math.max(0, countNonEmptyLines(sourceRaw) - 1)
-  const missingTargets = task.dataset.targetCols.filter((target) => !header.includes(target))
-  if (missingTargets.length > 0) {
-    return { warning: datasetProfileWarning(datasetPath, "missing_target_columns", `Missing target columns: ${missingTargets.join(", ")}`) }
-  }
-  const targetIndexes = task.dataset.targetCols
-    .map((target) => header.indexOf(target))
-    .filter((index) => index >= 0)
-  let fallbackRows: string[][] | undefined
-  const allNumericIndexes =
-    targetIndexes.length > 0
-      ? targetIndexes
-      : header
-          .map((_, index) => index)
-          .filter((index) => {
-            fallbackRows ??= dataLines.map(splitCSVLine)
-            const parsed = fallbackRows.map((row) => parseNumberCell(row[index] ?? ""))
-            const valid = parsed.filter(Number.isFinite).length
-            return valid > 0 && valid / fallbackRows.length >= 0.5
-          })
-  if (allNumericIndexes.length === 0) {
-    return {
-      warning: datasetProfileWarning(
-        datasetPath,
-        "no_numeric_columns",
-        "Dataset profile could not find numeric target or fallback columns.",
-      ),
-    }
-  }
-  const numericIndexes = sampleEvenly(allNumericIndexes, MAX_PROFILE_COLS)
-  const timestampIndex = header.findIndex((item) => ["date", "time", "timestamp", "datetime"].includes(item.toLowerCase()))
-  const profileIndexes = [...new Set([timestampIndex >= 0 ? timestampIndex : 0, ...numericIndexes])].sort((left, right) => left - right)
-  const profileHeader = profileIndexes.map((index) => header[index] ?? `col_${index}`)
-  const profilePositions = new Map(profileIndexes.map((index, position) => [index, position]))
-  const profileNumericIndexes = numericIndexes.map((index) => profilePositions.get(index)!)
-  const dataRows = dataLines.map((line) => selectCSVCells(line, profileIndexes))
+}
 
-  let missing = 0
-	  const matrix = dataRows.map((row) =>
-	    profileNumericIndexes.map((index) => {
-	      const value = parseNumberCell(row[index] ?? "")
-	      if (!Number.isFinite(value)) missing += 1
-	      return value
-	    }),
-	  )
-	  const timeAxis = profileTimeAxis(profileHeader, dataRows)
-	  const numericColumns = numericIndexes.map((index) => header[index] ?? `col_${index}`)
-	  const seasonality = analyzeSeasonality(matrix, timeAxis)
-	  const adf = profileADF(matrix)
-	  const correlationMatrix = profileCorrelationMatrix(matrix, numericColumns)
-	  const totalCells = Math.max(dataRows.length * numericIndexes.length, 1)
-	  const profileFingerprint = createHash("sha256")
-	    .update("seasonality.v2\0")
-	    .update(sourceFingerprint)
-	    .update("\0")
-	    .update(raw)
-	    .update("\0")
-	    .update(JSON.stringify(task.dataset.targetCols))
-	    .digest("hex")
-	  return {
-	    ...(warning ? { warning } : {}),
-	    profile: {
-	      source: "dataset.path",
-      path: datasetPath,
-      sourceFingerprint,
-      profileFingerprint,
+function profileTSFDataset(task: TSFTaskSpec, context?: DomainSummaryContext): DatasetProfileResult {
+  const { raw, sourceRaw, sourceFingerprint, datasetPath, warning } = resolveTSFProfileSource(task, context)
+  if (raw === undefined || sourceRaw === undefined || sourceFingerprint === undefined || !datasetPath) return { warning }
+  const MAX_PROFILE_COLS = 20 // Separate limits keep covariates from displacing targets, or vice versa.
+  const lines = firstNonEmptyLines(raw, 5001)
+  const header = lines[0] ? splitCSVLine(lines[0]) : undefined
+  if (!header || lines.length < 2) return { warning: datasetProfileWarning(datasetPath, "dataset_empty", "Dataset profile requires a header and data rows.") }
+  const missingTargets = task.dataset.targetCols.filter((name) => !header.includes(name))
+  if (missingTargets.length) return { warning: datasetProfileWarning(datasetPath, "missing_target_columns", `Missing target columns: ${missingTargets.join(", ")}`) }
+  const missingCovariates = task.dataset.observedPastCovariates.filter((name) => !header.includes(name))
+  if (missingCovariates.length) return { warning: datasetProfileWarning(datasetPath, "missing_covariate_columns", `Missing observed-past covariate columns: ${missingCovariates.join(", ")}`) }
+  const dataLines = lines.slice(1)
+  const covariateIndexes = task.dataset.observedPastCovariates.map((name) => header.indexOf(name))
+  const fallbackRows = task.dataset.targetCols.length ? [] : dataLines.map(splitCSVLine)
+  const targetIndexes = task.dataset.targetCols.length
+    ? task.dataset.targetCols.map((name) => header.indexOf(name))
+    : header.map((_, index) => index).filter((index) => {
+        if (covariateIndexes.includes(index) || header[index]!.startsWith("__neo_missing__")) return false
+        const parsed = fallbackRows.map((row) => parseNumberCell(row[index] ?? ""))
+        return parsed.filter(Number.isFinite).length / parsed.length >= 0.5
+      })
+  if (!targetIndexes.length) return { warning: datasetProfileWarning(datasetPath, "no_numeric_columns", "Dataset profile could not find numeric target columns.") }
+  const sampledTargets = sampleEvenly(targetIndexes, MAX_PROFILE_COLS)
+  const sampledCovariates = sampleEvenly(covariateIndexes, MAX_PROFILE_COLS)
+  const timestampIndex = header.findIndex((name) => ["date", "time", "timestamp", "datetime"].includes(name.toLowerCase()))
+  const profileIndexes = [...new Set([timestampIndex >= 0 ? timestampIndex : 0, ...sampledTargets, ...sampledCovariates])].sort((a, b) => a - b)
+  const profileHeader = profileIndexes.map((index) => header[index]!)
+  const positions = new Map(profileIndexes.map((index, position) => [index, position]))
+  const dataRows = dataLines.map((line) => selectCSVCells(line, profileIndexes))
+  const series = (index: number) => ({ name: header[index]!, values: dataRows.map((row) => parseNumberCell(row[positions.get(index)!] ?? "")) })
+  const targets = sampledTargets.map(series)
+  const covariates = sampledCovariates.map(series)
+  const timeAxis = profileTimeAxis(profileHeader, dataRows)
+  const matrix = dataRows.map((_, row) => targets.map((target) => target.values[row]!))
+  const correlations = profileCorrelations(targets, covariates)
+  const profileFingerprint = createHash("sha256").update("covariate-profile.v3\0").update(sourceFingerprint)
+    .update("\0").update(raw).update("\0")
+    .update(JSON.stringify({ targets: task.dataset.targetCols, observedPastCovariates: task.dataset.observedPastCovariates })).digest("hex")
+  return {
+    ...(warning ? { warning } : {}),
+    profile: {
+      source: "dataset.path", path: datasetPath, sourceFingerprint, profileFingerprint,
       ...(context ? { taskID: context.taskID, workspaceRoot: context.workspaceRoot } : {}),
-      rowCount: totalRowCount,
+      rowCount: Math.max(0, countNonEmptyLines(sourceRaw) - 1),
       targetCount: targetIndexes.length,
-      numericColumnCount: allNumericIndexes.length,
+      observedPastCovariateCount: covariateIndexes.length,
+      numericColumnCount: targetIndexes.length + covariateIndexes.length,
       profiledRowCount: dataRows.length,
-      profiledColumnCount: numericIndexes.length,
-      missingRate: roundProfileValue(missing / totalCells),
-      trendStrength: roundProfileValue(profileTrend(matrix, timeAxis)),
-      seasonalityStrength: roundProfileValue(seasonality.strength),
-	      crossVarCorrelation: roundProfileValue(
-	        correlationMatrix ? crossCorrelationFromMatrix(correlationMatrix) : profileCrossCorrelation(matrix),
-	      ),
-	      distributionShift: roundProfileValue(profileDistributionShift(matrix)),
-	      outlierRate: roundProfileValue(profileOutlierRate(matrix)),
-	      ...(seasonality.period === undefined
-	        ? {}
-	        : {
-	            acfMainPeriod: seasonality.period,
-	            acfMainPeriodStrength: roundProfileValue(seasonality.strength),
-	          }),
-	      ...(adf === undefined
-	        ? {}
-	        : {
-	            adfStatistic: adf.statistic,
-	            adfStationary: adf.stationary,
-	          }),
-	      ...(correlationMatrix === undefined ? {} : { correlationMatrix }),
-	      ...profileTimestampQuality(profileHeader, dataRows),
-	    },
-	  }
-	}
+      profiledColumnCount: targets.length + covariates.length,
+      profiledTargetColumns: targets.map((item) => item.name),
+      profiledCovariateColumns: covariates.map((item) => item.name),
+      ...profileSeries(matrix, timeAxis),
+      covariateProfiles: covariates.map((item) => ({ column: item.name, role: "observed_past", ...profileSeries(item.values.map((value) => [value]), timeAxis) })),
+      correlations,
+      ...(correlations.meanAbsCorrelation === undefined ? {} : { crossVarCorrelation: correlations.meanAbsCorrelation }),
+      ...profileTimestampQuality(profileHeader, dataRows),
+    },
+  }
+}
 
 function datasetProfileBiases(profile: DatasetProfile | undefined) {
   if (!profile) return []
   return [
     profile.seasonalityStrength >= 0.4 || (profile.acfMainPeriod !== undefined && profile.seasonalityStrength >= 0.2) ? "seasonal" : undefined,
     profile.trendStrength >= 0.2 ? "trend" : undefined,
-    profile.crossVarCorrelation >= 0.5 ? "cross_var_correlated" : undefined,
+    (profile.crossVarCorrelation ?? 0) >= 0.5 ? "cross_var_correlated" : undefined,
     profile.missingRate > 0 ? "missing_values" : undefined,
     profile.distributionShift >= 0.5 ? "distribution_shift" : undefined,
   ].filter((value): value is string => typeof value === "string")
@@ -1977,7 +1931,7 @@ function datasetProfileFromFingerprint(taskFingerprint: Record<string, unknown>)
     missingRate: numberFromRecord(record, "missingRate"),
     trendStrength: numberFromRecord(record, "trendStrength"),
 	    seasonalityStrength: numberFromRecord(record, "seasonalityStrength"),
-	    crossVarCorrelation: numberFromRecord(record, "crossVarCorrelation"),
+	    ...(typeof record.crossVarCorrelation === "number" ? { crossVarCorrelation: record.crossVarCorrelation } : {}),
 	    distributionShift: numberFromRecord(record, "distributionShift"),
 	    ...(typeof record.outlierRate === "number" ? { outlierRate: numberFromRecord(record, "outlierRate") } : {}),
 	    ...(typeof record.acfMainPeriod === "number" ? { acfMainPeriod: numberFromRecord(record, "acfMainPeriod") } : {}),
@@ -2368,7 +2322,7 @@ function profileSimilarity(taskFingerprint: JsonRecord, memoryFingerprint: unkno
     Math.abs(current.missingRate - previous.missingRate),
     Math.abs(current.trendStrength - previous.trendStrength),
     Math.abs(current.seasonalityStrength - previous.seasonalityStrength),
-    Math.abs(current.crossVarCorrelation - previous.crossVarCorrelation),
+    current.crossVarCorrelation === undefined || previous.crossVarCorrelation === undefined ? 0 : Math.abs(current.crossVarCorrelation - previous.crossVarCorrelation),
     Math.abs(current.distributionShift - previous.distributionShift),
     Math.abs(current.targetCount - previous.targetCount) / Math.max(current.targetCount, previous.targetCount, 1),
   ]
@@ -2748,8 +2702,8 @@ function profileMutationSequence(task: TSFTaskSpec, taskFingerprint: JsonRecord)
   }
 
   // 2. Cross-var correlated: switch temporal fusion to gated_hybrid
-  if (biases.has("cross_var_correlated") || (profile && profile.crossVarCorrelation >= 0.5)) {
-    const crossVarCorrelation = profile ? Number(profile.crossVarCorrelation.toFixed(3)) : "unknown"
+  if (biases.has("cross_var_correlated") || (profile && (profile.crossVarCorrelation ?? 0) >= 0.5)) {
+    const crossVarCorrelation = profile ? Number((profile.crossVarCorrelation ?? 0).toFixed(3)) : "unknown"
     factories.push((base, recipeID) => {
       if (base.fusion.type !== "temporal") return undefined
       return recipe(task, {

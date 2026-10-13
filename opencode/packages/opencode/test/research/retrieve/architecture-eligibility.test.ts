@@ -61,6 +61,10 @@ test("missing channel diagnostics cannot be renamed a matched weak-dependence co
     .some((issue) => issue.includes("Cross-channel diagnostics are unavailable"))).toBe(true)
   const computed = { quantitativeReport: { ...missing.quantitativeReport, statistics: { ...report().statistics, crossLag: { source: "temp", target: "load", lag: 0, correlation: 0 } } } }
   expect(architectureEligibilityIssues(review, computed)).toEqual([])
+  const measured = { quantitativeReport: { ...missing.quantitativeReport, profile: { ...missing.quantitativeReport.profile,
+    correlations: { scope: "target_covariate", evaluatedPairCount: 1, validPairCount: 1, meanAbsCorrelation: 0, maxAbsCorrelation: 0, strongestPairs: [] },
+  } } }
+  expect(architectureEligibilityIssues(review, measured)).toEqual([])
 })
 
 test("PatchTST local-patch knowledge maps to patch tokenization without reproducing its full pipeline", () => {

@@ -14,33 +14,34 @@ export const SpectralPeakSchema = z.object({
 }).strict()
 export type SpectralPeak = z.infer<typeof SpectralPeakSchema>
 
-export const DatasetQuantitativeAnalysisSchema = z.object({
-  schemaVersion: z.literal("dataset_quantitative_analysis_v1"),
-  taskID: z.string().min(1),
-  domain: z.string().min(1),
-  dataset: z.object({
-    samplingFrequency: z.string().min(1),
-    targetColumns: z.array(z.string()),
-    observedPastCovariates: z.array(z.string()),
-    knownFutureCovariates: z.array(z.string()),
-    staticCovariates: z.array(z.string()),
-  }).strict(),
-  forecast: z.object({
-    contextLength: z.number().int().positive(),
-    predictionLengths: z.array(z.number().int().positive()).min(1),
-    horizonContextRatio: FiniteNumber.nonnegative(),
-  }).strict(),
-  profile: z.object({
-    rowCount: z.number().int().nonnegative(),
-    missingRate: FiniteNumber.min(0).max(1),
-    trendStrength: FiniteNumber.nonnegative(),
-    seasonalityStrength: FiniteNumber.nonnegative(),
-    crossVarCorrelation: FiniteNumber.nonnegative(),
-    distributionShift: FiniteNumber.nonnegative(),
-    outlierRate: FiniteNumber.min(0).max(1),
-    irregularIntervalRatio: FiniteNumber.min(0).max(1),
-  }).strict(),
-  statistics: z.object({
+export const SeriesProfileSchema = z.object({
+  missingRate: FiniteNumber.min(0).max(1),
+  trendStrength: FiniteNumber.nonnegative(),
+  seasonalityStrength: FiniteNumber.nonnegative(),
+  distributionShift: FiniteNumber.nonnegative(),
+  outlierRate: FiniteNumber.min(0).max(1),
+  acfMainPeriod: z.number().int().positive().optional(),
+  acfMainPeriodStrength: FiniteNumber.nonnegative().optional(),
+  adfStatistic: FiniteNumber.optional(),
+  adfStationary: z.boolean().optional(),
+}).strict()
+export type SeriesProfile = z.infer<typeof SeriesProfileSchema>
+
+export const CorrelationSummarySchema = z.object({
+  scope: z.enum(["target_covariate", "target_target"]),
+  evaluatedPairCount: z.number().int().nonnegative(),
+  validPairCount: z.number().int().nonnegative(),
+  meanAbsCorrelation: FiniteNumber.min(0).max(1).optional(),
+  maxAbsCorrelation: FiniteNumber.min(0).max(1).optional(),
+  strongestPairs: z.array(z.object({
+    source: z.string().min(1),
+    target: z.string().min(1),
+    correlation: FiniteNumber.min(-1).max(1),
+  }).strict()),
+}).strict()
+export type CorrelationSummary = z.infer<typeof CorrelationSummarySchema>
+
+export const DatasetStatisticsSchema = z.object({
     stationarity: z.object({
       adfStatistic: FiniteNumber.optional(),
       adfStationary: z.boolean().optional(),
@@ -75,7 +76,48 @@ export const DatasetQuantitativeAnalysisSchema = z.object({
       lag: z.number().int().optional(),
       correlation: FiniteNumber.optional(),
     }).strict(),
+  }).strict()
+
+export const DatasetQuantitativeAnalysisSchema = z.object({
+  schemaVersion: z.literal("dataset_quantitative_analysis_v1"),
+  taskID: z.string().min(1),
+  domain: z.string().min(1),
+  dataset: z.object({
+    samplingFrequency: z.string().min(1),
+    targetColumns: z.array(z.string()),
+    observedPastCovariates: z.array(z.string()),
+    knownFutureCovariates: z.array(z.string()),
+    staticCovariates: z.array(z.string()),
   }).strict(),
+  forecast: z.object({
+    contextLength: z.number().int().positive(),
+    predictionLengths: z.array(z.number().int().positive()).min(1),
+    horizonContextRatio: FiniteNumber.nonnegative(),
+  }).strict(),
+  analysisCoverage: z.object({
+    profiledRows: z.number().int().nonnegative(),
+    statisticRows: z.number().int().nonnegative(),
+    targetColumns: z.array(z.string()),
+    covariateColumns: z.array(z.string()),
+  }).strict().optional(),
+  profile: z.object({
+    rowCount: z.number().int().nonnegative(),
+    missingRate: FiniteNumber.min(0).max(1),
+    trendStrength: FiniteNumber.nonnegative(),
+    seasonalityStrength: FiniteNumber.nonnegative(),
+    crossVarCorrelation: FiniteNumber.nonnegative().optional(),
+    correlations: CorrelationSummarySchema.optional(),
+    distributionShift: FiniteNumber.nonnegative(),
+    outlierRate: FiniteNumber.min(0).max(1),
+    irregularIntervalRatio: FiniteNumber.min(0).max(1),
+  }).strict(),
+  statistics: DatasetStatisticsSchema,
+  covariates: z.array(z.object({
+    column: z.string().min(1),
+    role: z.literal("observed_past"),
+    profile: SeriesProfileSchema,
+    statistics: DatasetStatisticsSchema,
+  }).strict()).optional(),
   warnings: z.array(z.string()),
   sourceArtifactIDs: z.array(z.string()),
 }).strict()

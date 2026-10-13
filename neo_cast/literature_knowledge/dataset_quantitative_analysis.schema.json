@@ -5,6 +5,35 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "taskID", "domain", "dataset", "forecast", "profile", "statistics", "warnings", "sourceArtifactIDs"],
+  "$defs": {
+    "seriesProfile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["missingRate", "trendStrength", "seasonalityStrength", "distributionShift", "outlierRate"],
+      "properties": {
+        "missingRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "trendStrength": {"type": "number", "minimum": 0},
+        "seasonalityStrength": {"type": "number", "minimum": 0},
+        "distributionShift": {"type": "number", "minimum": 0},
+        "outlierRate": {"type": "number", "minimum": 0, "maximum": 1},
+        "acfMainPeriod": {"type": "integer", "minimum": 1},
+        "acfMainPeriodStrength": {"type": "number", "minimum": 0},
+        "adfStatistic": {"type": "number"},
+        "adfStationary": {"type": "boolean"}
+      }
+    },
+    "correlations": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scope", "evaluatedPairCount", "validPairCount", "strongestPairs"],
+      "properties": {
+        "scope": {"enum": ["target_covariate", "target_target"]},
+        "evaluatedPairCount": {"type": "integer", "minimum": 0},
+        "validPairCount": {"type": "integer", "minimum": 0},
+        "meanAbsCorrelation": {"type": "number", "minimum": 0, "maximum": 1},
+        "maxAbsCorrelation": {"type": "number", "minimum": 0, "maximum": 1},
+        "strongestPairs": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["source", "target", "correlation"], "properties": {"source": {"type": "string", "minLength": 1}, "target": {"type": "string", "minLength": 1}, "correlation": {"type": "number", "minimum": -1, "maximum": 1}}}}
+      }
+    }
+  },
   "properties": {
     "schemaVersion": {"const": "dataset_quantitative_analysis_v1"},
     "taskID": {"type": "string", "minLength": 1},
@@ -29,15 +58,23 @@
         "horizonContextRatio": {"type": "number", "minimum": 0}
       }
     },
+    "analysisCoverage": {
+      "type": "object", "additionalProperties": false, "required": ["profiledRows", "statisticRows", "targetColumns", "covariateColumns"],
+      "properties": {
+        "profiledRows": {"type": "integer", "minimum": 0}, "statisticRows": {"type": "integer", "minimum": 0},
+        "targetColumns": {"type": "array", "items": {"type": "string"}}, "covariateColumns": {"type": "array", "items": {"type": "string"}}
+      }
+    },
     "profile": {
       "type": "object", "additionalProperties": false,
-      "required": ["rowCount", "missingRate", "trendStrength", "seasonalityStrength", "crossVarCorrelation", "distributionShift", "outlierRate", "irregularIntervalRatio"],
+      "required": ["rowCount", "missingRate", "trendStrength", "seasonalityStrength", "distributionShift", "outlierRate", "irregularIntervalRatio"],
       "properties": {
         "rowCount": {"type": "integer", "minimum": 0},
         "missingRate": {"type": "number", "minimum": 0, "maximum": 1},
         "trendStrength": {"type": "number", "minimum": 0},
         "seasonalityStrength": {"type": "number", "minimum": 0},
         "crossVarCorrelation": {"type": "number", "minimum": 0},
+        "correlations": {"$ref": "#/$defs/correlations"},
         "distributionShift": {"type": "number", "minimum": 0},
         "outlierRate": {"type": "number", "minimum": 0, "maximum": 1},
         "irregularIntervalRatio": {"type": "number", "minimum": 0, "maximum": 1}
@@ -59,6 +96,15 @@
         },
         "changepoint": {"type": "object", "additionalProperties": false, "properties": {"index": {"type": "integer", "minimum": 0}, "score": {"type": "number", "minimum": 0}, "severity": {"enum": ["low", "medium", "high"]}}},
         "crossLag": {"type": "object", "additionalProperties": false, "properties": {"source": {"type": "string", "minLength": 1}, "target": {"type": "string", "minLength": 1}, "lag": {"type": "integer"}, "correlation": {"type": "number"}}}
+      }
+    },
+    "covariates": {
+      "type": "array", "items": {
+        "type": "object", "additionalProperties": false, "required": ["column", "role", "profile", "statistics"],
+        "properties": {
+          "column": {"type": "string", "minLength": 1}, "role": {"const": "observed_past"},
+          "profile": {"$ref": "#/$defs/seriesProfile"}, "statistics": {"$ref": "#/properties/statistics"}
+        }
       }
     },
     "warnings": {"type": "array", "items": {"type": "string"}},

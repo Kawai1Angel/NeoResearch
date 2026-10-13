@@ -930,7 +930,7 @@ describe("Research service", () => {
         expect(unified).toContain("领域解读")
         expect(unified).toContain("![Time series overview](quantitative/plots/time-series-overview.png)")
         expect(unified).toContain("ADF stationarity")
-        expect(unified).toContain("## Correlation Matrix")
+        expect(unified).toContain("## Target Correlations")
         const plotArtifacts = analysisArtifacts.filter((artifact) => artifact.kind === "dataset_analysis_plot_png")
         expect(plotArtifacts.map((artifact) => artifact.metadata.plotType).sort()).toEqual([
           "acf_pacf",

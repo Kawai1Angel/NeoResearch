@@ -75,8 +75,11 @@ export function mapScientificConcepts(
   if (report.dataset.knownFutureCovariates.length > 0) {
     result.push(concept("covariate_conditioning", 0.95, [byPath.get("$.dataset.knownFutureCovariates")], "Use information known over the forecast horizon."))
   }
-  if (report.profile.crossVarCorrelation >= 0.5) {
-    result.push(concept("cross_series_dependency", report.profile.crossVarCorrelation, [byPath.get("$.profile.crossVarCorrelation")], "Capture dependencies between variables."))
+  if (report.dataset.observedPastCovariates.length > 0 && report.dataset.knownFutureCovariates.length === 0) {
+    result.push(concept("covariate_conditioning", 0.9, [byPath.get("$.dataset.observedPastCovariates"), byPath.get("$.covariates")], "Evaluate conditioning on historical exogenous inputs using their own diagnostics."))
+  }
+  if ((report.profile.crossVarCorrelation ?? 0) >= 0.5) {
+    result.push(concept("cross_series_dependency", report.profile.crossVarCorrelation!, [byPath.get("$.profile.crossVarCorrelation")], "Capture dependencies between variables."))
   }
   if (Math.abs(report.statistics.crossLag.correlation ?? 0) >= 0.4 && report.statistics.crossLag.lag !== undefined) {
     result.push(concept("lead_lag_relationship", Math.abs(report.statistics.crossLag.correlation ?? 0), [byPath.get("$.statistics.crossLag")], "Capture delayed effects across variables."))

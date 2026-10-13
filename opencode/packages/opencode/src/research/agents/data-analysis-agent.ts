@@ -1,7 +1,8 @@
-import { resolveTSFProfileSource, TSFTaskSpec } from "../domains/tsf"
+import { profileSeries, resolveTSFProfileSource, TSFTaskSpec } from "../domains/tsf"
 import { decomposeSeasonality } from "../seasonality"
 import { taskExecutionRoot } from "../task-isolation"
-import { analyzeDatasetProfileForPrompt, renderCorrelationMatrixSummary } from "../prompt-context"
+import { analyzeDatasetProfileForPrompt, renderCorrelationSummary } from "../prompt-context"
+import { spectralPowers } from "../spectral-analysis"
 import { deflateSync } from "zlib"
 import { Instance } from "@/project/instance"
 import type { JsonRecord, ResearchArtifact, ResearchArtifactID, ResearchTask } from "../schema"
@@ -9,6 +10,7 @@ import {
   DatasetQuantitativeAnalysisSchema,
   type DatasetQuantitativeAnalysis,
   type SpectralPeak,
+  type SeriesProfile,
 } from "../retrieve/contract"
 
 export type DatasetAnalysisPlot = {
@@ -58,7 +60,9 @@ export type DatasetStatisticalAnalysis = {
 }
 
 export type DatasetAnalysisContext = {
+  readonly rowCount?: number
   readonly statistics: DatasetStatisticalAnalysis
+  readonly covariates?: readonly { column: string; role: "observed_past"; profile: SeriesProfile; statistics: DatasetStatisticalAnalysis }[]
   readonly plotRefs: readonly DatasetAnalysisPlot[]
 }
 
@@ -103,7 +107,7 @@ function stringArray(value: unknown) {
 }
 
 function renderCorrelationMatrix(value: unknown) {
-  return renderCorrelationMatrixSummary(value)
+  return renderCorrelationSummary(value)
 }
 
 function renderDatasetProfileAnalysis(value: unknown) {
@@ -230,28 +234,36 @@ function datasetTargetColumns(task: ResearchTask, header: readonly string[]) {
   return header.slice(1)
 }
 
-async function loadDatasetSeriesMatrix(task: ResearchTask): Promise<DatasetSeriesMatrix | undefined> {
+async function loadDatasetSeriesMatrix(task: ResearchTask): Promise<{ targets: DatasetSeriesMatrix; covariates: DatasetSeriesMatrix; timestamps?: number[] } | undefined> {
   const spec = TSFTaskSpec.safeParse(task.taskSpec)
   if (!spec.success) return undefined
   const source = resolveTSFProfileSource(spec.data, {
     taskID: task.id, projectRoot: Instance.directory, workspaceRoot: taskExecutionRoot(task, Instance.directory),
   })
   if (source.raw === undefined) return undefined
-  const text = source.raw
-  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0)
+  const lines = source.raw.split(/\r?\n/).filter((line) => line.trim().length > 0)
   if (lines.length < 3) return undefined
   const header = csvCells(lines[0]!)
-  const columns = datasetTargetColumns(task, header)
-  const columnIndexes = columns.map((column) => header.indexOf(column))
-  if (columns.length === 0 || columnIndexes.some((index) => index < 0)) return undefined
-  const values = lines.slice(1, source.usingTrainFile ? undefined : 5001).map((line) => {
-    const row = csvCells(line)
-    return columnIndexes.map((columnIndex) => {
-      const parsed = Number(row[columnIndex])
-      return Number.isFinite(parsed) ? parsed : Number.NaN
-    })
-  })
-  return { columns, values }
+  const targets = datasetTargetColumns(task, header).filter((name) => !spec.data.dataset.observedPastCovariates.includes(name))
+  const covariates = spec.data.dataset.observedPastCovariates
+  if (!targets.length || covariates.some((name) => !header.includes(name))) return undefined
+  // Match the bounded column selection in the fingerprint; each role has its own limit.
+  const sample = (columns: readonly string[]) => columns.length <= 20 ? [...columns]
+    : Array.from({ length: 20 }, (_, index) => columns[Math.round(index * (columns.length - 1) / 19)]!)
+  const targetColumns = sample(targets), covariateColumns = sample(covariates)
+  const indexes = [...targetColumns, ...covariateColumns].map((name) => header.indexOf(name))
+  const timestampIndex = header.findIndex((name) => ["date", "time", "timestamp", "datetime"].includes(name.toLowerCase()))
+  const rows = lines.slice(1, source.usingTrainFile ? undefined : 5001).map(csvCells)
+  const values = rows.map((row) => indexes.map((index) => {
+    const value = row[index]?.trim()
+    return value && Number.isFinite(Number(value)) ? Number(value) : Number.NaN
+  }))
+  const timestamps = timestampIndex < 0 ? undefined : rows.map((row) => Date.parse(row[timestampIndex] ?? ""))
+  return {
+    targets: { columns: targetColumns, values: values.map((row) => row.slice(0, targetColumns.length)) },
+    covariates: { columns: covariateColumns, values: values.map((row) => row.slice(targetColumns.length)) },
+    timestamps,
+  }
 }
 
 function finiteSeries(values: readonly number[]) {
@@ -348,8 +360,8 @@ function stationarityAnalysis(matrix: DatasetSeriesMatrix, profile: Record<strin
 function acfPacfAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
   const acfValues = Array.from({ length: maxLag }, (_, index) => {
     const lag = index + 1
-    return { lag, value: averageAutocorrelation(matrix, lag) ?? 0 }
-  })
+    return { lag, value: averageAutocorrelation(matrix, lag) }
+  }).filter((item): item is { lag: number; value: number } => item.value !== undefined)
   const pacfValues = acfValues.map((item, index) => ({
     lag: item.lag,
     value: index === 0 ? item.value : item.value - acfValues[index - 1]!.value * acfValues[0]!.value,
@@ -365,22 +377,13 @@ function acfPacfAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
 }
 
 function frequencyAnalysis(series: readonly number[]) {
-  const values = finiteSeries(series)
-  const avg = finiteMean(values) ?? 0
-  const centered = values.map((value) => value - avg)
+  const avg = finiteMean(series) ?? 0
+  // Preserve observation positions rather than compressing time across missing cells.
+  const centered = series.map((value) => Number.isFinite(value) ? value - avg : 0)
   if (centered.length < 4) return { spectralPeaks: [] }
-  const powers: Array<{ period: number; power: number }> = []
-  for (let k = 1; k <= Math.floor(centered.length / 2); k++) {
-    let real = 0
-    let imag = 0
-    for (let index = 0; index < centered.length; index++) {
-      const angle = (2 * Math.PI * k * index) / centered.length
-      real += centered[index]! * Math.cos(angle)
-      imag -= centered[index]! * Math.sin(angle)
-    }
-    powers.push({ period: centered.length / k, power: real * real + imag * imag })
-  }
+  const powers = spectralPowers(centered)
   const totalPower = powers.reduce((sum, item) => sum + item.power, 0)
+  if (totalPower <= 1e-20) return { spectralPeaks: [] }
   const best = powers.toSorted((left, right) => right.power - left.power)[0]
   const localPeaks = powers.filter((item, index) => {
     const previous = powers[index - 1]?.power ?? Number.NEGATIVE_INFINITY
@@ -405,16 +408,18 @@ function frequencyAnalysis(series: readonly number[]) {
 }
 
 function changepointAnalysis(series: readonly number[]) {
-  const values = finiteSeries(series)
-  const std = Math.sqrt(variance(values) ?? 0)
-  const minWindow = Math.max(6, Math.floor(values.length * 0.1))
-  if (values.length < minWindow * 2 || std === 0) return {}
+  const std = Math.sqrt(variance(series) ?? 0)
+  const minWindow = Math.max(6, Math.floor(series.length * 0.1))
+  if (series.length < minWindow * 2 || std === 0) return {}
+  const total = finiteSeries(series).reduce((sum, value) => sum + value, 0)
+  const count = finiteSeries(series).length
+  let prefix = 0, prefixCount = 0
   let best: { index: number; score: number } | undefined
-  for (let index = minWindow; index <= values.length - minWindow; index++) {
-    const left = finiteMean(values.slice(0, index))
-    const right = finiteMean(values.slice(index))
-    if (left === undefined || right === undefined) continue
-    const score = Math.abs(left - right) / std
+  for (let index = 1; index <= series.length - minWindow; index++) {
+    const value = series[index - 1]!
+    if (Number.isFinite(value)) { prefix += value; prefixCount++ }
+    if (index < minWindow || !prefixCount || count === prefixCount) continue
+    const score = Math.abs(prefix / prefixCount - (total - prefix) / (count - prefixCount)) / std
     if (!best || score > best.score) best = { index, score }
   }
   return {
@@ -424,24 +429,19 @@ function changepointAnalysis(series: readonly number[]) {
   }
 }
 
-function crossLagAnalysis(matrix: DatasetSeriesMatrix, maxLag: number) {
+function crossLagAnalysis(targets: DatasetSeriesMatrix, maxLag: number, covariates?: DatasetSeriesMatrix) {
   let best: DatasetStatisticalAnalysis["crossLag"] = {}
-  for (let leftIndex = 0; leftIndex < matrix.columns.length; leftIndex++) {
-    for (let rightIndex = 0; rightIndex < matrix.columns.length; rightIndex++) {
-      if (leftIndex === rightIndex) continue
-      const left = matrixColumn(matrix, leftIndex)
-      const right = matrixColumn(matrix, rightIndex)
-      for (let lag = -maxLag; lag <= maxLag; lag++) {
-        if (lag === 0) continue
+  const sources = covariates?.columns.length ? covariates : targets
+  for (let sourceIndex = 0; sourceIndex < sources.columns.length; sourceIndex++) {
+    for (let targetIndex = 0; targetIndex < targets.columns.length; targetIndex++) {
+      if (sources.columns[sourceIndex] === targets.columns[targetIndex]) continue
+      const left = matrixColumn(sources, sourceIndex), right = matrixColumn(targets, targetIndex)
+      // Positive lag means the observed source leads the target. No future covariate values are used.
+      for (let lag = 1; lag <= maxLag; lag++) {
         const correlation = correlationAtLag(left, right, lag)
         if (correlation === undefined) continue
         if (best.correlation === undefined || Math.abs(correlation) > Math.abs(best.correlation)) {
-          best = {
-            source: matrix.columns[leftIndex],
-            target: matrix.columns[rightIndex],
-            lag,
-            correlation: roundAnalysisValue(correlation),
-          }
+          best = { source: sources.columns[sourceIndex], target: targets.columns[targetIndex], lag, correlation: roundAnalysisValue(correlation) }
         }
       }
     }
@@ -594,10 +594,23 @@ function buildDatasetAnalysisPlots(
 }
 
 export async function buildDatasetAnalysisContext(task: ResearchTask, fingerprint: JsonRecord): Promise<DatasetAnalysisContext> {
-  const matrix = await loadDatasetSeriesMatrix(task)
-  const statistics = buildStatisticalAnalysis(matrix, fingerprint)
+  const bundle = await loadDatasetSeriesMatrix(task)
+  const matrix = bundle?.targets
+  const statistics = { ...buildStatisticalAnalysis(matrix, fingerprint),
+    ...(bundle?.covariates.columns.length ? { crossLag: crossLagAnalysis(bundle.targets, 24, bundle.covariates) } : {}),
+  }
+  const covariates = bundle?.covariates.columns.map((column, index) => {
+    const matrix = { columns: [column], values: bundle.covariates.values.map((row) => [row[index]!]) }
+    const profile = profileSeries(matrix.values, bundle.timestamps)
+    const statistics = { ...buildStatisticalAnalysis(matrix, { datasetProfile: profile } as unknown as JsonRecord),
+      crossLag: crossLagAnalysis(bundle.targets, 24, matrix),
+    }
+    return { column, role: "observed_past" as const, profile, statistics }
+  })
   return {
     statistics,
+    rowCount: matrix?.values.length,
+    ...(covariates?.length ? { covariates } : {}),
     plotRefs: buildDatasetAnalysisPlots(matrix, statistics),
   }
 }
@@ -648,22 +661,46 @@ export function buildDatasetQuantitativeAnalysis(input: {
       predictionLengths: safePredictionLengths,
       horizonContextRatio: finiteOrZero(input.fingerprint.horizonContextRatio) || Math.max(...safePredictionLengths) / contextLength,
     },
+    ...(input.context.rowCount === undefined ? {} : { analysisCoverage: {
+      profiledRows: nonnegativeIntegerOrZero(profile.profiledRowCount),
+      statisticRows: input.context.rowCount,
+      targetColumns: stringArray(profile.profiledTargetColumns),
+      covariateColumns: stringArray(profile.profiledCovariateColumns),
+    } }),
     profile: {
       rowCount: nonnegativeIntegerOrZero(profile.rowCount),
       missingRate: finiteOrZero(profile.missingRate),
       trendStrength: finiteOrZero(profile.trendStrength),
       seasonalityStrength: finiteOrZero(profile.seasonalityStrength),
-      crossVarCorrelation: finiteOrZero(profile.crossVarCorrelation),
+      crossVarCorrelation: numberValue(profile.crossVarCorrelation),
+      ...(profile.correlations ? { correlations: profile.correlations } : {}),
       distributionShift: finiteOrZero(profile.distributionShift),
       outlierRate: finiteOrZero(profile.outlierRate),
       irregularIntervalRatio: finiteOrZero(profile.irregularIntervalRatio),
     },
     statistics: input.context.statistics,
+    ...(input.context.covariates ? { covariates: input.context.covariates } : {}),
     warnings: Object.keys(warning).length === 0
       ? []
       : [`${typeof warning.code === "string" ? warning.code : "dataset_profile_warning"}: ${typeof warning.message === "string" ? warning.message : "dataset profile warning"}`],
     sourceArtifactIDs: input.sourceArtifactIDs ?? [],
   })
+}
+
+function renderCovariateAnalysis(report: DatasetQuantitativeAnalysis) {
+  const lines = ["## Target Correlations", "", ...renderCorrelationSummary(report.profile.correlations), "", "## Observed-past Covariate Analysis", ""]
+  if (!report.covariates?.length) return [...lines, "- No covariate diagnostics are available; this does not establish weak or independent covariates.", ""]
+  for (const item of report.covariates) {
+    const stats = item.statistics
+    lines.push(`### ${item.column}`, "", ...renderDatasetProfileAnalysis(item.profile), "",
+      `- Stationarity: ${JSON.stringify(stats.stationarity)}`,
+      `- ACF/PACF: ${JSON.stringify(stats.acf)}`,
+      `- Moving-average seasonal decomposition: ${JSON.stringify(stats.decomposition)}`,
+      `- Frequency: ${JSON.stringify(stats.frequency)}`,
+      `- Change point: ${JSON.stringify(stats.changepoint)}`,
+      `- Lead-lag into targets (positive lag = covariate leads): ${JSON.stringify(stats.crossLag)}`, "")
+  }
+  return lines
 }
 
 export function analyzeDataset(input: {
@@ -688,7 +725,7 @@ export function analyzeDataset(input: {
     ["Missing rate", profile.missingRate, "fraction of missing numeric target cells"],
     ["Trend strength", profile.trendStrength, "mean absolute correlation with time index"],
     ["Seasonality strength", profile.seasonalityStrength, "mean positive detrended ACF peak strength; cadence-aware periods, at least three cycles"],
-    ["Cross-variate correlation", profile.crossVarCorrelation, "mean absolute pairwise target correlation"],
+    ["Cross-variate correlation", profile.crossVarCorrelation, "mean absolute target–covariate correlation when covariates are configured; otherwise target–target correlation; unavailable pairs are omitted"],
     ["Distribution shift", profile.distributionShift, "normalized first-half vs second-half drift"],
     ["Outlier rate", profile.outlierRate, "IQR-based extreme-value share"],
     ["ACF main period", rawProfile.acfMainPeriod, "detected seasonal period in observations; short-lag persistence alone is insufficient"],
@@ -707,8 +744,8 @@ export function analyzeDataset(input: {
     ["Dominant frequency power share", stats.frequency.dominantPowerShare, "share of spectral energy explained by the dominant period"],
     ["Change point", stats.changepoint.index, "index with largest normalized mean shift between prefix and suffix windows"],
     ["Change point score", stats.changepoint.score, "normalized change-point severity score"],
-    ["Cross-lag", stats.crossLag.lag, "best non-zero lag between target columns"],
-    ["Cross-lag correlation", stats.crossLag.correlation, "strongest absolute lead-lag correlation across target pairs"],
+    ["Cross-lag", stats.crossLag.lag, "best positive source-leading lag into forecast targets"],
+    ["Cross-lag correlation", stats.crossLag.correlation, "strongest historical covariate-to-target lead-lag correlation; target pairs only when no covariates are configured"],
   ]
   const lines = [
     "# Quantitative Sub-Agent Data Analysis",
@@ -732,6 +769,11 @@ export function analyzeDataset(input: {
     "",
     "## Dataset Metrics",
     "",
+    ...(quantitative.analysisCoverage ? [
+      `- Target summary and contemporaneous correlations use ${quantitative.analysisCoverage.profiledRows} leading observations; statistical diagnostics and detailed per-covariate profiles use ${quantitative.analysisCoverage.statisticRows} observations. Both use verified training data when available; otherwise both use a bounded source prefix.`,
+      `- Sampled targets: ${quantitative.analysisCoverage.targetColumns.join(", ")}; sampled covariates: ${quantitative.analysisCoverage.covariateColumns.join(", ") || "none"}. Each role is bounded to 20 columns.`,
+      "",
+    ] : []),
     "| Metric | Value | Interpretation |",
     "| --- | ---: | --- |",
     ...rows.map(([label, value, meaning]) => `| ${label} | ${renderAnalysisValue(value)} | ${meaning} |`),
@@ -766,6 +808,7 @@ export function analyzeDataset(input: {
     `- Change point: ${renderAnalysisValue(stats.changepoint.index)} score=${renderAnalysisValue(stats.changepoint.score)} severity=${renderAnalysisValue(stats.changepoint.severity)}`,
     `- Cross-lag: ${renderAnalysisValue(stats.crossLag.source)} -> ${renderAnalysisValue(stats.crossLag.target)} lag=${renderAnalysisValue(stats.crossLag.lag)} corr=${renderAnalysisValue(stats.crossLag.correlation)}`,
     "",
+    ...renderCovariateAnalysis(quantitative),
     "## Visualizations",
     "",
     ...context.plotRefs.map((plot) => `![${plot.metadata.title}](${plot.relativePath})`),
@@ -800,9 +843,15 @@ export function buildDatasetAnalysisReportMarkdown(input: {
     "",
     ...renderDatasetProfileAnalysis(profile),
     "",
-    "## Correlation Matrix",
+    "## Target Correlations",
     "",
-    ...renderCorrelationMatrix(profile.correlationMatrix),
+    ...renderCorrelationMatrix(profile.correlations),
+    "",
+    "## Observed-past Covariate Profiles",
+    "",
+    ...(Array.isArray(profile.covariateProfiles) ? profile.covariateProfiles.flatMap((item) => [
+      `### ${String(recordValue(item).column)}`, ...renderDatasetProfileAnalysis(item), "",
+    ]) : ["- No covariate profiles available."]),
     "",
     "## Search Handoff",
     "",
