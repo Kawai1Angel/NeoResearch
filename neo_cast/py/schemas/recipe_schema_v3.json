@@ -1326,6 +1326,22 @@
           ],
           "properties": {
             "type": {
+              "const": "identity"
+            },
+            "output_distribution": {
+              "const": "point"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "output_distribution"
+          ],
+          "properties": {
+            "type": {
               "const": "linear"
             },
             "output_distribution": {

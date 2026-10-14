@@ -295,6 +295,8 @@ For relay keys, `NEO_CAST_LLM_API_KEY`, `OPENAI_API_KEY`, or `AIGCBEST_API_KEY` 
   <task_id>_ref_test.csv
 ```
 
+Source CSV column names have leading and trailing whitespace removed before inference and validation; internal spaces are preserved (for example, ` Generation forecast` becomes `Generation forecast`). Names that collide after trimming are rejected. The source file is unchanged, and prepared splits and contracts use the trimmed names.
+
 The default input is still a full `ETTh1.csv` with these columns:
 
 ```text
@@ -348,6 +350,7 @@ Missing values and timestamps:
 
 - Default missing strategy is `forward_fill`; alternatives are `reject`, `drop`, `mean_fill`, and `linear_interpolate`.
 - `prepare-data` profiles timestamp frequency, duplicate timestamps, monotonic order, and irregular interval ratio.
+- Exact duplicate source rows are removed before splitting, with removal counts recorded in the profile's `duplicate_action`. Conflicting timestamp duplicates still fail. Explicit row ranges refer to deduplicated rows; `--split-ratios 7,1,2` computes boundaries from the deduplicated row count.
 - Irregular timestamps are allowed by default with a warning because the current trainer still uses row-based windows; use `--reject-irregular` to fail fast.
 - The profile is written to `.neo-cast/dataset/<task_id>_profile.json` and copied into exported `preprocess.json`.
 

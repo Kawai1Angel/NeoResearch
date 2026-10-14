@@ -101,9 +101,12 @@ ACTION_REQUIRED_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     },
 }
 
-# V2 stays frozen. V3 adds sequence-preserving encoders with its typed validator.
+# V2 stays frozen. V3 adds sequence encoders and a parameter-free forecast head.
 V3_ACTION_SPECS = {
     **ACTION_SPECS,
+    "head": {**ACTION_SPECS["head"], "identity": {
+        "phase_min": "phase2", "bridge_supported": False, "recipe_version": "recipe_schema_v3",
+    }},
     "backbone": {**ACTION_SPECS["backbone"], **{
         name: {"phase_min": "phase2", "bridge_supported": False, "recipe_version": "recipe_schema_v3"}
         for name in ("diagonal_ssm", "timesblock_encoder", "mamba")

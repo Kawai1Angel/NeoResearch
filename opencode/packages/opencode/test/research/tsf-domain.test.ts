@@ -30,6 +30,34 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 describe("TSF research domain", () => {
+  test("renders original DLinear with a parameter-free head and rejects incompatible horizons", () => {
+    const task = Research.DomainRegistry.createTaskSpec("tsf", {
+      ...taskSpec, contextLength: 168, predictionLengths: [24], runtime: { bridgeOnly: false },
+    })
+    const candidate = {
+      ...validTransformerCandidate(),
+      recipeVersion: "recipe_schema_v3",
+      recipeID: "tsf_original_dlinear",
+      preprocessing: { actions: [{ type: "none" }] },
+      embedding: { type: "none" },
+      backbone: { type: "dlinear", kernelSize: 25, individual: false, bias: true },
+      representation: { layout: "channel_latent", readout: "none", latentDim: 24 },
+      composition: { type: "single" },
+      fusion: { type: "temporal", channelMode: "independent" },
+      predictionHead: { type: "identity", outputDistribution: "point" },
+    }
+    const plan = Research.DomainRegistry.createRunPlan("tsf", { taskSpec: task, candidateSpec: candidate, stage: "smoke" })
+    expect(plan.validation.ok).toBe(true)
+    expect(plan.writes[0]!.content.prediction_head).toEqual({ type: "identity", output_distribution: "point" })
+    expect(plan.writes[0]!.content.representation).toMatchObject({ latent_dim: 24 })
+    const multi = Research.DomainRegistry.createTaskSpec("tsf", { ...taskSpec, runtime: { bridgeOnly: false } })
+    expect(Research.DomainRegistry.validateCandidate("tsf", { taskSpec: multi, candidateSpec: candidate }).ok).toBe(false)
+    const legacy = { ...candidate, recipeVersion: "recipe_schema_v2" }
+    delete (legacy as Record<string, unknown>).representation
+    delete (legacy as Record<string, unknown>).composition
+    expect(TSFCandidateRecipe.safeParse(legacy).success).toBe(false)
+  })
+
   test("validates secondary encoders for both composition types before creating a run", () => {
     const task = Research.DomainRegistry.createTaskSpec("tsf", { ...taskSpec, runtime: { bridgeOnly: false } })
     const primary = {
@@ -106,6 +134,27 @@ describe("TSF research domain", () => {
         },
       },
     }).success).toBe(false)
+  })
+
+  test("normalizes role column whitespace before validating names and overlaps", () => {
+    const dataset = {
+      loaderID: "local_csv",
+      targetCols: [" OT "],
+      observedPastCovariates: [" Generation forecast", " System load forecast "],
+    }
+    expect(TSFTaskSpec.parse({ ...taskSpec, dataset }).dataset).toMatchObject({
+      targetCols: ["OT"],
+      observedPastCovariates: ["Generation forecast", "System load forecast"],
+    })
+    for (const role of [
+      { targetCols: ["OT", " OT "] },
+      { observedPastCovariates: ["Generation forecast", " Generation forecast "] },
+      { observedPastCovariates: [" OT "] },
+      { targetCols: ["  "] },
+      { observedPastCovariates: ["  "] },
+    ]) {
+      expect(TSFTaskSpec.safeParse({ ...taskSpec, dataset: { ...dataset, ...role } }).success).toBe(false)
+    }
   })
 
   test("rejects unsupported future and static inputs", () => {

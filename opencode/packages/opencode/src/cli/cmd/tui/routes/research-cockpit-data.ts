@@ -3,6 +3,7 @@ import {
   NAS_DEFAULT_MAX_ITERATIONS,
   NAS_DEFAULT_MAX_NO_IMPROVE,
   RESEARCH_MAX_RUNS_SAFETY_LIMIT,
+  RESEARCH_MAX_PARALLEL_EXPERIMENTS,
 } from "@/research/defaults"
 import { literatureSummary } from "./research-literature-state"
 import { spawnSync } from "node:child_process"
@@ -2608,7 +2609,7 @@ export function buildDefaultTsfResearchTask(
     },
     budget: {
       maxRuns: defaults.maxRuns ?? RESEARCH_MAX_RUNS_SAFETY_LIMIT,
-      maxParallel: 1,
+      maxParallel: RESEARCH_MAX_PARALLEL_EXPERIMENTS,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
       parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
       loop: {

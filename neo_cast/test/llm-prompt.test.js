@@ -81,6 +81,7 @@ test("LLM system prompt exposes advanced fusion and probabilistic heads", () => 
     "gated_hybrid",
   ].sort());
   assert.deepEqual(promptActionList(prompt, "prediction_head"), [
+    "identity",
     "linear",
     "quantile",
     "gaussian",

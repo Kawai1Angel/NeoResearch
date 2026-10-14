@@ -22,6 +22,8 @@ from export import (  # noqa: E402
     render_eval_report,
     render_inference_py,
     render_mcp_server_py,
+    render_example_py,
+    render_readme_md,
     render_tool_schema,
     validate_metadata_payload,
     write_export_files,
@@ -31,6 +33,35 @@ from research_trace import build_research_trace  # noqa: E402
 
 
 class ExportContractTest(unittest.TestCase):
+    def test_example_preserves_dataset_input_roles_and_accepts_explicit_history(self) -> None:
+        for schema, covariate_mean in (("dataset.v1", [7.0, 8.0]), ("dataset.v2", [7.0, 8.0]), ("dataset.v2", None)):
+            with self.subTest(schema=schema, covariate_mean=covariate_mean), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                metadata = {"dataset_schema_version": schema, "input_len": 3, "horizons": [2]}
+                preprocess = {"input_len": 3, "scaler_mean": [2.0], "target_scaler": {"mean": [2.0]}, "covariate_scaler": {"mean": covariate_mean} if covariate_mean else None}
+                (root / "preprocess.json").write_text(json.dumps(preprocess))
+                (root / "example.py").write_text(render_example_py())
+                history = {"target_history": [[2.0]] * 3, "exogenous_past": [covariate_mean or []] * 3} if schema == "dataset.v2" else [[2.0]] * 3
+                (root / "inference.py").write_text(
+                    "import json, pathlib\n"
+                    f"def load_model(): return {{'metadata': {metadata!r}}}\n"
+                    "def predict_raw(bundle, history, horizon):\n"
+                    f"    assert history == {history!r}\n"
+                    "    assert horizon == 2\n"
+                    "    return type('Prediction', (), {'shape': (2, 1)})()\n"
+                )
+                for args in ([], [str(root / "history.json")]):
+                    (root / "history.json").write_text(json.dumps(history))
+                    result = subprocess.run([sys.executable, str(root / "example.py"), *args], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("(2, 1)", result.stdout)
+
+    def test_covariate_readme_describes_structured_history(self) -> None:
+        metadata = {"dataset_schema_version": "dataset.v2", "task_id": "fixture", "model_family": "recipe_factory", "run_id": "fixture", "input_len": 96, "horizons": [96], "feature_names": ["target", "past"], "num_channels": 1, "target_channels": 1, "past_exogenous_channels": 4}
+        readme = render_readme_md(metadata, None)
+        self.assertIn("`target_history` shape `[96, 1]`", readme)
+        self.assertIn("`exogenous_past` shape `[96, 4]`", readme)
+
     def test_export_cli_uses_snapshots_without_importing_training_stack(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

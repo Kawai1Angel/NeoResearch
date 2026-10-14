@@ -7,6 +7,7 @@ import {
   experienceFromMemory,
   experienceFactForPrompt,
   experiencePromptRecord,
+  experienceSummaryForPrompt,
   type ExperienceDraft,
 } from "@/research/experience"
 import { readExperiences, writeExperience } from "@/research/experience-store"
@@ -37,7 +38,15 @@ export const WriteExperienceTool = Tool.define(
             title: "write_experience",
             metadata: { saved: true, experienceID: result.memory.id as string | undefined },
             output: JSON.stringify(
-              { saved: true, created: result.created, experience: experiencePromptRecord(result.memory) },
+              { saved: true, created: result.created, experience: {
+                id: result.memory.id, sourceTaskID: result.memory.taskID,
+                level: experienceFromMemory(result.memory)?.draft.level,
+                polarity: experienceFromMemory(result.memory)?.draft.polarity,
+                supportDatasetCount: experienceFromMemory(result.memory)?.supportDatasetCount,
+                evidence: experienceFromMemory(result.memory)?.draft.evidence,
+                facts: experienceSummaryForPrompt(result.memory).sourceRuns,
+                detailAccess: { tool: "read_experiences", experienceID: result.memory.id, includeFacts: true },
+              } },
               null,
               2,
             ),
@@ -54,6 +63,7 @@ export const WriteExperienceTool = Tool.define(
 )
 
 const ReadParameters = Schema.Struct({
+  experienceID: Schema.optional(Schema.String).annotate({ description: "Read one saved experience by exact ID; use includeFacts=true for its detailed authoritative snapshots." }),
   scope: Schema.optional(Schema.Literals(["task", "project"])).annotate({
     description: "task for current-task experience; project (default) includes other tasks in the same domain.",
   }),
@@ -86,10 +96,13 @@ export const ReadExperiencesTool = Tool.define(
             metadata: { count: 0 },
             output: JSON.stringify({ available: false, error: "Research task session required" }),
           }
-        const limit = Number.isFinite(args.limit) ? Math.max(1, Math.min(50, Math.floor(args.limit!))) : 12
-        const memories = readExperiences(taskID, { ...args, limit })
+        const limit = Number.isFinite(args.limit) ? Math.max(1, Math.min(50, Math.floor(args.limit!)))
+          : ctx.agent === "research-reflection" ? 3 : 12
+        const memories = readExperiences(taskID, { ...args,
+          scope: args.scope ?? (ctx.agent === "research-reflection" && !args.experienceID ? "task" : "project"), limit })
         const experiences = memories.map((memory) => ({
-          ...experiencePromptRecord(memory),
+          ...(ctx.agent === "research-reflection" && !args.includeFacts
+            ? experienceSummaryForPrompt(memory) : experiencePromptRecord(memory)),
           relationship: memory.taskID === taskID ? "same_task" : "same_domain",
           ...(args.includeFacts ? { facts: experienceFromMemory(memory)!.facts.map(experienceFactForPrompt) } : {}),
         }))

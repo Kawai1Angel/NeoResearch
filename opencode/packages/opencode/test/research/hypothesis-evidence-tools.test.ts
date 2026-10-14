@@ -7,6 +7,7 @@ import { Agent } from "../../src/agent/agent"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import * as Truncate from "../../src/tool/truncate"
 import { HypothesisAddTool, HypothesisUpdateTool, HypothesisListTool } from "../../src/tool/research-hypothesis"
+import { ReadTaskEvidenceTool } from "../../src/tool/research-knowledge"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { bindTaskEvidenceToSession } from "../../src/research/hypothesis-store"
 import { provideTmpdirInstance } from "../fixture/fixture"
@@ -43,6 +44,13 @@ it.live("session tools preserve evidence through add/update/list and reject inva
     const add = yield* (yield* HypothesisAddTool).init()
     const update = yield* (yield* HypothesisUpdateTool).init()
     const list = yield* (yield* HypothesisListTool).init()
+    const read = yield* (yield* ReadTaskEvidenceTool).init()
+    const readRequest = { cardID: entry.cardID, cardRevision: entry.cardRevision, section: "sources" as const, limit: 50 }
+    const page = JSON.parse((yield* read.execute(readRequest, ctx)).output)
+    expect(page.cardID).toBe(entry.cardID)
+    expect(page.text.length).toBeLessThanOrEqual(50)
+    expect((yield* Effect.exit(read.execute({ ...readRequest, cardRevision: 999 }, ctx)))._tag).toBe("Failure")
+    expect((yield* Effect.exit(read.execute(readRequest, { ...ctx, abort: AbortSignal.abort() })))._tag).toBe("Failure")
     const added = yield* add.execute(draft, ctx)
     expect(added.metadata.hypoID).toBeDefined()
     const hypoID = added.metadata.hypoID!
@@ -72,10 +80,12 @@ it.live("session tools preserve evidence through add/update/list and reject inva
       yield* Effect.promise(() => writeFile(nextPath, JSON.stringify(next)))
       yield* svc.createArtifact({ taskID: task.id, kind: "task_evidence_bundle_json", uri: `file://${nextPath}`, metadata: { retrieveRunID: next.retrieveRunID } })
       expect((yield* update.execute({ hypoID, risk: "Pinned evidence remains available" }, ctx)).output).toContain("Updated hypothesis")
+      expect(JSON.parse((yield* read.execute(readRequest, ctx)).output)).toEqual(page)
       yield* Effect.promise(() => writeFile(bundlePath, JSON.stringify({ ...bundle, taskID: "wrong_task" })))
       expect((yield* update.execute({ hypoID, risk: "must fail" }, ctx)).output).toContain("provenance mismatch")
     }).pipe(Effect.ensuring(Effect.sync(release)))
     expect((yield* update.execute({ hypoID, risk: "Unpinned session must use latest evidence" }, ctx)).output).toContain("unknown task-evidence card")
+    expect((yield* Effect.exit(read.execute(readRequest, ctx)))._tag).toBe("Failure")
   }).pipe(Effect.provide(layer)), { git: true, config: { formatter: false, lsp: false } }),
   30_000,
 )

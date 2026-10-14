@@ -56,8 +56,10 @@
     ],
     "covariate_conditioning": [
       "exogenous",
-      "known future covariate",
       "covariate fusion"
+    ],
+    "known_future_covariates": [
+      "known future covariate"
     ],
     "cross_series_dependency": [
       "cross variable",

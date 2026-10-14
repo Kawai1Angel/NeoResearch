@@ -14,7 +14,8 @@ import REFLECTION_PROMPT from "../../src/agent/prompt/research-reflection.txt"
 
 test("direct reflection synthesizes inline evidence without requesting session tools", () => {
   const prompt = buildInlineReflectionSystemPrompt(REFLECTION_PROMPT)
-  expect(prompt).toContain("Tools are unavailable; produce the final analysis directly")
+  expect(prompt).toContain("Native tools are unavailable")
+  expect(prompt).toContain("at most three requests")
   expect(prompt).toContain("experimentDesign")
   expect(prompt).toContain("trainingCurve")
   expect(prompt).toContain("historicalExperimentMemory")

@@ -1,4 +1,4 @@
-import { ReadKnowledgeCardsTool, ConfirmKnowledgeTool } from "./research-knowledge"
+import { ReadKnowledgeCardsTool, ReadTaskEvidenceTool, ConfirmKnowledgeTool } from "./research-knowledge"
 import { LiteratureRunTool, LiteratureListIntentsTool, LiteratureSearchTool, LiteratureReadPaperTool, LiteratureGetResultsTool } from "./research-literature"
 import { PlanExitTool } from "./plan"
 import { Session } from "../session"
@@ -137,6 +137,7 @@ export const layer: Layer.Layer<
     const readExperiences = yield* ReadExperiencesTool
     const writeExperience = yield* WriteExperienceTool
     const readKnowledgeCards = yield* ReadKnowledgeCardsTool
+    const readTaskEvidence = yield* ReadTaskEvidenceTool
     const confirmKnowledge = yield* ConfirmKnowledgeTool
     const literatureRun = yield* LiteratureRunTool
     const literatureListIntents = yield* LiteratureListIntentsTool
@@ -251,6 +252,7 @@ export const layer: Layer.Layer<
           readExperiences: Tool.init(readExperiences),
           writeExperience: Tool.init(writeExperience),
           readKnowledgeCards: Tool.init(readKnowledgeCards),
+          readTaskEvidence: Tool.init(readTaskEvidence),
           confirmKnowledge: Tool.init(confirmKnowledge),
           literatureRun: Tool.init(literatureRun),
           literatureListIntents: Tool.init(literatureListIntents),
@@ -298,6 +300,7 @@ export const layer: Layer.Layer<
             tool.readExperiences,
             tool.writeExperience,
             tool.readKnowledgeCards,
+            tool.readTaskEvidence,
             tool.confirmKnowledge,
             tool.literatureRun,
             tool.literatureListIntents,

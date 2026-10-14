@@ -560,6 +560,8 @@ async function handlePrepareData(rawFlags) {
     ["train-rows", "--train-rows"],
     ["val-rows", "--val-rows"],
     ["ref-test-rows", "--ref-test-rows"],
+    ["split-strategy", "--split-strategy"],
+    ["split-ratios", "--split-ratios"],
     ["missing-strategy", "--missing-strategy"],
     ["missing-limit", "--missing-limit"],
     ["frequency", "--frequency"],

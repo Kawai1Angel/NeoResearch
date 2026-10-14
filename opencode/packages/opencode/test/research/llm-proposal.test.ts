@@ -95,6 +95,17 @@ const proposalContext: DomainProposalContext = {
   memory: [],
 }
 
+test("direct design transport accepts bounded evidence requests and passes exact requested pages back to the model", () => {
+  const request = { cardID: "kn_example", cardRevision: 1, section: "sources" as const, limit: 4000 }
+  const config = { provider: "openai-compatible" as const, model: "test-model", maxTokens: 8192, temperature: 0.2 }
+  const result = buildLLMProposalFromText(JSON.stringify({ status: "evidence_request", request }), ZERO_USAGE, config)
+  expect(result.evidenceRequest).toEqual(request)
+  expect(result.proposal).toBeUndefined()
+  const page = { cardID: request.cardID, text: "Exact stored quote", nextOffset: null }
+  expect(JSON.parse(buildUserPrompt({ task: task(false), proposalContext, requestedEvidence: [page] })).requestedEvidence).toEqual([page])
+  expect(buildLLMProposalFromText(JSON.stringify({ status: "evidence_request", request: { ...request, limit: 12001 } }), ZERO_USAGE, config).evidenceRequest).toBeUndefined()
+})
+
 test("full-recipe LLM proposals require review instead of auto-approval", async () => {
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), "opencode-llm-proposal-"))
   process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"

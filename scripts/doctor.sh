@@ -101,14 +101,15 @@ else
 fi
 
 print_step "Python imports"
-if python3 - <<'PY' >/dev/null 2>&1
+python_bin="$(neo_cast_python_for_root "$ROOT")"
+if "$python_bin" - <<'PY' >/dev/null 2>&1
 import numpy
 import torch
 PY
 then
-  print_ok "numpy and torch import"
+  print_ok "numpy and torch import: $python_bin"
 else
-  print_fail "Python cannot import numpy and torch"
+  print_fail "Python cannot import numpy and torch: $python_bin"
   failures=$((failures + 1))
 fi
 

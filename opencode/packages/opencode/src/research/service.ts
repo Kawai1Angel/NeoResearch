@@ -1,17 +1,21 @@
 import { finalMetrics, finalEvaluationRecords } from "./runner-evidence"
+import { copyModelExportRuntime } from "./model-export-runtime"
 import { ExperimentConstraints, conflictingMechanismRequirements } from "./experiment-constraints"
 import { DesignUnavailable, DesignHistoryRequest, designTaskSpec, schemaRemovalUnavailable, frequencyModeUnavailable, mechanismRequirementsUnavailable, formatDesignValidationIssue } from "./design-feedback"
 import { comparisonRecipe } from "./comparison-run"
 import { readDesignHistory } from "./design-history"
 import { KnowledgeValidationDraftSchema } from "./literature/knowledge-confidence"
-import { confirmKnowledgeExperiment, readReflectionKnowledge } from "./literature/knowledge-feedback"
-import { ExperienceDraftSchema, experienceFromMemory, experiencePromptRecord } from "./experience"
+import { confirmKnowledgeExperiment, readReflectionKnowledge, reflectionKnowledgeForPrompt } from "./literature/knowledge-feedback"
+import { ExperienceDraftSchema, experienceFromMemory, experienceSummaryForPrompt } from "./experience"
 import { captureExperienceContext, readExperiences, writeExperience } from "./experience-store"
-import { projectTaskEvidence, citableTaskEvidence } from "./retrieve/evidence-handoff"
+import { citableTaskEvidence } from "./retrieve/evidence-handoff"
+import { projectPlanningTaskEvidence, readTaskEvidencePage, DirectEvidenceRequestSchema } from "./retrieve/planning-evidence"
+import { readReflectionHistory } from "./reflection-context"
 import { timedEffect } from "@/util/runtime-timing"
 import { extractTrainingCurve, runnerFailureEvidence, recoverRunnerFailure, reflectionExecutionEvidence, type TrainingCurvePoint } from "./runner-evidence"
 import { supersedeIntentCheckpoints } from "./taskspec-store"
 import { taskExecutionRoot, taskSessionModel, validateTaskRuntimePaths } from "./task-isolation"
+import { experimentParallelLimit, experimentScheduler, isolateExperimentPlan } from "./experiment-runtime"
 import { readSelectedSessionModel, resolveSessionModel } from "./session-model"
 import { Provider } from "@/provider"
 import { appendLog, recordResearchEvent, snapshotPhaseArtifact } from "./log-archive"
@@ -23,6 +27,7 @@ import {
   NAS_DEFAULT_MAX_ITERATIONS,
   NAS_DEFAULT_MAX_NO_IMPROVE,
   RESEARCH_MAX_RUNS_SAFETY_LIMIT,
+  RESEARCH_MAX_PARALLEL_EXPERIMENTS,
 } from "./defaults"
 import { abortable } from "./abortable"
 import { EffectBridge } from "@/effect"
@@ -652,8 +657,7 @@ function maxRunsLimit(budget: ResearchTask["budget"]) {
 }
 
 function maxParallelLimit(budget: ResearchTask["budget"]) {
-  const value = (budget as Record<string, unknown>).maxParallel
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
+  return experimentParallelLimit(budget as Record<string, unknown>)
 }
 
 function budgetLoopPolicy(task: ResearchTask) {
@@ -2202,6 +2206,7 @@ function buildHypoPlannerUserPrompt(
     sessionMode?: boolean
     baselineOptions?: readonly { recipeID: string; description: string }[]
     requestedHistory?: readonly unknown[]
+    requestedEvidence?: readonly unknown[]
   },
 ): string {
   return JSON.stringify(
@@ -2211,6 +2216,7 @@ function buildHypoPlannerUserPrompt(
       designFeedback: recordValue(task.taskSpec.metadata).designFeedback ?? null,
       modelCapabilities: MODEL_CAPABILITIES,
       ...(opts?.requestedHistory?.length ? { requestedHistory: opts.requestedHistory } : {}),
+      ...(opts?.requestedEvidence?.length ? { requestedEvidence: opts.requestedEvidence } : {}),
       historyAccess: { tool: "experiment_results", filters: ["runID", "candidateID", "hypothesisID", "limit", "offset"], directMode: "Return {status:history_request,request:{runID:...}} to retrieve a comparison before planning." },
       searchProgress: recordValue(task.taskSpec.metadata).searchProgress ?? null,
       dataAnalysis: dataAnalysisSummary,
@@ -2220,9 +2226,7 @@ function buildHypoPlannerUserPrompt(
       abandonedHypotheses: abandonedHypotheses && abandonedHypotheses.length > 0
         ? abandonedHypotheses.map((h) => ({ statement: h.statement }))
         : null,
-      taskEvidence: taskEvidence
-        ? projectTaskEvidence(taskEvidence)
-        : { readiness: "ready_data_only", entries: [], conflicts: [], gaps: [] },
+      taskEvidence: projectPlanningTaskEvidence(taskEvidence),
       ...(opts?.baselineOptions && opts.baselineOptions.length > 0
         ? { baselineOptions: opts.baselineOptions }
         : {}),
@@ -2386,16 +2390,23 @@ async function generateLLMHypotheses(
     }
     const system = buildHypoPlannerSystemPrompt() + "\nDirect mode: no native tool calls. To read historical facts return {status:history_request,request:{runID:...}} first; the coordinator returns the requested history. Otherwise return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms. When baselineOptions are supplied, explicitly return referenceBaseline and referenceBaselineRationale. The selected baseline completes full evaluation before later hypothesis experiments."
     const requestedHistory: unknown[] = []
+    const requestedEvidence: unknown[] = []
     let validationFeedback: string | undefined
     let repairAttempts = 0
     for (let historyRound = 0; historyRound <= 5; historyRound++) {
-      const user = JSON.stringify({ ...JSON.parse(buildHypoPlannerUserPrompt(task, dataAnalysisSummary, existingHypotheses ?? [], abandonedHypotheses ?? [], taskEvidence, { requestedHistory, baselineOptions })), ...(validationFeedback ? { validationFeedback } : {}) })
+      const user = JSON.stringify({ ...JSON.parse(buildHypoPlannerUserPrompt(task, dataAnalysisSummary, existingHypotheses ?? [], abandonedHypotheses ?? [], taskEvidence, { requestedHistory, requestedEvidence, baselineOptions })), ...(validationFeedback ? { validationFeedback } : {}) })
       const llmPromise = onDelta
         ? requestNeoCastLLMStream({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user, onDelta)
         : requestNeoCastLLM({ ...effectiveConfig, maxTokens: 8192 }, apiKey, system, user)
       let timer: ReturnType<typeof setTimeout> | undefined
       const result = await Promise.race([llmPromise, new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 120_000) })]).finally(() => clearTimeout(timer))
       if (!result) return undefined
+      const evidenceRequest = DirectEvidenceRequestSchema.safeParse(extractJsonObject(result.text))
+      if (evidenceRequest.success) {
+        if (historyRound === 5) return undefined
+        requestedEvidence.push(readTaskEvidencePage(taskEvidence, evidenceRequest.data.request))
+        continue
+      }
       const request = DesignHistoryRequest.safeParse(extractJsonObject(result.text))
       if (request.success) {
         if (historyRound === 5) return undefined
@@ -2435,6 +2446,8 @@ interface ReflectionLLMContext {
   readonly sourceRuns?: readonly unknown[]
   readonly experiences?: readonly unknown[]
   readonly literatureKnowledge?: Awaited<ReturnType<typeof readReflectionKnowledge>>
+  readonly requestedEvidence?: readonly unknown[]
+  readonly evidenceArtifactID?: ResearchArtifactID
 }
 
 function buildReflectionLLMSystemPrompt(): string {
@@ -2478,8 +2491,8 @@ function buildReflectionSessionUserPrompt(
         plateauStreak: analysis.plateauStreak,
       },
       instruction:
-        "Follow the 4-step tool workflow in the system prompt (experiment_results → read_reflection → " +
-        "read_training_curve → read_memory_lessons). Read structured experience with read_experiences when helpful. " +
+        "Read current and required comparison evidence (experiment_results → read_reflection → read_training_curve). " +
+        "Use memory/experience summaries only when needed; request exact experience IDs before full facts. " +
         "Optionally call write_experience for useful findings. Read literature using read_knowledge_cards and confirm_knowledge only when current experiment facts validate a supplied claim; then output the 7-key JSON analysis object.",
     }),
     null,
@@ -2541,7 +2554,8 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
       experiences: context.experiences ?? [],
       experienceWriteSchema: z.toJSONSchema(ExperienceDraftSchema),
       knowledgeValidationSchema: z.toJSONSchema(KnowledgeValidationDraftSchema),
-    })), literatureKnowledge: context.literatureKnowledge },
+    })), literatureKnowledge: context.literatureKnowledge ? reflectionKnowledgeForPrompt(context.literatureKnowledge) : undefined,
+      ...(context.requestedEvidence?.length ? { requestedEvidence: context.requestedEvidence } : {}) },
     null,
     2,
   )
@@ -2632,18 +2646,34 @@ async function generateLLMReflectionSynthesis(
   }
   try {
     const system = buildReflectionLLMSystemPrompt()
-    const user = buildReflectionLLMUserPrompt(result.analysis, context)
-    // Race against 25-second timeout so a slow/hung LLM provider never blocks the pipeline.
-    const llmPromise = requestNeoCastLLM(effectiveConfig, apiKey, system, user)
-    const timeoutPromise = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 25_000))
-    const llmResult = await Promise.race([llmPromise, timeoutPromise])
+    const requestedEvidence: unknown[] = []
+    let llmResult: Awaited<ReturnType<typeof requestNeoCastLLM>> | undefined
+    let usage = { ...ZERO_USAGE }
+    for (let round = 0; round <= 3; round++) {
+      const user = buildReflectionLLMUserPrompt(result.analysis, { ...context, requestedEvidence })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      llmResult = await Promise.race([
+        requestNeoCastLLM(effectiveConfig, apiKey, system, user),
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 25_000) }),
+      ]).finally(() => clearTimeout(timer))
+      if (!llmResult) break
+      usage = { inputTokens: usage.inputTokens + llmResult.usage.inputTokens,
+        outputTokens: usage.outputTokens + llmResult.usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens + llmResult.usage.cacheReadTokens,
+        cacheWriteTokens: usage.cacheWriteTokens + llmResult.usage.cacheWriteTokens }
+      const request = DirectEvidenceRequestSchema.safeParse(extractJsonObject(llmResult.text))
+      if (!request.success) break
+      if (round === 3) throw new Error("Reflection exhausted the bounded source-reading budget")
+      const bundle = await loadTaskEvidenceForTask(task.id, context.evidenceArtifactID)
+      requestedEvidence.push(readTaskEvidencePage(bundle, request.data.request))
+    }
     if (llmResult === undefined) return { ...result, llm: { status: "failed" } }
     const structured = parseReflectionLLMStructured(llmResult.text)
     if (!structured) {
       return { ...result, llm: {
         status: "failed", model: effectiveConfig.model,
         error: "Reflection response must contain the seven required analysis fields.",
-        usage: llmResult.usage,
+        usage,
       } }
     }
     return {
@@ -2653,7 +2683,7 @@ async function generateLLMReflectionSynthesis(
         model: effectiveConfig.model,
         text: llmResult.text,
         structured,
-        usage: llmResult.usage,
+        usage,
       },
     }
   } catch {
@@ -2945,6 +2975,7 @@ async function buildReproducibilitySeal(
     path.join(workspaceRoot, "package-lock.json"),
   ])
   const preprocessPath = firstExistingFile([
+    ...(plan.command.env?.NEO_TSF_DATA_ROOT ? [path.join(plan.command.env.NEO_TSF_DATA_ROOT, "dataset_spec.json")] : []),
     path.join(plan.command.cwd ?? workspaceRoot, ".neo-cast", "dataset_spec.json"),
     path.join(plan.command.cwd ?? workspaceRoot, ".neo-cast", "dataset", "dataset_spec.json"),
     path.join(neoCastRoot, "py", "prepare_tsf.py"),
@@ -2986,18 +3017,17 @@ function tsfDatasetPreparationConfig(task: ResearchTask) {
   const predictionLengths = Array.isArray(taskSpec.predictionLengths)
     ? taskSpec.predictionLengths.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
     : []
-  const targetCols = Array.isArray(dataset.targetCols)
-    ? dataset.targetCols.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : []
-  const observedPastCovariates = Array.isArray(dataset.observedPastCovariates)
-    ? dataset.observedPastCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : []
-  const knownFutureCovariates = Array.isArray(dataset.knownFutureCovariates)
-    ? dataset.knownFutureCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : []
-  const staticCovariates = Array.isArray(dataset.staticCovariates)
-    ? dataset.staticCovariates.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : []
+  // Match the CSV header and Python backend normalization, preserving internal spaces.
+  const normalizeColumns = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+      : []
+  const targetCols = normalizeColumns(dataset.targetCols)
+  const observedPastCovariates = normalizeColumns(dataset.observedPastCovariates)
+  const knownFutureCovariates = normalizeColumns(dataset.knownFutureCovariates)
+  const staticCovariates = normalizeColumns(dataset.staticCovariates)
   const loaderID = typeof dataset.loaderID === "string" && dataset.loaderID.length > 0 ? dataset.loaderID : "local_csv"
   const ratios = Array.isArray(split.ratios) && split.ratios.length === 3
     ? split.ratios.map((item) => Number(item))
@@ -3056,7 +3086,7 @@ function csvHeaderColumns(csvPath: string): string[] {
     const chunk = buf.slice(0, bytesRead).toString("utf8")
     const newline = chunk.indexOf("\n")
     const firstLine = (newline < 0 ? chunk : chunk.slice(0, newline)).trim()
-    return firstLine.split(",").map((h) => h.trim().replace(/^"|"$/g, ""))
+    return firstLine.split(",").map((h) => h.trim().replace(/^"|"$/g, "").trim())
   } catch {
     return []
   } finally {
@@ -3179,9 +3209,14 @@ function buildPrepareDatasetCommand(task: ResearchTask, force: boolean, projectR
   if (preset) args.push("--dataset-preset", preset)
   else args.push("--task-id", config.loaderID)
   const splitRows = resolveDatasetSplitRows(config)
-  args.push("--train-rows", splitRows.train.join(":"))
-  args.push("--val-rows", splitRows.validation.join(":"))
-  args.push("--ref-test-rows", splitRows.test.join(":"))
+  if (config.splitMethod === "row_ranges") {
+    args.push("--train-rows", splitRows.train.join(":"))
+    args.push("--val-rows", splitRows.validation.join(":"))
+    args.push("--ref-test-rows", splitRows.test.join(":"))
+  } else {
+    // The backend removes repeated source rows before computing boundaries.
+    args.push("--split-ratios", config.splitRatios.join(","))
+  }
   const warnings: string[] = []
   if (config.targetCols.length > 0) {
     const csvHeaders = csvHeaderColumns(config.source)
@@ -4192,12 +4227,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
 
       const maxParallel = maxParallelLimit(task.budget)
-      if (maxParallel !== undefined && (status === "queued" || status === "running")) {
+      if (status === "running") {
         const used = yield* db((d) =>
           d
             .select({ id: ResearchRunTable.id })
             .from(ResearchRunTable)
-            .where(and(eq(ResearchRunTable.task_id, task.id), inArray(ResearchRunTable.status, ["queued", "running"])))
+            .where(and(eq(ResearchRunTable.task_id, task.id), eq(ResearchRunTable.status, "running")))
             .all(),
         ).pipe(Effect.map((rows) => rows.length))
         if (used >= maxParallel) {
@@ -4543,7 +4578,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
     })
 
-    const createRun = Effect.fn("Research.createRun")(function* (input: CreateRunInput) {
+    const createRunInternal = Effect.fn("Research.createRunInternal")(function* (input: CreateRunInput) {
       const task = yield* getTask(input.taskID)
       const candidate = yield* getCandidateForTask(input.taskID, input.candidateID)
       assertCandidateApproved(task.id, candidate)
@@ -4593,6 +4628,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
       if (run.status === "succeeded") yield* evaluateSucceededRun(run)
       return run
+    })
+
+    const createRun = Effect.fn("Research.createRun")(function* (input: CreateRunInput) {
+      return yield* experimentScheduler(Instance.directory).admit(input.taskID, createRunInternal(input))
     })
 
     const latestExecutionBlocker = Effect.fn("Research.latestExecutionBlocker")(function* (taskID: ResearchTaskID) {
@@ -4875,7 +4914,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       yield* ensureRunApprovalGates(task, candidate, stage)
       const candidateSpec = input.seed === undefined ? candidate.candidateSpec : candidateSpecWithSeed(candidate.candidateSpec, input.seed)
       let runnerRunID = input.runnerRunID
-      if ((stage === "ref_test" || stage === "blind_test") && runnerRunID === undefined) {
+      let referenceWorkspace: string | undefined
+      if (stage === "ref_test" || stage === "blind_test") {
         const prerequisiteStage = stage === "ref_test" ? "full" : "ref_test"
         const prerequisiteRuns = yield* db((d) =>
           d
@@ -4890,11 +4930,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               ),
             )
             .orderBy(desc(ResearchRunTable.time_created))
-            .limit(1)
             .all(),
         )
-        const prerequisiteRun = prerequisiteRuns[0]
-        if (prerequisiteRun !== undefined) {
+        for (const prerequisiteRun of prerequisiteRuns) {
           const artifacts = yield* db((d) =>
             d
               .select()
@@ -4908,7 +4946,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               )
               .all(),
           )
-          runnerRunID = artifacts.map((artifact) => neoCastRunIDFromArtifactURI(artifact.uri)).find(Boolean)
+          const ids = artifacts.map((artifact) => neoCastRunIDFromArtifactURI(artifact.uri)).filter(Boolean)
+          const id = runnerRunID === undefined ? ids[0] : ids.find((id) => id === runnerRunID)
+          if (id === undefined) continue
+          runnerRunID = id
+          const artifact = artifacts.find((artifact) => neoCastRunIDFromArtifactURI(artifact.uri) === id)
+          const source = artifact === undefined ? undefined : filePathFromURI(artifact.uri)
+          const execution = recordValue(prerequisiteRun.resource_usage.execution)
+          if (typeof execution.workspace === "string") referenceWorkspace = execution.workspace
+          if (source && path.basename(path.dirname(source)) === "artifacts" && path.basename(path.dirname(path.dirname(source))) === ".neo-cast") {
+            referenceWorkspace = path.dirname(path.dirname(path.dirname(source)))
+          }
+          break
         }
         if (runnerRunID === undefined) {
           throw new Error(
@@ -4916,7 +4965,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           )
         }
       }
-      const runPlan = DomainRegistry.createRunPlan(task.domainID, {
+      let runPlan = DomainRegistry.createRunPlan(task.domainID, {
         taskSpec: task.taskSpec,
         candidateSpec,
         stage: stage as DomainRunStage,
@@ -4964,6 +5013,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           hypothesisSnapshot: JSON.parse(JSON.stringify((yield* listHypotheses(task.id)).find((h) => h.id === candidate.hypothesisID) ?? null)),
         },
       })
+
+      if (task.domainID === "tsf" && maxParallelLimit(task.budget) > 1) {
+        runPlan = isolateExperimentPlan(runPlan, executionRoot, run.id, referenceWorkspace)
+        yield* Effect.promise(() => mkdir(runPlan.command.cwd!, { recursive: true }))
+      }
 
       const root = runnerPath(Instance.directory, ".neo-research/run-plans")
       const directory = path.join(root, task.id)
@@ -5066,7 +5120,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       } satisfies PreparedRun
     })
 
-    const evaluateSucceededRun = Effect.fn("Research.evaluateSucceededRun")(function* (run: ResearchRun) {
+    const evaluateSucceededRunInternal = Effect.fn("Research.evaluateSucceededRunInternal")(function* (run: ResearchRun) {
       const task = yield* getTask(run.taskID)
       if (!run.candidateID) return
       if (task.domainID === "tsf" && (!((run.resourceUsage as any).executionContract?.status === "verified") || run.stage !== "full")) return
@@ -5173,7 +5227,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (evaluated) yield* bus.publish(Event.RunUpdated, { run: mapRun(evaluated) })
     })
 
-    const executePreparedRun = logPhaseMethod("executePreparedRun", Effect.fn("Research.executePreparedRun")(function* (
+    const evaluateSucceededRun = Effect.fn("Research.evaluateSucceededRun")(function* (run: ResearchRun) {
+      return yield* experimentScheduler(Instance.directory).evaluate(run.taskID, evaluateSucceededRunInternal(run))
+    })
+
+    const executePreparedRunInternal = Effect.fn("Research.executePreparedRunInternal")(function* (
       prepared: PreparedRun,
       options: { readonly completeQueuedRuntimeJob?: boolean; readonly recoveredExecution?: RunnerExecution } = {},
     ) {
@@ -5259,10 +5317,6 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .catch(() => undefined)
       })
       const execution = options.recoveredExecution ?? (yield* abortable(async (signal) => {
-        const cwd = prepared.runPlan.command.cwd ?? Instance.directory
-        const workspace = existsSync(cwd) ? realpathSync(cwd) : path.resolve(cwd)
-        const acquired = Database.use((db) => db.insert(ResearchRunnerLockTable).values({ workspace, run_id: running.id }).onConflictDoNothing().returning().get())
-        if (!acquired) throw new Error(`Runner workspace is still owned by another attempt: ${workspace}`)
         const result = await executeRunnerPlan(prepared.runPlan, publishProgressLine, signal, (pid) => {
           Database.use((db) => db.update(ResearchRunTable).set({ resource_usage: {
             ...running.resourceUsage,
@@ -5271,7 +5325,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         }, (line) => appendLog(liveProgressPath, { stream: "stderr", line })).catch((error) => {
           appendLog(liveProgressPath, { event: signal.aborted ? "runner_canceled" : "runner_failed", error: String(error), runID: running.id })
           throw error
-        }).finally(() => Database.use((db) => db.delete(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.run_id, running.id)).run()))
+        })
         appendLog(liveProgressPath, { event: signal.aborted ? "runner_canceled" : "runner_exited", exitCode: result.exitCode, runID: running.id })
         await progressPublishQueue
         return result
@@ -5378,12 +5432,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         }
         return null
       })
+      const latestExecution = yield* getRunForTask(running.taskID, running.id)
       const run = yield* updateRunStatus({
         runID: running.id,
         status: contractInvalid ? "invalid" : duplicateRunning ? "rejected" : succeeded ? "succeeded" : "failed",
         metrics: (contractInvalid || reused || duplicateRunning ? {} : metrics) as ResearchRun["metrics"],
         resourceUsage: {
-          ...running.resourceUsage,
+          ...latestExecution.resourceUsage,
           independentEvidence: !reused && !duplicateRunning,
           duplicateExperiment: reused || duplicateRunning,
           reusedExperiment: execution.records.findLast((record) => record.event === "experiment_reused"),
@@ -5425,6 +5480,42 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         return { run: yield* attachArtifactRefToRun(run, proof.id), runPlan: prepared.runPlan }
       }
       return { run, runPlan: prepared.runPlan }
+    })
+
+    const executePreparedRun = logPhaseMethod("executePreparedRun", Effect.fn("Research.executePreparedRun")(function* (
+      prepared: PreparedRun,
+      options: { readonly completeQueuedRuntimeJob?: boolean; readonly recoveredExecution?: RunnerExecution } = {},
+    ) {
+      const task = yield* getTask(prepared.run.taskID)
+      const limit = maxParallelLimit(task.budget)
+      if (limit === 0) yield* ensureRunBudget(task, "running")
+      const workspace = path.resolve(prepared.runPlan.command.cwd ?? Instance.directory)
+      const execute = Effect.gen(function* () {
+        if (options.recoveredExecution) return yield* executePreparedRunInternal(prepared, options)
+        while (true) {
+          const result = yield* Effect.acquireUseRelease(
+            Effect.sync(() => Database.transaction((d) => {
+              const canonical = existsSync(workspace) ? realpathSync(workspace) : workspace
+              const owned = d.select().from(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.workspace, canonical)).get()
+              if (owned) throw new Error(`Runner workspace is still owned by another attempt: ${canonical}`)
+              const active = d.select({ taskID: ResearchRunTable.task_id }).from(ResearchRunnerLockTable)
+                .innerJoin(ResearchRunTable, eq(ResearchRunnerLockTable.run_id, ResearchRunTable.id))
+                .innerJoin(ResearchTaskTable, eq(ResearchRunTable.task_id, ResearchTaskTable.id))
+                .where(eq(ResearchTaskTable.project_id, Instance.project.id)).all()
+              if (active.length >= RESEARCH_MAX_PARALLEL_EXPERIMENTS || active.filter((run) => run.taskID === task.id).length >= limit) return false
+              d.insert(ResearchRunnerLockTable).values({ workspace: canonical, run_id: prepared.run.id }).run()
+              return true
+            }, { behavior: "immediate" })),
+            (acquired) => acquired ? executePreparedRunInternal(prepared, options) : Effect.succeed(undefined),
+            (acquired) => Effect.sync(() => {
+              if (acquired) Database.use((d) => d.delete(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.run_id, prepared.run.id)).run())
+            }),
+          )
+          if (result !== undefined) return result
+          yield* Effect.sleep("50 millis")
+        }
+      })
+      return yield* experimentScheduler(Instance.directory).execute(task.id, limit, workspace, execute)
     }))
 
     const reconcileInterruptedRuns = Effect.fn("Research.reconcileInterruptedRuns")(function* (taskID: ResearchTaskID) {
@@ -6014,6 +6105,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         let proposal: DomainCandidateProposal | undefined
         let validationFeedback = recovery?.feedback
         const requestedHistory: unknown[] = []
+        const requestedEvidence: unknown[] = []
         let historyRequests = 0
         const maxModelDesignerAttempts = 3
         for (let attempt = 1; attempt <= maxModelDesignerAttempts; attempt++) {
@@ -6021,9 +6113,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             task,
             proposalContext,
             requestedHistory,
+            requestedEvidence,
             ...(validationFeedback ? { validationFeedback } : {}),
           }
           const modelDesignerSessionAttempt = yield* requestViaSession({
+            evidenceBinding: { taskID: task.id, artifactID: designTaskEvidence
+              ? (yield* listArtifacts(task.id)).find((item) => item.kind === "task_evidence_bundle_json" &&
+                  recordValue(item.metadata).retrieveRunID === designTaskEvidence.retrieveRunID)?.id
+              : undefined },
             rootSessionID: task.sessionID,
             agent: "research-model-designer",
             stageLabel: attempt === 1 ? "ModelDesigner" : `ModelDesigner retry ${attempt}`,
@@ -6056,6 +6153,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 }),
               )
           llmMetadata = { ...llmResult.metadata, llmAttempt: attempt }
+          if (llmResult.evidenceRequest) {
+            if (++historyRequests > 5) throw new DesignPlanningStopped({ reason: "ModelDesigner exceeded the bounded evidence/history-request budget without proposing an experiment." })
+            const permitted = selectedHypothesis?.literatureEvidence?.some((citation) =>
+              citation.cardID === llmResult.evidenceRequest!.cardID && citation.cardRevision === llmResult.evidenceRequest!.cardRevision)
+            if (!permitted) throw new Error("ModelDesigner evidence request must reference the selected hypothesis citations")
+            requestedEvidence.push(readTaskEvidencePage(designTaskEvidence, llmResult.evidenceRequest))
+            attempt -= 1
+            continue
+          }
           if (llmResult.historyRequest) {
             if (++historyRequests > 5) throw new DesignPlanningStopped({ reason: "ModelDesigner exceeded the bounded history-request budget without proposing an experiment." })
             const result = yield* Effect.promise(() => readDesignHistory(task.id, llmResult.historyRequest!))
@@ -6801,6 +6907,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (timeBudgetSeconds !== undefined && cycle.elapsed_ms + Date.now() - startedAt >= timeBudgetSeconds * 1000) return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "time_budget_exhausted" })
       if (cycle.iterations < maxIterations && parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment)?.action === "stop") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" })
       const initialBaseline = yield* getReferenceBaselineInitialization(task)
+      // A failed planning call clears the previous selection. On resume, obtain
+      // a new explicit decision instead of recovering the pool without a pick.
+      if (cycle.iterations > 0 && cycle.iterations < maxIterations && !parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment) && (!initialBaseline || initialBaseline.completed)) {
+        const planned = yield* refreshPlanner()
+        if (!planned.plan.nextExperiment) throw new Error("HypoPlanner must explicitly select the next experiment; no order-based fallback is permitted")
+      }
       if (cycle.iterations > 0 && noImproveStreak >= maxNoImprove && cycle.iterations < maxIterations && (!initialBaseline || initialBaseline.completed)) {
         const planned = yield* refreshPlanner()
         if (planned.llm.status !== "used") return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "plateau" })
@@ -7339,6 +7451,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             }
             const modelImplSource = path.join(championArtifactDir, "model_impl.py")
             if (existsSync(modelImplSource)) {
+              Object.assign(copiedFiles, await copyModelExportRuntime(championArtifactDir, modelDirectory))
               await cp(modelImplSource, path.join(modelDirectory, "model.py"), { force: true })
               copiedFiles.modelPy = "model/model.py"
             }
@@ -8982,6 +9095,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        ))
             const reflectionKnowledge = yield* Effect.promise(() => readReflectionKnowledge(task.id))
 	        const reflectionSessionAttempt = yield* requestViaSession({
+	          evidenceBinding: { taskID: task.id, artifactID: artifacts.find((artifact) => artifact.kind === "task_evidence_bundle_json")?.id },
 	          rootSessionID: task.sessionID,
 	          agent: "research-reflection",
 	          stageLabel: "Reflection",
@@ -9059,9 +9173,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	                recentMemories: recentLessons,
 	                bestMemoryLesson: bestMemory && bestMemory.id !== sortedMemories[0]?.id && bestMemory.id !== sortedMemories[1]?.id
 	                  ? bestMemory.lesson : undefined,
-                  sourceRuns: (await readDesignHistory(task.id, { limit: 20 }, { forReflection: true })).runs,
-                  experiences: readExperiences(task.id, { limit: 12 }).map(experiencePromptRecord),
+                  sourceRuns: (await readReflectionHistory(task.id)).runs,
+                  experiences: readExperiences(task.id, { scope: "task", limit: 3 }).map(experienceSummaryForPrompt),
                   literatureKnowledge: reflectionKnowledge,
+                  evidenceArtifactID: artifacts.find((artifact) => artifact.kind === "task_evidence_bundle_json")?.id,
 	              }
 	              return generateLLMReflectionSynthesis(task, baseResult, llmContext).catch(() => ({
 	                ...baseResult, llm: { status: 'failed' as const },

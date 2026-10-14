@@ -28,6 +28,16 @@ import type { HypothesisObject } from "../../src/research/agents/hypo-planner-ag
 const run = <A>(fn: (svc: Research.Interface) => Effect.Effect<A>) =>
   Effect.runPromise(Research.Service.use(fn).pipe(Effect.provide(Research.defaultLayer)))
 afterEach(resetDatabase)
+
+test("identity head reports direct horizon forecasting only for v3 recipes", () => {
+  const spec = { recipeVersion: "recipe_schema_v3", backbone: { type: "dlinear" },
+    embedding: { type: "none" }, predictionHead: { type: "identity", outputDistribution: "point" } }
+  expect(candidateMechanisms(spec)).toEqual(["direct_horizon_forecast", "moving_average_decomposition"])
+  expect(candidateMechanisms({ ...spec, predictionHead: { type: "linear" } })).toEqual(["moving_average_decomposition"])
+  expect(candidateMechanisms({ ...spec, recipeVersion: "recipe_schema_v2" })).toEqual(["moving_average_decomposition"])
+  expect(MODEL_CAPABILITIES.unsupported_mechanisms).not.toContain("direct_horizon_forecast")
+})
+
 const hypothesis = {
   experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
   id: "H1",
@@ -232,6 +242,59 @@ async function setup(root: string) {
   )
   return { task, candidate }
 }
+
+test("verified hypothesis definitions stay fixed while follow-up experiments use new identities", async () => {
+  await using tmp = await tmpdir({ git: true })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const { task, candidate } = await setup(path.join(tmp.path, "runner"))
+    const original = (await listHypothesesInPool(task.id))[0]!
+    await run((svc) => svc.createRun({
+      taskID: task.id, candidateID: candidate.id, stage: "full", status: "succeeded",
+      metrics: { cv_avg_mse: 0.4 },
+      resourceUsage: { hypothesisSnapshot: original as any, executionContract: { status: "verified" } },
+    }))
+    const control = { ...original, suggestedBackbones: ["linear"], experimentContract: {
+      mode: "controlled" as const, comparisonRunID: "new-comparison",
+      changes: [{ operation: "set" as const, path: "backbone.type", before: "timesnet_lite", after: "linear" }], frozenPaths: [],
+      requiredValues: [{ path: "backbone.type", value: "linear" }], forbiddenMechanisms: [],
+    } }
+    for (const patch of [
+      { suggestedBackbones: control.suggestedBackbones },
+      { suggestedPreprocessing: ["instance_norm"] },
+      { requiredMechanisms: ["moving_average_decomposition"] as any },
+      { experimentContract: control.experimentContract },
+    ]) {
+      await expect(updateHypothesisInPool(task.id, original.id, patch)).rejects.toThrow("add a new hypothesis")
+    }
+    expect((await listHypothesesInPool(task.id))[0]!.experimentContract).toEqual(original.experimentContract)
+    const refined = await updateHypothesisInPool(task.id, original.id, { motivation: ["Observed cv_avg_mse=0.4"], status: "active" })
+    expect(refined.motivation).toEqual(["Observed cv_avg_mse=0.4"])
+    const { id, status, ...draft } = control
+    const followup = await addHypothesisToPool(task.id, draft)
+    expect(followup.id).not.toBe(id)
+    expect(followup.experimentContract).toEqual(control.experimentContract)
+
+    // Simulate legacy rows already rewritten before the guard existed; restore from evidence.
+    Database.use((d) => d.update(ResearchHypothesisTable).set({
+      experiment_contract: control.experimentContract, suggested_backbones: ["linear"],
+    }).where(eq(ResearchHypothesisTable.hypo_id, id)).run())
+    const restored = await updateHypothesisInPool(task.id, id, {
+      experimentContract: original.experimentContract, suggestedBackbones: original.suggestedBackbones,
+    })
+    expect(restored.experimentContract).toEqual(original.experimentContract)
+    expect(restored.suggestedBackbones).toEqual(original.suggestedBackbones)
+    expect((await run((svc) => svc.listRuns(task.id)))[0]!.metrics).toEqual({ cv_avg_mse: 0.4 })
+  } })
+})
+
+test("unexecuted hypotheses can still be repaired before producing verified full evidence", async () => {
+  await using tmp = await tmpdir({ git: true })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const { task } = await setup(path.join(tmp.path, "runner"))
+    const repaired = await updateHypothesisInPool(task.id, hypothesis.id, { suggestedBackbones: ["linear"] })
+    expect(repaired.suggestedBackbones).toEqual(["linear"])
+  } })
+})
 
 test("violation pauses, consumes no full run, preserves evidence, and approval re-verifies original candidate", async () => {
   await using tmp = await tmpdir({ git: true })

@@ -2,6 +2,30 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common.sh"
+
+# Verify interpreter precedence without depending on installed Python packages.
+(
+  fixture_root="$(mktemp -d)"
+  trap 'rm -rf "$fixture_root"' EXIT
+  unset NEO_CAST_ROOT NEO_CAST_PYTHON
+  [[ "$(neo_cast_python_for_root "$fixture_root")" == "python3" ]]
+  runtime_python="$fixture_root/neo_cast/.neo-cast/runtime/.venv/bin/python"
+  mkdir -p "$(dirname "$runtime_python")"
+  touch "$runtime_python"
+  chmod +x "$runtime_python"
+  [[ "$(neo_cast_python_for_root "$fixture_root")" == "$runtime_python" ]]
+  export NEO_CAST_ROOT="$fixture_root/external neo cast"
+  [[ "$(neo_cast_python_for_root "$fixture_root")" == "python3" ]]
+  custom_python="$NEO_CAST_ROOT/.neo-cast/runtime/.venv/bin/python"
+  mkdir -p "$(dirname "$custom_python")"
+  touch "$custom_python"
+  chmod +x "$custom_python"
+  [[ "$(neo_cast_python_for_root "$fixture_root")" == "$custom_python" ]]
+  export NEO_CAST_PYTHON="$fixture_root/explicit python"
+  [[ "$(neo_cast_python_for_root "$fixture_root")" == "$NEO_CAST_PYTHON" ]]
+)
 
 required_scripts=(
   "bootstrap_local_dev.sh"

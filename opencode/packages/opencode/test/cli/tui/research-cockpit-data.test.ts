@@ -750,7 +750,7 @@ describe("research cockpit data helpers", () => {
         },
         metadata: { interactionMode: "socratic" },
       },
-      budget: { maxRuns: 200, maxParallel: 1, loop: { maxIterations: 25, maxNoImprove: 7 } },
+      budget: { maxRuns: 200, maxParallel: 4, loop: { maxIterations: 25, maxNoImprove: 7 } },
     })
     expect(companionTask).toMatchObject({
       mode: "autonomous",
@@ -896,7 +896,7 @@ describe("research cockpit data helpers", () => {
     })
     expect(payload.budget).toMatchObject({
       maxRuns: 5,
-      maxParallel: 1,
+      maxParallel: 4,
       loop: {
         timeBudgetSeconds: 120,
       },

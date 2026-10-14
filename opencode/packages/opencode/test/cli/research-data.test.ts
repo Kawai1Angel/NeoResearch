@@ -110,7 +110,7 @@ describe("research CLI data helpers", () => {
         secondaryMetrics: ["cv_std_mse", "val_avg_mse"],
         direction: "minimize",
       },
-      budget: { maxRuns: 200, maxParallel: 1, loop: { maxIterations: 25, maxNoImprove: 7 } },
+      budget: { maxRuns: 200, maxParallel: 4, loop: { maxIterations: 25, maxNoImprove: 7 } },
     })
     expect(buildDefaultTsfResearchTaskInput({ mode: "review", interactionMode: "companion" })).toMatchObject({
       mode: "autonomous",

@@ -27,6 +27,7 @@ export function candidateMechanisms(spec: any): ModelMechanism[] {
     ...new Set([
       ...branch(spec),
       ...branch(spec?.composition?.secondary),
+      ...(spec?.recipeVersion === "recipe_schema_v3" && spec?.predictionHead?.type === "identity" ? ["direct_horizon_forecast" as const] : []),
       ...(spec?.composition?.type === "decomposition_two_branch" ? ["moving_average_decomposition" as const] : []),
       ...(spec?.preprocessing?.actions ?? []).flatMap((action: any) => preprocessing[action.type] ?? []),
     ]),

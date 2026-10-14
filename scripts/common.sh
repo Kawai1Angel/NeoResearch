@@ -89,6 +89,20 @@ resolve_neo_cast_root() {
   printf '%s\n' "$root/neo_cast"
 }
 
+neo_cast_python_for_root() {
+  local root="$1"
+  local neo_cast_root
+  neo_cast_root="$(resolve_neo_cast_root "$root")"
+
+  if [[ -n "${NEO_CAST_PYTHON:-}" ]]; then
+    printf '%s\n' "$NEO_CAST_PYTHON"
+  elif [[ -x "$neo_cast_root/.neo-cast/runtime/.venv/bin/python" ]]; then
+    printf '%s\n' "$neo_cast_root/.neo-cast/runtime/.venv/bin/python"
+  else
+    printf '%s\n' "python3"
+  fi
+}
+
 resolve_runtime_root() {
   local root="$1"
   if [[ -n "${NEO_RESEARCH_RUNTIME_ROOT:-}" ]]; then

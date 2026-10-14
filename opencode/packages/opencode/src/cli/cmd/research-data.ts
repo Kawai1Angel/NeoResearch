@@ -6,6 +6,7 @@ import {
   NAS_DEFAULT_MAX_ITERATIONS,
   NAS_DEFAULT_MAX_NO_IMPROVE,
   RESEARCH_MAX_RUNS_SAFETY_LIMIT,
+  RESEARCH_MAX_PARALLEL_EXPERIMENTS,
 } from "@/research/defaults"
 
 export type ResearchOutputFormat = "table" | "json"
@@ -109,7 +110,7 @@ export function buildDefaultTsfResearchTaskInput(input: {
     },
     budget: {
       maxRuns: input.maxRuns ?? RESEARCH_MAX_RUNS_SAFETY_LIMIT,
-      maxParallel: 1,
+      maxParallel: RESEARCH_MAX_PARALLEL_EXPERIMENTS,
       latencyBudget: "offline batch scoring unless the user specifies stricter latency",
       parameterBudget: "prefer lightweight models under 20M parameters when accuracy is close",
       loop,

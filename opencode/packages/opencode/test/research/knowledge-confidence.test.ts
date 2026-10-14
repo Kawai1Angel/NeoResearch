@@ -187,6 +187,9 @@ it.live("Reflection tool binds current-task cards to authoritative facts and pre
       const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
       const fetch = globalThis.fetch
       let writes: KnowledgeValidationDraft[] | undefined
+      let sourceRequested = false
+      let forceSourceRequests = false
+      let sourceRequestCount = 0
       try {
         process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
         process.env.NEO_CAST_LLM_BASE_URL = "http://knowledge.fixture/v1"
@@ -196,9 +199,23 @@ it.live("Reflection tool binds current-task cards to authoritative facts and pre
           const body = JSON.parse(String(init?.body))
           const input = JSON.parse(body.messages[1].content)
           expect(input.literatureKnowledge.currentRunID).toBe(next.id)
-          expect(input.literatureKnowledge.entries[0].knowledge.assertions).toEqual(card.assertions)
-          expect(input.literatureKnowledge.experimentFacts.find((f: ExperimentFact) => f.runID === next.id).executedModel).toEqual(usage.executionContract.manifest.actual)
+          expect(input.literatureKnowledge.entries[0].assertions).toEqual(card.assertions)
+          expect(input.literatureKnowledge.entries[0].knowledge).toBeUndefined()
+          expect(input.literatureKnowledge.experimentFacts).toBeUndefined()
+          expect(input.sourceRuns.find((f: { runID: string }) => f.runID === next.id).executedModel).toEqual(usage.executionContract.manifest.actual)
           expect(input.knowledgeValidationSchema.properties.assertionIDs).toBeDefined()
+          if (!sourceRequested || forceSourceRequests) {
+            sourceRequested = true
+            sourceRequestCount += 1
+            const content = JSON.stringify({ status: "evidence_request", request: {
+              cardID: card.knowledgeID, cardRevision: 1, section: "sources", sourceIDs: [card.sources[0]!.sourceID], limit: 4000,
+            } })
+            return new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 20, completion_tokens: 10 } }), { headers: { "content-type": "application/json" } })
+          }
+          if (sourceRequestCount === 1 && writes === undefined) {
+            expect(input.requestedEvidence).toHaveLength(1)
+            expect(input.requestedEvidence[0].text).toContain(card.sources[0]!.quote)
+          }
           const content = JSON.stringify({
             trainingHealthAssessment: "Full metrics available.", hypothesisValidation: "Supports the scoped claim.",
             attributionAnalysis: "Only the recorded operation was tested.", historicalComparison: "Paired full runs.",
@@ -212,6 +229,7 @@ it.live("Reflection tool binds current-task cards to authoritative facts and pre
         }) as typeof globalThis.fetch
         const skipped = yield* svc.runReflectionAgent({ taskID: task.id, stoppedReason: "max_iterations" })
         expect(skipped.llm.status).toBe("used")
+        expect(sourceRequestCount).toBe(1)
         expect(skipped.knowledgeValidationResults).toEqual([])
         expect(store.getCard(card.knowledgeID)?.confidence).toBe(0.51)
         writes = [{ ...request, runID: next.id }]
@@ -220,6 +238,11 @@ it.live("Reflection tool binds current-task cards to authoritative facts and pre
         expect(store.getCard(card.knowledgeID)?.experimentValidations.at(-1)?.facts[0].primaryValue).toBe(0.25)
         const duplicate = yield* svc.runReflectionAgent({ taskID: task.id, stoppedReason: "max_iterations" })
         expect(duplicate.knowledgeValidationResults?.[0]).toMatchObject({ saved: true, updated: false, confidence: 0.52 })
+        forceSourceRequests = true
+        const exhausted = yield* svc.runReflectionAgent({ taskID: task.id, stoppedReason: "max_iterations" })
+        expect(exhausted.llm.status).toBe("failed")
+        expect(sourceRequestCount).toBe(5) // Initial successful request plus four bounded request responses.
+        expect(store.getCard(card.knowledgeID)?.confidence).toBe(0.52)
       } finally {
         globalThis.fetch = fetch
         for (const key of keys) {

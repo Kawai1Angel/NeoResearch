@@ -688,7 +688,14 @@ def _build_scheduler(
         base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs)
     elif scheduler_type == "one_cycle":
         max_lr = max(float(group["lr"]) for group in optimizer.param_groups)
+        # OneCycleLR's warmup phase ends at pct_start * total_steps - 1.
+        # A single warmup epoch (including a smoke budget clamped to two
+        # epochs) gives a zero-length phase and divides by zero at creation.
+        # Keep the adjustment minimal: use two warmup points when the budget
+        # leaves room for decay, otherwise use the default short-cycle fraction.
         pct_start = (warmup_steps / max_epochs) if warmup_steps else 0.3
+        if warmup_steps == 1:
+            pct_start = (2 / max_epochs) if max_epochs > 2 else 0.3
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=max_lr, total_steps=max(max_epochs, 1), pct_start=pct_start,
         )

@@ -4,7 +4,8 @@ import { and, desc, eq, Database } from "@/storage"
 import { Bus } from "@/bus"
 import { SessionTable } from "@/session/session.sql"
 import { readFile } from "fs/promises"
-import { ResearchArtifactTable, ResearchHypothesisTable, ResearchTaskTable } from "./research.sql"
+import { isDeepStrictEqual } from "node:util"
+import { ResearchArtifactTable, ResearchCandidateTable, ResearchHypothesisTable, ResearchRunTable, ResearchTaskTable } from "./research.sql"
 import { ResearchHypothesisID, type JsonRecord, type ResearchTaskID, type ResearchArtifactID } from "./schema"
 import { Event } from "./event"
 import { isOpenHypothesis, type NextExperimentDecision } from "./agents/hypo-planner-agent"
@@ -78,6 +79,38 @@ function assertConsistentMechanisms(hypothesis: Pick<HypothesisObject, "required
   if (conflicts.length) throw new Error(
     `The candidate arm cannot both require and forbid mechanisms: ${conflicts.join(", ")}. requiredMechanisms describes the generated arm, not the treatment in its comparison.`,
   )
+}
+
+const executionFields = ["experimentContract", "requiredMechanisms", "suggestedBackbones", "suggestedPreprocessing"] as const
+
+function executionDefinition(hypothesis: Partial<HypothesisObject>) {
+  return {
+    experimentContract: hypothesis.experimentContract ? ExperimentConstraints.parse(hypothesis.experimentContract) : null,
+    requiredMechanisms: hypothesis.requiredMechanisms ?? [],
+    suggestedBackbones: hypothesis.suggestedBackbones ?? [],
+    suggestedPreprocessing: hypothesis.suggestedPreprocessing ?? [],
+  }
+}
+
+function assertPreservesVerifiedExperiment(taskID: ResearchTaskID, hypoID: string, hypothesis: HypothesisObject) {
+  const runs = Database.use((d) => d
+    .select({ id: ResearchRunTable.id, usage: ResearchRunTable.resource_usage })
+    .from(ResearchRunTable)
+    .innerJoin(ResearchCandidateTable, eq(ResearchRunTable.candidate_id, ResearchCandidateTable.id))
+    .where(and(
+      eq(ResearchRunTable.task_id, taskID),
+      eq(ResearchCandidateTable.task_id, taskID),
+      eq(ResearchCandidateTable.hypothesis_id, hypoID),
+      eq(ResearchRunTable.stage, "full"),
+      eq(ResearchRunTable.status, "succeeded"),
+    )).all())
+  for (const run of runs) {
+    const proof = run.usage.executionContract as { status?: string } | undefined
+    const snapshot = run.usage.hypothesisSnapshot as unknown as HypothesisObject | undefined
+    if (proof?.status !== "verified" || snapshot?.id !== hypoID) continue
+    if (isDeepStrictEqual(executionDefinition(hypothesis), executionDefinition(snapshot))) continue
+    throw new Error(`Hypothesis ${hypoID} has a verified full run (${run.id}); preserve its execution definition and add a new hypothesis for the next experiment.`)
+  }
 }
 
 function publishChanged(taskID: ResearchTaskID, action: "add" | "update" | "abandon", hypothesis: HypothesisObject) {
@@ -207,6 +240,9 @@ export async function updateHypothesisInPool(
   )
   if (!existingRow) throw new HypothesisNotFoundError(hypoID)
 
+  // Compare with executed evidence, not the mutable row, so legacy corruption can be restored.
+  if (executionFields.some((field) => patch[field] !== undefined))
+    assertPreservesVerifiedExperiment(taskID, hypoID, { ...mapRow(existingRow), ...patch })
   if (patch.requiredMechanisms !== undefined || patch.experimentContract !== undefined)
     assertConsistentMechanisms({ ...mapRow(existingRow), ...patch })
   const status = patch.status && VALID_STATUSES.includes(patch.status) ? patch.status : undefined

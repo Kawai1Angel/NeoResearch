@@ -72,14 +72,15 @@ print_ok "opencode directory found"
 print_ok "Neo-Cast root: $NEO_CAST_ROOT_RESOLVED"
 
 print_step "Checking Python runtime dependencies"
-if python3 - <<'PY' >/dev/null 2>&1
+python_bin="$(neo_cast_python_for_root "$ROOT")"
+if "$python_bin" - <<'PY' >/dev/null 2>&1
 import numpy
 import torch
 PY
 then
-  print_ok "Python imports numpy and torch"
+  print_ok "Python imports numpy and torch: $python_bin"
 else
-  print_warn "Python cannot import numpy and torch; install Neo-Cast Python dependencies before full training"
+  print_warn "Python cannot import numpy and torch: $python_bin; install Neo-Cast Python dependencies before full training"
 fi
 
 print_step "Preparing local configuration"

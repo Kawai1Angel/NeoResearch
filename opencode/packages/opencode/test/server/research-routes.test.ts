@@ -57,6 +57,15 @@ async function json<T>(response: Response) {
   return (await response.json()) as T
 }
 
+async function recordedRun(taskID: string, runID: string, headers: Record<string, string>) {
+  const runs = await json<Research.ResearchRun[]>(
+    await app().request(pathFor(ResearchPaths.taskRuns, { taskID }), { headers }),
+  )
+  const run = runs.find((item) => item.id === runID)
+  expect(run).toBeDefined()
+  return run!
+}
+
 const fakeContractEvents = `
 ${process.execPath} -e '
 const fs = require("fs"), crypto = require("crypto")
@@ -80,11 +89,18 @@ async function selectSearchHypothesis(taskID: Research.ResearchTaskID) {
     testable: true,
   })
   await selectNextExperimentInPool(taskID, {
-    action: "experiment", hypothesisID: hypothesis.id, rationale: "Compare the next declared architecture through the API.",
+    action: "experiment",
+    hypothesisID: hypothesis.id,
+    rationale: "Compare the next declared architecture through the API.",
   })
 }
 
-const plannerEnvKeys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"] as const
+const plannerEnvKeys = [
+  "NEO_CAST_LLM_PROVIDER",
+  "NEO_CAST_LLM_BASE_URL",
+  "NEO_CAST_LLM_MODEL",
+  "NEO_CAST_LLM_API_KEY",
+] as const
 let restorePlanner: (() => void) | undefined
 
 function installPlannerFixture() {
@@ -99,25 +115,57 @@ function installPlannerFixture() {
     if (!String(input).startsWith("http://route-planner.fixture/")) return previousFetch(input, init)
     const body = JSON.parse(String(init?.body))
     const system = body.messages[0].content as string
-    const result = system.startsWith("You are the NeoResearch HypoPlanner") ? {
-      hypotheses: [{
-        id: "H_route_search", statement: "Compare the declared architectures under the task protocol.",
-        motivation: ["API workflow fixture with an explicit experiment selection."], expectedOutcome: "Improve the primary metric.",
-        suggestedBackbones: ["linear", "mlp", "transformer", "dlinear", "nbeats", "rnn", "freq_mixer"],
-        suggestedPreprocessing: [], requiredMechanisms: [], risk: "May underfit", testable: true,
-        datasetEvidencePaths: [], literatureEvidence: [], applicabilityAssumptions: [],
-        falsificationCriteria: ["No improvement in completed independent experiments."], evidenceLevel: "data_only",
-      }],
-      nextExperiment: { action: "experiment", hypothesisID: "H_route_search", rationale: "Evaluate this declared direction." },
-    } : {
-      trainingHealthAssessment: "The fixture completed the execution protocol.", hypothesisValidation: "Use completed primary metrics.",
-      attributionAnalysis: "Compare under the shared protocol.", historicalComparison: "Use the task history.",
-      modelDesignReflection: "An implementation manifest is available.", nextStepRecommendation: "Ask HypoPlanner for the next experiment.",
-      distillableMemory: "API workflow result.",
-    }
+    const user = JSON.parse(body.messages[1].content)
+    const result = system.startsWith("You are the NeoResearch HypoPlanner")
+      ? {
+          ...(user.baselineOptions?.length
+            ? {
+                referenceBaseline: user.baselineOptions[0].recipeID,
+                referenceBaselineRationale: "Initialize the API workflow with the explicitly selected control.",
+              }
+            : {}),
+          hypotheses: [
+            {
+              id: "H_route_search",
+              statement: "Compare the declared architectures under the task protocol.",
+              experimentContract: { mode: "exploratory" },
+              motivation: ["API workflow fixture with an explicit experiment selection."],
+              expectedOutcome: "Improve the primary metric.",
+              suggestedBackbones: ["linear", "mlp", "transformer", "dlinear", "nbeats", "rnn", "freq_mixer"],
+              suggestedPreprocessing: [],
+              requiredMechanisms: [],
+              risk: "May underfit",
+              testable: true,
+              datasetEvidencePaths: [],
+              literatureEvidence: [],
+              applicabilityAssumptions: [],
+              falsificationCriteria: ["No improvement in completed independent experiments."],
+              evidenceLevel: "data_only",
+            },
+          ],
+          nextExperiment: {
+            action: "experiment",
+            hypothesisID: "H_route_search",
+            rationale: "Evaluate this declared direction.",
+          },
+        }
+      : {
+          trainingHealthAssessment: "The fixture completed the execution protocol.",
+          hypothesisValidation: "Use completed primary metrics.",
+          attributionAnalysis: "Compare under the shared protocol.",
+          historicalComparison: "Use the task history.",
+          modelDesignReflection: "An implementation manifest is available.",
+          nextStepRecommendation: "Ask HypoPlanner for the next experiment.",
+          distillableMemory: "API workflow result.",
+        }
     const content = JSON.stringify(result)
-    if (body.stream) return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { headers: { "content-type": "application/json" } })
+    if (body.stream)
+      return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, {
+        headers: { "content-type": "text/event-stream" },
+      })
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+      headers: { "content-type": "application/json" },
+    })
   }) as typeof fetch
   restorePlanner = () => {
     globalThis.fetch = previousFetch
@@ -152,19 +200,29 @@ printf '{"event":"done","status":"success"}\\n'
 `,
     "utf8",
   )
-  await writeFile(path.join(root, "py", "runner.py"), `#!/usr/bin/env bash
+  await writeFile(
+    path.join(root, "py", "runner.py"),
+    `#!/usr/bin/env bash
 set -euo pipefail
 ${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_train
 printf '{"val_avg_mse":0.123,"val_avg_mae":0.456}' > .neo-cast/artifacts/run_train/val_metrics.json
 printf '{"cv_avg_mse":0.123,"cv_std_mse":0.01}' > .neo-cast/artifacts/run_train/cv_metrics.json
-cp .neo-cast/artifacts/run_fake/model_impl.py .neo-cast/artifacts/run_train/model_impl.py
-cp .neo-cast/artifacts/run_fake/inference.py .neo-cast/artifacts/run_train/inference.py
+cat > .neo-cast/artifacts/run_train/model_impl.py <<'PY'
+class Model:
+    pass
+PY
+cat > .neo-cast/artifacts/run_train/inference.py <<'PY'
+def predict(rows):
+    return rows
+PY
 printf '{"event":"eval_done","val_avg_mse":0.123,"val_avg_mae":0.456}\\n'
 printf '{"event":"cv_eval_done","cv_avg_mse":0.123,"cv_std_mse":0.01}\\n'
 printf '{"event":"artifact_ready","run_id":"train","artifact_dir":"%s"}\\n' "$(pwd)/.neo-cast/artifacts/run_train"
 printf '{"event":"done","status":"success"}\\n'
-`, "utf8")
+`,
+    "utf8",
+  )
 }
 
 afterEach(async () => {
@@ -193,7 +251,11 @@ describe("research routes", () => {
                 contextLength: 96,
                 predictionLengths: [24],
                 dataset: { loaderID: "local_csv", path: "./dataset.csv", targetCols: ["OT"] },
-                metadata: { businessContext: "Forecast transformer temperature", interpretability: "simple models", deploymentTarget: "local" },
+                metadata: {
+                  businessContext: "Forecast transformer temperature",
+                  interpretability: "simple models",
+                  deploymentTarget: "local",
+                },
               },
               objective: { primaryMetric: "val_avg_mse", direction: "minimize", errorPreferences: "average error" },
               budget: { maxRuns: 3, latencyBudget: "offline", parameterBudget: "small" },
@@ -693,9 +755,13 @@ describe("research routes", () => {
         )
         expect(queuedExecution.status).toBe(409)
         expect(await queuedExecution.json()).toMatchObject({ name: "ResearchReconciliationRequired" })
-        await json<Research.ResearchRun>(await app().request(pathFor(ResearchPaths.runStatus, { runID: prepared.run.id }), {
-          method: "PATCH", headers, body: JSON.stringify({ status: "failed", error: "Canceled queued preparation." }),
-        }))
+        await json<Research.ResearchRun>(
+          await app().request(pathFor(ResearchPaths.runStatus, { runID: prepared.run.id }), {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({ status: "failed", error: "Canceled queued preparation." }),
+          }),
+        )
 
         const executed = await json<{ run: Research.ResearchRun; runPlan: Research.DomainRunPlan }>(
           await app().request(
@@ -1036,7 +1102,9 @@ describe("research routes", () => {
         })
 
         const approvals = await json<Research.ResearchApproval[]>(
-          await app().request(`${pathFor(ResearchPaths.taskApprovals, { taskID: task.id })}?status=pending`, { headers }),
+          await app().request(`${pathFor(ResearchPaths.taskApprovals, { taskID: task.id })}?status=pending`, {
+            headers,
+          }),
         )
         const intentApproval = approvals.find(
           (approval) =>
@@ -1330,12 +1398,16 @@ describe("research routes", () => {
         const memory = await json<Research.ResearchMemory[]>(
           await app().request(pathFor(ResearchPaths.taskMemory, { taskID: task.id }), { headers }),
         )
-        expect(memory[0]?.fingerprintSummary.primaryMetricName).toBe("val_avg_mae")
+        expect(memory).toEqual([])
+        expect((await recordedRun(task.id, iteration.run.id, headers)).resourceUsage.evaluationDecision).toMatchObject({
+          primaryMetricName: "val_avg_mae",
+          primaryMetric: 0.456,
+        })
       },
     })
   })
 
-  test("run status updates evaluate champion and memory", async () => {
+  test("run status updates record evaluation facts without curating memory", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1352,7 +1424,10 @@ describe("research routes", () => {
               title: "TSF external runner evaluation",
               domainID: "tsf",
               mode: "review",
-              taskSpec: { ...validTsfTaskSpec(), runtime: { neoCastProjectRoot: fakeNeoCastRoot, pythonExecutable: "bash" } },
+              taskSpec: {
+                ...validTsfTaskSpec(),
+                runtime: { neoCastProjectRoot: fakeNeoCastRoot, pythonExecutable: "bash" },
+              },
               objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
               budget: { maxRuns: 3 },
             }),
@@ -1377,10 +1452,12 @@ describe("research routes", () => {
           }),
         )
 
-        const smoke = await json<{ run: Research.ResearchRun }>(await app().request(
-          pathFor(ResearchPaths.taskCandidateExecuteRun, { taskID: task.id, candidateID: candidate.id }),
-          { method: "POST", headers, body: JSON.stringify({ stage: "smoke" }) },
-        ))
+        const smoke = await json<{ run: Research.ResearchRun }>(
+          await app().request(
+            pathFor(ResearchPaths.taskCandidateExecuteRun, { taskID: task.id, candidateID: candidate.id }),
+            { method: "POST", headers, body: JSON.stringify({ stage: "smoke" }) },
+          ),
+        )
         expect(smoke.run.status).toBe("succeeded")
         const run = await json<Research.ResearchRun>(
           await app().request(ResearchPaths.runs, {
@@ -1399,7 +1476,11 @@ describe("research routes", () => {
           await app().request(pathFor(ResearchPaths.runStatus, { runID: run.id }), {
             method: "PATCH",
             headers,
-            body: JSON.stringify({ status: "succeeded", metrics: { val_avg_mse: 0.111 }, resourceUsage: { executionContract: { status: "verified" } } }),
+            body: JSON.stringify({
+              status: "succeeded",
+              metrics: { val_avg_mse: 0.111 },
+              resourceUsage: { executionContract: { status: "verified" } },
+            }),
           }),
         )
 
@@ -1415,13 +1496,17 @@ describe("research routes", () => {
         const memory = await json<Research.ResearchMemory[]>(
           await app().request(pathFor(ResearchPaths.taskMemory, { taskID: task.id }), { headers }),
         )
-        expect(memory).toHaveLength(1)
-        expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, primaryMetric: 0.111 })
+        expect(memory).toEqual([])
+        expect((await recordedRun(task.id, run.id, headers)).resourceUsage.evaluationDecision).toMatchObject({
+          primaryMetricName: "val_avg_mse",
+          primaryMetric: 0.111,
+          championUpdated: true,
+        })
       },
     })
   })
 
-  test("direct succeeded run creation evaluates champion and memory", async () => {
+  test("direct succeeded run creation records evaluation facts without curating memory", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1488,13 +1573,17 @@ describe("research routes", () => {
         const memory = await json<Research.ResearchMemory[]>(
           await app().request(pathFor(ResearchPaths.taskMemory, { taskID: task.id }), { headers }),
         )
-        expect(memory).toHaveLength(1)
-        expect(memory[0]!.lesson).toContain(`Candidate ${candidate.id} became champion`)
+        expect(memory).toEqual([])
+        expect((await recordedRun(task.id, run.id, headers)).resourceUsage.evaluationDecision).toMatchObject({
+          primaryMetricName: "val_avg_mse",
+          primaryMetric: 0.109,
+          championUpdated: true,
+        })
       },
     })
   })
 
-  test("failed run status updates create failed research memory", async () => {
+  test("failed run status updates preserve failure facts without curating memory", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1558,17 +1647,17 @@ describe("research routes", () => {
         const memory = await json<Research.ResearchMemory[]>(
           await app().request(pathFor(ResearchPaths.taskMemory, { taskID: task.id }), { headers }),
         )
-        expect(memory).toHaveLength(1)
-        expect(memory[0]).toMatchObject({
-          outcome: "failed",
-          lesson: `[dataset:loader:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: bridge timeout`,
+        expect(memory).toEqual([])
+        expect(await recordedRun(task.id, run.id, headers)).toMatchObject({
+          candidateID: candidate.id,
+          status: "failed",
+          error: "bridge timeout",
         })
-        expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, status: "failed" })
       },
     })
   })
 
-  test("direct failed run creation creates failed research memory", async () => {
+  test("direct failed run creation preserves failure facts without curating memory", async () => {
     await using tmp = await tmpdir({ git: true })
     const headers = { "x-opencode-directory": tmp.path, "content-type": "application/json" }
 
@@ -1624,12 +1713,11 @@ describe("research routes", () => {
         const memory = await json<Research.ResearchMemory[]>(
           await app().request(pathFor(ResearchPaths.taskMemory, { taskID: task.id }), { headers }),
         )
-        expect(memory).toHaveLength(1)
-        expect(memory[0]).toMatchObject({
-          outcome: "failed",
-          lesson: `[dataset:loader:etth1_tslib_v1] Candidate ${candidate.id} failed during smoke: failed`,
+        expect(memory).toEqual([])
+        expect(await recordedRun(task.id, run.id, headers)).toMatchObject({
+          candidateID: candidate.id,
+          status: "failed",
         })
-        expect(memory[0]!.candidateSummary).toMatchObject({ runID: run.id, status: "failed" })
       },
     })
   })
@@ -1975,16 +2063,29 @@ describe("research routes", () => {
 
         const fullRun = await json<Research.ResearchRun>(
           await app().request(ResearchPaths.runs, {
-            method: "POST", headers,
-            body: JSON.stringify({ taskID: task.id, candidateID: candidate.id, stage: "full", status: "succeeded",
-              metrics: { val_avg_mse: 0.123 }, resourceUsage: { executionContract: { status: "verified" } } }),
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              taskID: task.id,
+              candidateID: candidate.id,
+              stage: "full",
+              status: "succeeded",
+              metrics: { val_avg_mse: 0.123 },
+              resourceUsage: { executionContract: { status: "verified" } },
+            }),
           }),
         )
         await json<Research.ResearchArtifact>(
           await app().request(ResearchPaths.artifacts, {
-            method: "POST", headers,
-            body: JSON.stringify({ taskID: task.id, runID: fullRun.id, kind: "runner_artifact",
-              uri: "file:///tmp/neo-cast/artifacts/run_route_full", metadata: {} }),
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              taskID: task.id,
+              runID: fullRun.id,
+              kind: "runner_artifact",
+              uri: "file:///tmp/neo-cast/artifacts/run_route_full",
+              metadata: {},
+            }),
           }),
         )
 

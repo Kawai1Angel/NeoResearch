@@ -553,6 +553,28 @@ class RecipeFactoryTest(unittest.TestCase):
         optimizer.step()
         _step_scheduler(one_cycle, 1.0)
 
+    def test_one_cycle_handles_single_epoch_warmup_and_smoke_budget(self) -> None:
+        for epochs, warmup in [(1, 2), (2, 2), (2, 1), (3, 1), (50, 1), (50, 2)]:
+            with self.subTest(epochs=epochs, warmup=warmup):
+                recipe = make_recipe()
+                recipe["training_strategy"]["scheduler"] = {
+                    "type": "one_cycle", "warmup_steps": warmup,
+                }
+                parameter = torch.nn.Parameter(torch.tensor([1.0]))
+                optimizer = torch.optim.Adam([parameter], lr=0.0001)
+                scheduler = _build_scheduler(optimizer, {"recipe": recipe}, max_epochs=epochs)
+                # Check the LR actually used by each epoch, not just construction.
+                for _ in range(epochs):
+                    lr = optimizer.param_groups[0]["lr"]
+                    self.assertTrue(torch.isfinite(torch.tensor(lr)).item())
+                    self.assertGreater(lr, 0.0)
+                    optimizer.zero_grad()
+                    parameter.square().sum().backward()
+                    optimizer.step()
+                    _step_scheduler(scheduler, 1.0)
+                if epochs == 50:
+                    self.assertEqual(scheduler._schedule_phases[0]["end_step"], 1.0)
+
     def test_datasci_lradj_schedulers_match_epoch_end_rules(self) -> None:
         recipe = make_recipe(
             training_strategy={

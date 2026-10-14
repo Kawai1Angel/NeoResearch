@@ -5,6 +5,8 @@ import { tmpdir as osTmpdir } from "os"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
+import { Database, eq } from "../../src/storage"
+import { ResearchTaskTable } from "../../src/research/research.sql"
 import { addHypothesisToPool, selectNextExperimentInPool } from "../../src/research/hypothesis-store"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
@@ -151,7 +153,7 @@ afterEach(async () => {
 })
 
 describe("AutoResearch alpha e2e smoke", () => {
-  test("prepares data, completes two mock loop iterations, selects champion, and exports a reproducible bundle", async () => {
+  test.each([false, true])("prepares data, completes two mock loop iterations, selects champion, and exports a reproducible bundle (missing selection=%s)", async (missingSelection) => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const datasetPath = await writeProfileDataset()
 
@@ -193,6 +195,13 @@ describe("AutoResearch alpha e2e smoke", () => {
           statement: "Compare linear temporal controls under the same protocol.",
           motivation: ["Explicit planner fixture"],
           expectedOutcome: "Lower val_avg_mse",
+          experimentContract: {
+            mode: "exploratory",
+            changes: [],
+            frozenPaths: [],
+            requiredValues: [],
+            forbiddenMechanisms: [],
+          },
           suggestedBackbones: ["linear"],
           suggestedPreprocessing: [],
           risk: "Underfit",
@@ -237,9 +246,11 @@ describe("AutoResearch alpha e2e smoke", () => {
         process.env.NEO_CAST_LLM_BASE_URL = "http://e2e.fixture/v1"
         process.env.NEO_CAST_LLM_MODEL = "fixture-model"
         process.env.NEO_CAST_LLM_API_KEY = "fixture-key"
+        let plannerCalls = 0
         globalThis.fetch = (async (_: RequestInfo | URL, init?: RequestInit) => {
           const body = JSON.parse(String(init?.body))
           const system = body.messages[0].content as string
+          if (system.startsWith("You are the NeoResearch HypoPlanner")) plannerCalls += 1
           const result = system.startsWith("You are the NeoResearch HypoPlanner")
             ? {
                 hypotheses: [hypothesis],
@@ -267,6 +278,16 @@ describe("AutoResearch alpha e2e smoke", () => {
               })
         }) as typeof fetch
 
+        if (missingSelection) {
+          const first = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" })))
+          expect(first.run.status).toBe("succeeded")
+          const current = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+          const metadata = current.taskSpec.metadata
+          if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("Task metadata must be an object")
+          Database.use((db) => db.update(ResearchTaskTable).set({
+            task_spec: { ...current.taskSpec, metadata: { ...metadata, nextExperiment: null } },
+          }).where(eq(ResearchTaskTable.id, task.id)).run())
+        }
         const loop = await runResearch(
           Research.Service.use((svc) =>
             svc.runAutonomousLoop({
@@ -280,8 +301,9 @@ describe("AutoResearch alpha e2e smoke", () => {
         )
 
         expect(loop.stoppedReason).toBe("max_iterations")
-        expect(loop.iterations).toHaveLength(2)
+        expect(loop.iterations).toHaveLength(missingSelection ? 1 : 2)
         expect(loop.iterations.every((iteration) => iteration.run.status === "succeeded")).toBe(true)
+        expect(plannerCalls).toBeGreaterThanOrEqual(1)
 
         const champion = await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))
         expect(champion).toBeDefined()

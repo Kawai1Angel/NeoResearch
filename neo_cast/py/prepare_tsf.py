@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import urllib.error
 import urllib.request
@@ -356,7 +357,11 @@ def _enforce_time_policy(profile: dict[str, object]) -> None:
     if int(time_profile["invalid_timestamp_count"]) > 0:
         raise ValueError(f"Invalid timestamps found: {time_profile['invalid_timestamp_count']}")
     if int(time_profile["duplicate_timestamp_count"]) > 0:
-        raise ValueError(f"Duplicate timestamps found: {time_profile['duplicate_timestamp_count']}")
+        raise ValueError(
+            f"Duplicate timestamps found: {time_profile['duplicate_timestamp_count']}. "
+            "Exact duplicate source rows are removed automatically; remaining timestamp "
+            "duplicates have different source values and must be resolved in the source CSV."
+        )
     if not bool(time_profile["monotonic_increasing"]):
         raise ValueError("Timestamp column must be monotonic increasing in the current loader")
 
@@ -412,6 +417,7 @@ def _build_materialize_spec(
     val_rows: tuple[int, int] | None = None,
     ref_test_rows: tuple[int, int] | None = None,
     split_strategy: str | None = None,
+    split_ratios: list[float] | None = None,
     missing_strategy: str | None = None,
     missing_limit: int | None = None,
     frequency: str | None = None,
@@ -458,7 +464,18 @@ def _build_materialize_spec(
         preset_split_strategy if isinstance(preset_split_strategy, str) else None
     ) or "tsl_custom_70_10_20"
 
-    if train_rows and val_rows and ref_test_rows:
+    if split_ratios is not None:
+        if any(rows is not None for rows in (train_rows, val_rows, ref_test_rows)) or split_strategy is not None:
+            raise ValueError("--split-ratios cannot be combined with row ranges or --split-strategy")
+        if len(split_ratios) != 3 or not all(math.isfinite(value) and value > 0 for value in split_ratios):
+            raise ValueError("--split-ratios requires three finite positive numbers")
+        total_ratio = sum(split_ratios)
+        if not math.isfinite(total_ratio):
+            raise ValueError("--split-ratios sum must be finite")
+        train_end = int(len(df) * split_ratios[0] / total_ratio)
+        val_end = int(len(df) * (split_ratios[0] + split_ratios[1]) / total_ratio)
+        splits = {"train": (0, train_end), "val": (train_end, val_end), "ref_test": (val_end, len(df))}
+    elif train_rows and val_rows and ref_test_rows:
         splits = {
             "train": train_rows,
             "val": val_rows,
@@ -544,6 +561,7 @@ def materialize_visible_splits(
     val_rows: tuple[int, int] | None = None,
     ref_test_rows: tuple[int, int] | None = None,
     split_strategy: str | None = None,
+    split_ratios: list[float] | None = None,
     missing_strategy: str | None = None,
     missing_limit: int | None = None,
     frequency: str | None = None,
@@ -564,6 +582,25 @@ def materialize_visible_splits(
         )
 
     df = pd.read_csv(source_path)
+    # Match the CLI and task header checks, which trim surrounding whitespace.
+    # Preserve spaces inside names such as "Generation forecast".
+    normalized_columns = df.columns.str.strip()
+    duplicate_columns = normalized_columns[normalized_columns.duplicated()].tolist()
+    if duplicate_columns:
+        raise ValueError(
+            f"full source CSV has duplicate column names after trimming whitespace: {duplicate_columns}"
+        )
+    df.columns = normalized_columns
+    # Repeated source blocks must be removed before automatic split inference so
+    # the same observations cannot appear in both training and evaluation.
+    rows_before = len(df)
+    df = df.drop_duplicates().reset_index(drop=True)
+    duplicate_action = {
+        "strategy": "drop_exact_source_rows",
+        "rows_before": rows_before,
+        "rows_after": len(df),
+        "rows_removed": rows_before - len(df),
+    }
     spec = _build_materialize_spec(
         df=df,
         dataset_preset=dataset_preset,
@@ -583,6 +620,7 @@ def materialize_visible_splits(
         val_rows=val_rows,
         ref_test_rows=ref_test_rows,
         split_strategy=split_strategy,
+        split_ratios=split_ratios,
         missing_strategy=missing_strategy,
         missing_limit=missing_limit,
         frequency=frequency,
@@ -601,6 +639,13 @@ def materialize_visible_splits(
     prepared_profile = _build_dataset_profile(df)
     _enforce_time_policy(prepared_profile)
     prepared_profile["missing_action"] = missing_action
+    prepared_profile["duplicate_action"] = duplicate_action
+    if duplicate_action["rows_removed"]:
+        print(
+            f"dataset_warning: removed {duplicate_action['rows_removed']} exact duplicate source rows "
+            f"before splitting; rows={len(df)}. Row ranges refer to deduplicated rows.",
+            flush=True,
+        )
     df = df.iloc[: BORDER_TEST[1]].copy()
 
     if not force:
@@ -1506,6 +1551,12 @@ def main() -> None:
         help="Automatic split policy when explicit row ranges are omitted. Custom CSV defaults to tsl_custom_70_10_20.",
     )
     parser.add_argument(
+        "--split-ratios",
+        type=str,
+        default=None,
+        help="Train,validation,reference-test ratios, e.g. 7,1,2, applied after exact source duplicates are removed.",
+    )
+    parser.add_argument(
         "--missing-strategy",
         choices=["reject", "drop", "forward_fill", "mean_fill", "linear_interpolate"],
         default=None,
@@ -1582,6 +1633,7 @@ def main() -> None:
             val_rows=parse_row_range(args.val_rows) if args.val_rows else None,
             ref_test_rows=parse_row_range(args.ref_test_rows) if args.ref_test_rows else None,
             split_strategy=args.split_strategy,
+            split_ratios=[float(value.strip()) for value in args.split_ratios.split(",")] if args.split_ratios else None,
             missing_strategy=args.missing_strategy,
             missing_limit=args.missing_limit,
             frequency=args.frequency,

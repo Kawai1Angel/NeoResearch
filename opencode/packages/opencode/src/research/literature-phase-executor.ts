@@ -5,6 +5,7 @@ import z from "zod"
 import { RetrieveAgent, type RetrieveAgentInput } from "./retrieve/retrieve-agent"
 import { RetrieveResultSchema, TaskEvidenceBundleSchema } from "./retrieve/contract"
 import { ConfiguredPrincipleModel } from "./literature/principle-model"
+import { resolveLiteraturePaperMode } from "./literature/model-config"
 import { LiteratureAgent } from "./literature/literature-agent"
 import { DocumentChunkSchema } from "./literature/contract"
 import { citableTaskEvidence } from "./retrieve/evidence-handoff"
@@ -45,10 +46,11 @@ export async function createLiteraturePhase(input: {
   onProgress?: (progress: LiteratureProgress) => Promise<void>
 }) {
   const config = { neoCastRoot: input.neoCastRoot, workspaceRoot: input.workspaceRoot }
+  const run = { ...input.run, paperMode: input.run.paperMode ?? resolveLiteraturePaperMode() }
   const principleModel = await ConfiguredPrincipleModel.create(config)
   let snapshot = await serialize(path.resolve(input.neoCastRoot), async () => {
     const agent = new RetrieveAgent({ ...config, principleModel })
-    return agent.prepare(input.run).finally(() => agent.close())
+    return agent.prepare(run).finally(() => agent.close())
   })
   if (snapshot.report.taskID !== input.taskID) throw new Error("Quantitative report task mismatch")
   const runRoot = () => path.join(input.neoCastRoot, ".neo-cast", "literature-retrieval", "runs", snapshot.retrieveRunID)
@@ -60,7 +62,7 @@ export async function createLiteraturePhase(input: {
     await serialize(path.resolve(input.neoCastRoot), async () => {
       if (execution) return
       const reader = new RetrieveAgent({ ...config, principleModel })
-      snapshot = await reader.prepare({ ...input.run, quantitativeReport: snapshot.report }).finally(() => reader.close())
+      snapshot = await reader.prepare({ ...run, quantitativeReport: snapshot.report }).finally(() => reader.close())
     })
   }
   const validate = async (raw: unknown) => {
@@ -95,9 +97,9 @@ export async function createLiteraturePhase(input: {
       signal?.throwIfAborted()
     } })
     const result = await (async () => {
-      snapshot = await runner.prepare({ ...input.run, quantitativeReport: snapshot.report })
+      snapshot = await runner.prepare({ ...run, quantitativeReport: snapshot.report })
       signal?.throwIfAborted()
-      return runner.run({ ...input.run, quantitativeReport: snapshot.report }, snapshot)
+      return runner.run({ ...run, quantitativeReport: snapshot.report }, snapshot)
     })().finally(() => runner.close())
     signal?.throwIfAborted()
     const receipt = LiteratureReceiptSchema.parse({ schemaVersion: "literature_tool_receipt_v1", taskID: input.taskID,

@@ -302,6 +302,7 @@ export async function writeExperience(taskID: ResearchTaskID, input: ExperienceD
 }
 
 export interface ReadExperiencesOptions {
+  experienceID?: string
   scope?: "task" | "project"
   level?: ExperienceDraft["level"]
   polarity?: ExperienceDraft["polarity"]
@@ -327,6 +328,7 @@ export function readExperiences(taskID: ResearchTaskID, options: ReadExperiences
       .where(
         and(
           inArray(ResearchMemoryTable.task_id, taskIDs),
+          options.experienceID ? eq(ResearchMemoryTable.id, options.experienceID as ResearchMemoryID) : undefined,
           eq(ResearchMemoryTable.domain_id, task.domain_id),
           sql`json_extract(${ResearchMemoryTable.candidate_summary}, '$.experience.schemaVersion') = 'research_experience.v1'`,
         ),

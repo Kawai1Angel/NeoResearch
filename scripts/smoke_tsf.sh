@@ -40,7 +40,7 @@ load_env_local "$ROOT"
 export_local_dev_environment "$ROOT"
 NEO_CAST_ROOT_RESOLVED="$NEO_CAST_ROOT"
 
-cmd=(bash scripts/neo_research_tsf_e2e.sh --stage smoke --candidate py/schemas/recipe.example.json)
+cmd=(bash scripts/neo_research_tsf_e2e.sh --python "${PYTHON:-$(neo_cast_python_for_root "$ROOT")}" --stage smoke --candidate py/schemas/recipe.example.json)
 if [[ "$run" -eq 0 ]]; then
   cmd+=(--dry-run)
 fi

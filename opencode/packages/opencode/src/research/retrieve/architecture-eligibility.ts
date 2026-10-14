@@ -75,7 +75,11 @@ export function recipeMechanismFamilies(recipe: TSFCandidateRecipe): MechanismFa
 }
 
 function at(value: unknown, path: string): unknown {
-  return path.replace(/^\$\./, "").split(".").reduce<unknown>((item, key) =>
+  // Reviews use both dotted properties and JSONPath array indexes.
+  // Only normalize non-negative numeric indexes; never evaluate path text.
+  const dotted = path.replace(/^\$\./, "").replace(/\[(0|[1-9]\d*)\]/g, ".$1")
+  if (/[\[\]]/.test(dotted)) return undefined
+  return dotted.split(".").reduce<unknown>((item, key) =>
     item && typeof item === "object" && Object.hasOwn(item, key) ? (item as Record<string, unknown>)[key] : undefined, value)
 }
 

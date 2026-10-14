@@ -18,8 +18,15 @@ only independently accepted cards without replacing earlier accepted principles.
 Exports go to `exports/knowledge_cards_v2.jsonl`.
 
 The active retrieval/handoff format is `task_evidence_bundle_v2`. It embeds the
-entire revision-bound card; downstream prompts retain experiments, counterevidence,
-qualifications and falsification without separating them from their method.
+entire revision-bound card. Planning and model-design prompts carry admitted architecture
+decisions, applicability conditions, limitations, family transfer boundaries and exact card
+references. Complete cards, experiments, original quotes and review histories remain in the
+artifact and can be read on demand with the bounded, revision-checked `read_task_evidence`
+tool. Reflection also uses the currently admitted card set, defaults to sources referenced by
+the current hypothesis, and sends only assertions, conditions, boundaries, confidence and
+admitted decision summaries. Complete cards remain internal; raw retrieval audit entries do
+not authorize confidence updates. Compatible feedback-only revisions retain their source seal
+and idempotency; changed source content is rejected.
 Old v1 database tables, exports and helpers remain available for explicit audit
 (`runLegacyAudit`, `exportLegacyAudit`, `validateLegacyAudit`). They are excluded
 from active retrieval. Existing tasks with v1 evidence must rerun literature

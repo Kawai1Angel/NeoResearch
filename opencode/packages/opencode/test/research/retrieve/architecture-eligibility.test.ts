@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import path from "path"
 import { tmpdir } from "../../fixture/fixture"
-import { architectureEligibilityIssues, ArchitectureEligibilitySchema, recipeMechanismFamilies } from "../../../src/research/retrieve/architecture-eligibility"
+import { architectureEligibilityIssues, ArchitectureEligibilitySchema, recipeMechanismFamilies, matchedTargetEvidenceIssues } from "../../../src/research/retrieve/architecture-eligibility"
 import { TSFCandidateRecipe } from "../../../src/research/domains/tsf"
 import { distillArchitectureKnowledge } from "../../../src/research/retrieve/architecture-distiller"
 import { citableTaskEvidence, projectTaskEvidence } from "../../../src/research/retrieve/evidence-handoff"
@@ -16,6 +16,22 @@ const admitted = ArchitectureEligibilitySchema.parse({
   requiredMechanisms: [], target: "matched", targetReason: "The target is a numerical series",
   conditions: [{ condition: "Numerical target", path: "$.quantitativeReport.dataset.targetColumns", value: ["load"], status: "matched" }],
   objective: "prediction", predictionReason: "Scoped accuracy evidence", requiredData: { knownFutureCovariates: false, staticCovariates: false },
+})
+
+test("target evidence resolves numeric JSONPath array indexes without accepting wrong or missing values", () => {
+  const evidenceTask = { quantitativeReport: { forecast: { predictionLengths: [96, 192] } } }
+  const review = { ...admitted, conditions: [{ condition: "Prediction horizon", path: "$.quantitativeReport.forecast.predictionLengths[0]", value: 96, status: "matched" as const }] }
+  expect(matchedTargetEvidenceIssues(review, evidenceTask)).toEqual([])
+  for (const [path, value] of [
+    ["$.quantitativeReport.forecast.predictionLengths[0]", 192],
+    ["$.quantitativeReport.forecast.predictionLengths[2]", 96],
+    ["$.quantitativeReport.forecast.predictionLengths[-1]", 96],
+    ["$.quantitativeReport.forecast.predictionLengths[*]", 96],
+  ] as const) {
+    expect(matchedTargetEvidenceIssues({ ...review, conditions: [{ ...review.conditions[0]!, path, value }] }, evidenceTask))
+      .toEqual([`Target evidence does not match ${path}`])
+  }
+  expect(matchedTargetEvidenceIssues({ ...review, conditions: [{ ...review.conditions[0]!, path: "$.quantitativeReport.forecast.predictionLengths.1", value: 192 }] }, evidenceTask)).toEqual([])
 })
 
 test("admission requires an implementable mechanism family, established facts, and a prediction effect", () => {

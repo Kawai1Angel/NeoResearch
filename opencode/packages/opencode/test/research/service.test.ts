@@ -4,7 +4,7 @@ import { NAS_DEFAULT_MAX_NO_IMPROVE } from "../../src/research/defaults"
 import { existsSync } from "node:fs"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Cause, Effect, Layer } from "effect"
-import { mkdir, mkdtemp, readFile, writeFile } from "fs/promises"
+import { mkdir, mkdtemp, readFile, writeFile, readdir } from "fs/promises"
 import { tmpdir as osTmpdir } from "os"
 import { Bus } from "../../src/bus"
 import { Session } from "../../src/session"
@@ -228,8 +228,14 @@ async function writeTrainingFakeNeoCastRunner(root: string) {
 set -euo pipefail
 ${fakeContractEvents}
 mkdir -p .neo-cast/artifacts/run_train
-cp .neo-cast/artifacts/run_fake/model_impl.py .neo-cast/artifacts/run_train/model_impl.py
-cp .neo-cast/artifacts/run_fake/inference.py .neo-cast/artifacts/run_train/inference.py
+cat > .neo-cast/artifacts/run_train/model_impl.py <<'PY'
+class Model:
+    pass
+PY
+cat > .neo-cast/artifacts/run_train/inference.py <<'PY'
+def predict(rows):
+    return rows
+PY
 cat > .neo-cast/artifacts/run_train/val_metrics.json <<'JSON'
 {"val_avg_mse":0.101,"val_avg_mae":0.303}
 JSON
@@ -660,6 +666,70 @@ afterEach(async () => {
 })
 
 describe("Research service", () => {
+  test("four isolated training experiments execute while a fifth stays queued", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await Instance.provide({ directory: tmp.path, fn: async () => {
+      const runnerRoot = path.join(tmp.path, "parallel-runner")
+      await writeTrainingFakeNeoCastRunner(runnerRoot)
+      const task = await createTSFTask("four parallel experiments", { bridgeOnly: true, neoCastProjectRoot: runnerRoot, pythonExecutable: "bash" })
+      const candidates = []
+      for (let index = 0; index < 5; index++) {
+        const candidate = await createCandidate({ taskID: task.id, rationale: `independent experiment ${index}` })
+        await executeFixtureSmoke(task.id, candidate.id)
+        candidates.push(candidate)
+      }
+      const prepared = []
+      for (const candidate of candidates) {
+        prepared.push(await runResearch(Research.Service.use((svc) => svc.prepareRun({ taskID: task.id, candidateID: candidate.id, stage: "full" }))))
+      }
+      expect(new Set(prepared.map((item) => item.runPlan.command.cwd)).size).toBe(5)
+      const gate = path.join(tmp.path, "training-gate")
+      await mkdir(gate)
+      const script = path.join(runnerRoot, "py/runner.py")
+      const body = await readFile(script, "utf8")
+      await writeFile(script, body.replace("set -euo pipefail", `set -euo pipefail
+if [[ "$1" == "run" ]]; then
+${process.execPath} -e '
+const fs = require("fs"), path = require("path")
+const gate = ${JSON.stringify(gate)}
+fs.writeFileSync(path.join(gate, "started-" + path.basename(process.cwd())), process.cwd())
+const timer = setInterval(() => { if (fs.existsSync(path.join(gate, "release"))) clearInterval(timer) }, 5)
+setTimeout(() => { clearInterval(timer); process.exit(1) }, 15000).unref()
+'
+fi`))
+      const pending = prepared.map((item) => runResearch(Research.Service.use((svc) => svc.executeRun({ taskID: task.id, candidateID: item.run.candidateID!, stage: "full" })))
+        .then((value) => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error })))
+      try {
+        const deadline = Date.now() + 5000
+        while ((await readdir(gate)).filter((name) => name.startsWith("started-")).length < 4) {
+          if (Date.now() > deadline) throw new Error("Four training processes did not start")
+          await Bun.sleep(5)
+        }
+        const runs = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+        expect(runs.filter((run) => run.stage === "full" && run.status === "running")).toHaveLength(4)
+        expect(runs.filter((run) => run.stage === "full" && run.status === "queued")).toHaveLength(1)
+        const runningIDs = new Set(runs.filter((run) => run.status === "running").map((run) => run.id))
+        for (const item of prepared.filter((item) => runningIDs.has(item.run.id))) {
+          const payload = JSON.parse(await readFile(path.join(item.runPlan.command.cwd!, ".neo-cast/current_candidate.json"), "utf8"))
+          expect(payload).toEqual(item.runPlan.writes[0]!.content)
+        }
+      } finally {
+        await writeFile(path.join(gate, "release"), "release")
+        const results = await Promise.all(pending)
+        expect(results.map((result) => result.error)).toEqual([undefined, undefined, undefined, undefined, undefined])
+        expect(results.map((result) => result.value?.run.status)).toEqual(Array(5).fill("succeeded"))
+      }
+      const full = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+      const source = full.find((run) => run.stage === "full")!
+      const approval = await runResearch(Research.Service.use((svc) => svc.createApproval({ taskID: task.id, candidateID: source.candidateID!, kind: "ref_test", reason: "fixture evaluation approval" })))
+      await runResearch(Research.Service.use((svc) => svc.replyApproval({ approvalID: approval.id, status: "approved" })))
+      const evaluation = await runResearch(Research.Service.use((svc) => svc.prepareRun({ taskID: task.id, candidateID: source.candidateID!, stage: "ref_test", runnerRunID: "train" })))
+      const sourcePlan = prepared.find((item) => item.run.id === source.id)!.runPlan
+      expect(evaluation.runPlan.command.cwd).toBe(sourcePlan.command.cwd)
+      expect(source.resourceUsage.execution).toMatchObject({ workspace: sourcePlan.command.cwd })
+    } })
+  })
+
   test("exposes multi-agent task statuses and export artifact kinds", () => {
     for (const status of ["idle", "intent_gathering", "analyzing", "data_analysis", "hypo_planning", "searching", "publishing"]) {
       expect(Research.ResearchTaskStatus.zod.safeParse(status).success).toBe(true)
@@ -1714,7 +1784,7 @@ describe("Research service", () => {
       const prepared = await runResearch(Research.Service.use((svc) => svc.prepareRun({
         taskID: first.id, candidateID: candidate.id, stage: "smoke",
       })))
-      expect(prepared.runPlan.command.cwd).toBe(path.join(tmp.path, ".neo-research", "workspaces", first.id))
+      expect(prepared.runPlan.command.cwd).toBe(path.join(tmp.path, ".neo-research", "workspaces", first.id, "experiments", prepared.run.id))
       expect(prepared.runPlan.command.env?.NEO_CAST_PROJECT_ROOT).toBe(prepared.runPlan.command.cwd)
     } })
   })
@@ -1765,9 +1835,8 @@ describe("Research service", () => {
         })
         const payload = JSON.parse(await readFile(prepared.path, "utf8"))
         expect(payload.command.args).toContain("--source")
-        expect(payload.command.args.slice(payload.command.args.indexOf("--train-rows"), payload.command.args.indexOf("--train-rows") + 2)).toEqual(["--train-rows", "0:67"])
-        expect(payload.command.args.slice(payload.command.args.indexOf("--val-rows"), payload.command.args.indexOf("--val-rows") + 2)).toEqual(["--val-rows", "67:76"])
-        expect(payload.command.args.slice(payload.command.args.indexOf("--ref-test-rows"), payload.command.args.indexOf("--ref-test-rows") + 2)).toEqual(["--ref-test-rows", "76:96"])
+        expect(payload.command.args.slice(payload.command.args.indexOf("--split-ratios"), payload.command.args.indexOf("--split-ratios") + 2)).toEqual(["--split-ratios", "7,1,2"])
+        expect(payload.command.args).not.toContain("--train-rows")
         expect(payload.datasetSpec.source_csv).toBe(path.resolve(datasetPath))
         const other = await runResearch(Research.Service.use((svc) => svc.createTask({
           title: "Different horizons", domainID: "tsf", mode: "autonomous",
@@ -1865,6 +1934,60 @@ describe("Research service", () => {
         })))
         expect(run.run.stage).toBe("smoke")
         expect(run.run.candidateID).toBe(candidate.id)
+      },
+    })
+  })
+
+  test.each([
+    "date, Generation forecast, System load forecast,OT",
+    'date," Generation forecast "," System load forecast "," OT "',
+  ])("prepare dataset normalizes whitespace in CSV headers and role columns: %s", async (header) => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const datasetPath = path.join(tmp.path, "BE.csv")
+    await writeFile(datasetPath, [header, ...Array.from({ length: 180 }, (_, i) => `${i},1,2,3`)].join("\n") + "\n")
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const fakeNeoCastRoot = path.join(tmp.path, "fake-neo-cast")
+        await writePrepareDataNeoCastRunner(fakeNeoCastRoot)
+        const task = await runResearch(Research.Service.use((svc) => svc.createTask({
+          title: "Prepare BE role columns with whitespace",
+          domainID: "tsf",
+          mode: "autonomous",
+          taskSpec: {
+            ...validTsfTaskSpec({ bridgeOnly: true, neoCastProjectRoot: fakeNeoCastRoot }),
+            contextLength: 12,
+            predictionLengths: [8],
+            dataset: {
+              loaderID: "local_csv",
+              path: datasetPath,
+              targetCols: [" OT "],
+              observedPastCovariates: [" Generation forecast", " System load forecast "],
+              knownFutureCovariates: [],
+              staticCovariates: [],
+            },
+          },
+          objective: {},
+          budget: {},
+        })))
+
+        const prepared = await runResearch(Research.Service.use((svc) => svc.prepareTaskDataset({ taskID: task.id })))
+        expect(prepared.datasetSpec).toMatchObject({
+          target_columns: ["OT"],
+          observed_past_covariates: ["Generation forecast", "System load forecast"],
+          known_future_covariates: [],
+          static_covariates: [],
+        })
+        const payload = JSON.parse(await readFile(prepared.path, "utf8"))
+        expect(payload.command.args).toContain("Generation forecast,System load forecast")
+        const updated = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+        expect(updated.taskSpec.dataset).toMatchObject({
+          targetCols: ["OT"],
+          observedPastCovariates: ["Generation forecast", "System load forecast"],
+          knownFutureCovariates: [],
+          staticCovariates: [],
+        })
       },
     })
   })
@@ -3250,7 +3373,7 @@ describe("Research service", () => {
         expect(executed.run.artifactRefs).toHaveLength(5)
 
         const writtenCandidate = JSON.parse(
-          await readFile(path.join(tmp.path, ".neo-research", "workspaces", task.id, ".neo-cast", "current_candidate.json"), "utf8"),
+          await readFile(path.join(executed.runPlan.command.cwd!, ".neo-cast", "current_candidate.json"), "utf8"),
         )
         expect(writtenCandidate.recipe_version).toBe("recipe_schema_v3")
 
@@ -3787,8 +3910,8 @@ fi
           ),
         ).toEqual([3, 5, 7])
 
-        const seedLog = await readFile(path.join(tmp.path, ".neo-research", "workspaces", task.id, ".neo-cast", "seed-log.txt"), "utf8")
-        expect(seedLog.trim().split("\n")).toEqual(["3", "5", "7"])
+        const seedLogs = await Promise.all(sweep.runs.map((item) => readFile(path.join(item.runPlan.command.cwd!, ".neo-cast", "seed-log.txt"), "utf8")))
+        expect(seedLogs.map((log) => log.trim())).toEqual(["3", "5", "7"])
 
         const exported = await runResearch(Research.Service.use((svc) => svc.exportTaskArtifact({ taskID: task.id })))
         expect(exported.artifact.metadata.multiSeedCandidateCount).toBe(1)
@@ -3930,7 +4053,10 @@ fi
         const runnerArtifactDir = path.join(tmp.path, ".neo-cast", "artifacts", "run_bundle")
         await mkdir(runnerArtifactDir, { recursive: true })
         await writeFile(path.join(runnerArtifactDir, "model.pt"), "weights", "utf8")
-        await writeFile(path.join(runnerArtifactDir, "model_impl.py"), "# model\n", "utf8")
+        await mkdir(path.join(runnerArtifactDir, "_neocast_runtime_bundle", "factory"), { recursive: true })
+        await writeFile(path.join(runnerArtifactDir, "_neocast_runtime_bundle", "__init__.py"), "")
+        await writeFile(path.join(runnerArtifactDir, "_neocast_runtime_bundle", "factory", "build_model.py"), "def build_model(): return 42\n")
+        await writeFile(path.join(runnerArtifactDir, "model_impl.py"), "from _neocast_runtime_bundle.factory.build_model import build_model\n", "utf8")
         await writeFile(path.join(runnerArtifactDir, "inference.py"), "# inference\n", "utf8")
         await writeFile(path.join(runnerArtifactDir, "metadata.json"), '{"model_family":"recipe_factory"}\n', "utf8")
         await writeFile(path.join(runnerArtifactDir, "model_spec.json"), '{"recipe_id":"bundle"}\n', "utf8")
@@ -4047,6 +4173,8 @@ fi
         })
         expect(await readFile(path.join(modelExport.path, "model", "requirements.txt"), "utf8")).toContain("mcp>=1.0")
         expect(await readFile(path.join(modelExport.path, "model", "mcp_server.py"), "utf8")).toContain("# mcp")
+        expect(modelManifest.files["runtime/_neocast_runtime_bundle"]).toBe("model/_neocast_runtime_bundle")
+        expect(await readFile(path.join(modelExport.path, "model", "_neocast_runtime_bundle", "factory", "build_model.py"), "utf8")).toContain("return 42")
       },
     })
   })

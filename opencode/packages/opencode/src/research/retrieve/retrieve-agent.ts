@@ -40,6 +40,7 @@ import { MODEL_CAPABILITIES } from "../model-capabilities"
 import { ARCHITECTURE_SELECTION_POLICY } from "./architecture-eligibility"
 import { ARCHITECTURE_LIMITS, distillArchitectureKnowledge } from "./architecture-distiller"
 import { loadArchitectureCorpus } from "./architecture-corpus"
+import { resolveLiteraturePaperMode, type LiteraturePaperMode } from "../literature/model-config"
 import { PAPER_SELECTION_VERSION } from "./candidate-selector"
 
 function stableJson(value: unknown): string {
@@ -85,6 +86,7 @@ export type RetrieveAgentInput = {
   readonly quantitativeReport: DatasetQuantitativeAnalysis | string
   readonly quantitativeReportArtifactID?: string
   readonly force?: boolean
+  readonly paperMode?: LiteraturePaperMode
   readonly budgets?: Partial<RetrievalBudgets>
   readonly maxCardsPerPaper?: number
   readonly catalogPath?: string
@@ -140,6 +142,7 @@ export class RetrieveAgent {
   }
 
   async prepare(input: RetrieveAgentInput) {
+    const paperMode = resolveLiteraturePaperMode(input.paperMode ?? "extract_missing")
     const report = typeof input.quantitativeReport === "string"
       ? await readQuantitativeReport(input.quantitativeReport)
       : readQuantitativeReportValue(input.quantitativeReport)
@@ -153,6 +156,7 @@ export class RetrieveAgent {
     const index = await buildLocalIndex({
       neoCastRoot: this.config.neoCastRoot,
       retrievalRoot: this.retrievalRoot,
+      readSourceDocuments: paperMode !== "reuse_only",
       ...(this.config.knowledgeRoot === undefined ? {} : { knowledgeRoot: this.config.knowledgeRoot }),
       ...(input.catalogPath === undefined ? {} : { catalogPath: input.catalogPath }),
     })
@@ -164,6 +168,7 @@ export class RetrieveAgent {
     const architectureCorpus = await loadArchitectureCorpus({ activeCards: storedCards,
       neoCastRoot: this.config.neoCastRoot, knowledgeRoot: this.config.knowledgeRoot })
     const runDigest = digest({
+      paperMode,
       reportDigest,
       quantitativeReportArtifactID,
       indexDigest: index.indexDigest,
@@ -202,7 +207,7 @@ export class RetrieveAgent {
     const intents = buildRetrievalIntents(transformations, budgets.maxIntents)
     const recalled = recallKnowledge({ cards: storedCards, report, taskContext: normalizedTaskContext.context,
       transformations, intents, budgets, compatibilityReviews: input.compatibilityReviews })
-    const candidates = intents.flatMap((intent) => buildRetrievalCandidates(
+    const candidates = paperMode === "reuse_only" ? [] : intents.flatMap((intent) => buildRetrievalCandidates(
       intent,
       [
         ...searchBM25({ documents: sourceDocuments }, intent, budgets.maxCandidatesPerIntent)
@@ -217,13 +222,13 @@ export class RetrieveAgent {
     ))
     const selectedCandidates = selectBridgeCandidates(candidates, budgets)
     candidates.push(...recalled.candidates)
-    return { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
+    return { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, paperMode, index,
       reportDigest, quantitativeReportArtifactID, runDigest, retrieveRunID, datasetEvidence,
       mappings, transformations, intents, candidates, selectedCandidates, recalled, knowledgeDigest, architectureCorpus }
   }
 
   async run(input: RetrieveAgentInput, prepared?: Awaited<ReturnType<RetrieveAgent["prepare"]>>): Promise<RetrieveResult> {
-    const { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, index,
+    const { report, budgets, normalizedTaskContext, contextDigest, maxCardsPerPaper, paperMode, index,
       reportDigest, quantitativeReportArtifactID, runDigest, retrieveRunID, datasetEvidence,
       transformations, intents, candidates, selectedCandidates, recalled, knowledgeDigest, architectureCorpus } = prepared ?? await this.prepare(input)
     if (prepared && knowledgeSnapshot(this.knowledgeSource).hash !== knowledgeDigest) {
@@ -316,11 +321,12 @@ export class RetrieveAgent {
     const status = result.summary.failedPaperCount > 0 || result.summary.missingPDFCount > 0 || architectureKnowledge.status !== "completed" ? "completed_with_warnings" : "completed"
     await this.store.save({
       result,
-      runInput: { ...input, quantitativeReport: report },
+      runInput: { ...input, paperMode, quantitativeReport: report },
       datasetEvidence,
       selectedCandidates,
       manifest: {
         schemaVersion: "retrieve_run_manifest_v1",
+        paperMode,
         retrieveRunID,
         runDigest,
         reportDigest,

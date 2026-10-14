@@ -187,6 +187,18 @@ export function experiencePromptRecord(memory: ResearchMemory) {
   }
 }
 
+/** Keep the conditional lesson and run IDs; detailed factual snapshots are opt-in. */
+export function experienceSummaryForPrompt(memory: ResearchMemory) {
+  const value = experiencePromptRecord(memory)
+  const { facts, ...summary } = value as Record<string, unknown>
+  return { ...summary, sourceRuns: Array.isArray(facts) ? facts.map((fact) => ({
+    runID: fact.runID, taskID: fact.taskID, stage: fact.stage, status: fact.status,
+    primaryMetric: fact.primaryMetric, primaryValue: fact.primaryValue, direction: fact.direction,
+    executionVerified: fact.executionVerified, independentEvidence: fact.independentEvidence,
+    attribution: fact.attribution, error: fact.error,
+  })) : [], detailAccess: { tool: "read_experiences", experienceID: memory.id, includeFacts: true } }
+}
+
 export function experienceFactForPrompt(fact: ExperimentFact) {
   const { evaluationDecision, ...snapshot } = fact
   const evidence = reflectionExecutionEvidence({

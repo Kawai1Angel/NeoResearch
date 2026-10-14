@@ -3,7 +3,7 @@
   "runtime_semantics_revision": 3,
   "representation": {
     "legacy_default_width": "min(context_length, 64)",
-    "forecast_path": "history -> encoder latent -> shared per-channel prediction head -> horizon",
+    "forecast_path": "history -> encoder output -> shared per-channel head -> horizon; v3 identity has no projection and requires encoder width H",
     "head_channel_shared": true,
     "horizons_trained_independently": true,
     "linear_rank_bound": "With single composition, raw preprocessing (no input-dependent normalization, centering or restoration), temporal/independent fusion, and a linear head, the linear/DLinear affine temporal map has rank at most latent_dim. This is not the original direct context-to-horizon DLinear."
@@ -15,7 +15,7 @@
     "fixed_trend_basis": "Unsupported: no fixed polynomial trend basis.",
     "fixed_seasonal_basis": "Unsupported: no fixed Fourier seasonal basis.",
     "multirate_sampling": "Unsupported: no N-HiTS-style pooling/interpolation hierarchy.",
-    "direct_horizon_forecast": "Unsupported: encoders emit latent features; heads own horizon projection."
+    "direct_horizon_forecast": "V3 identity head passes an already H-wide encoder forecast through without any additional projection."
   },
   "backbones": {
     "linear": {
@@ -88,8 +88,7 @@
   "unsupported_mechanisms": [
     "fixed_trend_basis",
     "fixed_seasonal_basis",
-    "multirate_sampling",
-    "direct_horizon_forecast"
+    "multirate_sampling"
   ],
   "component_semantics": {
     "preprocessing": {
@@ -137,7 +136,8 @@
       "linear": "Shared per-channel Linear(latent_dim,H) point forecast. Does not set encoder sharing and does not share parameters across different H models.",
       "residual_correction": "Shared Linear(latent,H) plus LayerNorm->Linear(correction_dim)->GELU->Dropout->Linear(H). Already a nonlinear residual MLP, not a plain linear correction. Dropout comes from backbone.dropout; DLinear has no supported dropout field.",
       "quantile": "Shared quantile projections with strictly increasing unique levels in (0,1); loss quantiles must match exactly and use quantile loss.",
-      "gaussian": "Shared mean/positive-scale projections (variance_floor). Requires gaussian_nll and compatible inversion/fusion; does not model joint covariance."
+      "gaussian": "Shared mean/positive-scale projections (variance_floor). Requires gaussian_nll and compatible inversion/fusion; does not model joint covariance.",
+      "identity": "V3-only parameter-free point head. Requires explicit representation.latent_dim equal to every requested H (including secondary branches). With DLinear, raw preprocessing, none embedding and independent temporal fusion, the seasonal/trend Linear(context,H) forecasts sum directly."
     },
     "composition": {
       "single": "One encoder and prediction path.",
@@ -173,7 +173,7 @@
   },
   "experiment_contract": {
     "sharing": "linear.shared=true corresponds to dlinear.individual=false for encoder weight sharing only. Head sharing and fusion mixing are separate. Explicitly choose these fields in both branches. For a matched dlinear-to-linear control, remove kernelSize and individual, add shared=true for individual=false, and preserve bias. Experiment constraints address normalized fields; removing a defaulted field does not disable it.",
-    "representation": "latent_dim integer 1..512. channel_latent uses readout=none. sequence_latent/channel_sequence requires mean or last readout. Encoders output latent; heads project to H. A separate model/optimizer/checkpoint trains for each H.",
+    "representation": "latent_dim integer 1..512. channel_latent uses readout=none. sequence_latent/channel_sequence requires mean or last readout. Encoders output latent; heads project to H. A separate model/optimizer/checkpoint trains for each H. V3 identity point heads require explicit latent_dim=H; unequal multiple horizons are incompatible with one fixed-width identity recipe.",
     "constraints": "System parameter budget is at most 10M summed across independently trained horizon models; smoke on one H does not establish full-budget feasibility. Unsupported known-future/static covariates; targets and observed-past only.",
     "training": "warmup_steps means epochs, must be <max_epochs; grad_clip is gradient-norm clipping, not dropout. Module-level dropout only. Explicit seed/batch_size/max_epochs/patience/time_budget_s are experimental conditions, not interchangeable metadata.",
     "horizon_weighting": "uniform gives equal horizon-position weights; front_heavy linearly weights 1.5 to 0.5; tail_heavy 0.5 to 1.5. learned_static currently falls back to uniform (no learned weights). All weight forecast positions, not sample time/recency."

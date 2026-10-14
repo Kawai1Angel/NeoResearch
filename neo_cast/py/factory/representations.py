@@ -27,6 +27,10 @@ def validate_typed_recipe(recipe: dict, input_len: int | None = None) -> list[st
         errors.append("representation: legacy backbones require channel_latent with readout=none")
     legacy = copy.deepcopy(recipe)
     legacy["recipe_version"] = "recipe_schema_v2"
+    # Identity is a v3-only point head; reuse the legacy distribution/loss
+    # checks without adding a new action to the frozen v2 registry.
+    if legacy["prediction_head"]["type"] == "identity":
+        legacy["prediction_head"]["type"] = "linear"
     if sequence:
         legacy["backbone"] = {"type": "linear", "shared": True}
         if layout == "sequence_latent" and legacy["fusion"] == {"type": "temporal", "channel_mode": "independent"}:

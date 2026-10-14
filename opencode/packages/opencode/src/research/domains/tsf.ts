@@ -67,6 +67,7 @@ const ACTION_REGISTRY = {
     gated_hybrid: { phaseMin: "phase2", bridgeSupported: true },
   },
   head: {
+    identity: { phaseMin: "phase2", bridgeSupported: true },
     linear: { phaseMin: "phase0b", bridgeSupported: true },
     quantile: { phaseMin: "phase2", bridgeSupported: true },
     gaussian: { phaseMin: "phase2", bridgeSupported: true },
@@ -184,10 +185,10 @@ export const TSFTaskSpec = z
       .object({
         loaderID: z.string().min(1),
         path: z.string().optional(),
-        targetCols: z.array(z.string().min(1)).default([]),
-        knownFutureCovariates: z.array(z.string()).max(0, "UNSUPPORTED_COVARIATE: knownFutureCovariates is unavailable").default([]),
-        observedPastCovariates: z.array(z.string()).default([]),
-        staticCovariates: z.array(z.string()).max(0, "UNSUPPORTED_COVARIATE: staticCovariates is unavailable").default([]),
+        targetCols: z.array(z.string().trim().min(1)).default([]),
+        knownFutureCovariates: z.array(z.string().trim().min(1)).max(0, "UNSUPPORTED_COVARIATE: knownFutureCovariates is unavailable").default([]),
+        observedPastCovariates: z.array(z.string().trim().min(1)).default([]),
+        staticCovariates: z.array(z.string().trim().min(1)).max(0, "UNSUPPORTED_COVARIATE: staticCovariates is unavailable").default([]),
         split: DatasetSplit,
       })
       .superRefine((dataset, ctx) => {
@@ -479,6 +480,12 @@ const Fusion = z.discriminatedUnion("type", [
 const PredictionHead = z.discriminatedUnion("type", [
   z
     .object({
+      type: z.literal("identity"),
+      outputDistribution: z.literal("point").default("point"),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("linear"),
       outputDistribution: z.literal("point").default("point"),
     })
@@ -597,7 +604,7 @@ export const TSFCandidateRecipe = z
   .strict()
   .superRefine((recipe, ctx) => {
     const sequence = ["diagonal_ssm", "timesblock_encoder", "mamba"].includes(recipe.backbone.type)
-    if (recipe.recipeVersion === "recipe_schema_v2" && (sequence || recipe.representation || recipe.composition)) {
+    if (recipe.recipeVersion === "recipe_schema_v2" && (sequence || recipe.representation || recipe.composition || recipe.predictionHead.type === "identity")) {
       ctx.addIssue({ code: "custom", path: ["recipeVersion"], message: "Typed encoders and composition require recipe_schema_v3" })
     }
     if (recipe.recipeVersion === "recipe_schema_v3") {
@@ -743,6 +750,13 @@ export function validateTSFCandidate(taskSpec: unknown, candidateSpec: unknown):
   const recipe = candidateResult.data
   const bridgeOnly = task.runtime.bridgeOnly
   const preprocessingTypes = recipe.preprocessing.actions.map((action) => action.type)
+
+  if (recipe.predictionHead.type === "identity") {
+    const representations = [recipe.representation, recipe.composition && recipe.composition.type !== "single" ? recipe.composition.secondary.representation : undefined].filter(Boolean)
+    if (representations.some((repr) => task.predictionLengths.some((horizon) => repr?.latentDim !== horizon))) {
+      issues.push(issue("representation.latentDim", "Identity head requires each latentDim to equal every prediction length"))
+    }
+  }
 
   if (preprocessingTypes.includes("none") && preprocessingTypes.length > 1) {
     issues.push(issue("preprocessing.actions", "preprocessing action 'none' cannot be combined with other actions"))
@@ -996,7 +1010,7 @@ function snakeFusion(fusion: TSFFusion) {
 }
 
 function snakePredictionHead(head: TSFPredictionHead) {
-  if (head.type === "linear") {
+  if (head.type === "linear" || head.type === "identity") {
     return { type: head.type, output_distribution: head.outputDistribution }
   }
   if (head.type === "quantile") {

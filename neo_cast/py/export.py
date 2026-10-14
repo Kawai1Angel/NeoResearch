@@ -764,6 +764,7 @@ def render_example_py() -> str:
     return """from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from inference import load_model, predict_raw
@@ -771,13 +772,19 @@ from inference import load_model, predict_raw
 
 def main() -> None:
     preprocess = json.loads((Path(__file__).resolve().parent / "preprocess.json").read_text(encoding="utf-8"))
-    history = [preprocess["scaler_mean"] for _ in range(preprocess["input_len"])]
     bundle = load_model()
-    if bundle["metadata"].get("training_summary", {}).get("embedding") == "calendar":
-        import sys
-        if len(sys.argv) != 2:
-            raise SystemExit("Usage: python example.py history.json (object with history and real timestamps)")
+    metadata = bundle["metadata"]
+    if len(sys.argv) == 2:
         history = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    elif len(sys.argv) != 1 or metadata.get("training_summary", {}).get("embedding") == "calendar":
+        raise SystemExit("Usage: python example.py history.json (calendar models require real aligned timestamps)")
+    elif metadata.get("dataset_schema_version") == "dataset.v2":
+        history = {
+            "target_history": [preprocess["target_scaler"]["mean"] for _ in range(metadata["input_len"])],
+            "exogenous_past": [(preprocess.get("covariate_scaler") or {}).get("mean", []) for _ in range(metadata["input_len"])],
+        }
+    else:
+        history = [preprocess["scaler_mean"] for _ in range(preprocess["input_len"])]
     prediction = predict_raw(bundle, history, bundle["metadata"]["horizons"][0])
     print(prediction.shape)
 
@@ -825,7 +832,12 @@ def render_readme_md(metadata: dict[str, Any], candidate: dict[str, Any] | None)
             "",
             "## Input Contract",
             "- Public entrypoint is raw-space input.",
-            f"- `history` must be shape `[{metadata['input_len']}, {metadata['num_channels']}]` with feature order matching `preprocess.json`.",
+            (
+                f"- Input must be an object with `target_history` shape `[{metadata['input_len']}, {metadata['target_channels']}]` "
+                f"and `exogenous_past` shape `[{metadata['input_len']}, {metadata['past_exogenous_channels']}]`, ordered as in `preprocess.json`."
+                if metadata.get("dataset_schema_version") == "dataset.v2"
+                else f"- `history` must be shape `[{metadata['input_len']}, {metadata['num_channels']}]` with feature order matching `preprocess.json`."
+            ),
             "- `predict_raw()` normalizes with the stored scaler before inference.",
             "- Calendar models require `{\"history\": [...], \"timestamps\": [...]}` with real aligned timestamps (UTC; naive timestamps are treated as UTC). For dataset.v2, add timestamps to the structured covariate input. `example.py history.json` accepts this input.",
             "- Gaussian models expose `{mean, scale}` via `predict_distribution_raw()`; scale is positive standard deviation in target units. `predict_raw()` remains the point-mean interface.",

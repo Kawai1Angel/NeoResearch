@@ -1,6 +1,6 @@
 import { MODEL_CAPABILITIES } from "../model-capabilities"
 import { isOpenHypothesis } from "./hypo-planner-agent"
-import { projectCitedTaskEvidence } from "../retrieve/evidence-handoff"
+import { projectPlanningTaskEvidence } from "../retrieve/planning-evidence"
 import type { TaskEvidenceBundle } from "../retrieve/contract"
 import type { DomainCandidateProposal, DomainCandidateRanking } from "../domain"
 import type {
@@ -297,7 +297,7 @@ export function buildModelDesignerTaskFingerprint(input: {
     ...(input.selectedHypothesis ? { selectedHypothesis: { ...input.selectedHypothesis } } : {}),
     ...(input.selectedHypothesis?.literatureEvidence?.length
       ? {
-          taskEvidence: projectCitedTaskEvidence(input.taskEvidence, input.selectedHypothesis.literatureEvidence),
+          taskEvidence: projectPlanningTaskEvidence(input.taskEvidence, input.selectedHypothesis.literatureEvidence),
         }
       : {}),
     searchBiases: unique([...baseBiases, ...planBiases, ...hypothesisBiases, ...(input.reflectionHypotheses ?? [])]),

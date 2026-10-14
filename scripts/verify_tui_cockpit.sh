@@ -33,6 +33,10 @@ run_bun "$ROOT" test \
   --timeout 30000
 
 print_step "Capturing TUI cockpit text snapshot"
-run_bun "$ROOT" script/verify-tui-cockpit-snapshot.tsx "$ARTIFACT_DIR/tui-cockpit.txt" "$ARTIFACT_DIR/tui-cockpit.json"
+snapshot_root="$(mktemp -d)"
+trap 'rm -rf "$snapshot_root"' EXIT
+XDG_DATA_HOME="$snapshot_root/data" XDG_CONFIG_HOME="$snapshot_root/config" \
+  XDG_CACHE_HOME="$snapshot_root/cache" XDG_STATE_HOME="$snapshot_root/state" \
+  run_bun "$ROOT" script/verify-tui-cockpit-snapshot.tsx "$ARTIFACT_DIR/tui-cockpit.txt" "$ARTIFACT_DIR/tui-cockpit.json"
 
 print_ok "TUI Cockpit verification completed"

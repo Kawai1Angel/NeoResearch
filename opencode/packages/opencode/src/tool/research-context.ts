@@ -1,4 +1,5 @@
 import { readDesignHistory } from "../research/design-history"
+import { readReflectionHistory } from "../research/reflection-context"
 import { extractTrainingCurve } from "../research/runner-evidence"
 export { extractTrainingCurve } from "../research/runner-evidence"
 import { Effect, Schema } from "effect"
@@ -39,8 +40,8 @@ export const ReadReflectionTool = Tool.define(
       "its status, model, raw text, and structured analysis (trainingHealthAssessment, hypothesisValidation, " +
       "attributionAnalysis, historicalComparison, modelDesignReflection, nextStepRecommendation, distillableMemory). " +
       "Returns { available: false } on the first iteration before any Reflection has run.",
-    parameters: Schema.Struct({}),
-    execute: (_args: Record<never, never>, ctx: Tool.Context) =>
+    parameters: Schema.Struct({ full: Schema.optional(Schema.Boolean) }),
+    execute: (args: { full?: boolean }, ctx: Tool.Context) =>
       Effect.promise(async () => {
         const taskID = await resolveTaskIDBySessionID(ctx.sessionID)
         if (!taskID) {
@@ -66,7 +67,11 @@ export const ReadReflectionTool = Tool.define(
               return {
                 title: "read_reflection",
                 metadata: { available: true },
-                output: JSON.stringify({ available: true, ...result.llm }, null, 2),
+                output: JSON.stringify(ctx.agent === "research-reflection" && !args.full
+                  ? { available: true, status: result.llm.status, structured: result.llm.structured,
+                    ...(!result.llm.structured ? { text: result.llm.text?.slice(0, 4000), truncated: (result.llm.text?.length ?? 0) > 4000 } : {}),
+                    detailAccess: "Use read_reflection(full=true) only if exact prior wording is needed." }
+                  : { available: true, ...result.llm }, null, 2),
               }
             } catch { continue }
           }
@@ -117,7 +122,9 @@ export const ExperimentResultsTool = Tool.define(
             output: NOT_IN_RESEARCH_SESSION,
           }
         }
-        const result = await readDesignHistory(taskID, args, { forReflection: ctx.agent === "research-reflection" })
+        const result = ctx.agent === "research-reflection" && !args.runID && !args.candidateID && !args.hypothesisID && !args.offset
+          ? await readReflectionHistory(taskID)
+          : await readDesignHistory(taskID, args, { forReflection: ctx.agent === "research-reflection" })
         return {
           title: "experiment_results",
           metadata: { runCount: result.runs.length },

@@ -126,8 +126,18 @@ Artifacts under `.neo-cast/literature-retrieval/runs/<retrieveRunID>/` include:
 
 Only sources of final approved decisions authorize downstream card/revision/role citations.
 The original `bundle.entries` and its intent counts remain source-selection audit data;
-consumers use `citableTaskEvidence()` / `projectTaskEvidence()`. A designer receives all
-sources needed for its cited decision, including complementary evidence. No model or no
+validators use `citableTaskEvidence()` / `projectTaskEvidence()`. Planning and design prompts
+use `projectPlanningTaskEvidence()`: admitted decisions, exact applicability conditions and
+AND/OR logic, limitations, available family mappings and transfer boundaries, and card IDs,
+revisions and permitted roles. Decisions appear once; full cards, quotes, source experiments,
+review histories and illustrative recipe witnesses stay in the sealed artifact. The designer
+retains all complementary source IDs needed for its selected hypothesis. `read_task_evidence`
+reads one exact stored section (`knowledge`, `sources`, or `review`) by card ID and revision,
+optionally selecting source IDs, with character pagination (default 4,000; maximum 12,000).
+It is bound to the session's task evidence artifact, rejects withheld/stale cards, and does not
+extract new papers. Direct transport uses the same reader through `evidence_request`, sharing
+the existing bounded history-request loop. Planning summaries over 120,000 characters fail
+before a model request rather than dropping scientific conditions or citations. No model or no
 approved decisions yields `ready_data_only`, with no fallback to old tuning cards.
 Partial failures withhold affected proposals and preserve the successfully reviewed subset.
 Original v2 bundles without an architecture packet retain their legacy citation contract.

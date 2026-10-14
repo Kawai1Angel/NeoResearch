@@ -62,7 +62,8 @@ print_step "App typecheck"
 (cd "$ROOT/opencode/packages/app" && npm run typecheck)
 
 print_step "Neo-Cast Python tests"
-(cd "$ROOT/neo_cast" && python3 -m unittest \
+python_bin="$(neo_cast_python_for_root "$ROOT")"
+(cd "$NEO_CAST_ROOT" && "$python_bin" -m unittest \
   py.tests.test_e2e_contract \
   py.tests.test_benchmark_manifest \
   py.tests.test_benchmark_report \

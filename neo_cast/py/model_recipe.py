@@ -302,7 +302,15 @@ def compile_model_recipe(model_recipe: dict[str, Any]) -> dict[str, Any]:
         load_validator(SCHEMA_DIR / "model_recipe_v2_schema.json").validate(model_recipe)
         if model_recipe["input"].get("known_future_covariates"):
             raise ValueError("UNSUPPORTED_COVARIATE: known_future_covariates")
-        prediction_horizons_from_input(model_recipe["input"])
+        horizons = prediction_horizons_from_input(model_recipe["input"])
+        architecture = model_recipe["architecture"]
+        if architecture["prediction_head"]["type"] == "identity":
+            widths = [architecture["representation"]["latent_dim"]]
+            secondary = architecture.get("composition", {}).get("secondary")
+            if secondary:
+                widths.append(secondary["representation"]["latent_dim"])
+            if any(width != horizon for width in widths for horizon in horizons):
+                raise ValueError("prediction_head.identity requires each representation.latent_dim to equal every forecast horizon")
         result = {
             "recipe_version": "recipe_schema_v3",
             "recipe_id": f"recipe_{_safe_model_slug(model_recipe['model_name'])}",

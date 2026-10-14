@@ -174,6 +174,7 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
     elif isinstance(mixer, factory.ChannelMixer) and model.fusion_type == "feature_mlp":
         fusion = "feature_mlp"
     head = {
+        factory.IdentityForecastHead: "identity",
         factory.ResidualCorrectionHead: "residual_correction",
         factory.QuantilePointHead: "quantile",
         factory.GaussianPointHead: "gaussian",
@@ -236,7 +237,9 @@ def describe_implementation(model: Any, factory: Any) -> dict[str, Any]:
     if any(type(m) is factory.MultiScalePatchEmbedding and len(m.embeddings) > 1 for m in modules):
         mechanisms.add("multiscale_patches")
     head = model.prediction_head
-    head_types = {factory.LinearHead, factory.ResidualCorrectionHead,
+    if type(head) is factory.IdentityForecastHead:
+        mechanisms.add("direct_horizon_forecast")
+    head_types = {factory.IdentityForecastHead, factory.LinearHead, factory.ResidualCorrectionHead,
                   factory.QuantilePointHead, factory.GaussianPointHead}
     projection = (head if type(head) is factory.LinearHead else
                   head.base if type(head) is factory.ResidualCorrectionHead else
@@ -244,11 +247,13 @@ def describe_implementation(model: Any, factory: Any) -> dict[str, Any]:
                   head.mean if type(head) is factory.GaussianPointHead else None)
     return {
         "input_length": model.input_len,
-        "head_input_width": projection.in_features if isinstance(projection, nn.Linear) else None,
+        "head_input_width": (model.latent_dim if type(head) is factory.IdentityForecastHead else
+                             projection.in_features if isinstance(projection, nn.Linear) else None),
         "head_channel_shared": type(head) in head_types,
         "forecast_horizon": model.horizon,
         "mechanisms": sorted(mechanisms),
-        "forecast_path": "history -> encoder latent -> shared channel head -> horizon",
+        "forecast_path": ("history -> horizon-sized encoder forecast -> identity head" if type(head) is factory.IdentityForecastHead else
+                          "history -> encoder latent -> shared channel head -> horizon"),
     }
 
 

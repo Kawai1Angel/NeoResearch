@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { beforeAll, beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { Global } from "@opencode-ai/core/global"
 import { chmod, mkdir, readFile, rm, writeFile } from "fs/promises"
@@ -28,10 +28,18 @@ function PreferenceProbe() {
 
 // Task selection and pending operation keys now survive a renderer restart.
 // Independent fixtures must start with independent UI preferences.
+let configuredNeoCastRoot: string | undefined
 beforeEach(async () => {
+  configuredNeoCastRoot = process.env.NEO_CAST_ROOT
+  delete process.env.NEO_CAST_ROOT
   await flushPreferences?.()
   await mkdir(Global.Path.state, { recursive: true })
   await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
+})
+
+afterEach(() => {
+  if (configuredNeoCastRoot === undefined) delete process.env.NEO_CAST_ROOT
+  else process.env.NEO_CAST_ROOT = configuredNeoCastRoot
 })
 
 const now = 1_765_000_000_000

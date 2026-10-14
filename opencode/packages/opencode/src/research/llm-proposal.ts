@@ -1,4 +1,5 @@
 import { normalizedRecipeKey } from "./recipe-naming"
+import { DirectEvidenceRequestSchema, type EvidenceReadRequest } from "./retrieve/planning-evidence"
 import { DesignUnavailable, DesignHistoryRequest, type HistoryRequest, designTaskSpec, recipeConfiguration } from "./design-feedback"
 import { MODEL_CAPABILITIES } from "./model-capabilities"
 import { readFile } from "fs/promises"
@@ -53,11 +54,15 @@ export type NeoCastLLMConfig = {
   readonly baseURL?: string
   readonly maxTokens: number
   readonly temperature: number
+  readonly thinking?: "enabled" | "disabled"
+  readonly reasoningEffort?: "low" | "high" | "max"
+  readonly responseFormat?: "json_object"
 }
 
 export type LLMProposalResult = {
   readonly unavailable?: DesignUnavailable
   readonly historyRequest?: HistoryRequest
+  readonly evidenceRequest?: EvidenceReadRequest
   readonly proposal?: DomainCandidateProposal
   readonly metadata: JsonRecord
 }
@@ -407,6 +412,7 @@ export function buildUserPrompt(input: {
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
   readonly requestedHistory?: readonly unknown[]
+  readonly requestedEvidence?: readonly unknown[]
   readonly validationFeedback?: {
     readonly attempt: number
     readonly issues: readonly {
@@ -445,6 +451,7 @@ export function buildUserPrompt(input: {
       instruction: "Retrieve the named comparison run before designing a controlled change. History and reflections are available on demand; no memory or search recommendations are preloaded. If tools are unavailable, return {status:'history_request', request:{runID:...}} as JSON and the coordinator will return the requested facts.",
     },
     ...(input.requestedHistory?.length ? { requestedHistory: input.requestedHistory } : {}),
+    ...(input.requestedEvidence?.length ? { requestedEvidence: input.requestedEvidence } : {}),
     ...(input.validationFeedback ? {
       candidateValidationFeedback: {
         ...input.validationFeedback,
@@ -468,6 +475,9 @@ async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string,
       model: config.model,
       max_tokens: config.maxTokens,
       temperature: config.temperature,
+      ...(config.thinking ? { thinking: { type: config.thinking } } : {}),
+      ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
+      ...(config.responseFormat ? { response_format: { type: config.responseFormat } } : {}),
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -476,6 +486,9 @@ async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string,
   })
   const payload = await response.json().catch(async () => ({ error: { message: await response.text() } }))
   if (!response.ok) throw new Error(payload?.error?.message || payload?.message || `${response.status}`)
+  if (payload?.choices?.[0]?.finish_reason === "length") {
+    throw new Error(`OpenAI-compatible output was truncated at max_tokens=${config.maxTokens}`)
+  }
   const text = payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text
   if (typeof text !== "string" || !text.trim()) throw new Error("OpenAI-compatible API returned empty content")
   const u = payload?.usage
@@ -621,6 +634,9 @@ async function requestOpenAICompatibleStream(
       model: config.model,
       max_tokens: config.maxTokens,
       temperature: config.temperature,
+      ...(config.thinking ? { thinking: { type: config.thinking } } : {}),
+      ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
+      ...(config.responseFormat ? { response_format: { type: config.responseFormat } } : {}),
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -793,6 +809,10 @@ export function candidateGovernance(candidateSpec: JsonRecord) {
 export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, config: NeoCastLLMConfig): LLMProposalResult {
   try {
     const response = extractDesignerResponse(text)
+    if (response.status === "evidence_request") {
+      const request = DirectEvidenceRequestSchema.parse(response)
+      return { evidenceRequest: request.request, metadata: llmMetadata(config, "used", { designStatus: "evidence_request" }, usage) }
+    }
     if (response.status === "unavailable") {
       const unavailable = DesignUnavailable.parse(response)
       return { unavailable, metadata: llmMetadata(config, "used", { designStatus: "unavailable" }, usage) }
@@ -857,6 +877,7 @@ export async function proposeLLMCandidate(input: {
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
   readonly requestedHistory?: readonly unknown[]
+  readonly requestedEvidence?: readonly unknown[]
   readonly validationFeedback?: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
 }): Promise<LLMProposalResult> {
   const runtime = isRecord(input.task.taskSpec.runtime) ? input.task.taskSpec.runtime : {}
@@ -898,6 +919,7 @@ export async function proposeLLMCandidate(input: {
     previousReflectionMarkdown: input.previousReflectionMarkdown,
     validationFeedback: input.validationFeedback,
     requestedHistory: input.requestedHistory,
+    requestedEvidence: input.requestedEvidence,
   }
   let user = buildUserPrompt(promptInput)
   const maxAttempts = 3
@@ -906,7 +928,7 @@ export async function proposeLLMCandidate(input: {
     try {
       const { text, usage } = await requestNeoCastLLM(effectiveConfig, apiKey, system, user)
       const result = buildLLMProposalFromText(text, usage, effectiveConfig)
-      if (result.unavailable || result.historyRequest) return result
+      if (result.unavailable || result.historyRequest || result.evidenceRequest) return result
       if (!result?.proposal) {
         const message = typeof result?.metadata.llmError === "string" ? result.metadata.llmError : "Failed to parse LLM proposal JSON"
         user = buildUserPrompt({ ...promptInput, validationFeedback: { attempt, issues: llmProposalValidationIssues(result?.metadata ?? {}) } })

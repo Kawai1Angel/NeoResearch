@@ -147,6 +147,7 @@ ${formatTaskContext(taskContext)}
 - { "type": "gated_hybrid", "gate_type": "learned"|"scalar"|"channel"|"time" }
 
 ### prediction_head
+- Native recipe_schema_v3 only: { "type": "identity", "output_distribution": "point" } requires representation.latent_dim=H for every requested horizon; no trainable head. Keep recipe_schema_v2 proposals on its existing heads.
 - { "type": "linear", "output_distribution": "point"}
 - { "type": "quantile", "output_distribution": "quantile", "quantiles": [0.1,0.5,0.9] }
 - { "type": "gaussian", "output_distribution": "gaussian", "variance_floor": 0.0001 }

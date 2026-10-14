@@ -162,6 +162,7 @@ export async function collectIndexedPapers(input: {
   readonly neoCastRoot: string
   readonly knowledgeRoot?: string
   readonly catalogPath?: string
+  readonly readSourceDocuments?: boolean
 }): Promise<{ documents: IndexedPaper[]; sourceDigests: Record<string, string> }> {
   const neoCastRoot = path.resolve(input.neoCastRoot)
   const knowledgeRoot = path.resolve(input.knowledgeRoot ?? path.join(neoCastRoot, ".neo-cast", "literature-knowledge"))
@@ -199,7 +200,7 @@ export async function collectIndexedPapers(input: {
     papers.set(paperID, paper)
   }
 
-  const previews = await readPDFPreviews(neoCastRoot, previewSources)
+  const previews = input.readSourceDocuments === false ? new Map() : await readPDFPreviews(neoCastRoot, previewSources)
   for (const [paperID, preview] of previews) {
     const paper = papers.get(paperID)!
     // First pages are preview text, not a verified abstract or card evidence.
@@ -208,7 +209,8 @@ export async function collectIndexedPapers(input: {
     sourceDigests[`preview:${paperID}:${PDF_PREVIEW_VERSION}`] = digestText(stableJson(preview))
   }
 
-  for (const documentPath of await filesUnder(path.join(knowledgeRoot, "documents"), ".document.json")) {
+  const documentPaths = input.readSourceDocuments === false ? [] : await filesUnder(path.join(knowledgeRoot, "documents"), ".document.json")
+  for (const documentPath of documentPaths) {
     const documentText = await readFile(documentPath, "utf8")
     sourceDigests[path.relative(neoCastRoot, documentPath)] = digestText(documentText)
     const raw = JSON.parse(documentText) as Record<string, unknown>
@@ -281,12 +283,14 @@ export async function buildLocalIndex(input: {
   readonly knowledgeRoot?: string
   readonly catalogPath?: string
   readonly taxonomyVersion?: string
+  readonly readSourceDocuments?: boolean
 }): Promise<LocalRetrievalIndex> {
   const retrievalRoot = path.resolve(input.retrievalRoot ?? path.join(input.neoCastRoot, ".neo-cast", "literature-retrieval"))
   const indexRoot = path.join(retrievalRoot, "index")
   await mkdir(indexRoot, { recursive: true })
   const { documents, sourceDigests } = await collectIndexedPapers(input)
-  const indexDigest = digestText(stableJson({ documents, sourceDigests, tokenizer: RETRIEVAL_TOKENIZER_VERSION }))
+  const sourceContentMode = input.readSourceDocuments === false ? "metadata_and_cards" : "source_documents"
+  const indexDigest = digestText(stableJson({ documents, sourceDigests, sourceContentMode, tokenizer: RETRIEVAL_TOKENIZER_VERSION }))
   const databasePath = path.join(indexRoot, "retrieval.db")
   const db = new Database(databasePath, { create: true, strict: true })
   try {
@@ -327,6 +331,7 @@ export async function buildLocalIndex(input: {
   }
   const manifest = {
     schemaVersion: RETRIEVAL_INDEX_SCHEMA_VERSION,
+    sourceContentMode,
     indexDigest,
     sourceDigests,
     catalogSha256: Object.entries(sourceDigests).find(([sourcePath]) => sourcePath.endsWith("catalog/papers.jsonl"))?.[1],

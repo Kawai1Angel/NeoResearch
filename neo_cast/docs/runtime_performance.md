@@ -21,6 +21,21 @@ training falls back to a fresh process with those overrides removed. The
 `phase_timing` event for `standard_fit` covers entrypoint initialization through
 completion, including cache reuse when applicable.
 
+## Independent experiment concurrency
+
+NeoResearch defaults to at most four independent experiments executing at once
+within a project. The TUI and CLI create tasks with `budget.maxParallel=4`;
+smaller explicit limits are honored, and larger values are capped at four.
+Additional prepared experiments wait in the queue until an execution slot is free.
+Each parallel experiment has its own runner workspace under the task's
+`experiments/<runID>/` directory, while the prepared dataset and experiment
+identity registry remain shared within that task. Reference and blind evaluation
+reuse the source model's workspace. Workspace writers and champion updates are
+serialized to preserve artifact and metric provenance.
+
+This limit applies to independently requested experiments. Dependent NAS steps
+continue to follow their existing design, evaluation, and reflection order.
+
 ## Measurements
 
 On 2026-09-23, comparing the pre-change exporter with the optimized exporter on

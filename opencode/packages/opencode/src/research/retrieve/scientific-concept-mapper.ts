@@ -76,7 +76,10 @@ export function mapScientificConcepts(
     result.push(concept("covariate_conditioning", 0.95, [byPath.get("$.dataset.knownFutureCovariates")], "Use information known over the forecast horizon."))
   }
   if (report.dataset.observedPastCovariates.length > 0 && report.dataset.knownFutureCovariates.length === 0) {
-    result.push(concept("covariate_conditioning", 0.9, [byPath.get("$.dataset.observedPastCovariates"), byPath.get("$.covariates")], "Evaluate conditioning on historical exogenous inputs using their own diagnostics."))
+    result.push({
+      ...concept("covariate_conditioning", 0.9, [byPath.get("$.dataset.observedPastCovariates"), byPath.get("$.covariates")], "Evaluate conditioning on historical exogenous inputs using their own diagnostics."),
+      paperTerms: scientificConfig.concepts.covariate_conditioning.observedPastPaperTerms,
+    })
   }
   if ((report.profile.crossVarCorrelation ?? 0) >= 0.5) {
     result.push(concept("cross_series_dependency", report.profile.crossVarCorrelation!, [byPath.get("$.profile.crossVarCorrelation")], "Capture dependencies between variables."))
@@ -99,4 +102,4 @@ export function mapScientificConcepts(
   return result.filter((item) => item.evidence.length > 0)
 }
 
-export const SCIENTIFIC_CONCEPT_MAPPING_VERSION = scientificConfig.schemaVersion
+export const SCIENTIFIC_CONCEPT_MAPPING_VERSION = `${scientificConfig.schemaVersion}:covariate_terms_v2`

@@ -349,6 +349,7 @@ missing_mask must be first, with mask_channel=true and cross-variable fusion; st
 - backbone: linear, mlp, transformer, temporal_conv, dlinear, nbeats, timesnet_lite, rnn, gated_depthwise_conv, mixer
 - fusion: temporal, feature_mlp, variate_attention, temporal_then_feature, feature_then_temporal, graph, gated_hybrid
 - prediction_head: linear, quantile, gaussian, residual_correction
+- Native recipe_schema_v3 additionally supports prediction_head identity with output_distribution=point and representation.latent_dim equal to every requested H. This is not available in model_recipe.v1/recipe_schema_v2. DLinear with latent_dim=H and identity head directly sums its trend/seasonal horizon forecasts.
 - output_distribution: point, quantile, gaussian
 - loss: mse, mae, huber, quantile, distillation, gaussian_nll
 - optimizer: adam, adamw, or sgd

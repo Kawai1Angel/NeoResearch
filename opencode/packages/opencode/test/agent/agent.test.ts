@@ -20,6 +20,18 @@ afterEach(async () => {
   await Instance.disposeAll()
 })
 
+test("planning and design agents can read bounded task evidence without acquiring knowledge-confirmation permission", async () => {
+  await using tmp = await tmpdir()
+  for (const name of ["research-hypo-planner", "research-model-designer"]) {
+    const agent = await load(tmp.path, (svc) => svc.get(name))
+    expect(evalPerm(agent, "read_task_evidence")).toBe("allow")
+    expect(evalPerm(agent, "confirm_knowledge")).toBe("deny")
+  }
+  const reflection = await load(tmp.path, (svc) => svc.get("research-reflection"))
+  expect(evalPerm(reflection, "read_task_evidence")).toBe("allow")
+  expect(evalPerm(reflection, "confirm_knowledge")).toBe("allow")
+})
+
 test("returns default native agents when no config", async () => {
   await using tmp = await tmpdir()
   await Instance.provide({

@@ -335,8 +335,8 @@ function compactPromptString(value: string) {
 }
 
 export function compactPromptContext(value: unknown, contextKey?: string): unknown {
-  // This bounded, selected evidence packet has its own schema; summarizing arrays here
-  // silently removes mechanisms, provenance and citation permissions.
+  // Planning evidence is projected and size-checked before reaching this layer.
+  // Generic array truncation would remove admitted conditions/citation permissions.
   if (contextKey === "taskEvidence") return value
   if (typeof value === "string") return compactPromptString(value)
   if (Array.isArray(value)) {

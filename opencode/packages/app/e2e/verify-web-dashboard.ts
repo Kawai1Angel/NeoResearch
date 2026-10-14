@@ -17,9 +17,12 @@ function json(body: unknown) {
 }
 
 async function verifyLocator(locator: ReturnType<import("@playwright/test").Page["locator"]>, label: string) {
-  await locator.first().waitFor({ state: "visible", timeout: 10_000 }).catch((error) => {
-    throw new Error(`missing visible Web Dashboard element: ${label}\n${error}`)
-  })
+  await locator
+    .first()
+    .waitFor({ state: "visible", timeout: 10_000 })
+    .catch((error) => {
+      throw new Error(`missing visible Web Dashboard element: ${label}\n${error}`)
+    })
 }
 
 async function verifyViewport(input: {
@@ -43,10 +46,19 @@ async function verifyViewport(input: {
     if (message.type() === "error") jsErrors.push(message.text())
   })
 
-  await page.route(/^http:\/\/(127\.0\.0\.1|localhost):4096\//, async (route) => {
+  const isBackendRequest = (url: URL) =>
+    /^http:\/\/(127\.0\.0\.1|localhost):4096\//.test(url.href) ||
+    (url.origin === new URL(input.baseURL).origin &&
+      /^\/(global|project|provider|path|research)(\/|$)/.test(url.pathname))
+  await page.route(isBackendRequest, async (route) => {
     const request = route.request()
     const url = new URL(request.url())
     const routePath = url.pathname
+
+    if (routePath === "/global/health") {
+      await route.fulfill(json({ healthy: true, version: "0.1.0-alpha.0" }))
+      return
+    }
 
     if (routePath === "/global/event") {
       await route.fulfill({
@@ -270,7 +282,10 @@ async function verifyViewport(input: {
       return
     }
 
-    if (routePath === `/research/tasks/${taskID}/candidates/${candidateID}/prepare-run` && request.method() === "POST") {
+    if (
+      routePath === `/research/tasks/${taskID}/candidates/${candidateID}/prepare-run` &&
+      request.method() === "POST"
+    ) {
       apiRequests.push(`${input.name}:prepare-run`)
       await route.fulfill(
         json({
@@ -290,7 +305,10 @@ async function verifyViewport(input: {
       return
     }
 
-    if (routePath === `/research/tasks/${taskID}/candidates/${candidateID}/execute-run` && request.method() === "POST") {
+    if (
+      routePath === `/research/tasks/${taskID}/candidates/${candidateID}/execute-run` &&
+      request.method() === "POST"
+    ) {
       apiRequests.push(`${input.name}:execute-run`)
       await route.fulfill(
         json({
@@ -314,7 +332,8 @@ async function verifyViewport(input: {
   })
 
   try {
-    await page.goto(input.baseURL, { waitUntil: "domcontentloaded" })
+    // The first Vite request compiles the dashboard and its workspace dependencies.
+    await page.goto(input.baseURL, { waitUntil: "domcontentloaded", timeout: 120_000 })
 
     await verifyLocator(page.getByText("NeoResearch", { exact: true }), "NeoResearch header")
     await verifyLocator(page.getByText("Dashboard", { exact: true }), "Dashboard header")
@@ -338,13 +357,16 @@ async function verifyViewport(input: {
     await page.getByRole("button", { name: "Smoke Exec" }).click()
     await verifyLocator(page.getByText("run_exec smoke succeeded"), "execute status update")
 
-    if (!apiRequests.includes(`${input.name}:prepare-run`)) throw new Error("Smoke Prep did not issue prepare-run API request")
-    if (!apiRequests.includes(`${input.name}:execute-run`)) throw new Error("Smoke Exec did not issue execute-run API request")
+    if (!apiRequests.includes(`${input.name}:prepare-run`))
+      throw new Error("Smoke Prep did not issue prepare-run API request")
+    if (!apiRequests.includes(`${input.name}:execute-run`))
+      throw new Error("Smoke Exec did not issue execute-run API request")
     if (jsErrors.length > 0) throw new Error(`JavaScript errors in ${input.name}: ${jsErrors.join(" | ")}`)
 
     const screenshotPath = path.join(input.artifactDir, `web-dashboard-${input.name}.png`)
     const screenshot = await page.screenshot({ fullPage: true, path: screenshotPath })
-    if (screenshot.length < 20_000) throw new Error(`${input.name} screenshot appears blank: ${screenshot.length} bytes`)
+    if (screenshot.length < 20_000)
+      throw new Error(`${input.name} screenshot appears blank: ${screenshot.length} bytes`)
 
     return {
       name: input.name,

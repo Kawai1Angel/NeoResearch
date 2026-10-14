@@ -1014,6 +1014,10 @@ class LinearHead(nn.Linear):
     """The sole latent-to-horizon projection for a point forecast."""
 
 
+class IdentityForecastHead(nn.Identity):
+    """Pass an already horizon-sized forecast through without parameters."""
+
+
 class ChannelLinear(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, channels: int, bias: bool) -> None:
         super().__init__()
@@ -1597,6 +1601,12 @@ class RecipeModel(nn.Module):
 
     def _build_prediction_head(self) -> nn.Module:
         head_type = self.head_cfg["type"]
+        if head_type == "identity":
+            if self.recipe.get("recipe_version") != "recipe_schema_v3":
+                raise ValueError("prediction_head.identity requires recipe_schema_v3")
+            if self.latent_dim != self.horizon:
+                raise ValueError("prediction_head.identity requires representation.latent_dim equal to the forecast horizon")
+            return IdentityForecastHead()
         if head_type == "linear":
             return LinearHead(self.latent_dim, self.horizon)
         if head_type == "residual_correction":

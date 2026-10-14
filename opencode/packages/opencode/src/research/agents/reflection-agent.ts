@@ -88,7 +88,7 @@ export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string
     throw new Error("Reflection prompt is missing its evidence/output sections")
   }
   const evidencePrompt = sessionPrompt.slice(0, narrationStart).replace(
-    "Use the four\ntools below to gather evidence.",
+    "Use the current-run\ntools below to gather evidence.",
     "Use the supplied inline evidence to assess the experiment.",
   )
   const outputPrompt = sessionPrompt.slice(outputStart).replace(
@@ -97,8 +97,8 @@ export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string
   ).replace("EXACTLY these 7 keys", "these 7 analysis keys, optionally followed by experienceWrites and knowledgeValidations")
     .replace("Each value is a concise string", "Each analysis value is a concise string")
   return `${evidencePrompt}## Inline evidence\n` +
-    "This is a direct API synthesis call. All available evidence is supplied in the user JSON. " +
-    "Tools are unavailable; produce the final analysis directly. " +
+    "This is a direct API synthesis call. Current/comparison run evidence and compact admitted knowledge summaries are supplied in the user JSON. " +
+    "Native tools are unavailable. Only for a specific unresolved source question return {status:evidence_request,request:{cardID,cardRevision,section:knowledge|sources|review,sourceIDs?,offset?,limit?}}; the coordinator supplies bounded exact stored pages (at most three requests). Otherwise produce the final analysis directly. " +
     "experimentResults and experimentDesign contain the run outcome and executed recipe; " +
     "trainingCurve contains observed curves, and historicalExperimentMemory contains prior lessons. " +
     "Treat absent evidence as unavailable and state the limitation. " +
@@ -108,7 +108,7 @@ export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string
     "boundaries and a falsifiable validationPlan. Performance experiences need verified independent full runs and " +
     "same-task comparisonRunID evidence. validated_principle needs support from at least two distinct dataset contents. " +
     "Use derivedFrom to refine prior experience while retaining counterevidence; cite only supplied run IDs. " +
-    "Inspect literatureKnowledge.entries and literatureKnowledge.experimentFacts to decide whether the current experiment supports the supplied literature assertions. " +
+    "Inspect literatureKnowledge.entries assertions/conditions/boundaries and sourceRuns current/comparison execution evidence to decide whether the current experiment supports the supplied literature assertions. " +
     "Optionally include knowledgeValidations (at most 3, using knowledgeValidationSchema) only for supported claims. " +
     "Use literatureKnowledge.currentRunID as runID, the supplied cardID/cardRevision, assertionIDs, conditionsAssessment, implementationAssessment, rationale and limitations. " +
     "A successful run or lower metric alone cannot validate a mechanism; assess the actual implementation and preserve qualifications. " +

@@ -6,7 +6,7 @@
     "trend_dynamics": { "label": "trend dynamics", "paperTerms": ["trend dynamics", "long-term evolution"] },
     "non_stationarity": { "label": "non-stationarity", "paperTerms": ["non-stationary time series", "temporal distribution shift"] },
     "potential_structural_break": { "label": "potential structural break", "paperTerms": ["structural breaks", "regime transitions"] },
-    "covariate_conditioning": { "label": "covariate-conditioned forecasting", "paperTerms": ["known future covariates", "exogenous variables"] },
+    "covariate_conditioning": { "label": "covariate-conditioned forecasting", "paperTerms": ["covariate-conditioned forecasting", "exogenous variables"], "observedPastPaperTerms": ["historical exogenous variables", "past-observed covariates"] },
     "cross_series_dependency": { "label": "cross-series dependency", "paperTerms": ["cross-variable dependencies", "inter-series correlation"] },
     "lead_lag_relationship": { "label": "lead-lag relationship", "paperTerms": ["lead-lag relationship", "lagged covariates"] },
     "contaminated_observations": { "label": "contaminated observations", "paperTerms": ["outlier-contaminated observations", "heavy-tailed noise"] },

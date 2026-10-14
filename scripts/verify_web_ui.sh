@@ -13,6 +13,7 @@ Run Playwright verification for the Web Dashboard in desktop and mobile viewport
 
 Environment:
   PLAYWRIGHT_PORT  Vite dev server port to use. Defaults to 4178.
+  NEO_RESEARCH_VERIFY_BUILT_UI=1  Verify the existing production build with Vite preview.
 USAGE
 }
 
@@ -35,12 +36,25 @@ mkdir -p "$ARTIFACT_DIR"
 export VITE_OPENCODE_SERVER_HOST="${VITE_OPENCODE_SERVER_HOST:-127.0.0.1}"
 export VITE_OPENCODE_SERVER_PORT="${VITE_OPENCODE_SERVER_PORT:-4096}"
 
-print_step "Starting Web Dashboard dev server"
-"$ROOT/scripts/dev_web.sh" -- --host 127.0.0.1 --port "$PORT" >"$LOG_FILE" 2>&1 &
+print_step "Starting Web Dashboard verification server"
+if [[ "${NEO_RESEARCH_VERIFY_BUILT_UI:-0}" == "1" ]]; then
+  [[ -f "$ROOT/opencode/packages/app/dist/index.html" ]] || {
+    print_fail "Web Dashboard build missing; run bun run build in opencode/packages/app"
+    exit 1
+  }
+  (
+    cd "$ROOT/opencode/packages/app"
+    exec node node_modules/vite/bin/vite.js preview --host 127.0.0.1 --port "$PORT" --strictPort
+  ) >"$LOG_FILE" 2>&1 &
+else
+  "$ROOT/scripts/dev_web.sh" -- --host 127.0.0.1 --port "$PORT" --strictPort >"$LOG_FILE" 2>&1 &
+fi
 server_pid=$!
 
 cleanup() {
   if kill -0 "$server_pid" >/dev/null 2>&1; then
+    # bun run dev owns the Vite child; terminate it before waiting for Bun.
+    pkill -TERM -P "$server_pid" >/dev/null 2>&1 || true
     kill "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" >/dev/null 2>&1 || true
   fi

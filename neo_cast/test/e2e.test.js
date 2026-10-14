@@ -83,6 +83,30 @@ test("prepare-data materializes visible and ref-test splits", () => {
   assert.ok(fs.existsSync(path.join(dataRoot, "etth1_ref_test.csv")));
 });
 
+test("prepare-data removes repeated blocks before computing requested split ratios", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-duplicates-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const source = path.join(root, "mopex.csv");
+  const rows = Array.from({ length: 100 }, (_, index) => {
+    const date = new Date(Date.UTC(1948, 0, 1) + index * 86400000).toISOString();
+    return `${date},${index},${index * 2}`;
+  });
+  fs.writeFileSync(source, ["date,flow,temp", ...rows.slice(0, 70), ...rows.slice(60, 70), ...rows.slice(70)].join("\n") + "\n");
+  const dataRoot = path.join(root, "dataset");
+  const result = runNode([
+    "prepare-data", "--source", source, "--task-id", "mopex",
+    "--target-cols", "flow", "--observed-past-covariates", "temp",
+    "--input-len", "8", "--horizons", "4", "--split-ratios", "3,1,1",
+  ], { cwd: root, env: { NEO_TSF_DATA_ROOT: dataRoot } });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /removed 10 exact duplicate source rows/);
+  const spec = JSON.parse(fs.readFileSync(path.join(dataRoot, "dataset_spec.json"), "utf8"));
+  assert.deepEqual(spec.splits, { train: [0, 60], val: [60, 80], ref_test: [80, 100] });
+  const profile = JSON.parse(fs.readFileSync(path.join(dataRoot, "mopex_profile.json"), "utf8"));
+  assert.equal(profile.duplicate_action.rows_removed, 10);
+  assert.equal(profile.time.duplicate_timestamp_count, 0);
+});
+
 test("init-runtime supports skip-install for fast project bootstrap", () => {
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "neo-cast-runtime-"));
   const result = runNode(
