@@ -54,6 +54,8 @@ import { Instance } from "@/project/instance"
 import { mapTask } from "./task-mapper"
 import { Log } from "@/util"
 import PROMPT_RESEARCH_DATA_ANALYSIS from "../agent/prompt/research-data-analysis.txt"
+import { BaselineDisabledError, isZeroResearch, researchVariant, validateResearchVariant } from "./research-variant"
+import PROMPT_RESEARCH_HYPO_PLANNER_ZERO from "../agent/prompt/research-hypo-planner-zero.txt"
 import PROMPT_RESEARCH_HYPO_PLANNER from "../agent/prompt/research-hypo-planner.txt"
 import PROMPT_RESEARCH_REFLECTION from "../agent/prompt/research-reflection.txt"
 import * as Process from "@/util/process"
@@ -830,7 +832,7 @@ function experimentPlanFromDB(task: ResearchTask, hypotheses: readonly Hypothesi
   if (hypotheses.length === 0) return undefined
   const metadata = recordValue(task.taskSpec.metadata)
   const baselineStrategy =
-    typeof metadata.baselineStrategy === "string" ? metadata.baselineStrategy : "planner_selected_experiments"
+    typeof metadata.baselineStrategy === "string" ? metadata.baselineStrategy : isZeroResearch(task.taskSpec) ? "autonomous_from_scratch" : "planner_selected_experiments"
   const referenceBaseline =
     typeof metadata.referenceBaseline === "string" ? metadata.referenceBaseline : undefined
   const searchBiases = Array.isArray(metadata.searchBiases)
@@ -1918,7 +1920,7 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
   const shift = numericProfileValue(profile, "distributionShift")
   const missing = numericProfileValue(profile, "missingRate")
   const recommendation = [
-    "Start from the existing linear and patch baselines to establish a low-cost floor.",
+    isZeroResearch(task.taskSpec) ? "Design the first model from dataset evidence and available components; no preset baseline is supplied." : "Start from the existing linear and patch baselines to establish a low-cost floor.",
     crossVar !== undefined && crossVar >= 0.5
       ? "Prioritize at least one cross-variate candidate because the quantitative and qualitative sub-agents both flag cross-variate structure."
       : datasetCovariateContext(task).observedPastCovariates.length > 0
@@ -1952,7 +1954,7 @@ function renderDatasetMainAnalysisSummary(task: ResearchTask, fingerprint: JsonR
     "",
     "## Handoff To Model Search",
     "",
-    "- Seed small baselines first.",
+    isZeroResearch(task.taskSpec) ? "- Ask HypoPlanner to select the first hypothesis and ModelDesigner to design its model directly." : "- Seed small baselines first.",
     "- Let autonomous iteration compare candidate utility against accuracy, resource cost, model size, and stability.",
     "- Stop when the configured target, plateau, crash, time, or run budget condition is reached.",
   ]
@@ -2121,8 +2123,8 @@ async function generateLLMQualitativeAnalysis(
   }
 }
 
-function buildHypoPlannerSystemPrompt(): string {
-  return PROMPT_RESEARCH_HYPO_PLANNER
+function buildHypoPlannerSystemPrompt(task: ResearchTask): string {
+  return isZeroResearch(task.taskSpec) ? PROMPT_RESEARCH_HYPO_PLANNER_ZERO : PROMPT_RESEARCH_HYPO_PLANNER
 }
 
 
@@ -2211,6 +2213,7 @@ function buildHypoPlannerUserPrompt(
 ): string {
   return JSON.stringify(
     {
+      researchVariant: researchVariant(task.taskSpec),
       taskSpec: designTaskSpec(task.taskSpec),
       taskDefinition: buildTaskDefinition(task),
       designFeedback: recordValue(task.taskSpec.metadata).designFeedback ?? null,
@@ -2231,6 +2234,7 @@ function buildHypoPlannerUserPrompt(
         ? { baselineOptions: opts.baselineOptions }
         : {}),
       instruction:
+        (isZeroResearch(task.taskSpec) ? "NeoResearch-zero: no preset baseline is available. Select a hypothesis for immediate model design from the first call. Use exploratory mode when no completed comparison exists. Never return referenceBaseline or call baseline tools. " : "") +
         "If designFeedback is present, handle it before ordinary reflection maintenance: the named hypothesis was NOT tested. Inspect the exact conflicts and regenerate a feasible hypothesis (or explicitly revise the original), then select it. Do not repeat an unchanged unavailable hypothesis or mark its mechanism refuted. A control need not contain the treatment mechanism. If no useful feasible experiment remains, select stop. " +
         "If existingHypotheses is empty and designFeedback is absent (first iteration), generate a fresh list of exactly 2-3 hypotheses grounded in dataAnalysis — do not add more. " +
         "When designFeedback is absent and hypotheses exist, identify the single existingHypothesis most recently tested (identify it from requested experiment history/reflection) and act on that one only: " +
@@ -2388,7 +2392,7 @@ async function generateLLMHypotheses(
         ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
       }
     }
-    const system = buildHypoPlannerSystemPrompt() + "\nDirect mode: no native tool calls. To read historical facts return {status:history_request,request:{runID:...}} first; the coordinator returns the requested history. Otherwise return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms. When baselineOptions are supplied, explicitly return referenceBaseline and referenceBaselineRationale. The selected baseline completes full evaluation before later hypothesis experiments."
+    const system = buildHypoPlannerSystemPrompt(task) + "\nDirect mode: no native tool calls. To read historical facts return {status:history_request,request:{runID:...}} first; the coordinator returns the requested history. Otherwise return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms. " + (isZeroResearch(task.taskSpec) ? " NeoResearch-zero: omit referenceBaseline and referenceBaselineRationale; select an exploratory hypothesis for immediate model design on the first call." : " When baselineOptions are supplied, explicitly return referenceBaseline and referenceBaselineRationale. The selected baseline completes full evaluation before later hypothesis experiments.")
     const requestedHistory: unknown[] = []
     const requestedEvidence: unknown[] = []
     let validationFeedback: string | undefined
@@ -2414,7 +2418,7 @@ async function generateLLMHypotheses(
         continue
       }
       const parsed = parseLLMHypothesesResult(result.text, result.usage)
-      if (parsed) return parsed
+      if (parsed && (!isZeroResearch(task.taskSpec) || (!parsed.referenceBaseline && !parsed.referenceBaselineRationale && parsed.hypotheses.every((h) => h.experimentContract && h.experimentContract.mode !== "baseline")))) return parsed
       if (++repairAttempts > 1) return undefined
       validationFeedback = "Previous response was invalid. Return hypotheses with a valid predeclared experimentContract for EACH hypothesis, requiredMechanisms for its candidate arm, id and statement, plus nextExperiment selecting one of these IDs or explicitly stopping. Never require and forbid the same mechanism; a control removing decomposition must not require decomposition. Do not silently change a controlled hypothesis into exploration. Retrieve the comparison run if needed."
     }
@@ -3709,11 +3713,21 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
       const taskSpecMetadata = recordValue(taskSpec.metadata)
       const managed = recordValue(existing.taskSpec.metadata)
+      const nextVariant = taskSpecMetadata.researchVariant ?? managed.researchVariant ?? "standard"
+      if (nextVariant !== researchVariant(existing.taskSpec)) {
+        const candidates = yield* listCandidates(existing.id)
+        const runs = yield* listRuns(existing.id)
+        const hypotheses = yield* listHypotheses(existing.id)
+        if (candidates.length || runs.length || hypotheses.length)
+          throw new Error("Research variant cannot change after planning or execution starts; create a fresh task")
+      }
       const nextMetadata: Record<string, unknown> = { ...taskSpecMetadata,
+        researchVariant: nextVariant,
         executionIsolation: "task",
         ...(managed.sessionModel ? { sessionModel: managed.sessionModel } : {}),
       }
       if (nextMetadata.workflow !== undefined) delete nextMetadata.workflow
+      validateResearchVariant({ ...taskSpec, metadata: nextMetadata as JsonRecord })
       const projectID = Instance.project.id
       const row = yield* db((d) =>
         d
@@ -3949,12 +3963,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const writeGovernanceLogArtifact = Effect.fn("Research.writeGovernanceLogArtifact")(function* (
       approval: ResearchApproval,
     ) {
+      const task = yield* getTask(approval.taskID)
       const time = nowTime()
       const dir = path.join(Instance.directory, ".neo-research", "governance", approval.taskID)
       const file = path.join(dir, `${approval.id}-${approval.status}.json`)
       const record = {
         approvalID: approval.id,
         taskID: approval.taskID,
+        ...(isZeroResearch(task.taskSpec) ? { researchVariant: "zero" } : {}),
         ...(approval.candidateID === undefined ? {} : { candidateID: approval.candidateID }),
         kind: approval.kind,
         status: approval.status,
@@ -3977,6 +3993,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             uri: `file://${file}`,
             metadata: {
               approvalID: approval.id,
+              ...(isZeroResearch(task.taskSpec) ? { researchVariant: "zero" } : {}),
               kind: approval.kind,
               status: approval.status,
               ...(approval.candidateID === undefined ? {} : { candidateID: approval.candidateID }),
@@ -4092,6 +4109,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const seedBaselines = Effect.fn("Research.seedBaselines")(function* (input: SeedBaselinesInput) {
       const task = yield* getTask(input.taskID)
+      if (isZeroResearch(task.taskSpec)) throw new BaselineDisabledError()
       const allProposals = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
       // An explicitly selected reference baseline narrows the comparison controls.
       // The chosen baseline completes initialization first; nextExperiment controls later search.
@@ -4160,6 +4178,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     const getReferenceBaselineInitialization = Effect.fn("Research.getReferenceBaselineInitialization")(function* (
       task: ResearchTask,
     ) {
+      if (isZeroResearch(task.taskSpec)) return undefined
       const metadata = recordValue(task.taskSpec.metadata)
       const recipeID = metadata.referenceBaseline
       if (typeof recipeID !== "string") return undefined
@@ -4580,6 +4599,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
     const createRunInternal = Effect.fn("Research.createRunInternal")(function* (input: CreateRunInput) {
       const task = yield* getTask(input.taskID)
+      if (input.stage === "baseline" && isZeroResearch(task.taskSpec)) throw new BaselineDisabledError()
       const candidate = yield* getCandidateForTask(input.taskID, input.candidateID)
       assertCandidateApproved(task.id, candidate)
       const status = input.status ?? "queued"
@@ -5293,6 +5313,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           if (displayProgressLines.length > 500) displayProgressLines.splice(0, displayProgressLines.length - 500)
           Database.use((d) => d.update(ResearchArtifactTable).set({
             metadata: {
+              ...liveProgressArtifact.metadata,
               runnerID: prepared.runPlan.runnerID,
               runnerKind: prepared.runPlan.runnerKind,
               stage: prepared.runPlan.stage,
@@ -5384,6 +5405,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
       yield* db((d) => d.update(ResearchArtifactTable).set({
         metadata: {
+          ...liveProgressArtifact.metadata,
           runnerID: prepared.runPlan.runnerID,
           runnerKind: prepared.runPlan.runnerKind,
           stage: prepared.runPlan.stage,
@@ -5897,6 +5919,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const resumeSeed = typeof resumeBlocker?.metadata.seed === "number" ? resumeBlocker.metadata.seed : undefined
       yield* ensureRunBudget(task, "queued")
       const plannerDecision = parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment)
+      if (isZeroResearch(task.taskSpec) && !plannerDecision && !resumeCandidate && !recovery?.hypothesisID)
+        throw new Error("NeoResearch-zero requires HypoPlanner to explicitly select the next experiment before model design")
       if (plannerDecision?.action === "stop" && !resumeCandidate && !recovery?.feedback && !recovery?.hypothesisID) throw new Error(`HypoPlanner stopped search: ${plannerDecision.rationale}`)
       let seeded: SeedBaselinesResult = { candidates: [], approvals: [] }
       let baselineInitialization = yield* getReferenceBaselineInitialization(task)
@@ -5980,12 +6004,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           bridgeOnly: (taskFingerprintWithExploration as Record<string, unknown>).bridgeOnly,
           searchBiases: mergedSearchBiases,
           explorationMode: forceExplore ? "forced" : "balanced",
+          researchVariant: researchVariant(task.taskSpec),
           ...(baselinePending ? { initializationPhase: "reference_baseline", referenceBaseline: baselineInitialization!.recipeID } : {}),
         }),
       ]
 
       let candidates = yield* listCandidates(task.id)
-      if (candidates.length === 0) {
+      if (candidates.length === 0 && !isZeroResearch(task.taskSpec)) {
         seeded = yield* seedBaselines({ taskID: task.id }).pipe(
           Effect.catchCause((cause) => {
             const error = Cause.squash(cause)
@@ -6002,13 +6027,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
       const runs = yield* listRuns(task.id)
       const primaryMetricName = objectiveMetricName(task.objective)
+      // In zero search, a compiler smoke pass does not complete the selected
+      // experiment. Keep its candidate available for full evaluation or retry.
+      const selectionRuns = isZeroResearch(task.taskSpec) && input.stage !== "smoke"
+        ? runs.filter((run) => run.stage !== "smoke" || run.status !== "succeeded")
+        : runs
       const designerSelection = selectModelDesignerCandidate({
         candidates: baselineCandidate
           ? candidates.filter((item) => item.id === baselineCandidate.id)
           : plannerDecision?.action === "experiment" && !resumeCandidate
           ? candidates.filter((item) => item.hypothesisID === selectedHypothesis?.id)
           : candidates,
-        runs,
+        runs: selectionRuns,
         primaryMetricName,
         maxFailedRetries: maxFailedCandidateRetries(task),
       })
@@ -6149,6 +6179,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                 proposeLLMCandidate({
                   ...promptInput,
                   workspaceRoot: Instance.directory,
+                  ...(isZeroResearch(task.taskSpec) ? { maxAttempts: 1 } : {}),
                   ...(authJsonKey ? { authJsonKey } : {}),
                 }),
               )
@@ -6182,7 +6213,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               attempt,
               issues: llmProposalValidationIssues(llmResult.metadata),
             }
-            if (modelDesignerSessionAttempt && attempt < maxModelDesignerAttempts) {
+            if ((modelDesignerSessionAttempt || isZeroResearch(task.taskSpec)) && attempt < maxModelDesignerAttempts) {
               continue
             }
             break
@@ -6231,7 +6262,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           }
         }
         rankings = DomainRegistry.rankCandidateProposals(task.domainID, proposalContext)
-        if (!proposal) {
+        if (!proposal && !isZeroResearch(task.taskSpec)) {
           // Heuristic proposals may be used only when they satisfy the selected
           // hypothesis. Never attach a generic fallback to an incompatible plan.
           proposal = selectedHypothesis && task.domainID === "tsf"
@@ -6909,7 +6940,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const initialBaseline = yield* getReferenceBaselineInitialization(task)
       // A failed planning call clears the previous selection. On resume, obtain
       // a new explicit decision instead of recovering the pool without a pick.
-      if (cycle.iterations > 0 && cycle.iterations < maxIterations && !parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment) && (!initialBaseline || initialBaseline.completed)) {
+      if ((cycle.iterations > 0 || isZeroResearch(task.taskSpec)) && cycle.iterations < maxIterations && !parseNextExperiment(recordValue(task.taskSpec.metadata).nextExperiment) && (!initialBaseline || initialBaseline.completed)) {
         const planned = yield* refreshPlanner()
         if (!planned.plan.nextExperiment) throw new Error("HypoPlanner must explicitly select the next experiment; no order-based fallback is permitted")
       }
@@ -7087,7 +7118,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     })
 
     const createArtifact = Effect.fn("Research.createArtifact")(function* (input: CreateArtifactInput) {
-      yield* getTask(input.taskID)
+      const task = yield* getTask(input.taskID)
       if (input.runID) yield* getRunForTask(input.taskID, input.runID)
       if (input.runID) {
         const existing = yield* db((d) => d.select().from(ResearchArtifactTable).where(and(eq(ResearchArtifactTable.task_id, input.taskID), eq(ResearchArtifactTable.run_id, input.runID!), eq(ResearchArtifactTable.kind, input.kind), eq(ResearchArtifactTable.uri, input.uri))).get())
@@ -7104,7 +7135,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             run_id: input.runID,
             kind: input.kind,
             uri: snapshot?.uri ?? input.uri,
-            metadata: { ...input.metadata, ...(snapshot ? { sourceURI: snapshot.sourceURI, sha256: snapshot.sha256 } : {}) },
+            metadata: { ...input.metadata, ...(isZeroResearch(task.taskSpec) ? { researchVariant: "zero" } : {}), ...(snapshot ? { sourceURI: snapshot.sourceURI, sha256: snapshot.sha256 } : {}) },
             time_created: time.created,
             time_updated: time.updated,
           })
@@ -8591,10 +8622,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	        const hypoConfig = hypoLLMContext?.config ?? (yield* Effect.promise(() =>
 	          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: hypoNeoCastRoot }),
 	        ))
-	        const isFirstHypoPlannerCall = typeof recordValue(task.taskSpec.metadata).referenceBaseline !== "string" && !runs.some((run) => run.candidateID)
+	        const isFirstHypoPlannerCall = isZeroResearch(task.taskSpec)
+          ? existingHypothesesRaw.length === 0
+          : typeof recordValue(task.taskSpec.metadata).referenceBaseline !== "string" && !runs.some((run) => run.candidateID)
 	        // referenceBaseline is only ever picked on the first call (see comment on
 	        // ExperimentPlan.referenceBaseline) — only compute/offer options then.
-	        const baselineOptions = isFirstHypoPlannerCall
+	        const baselineOptions = isFirstHypoPlannerCall && !isZeroResearch(task.taskSpec)
 	          ? DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
 	              .map((proposal) => {
 	                const recipeID = candidateRecipeID(proposal.candidateSpec)
@@ -8611,7 +8644,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const hypoSessionAttempt = yield* requestViaSession({
 	          evidenceBinding: { taskID: task.id, artifactID: evidenceArtifactID },
 	          rootSessionID: task.sessionID,
-	          agent: "research-hypo-planner",
+	          agent: isZeroResearch(task.taskSpec) ? "research-hypo-planner-zero" : "research-hypo-planner",
 	          stageLabel: "HypoPlanner",
 	          taskID: task.id,
 	          user: buildHypoPlannerUserPrompt(task, dataAnalysisSummary, existingHypotheses, abandonedHypotheses, taskEvidence, { sessionMode: true, baselineOptions }),
@@ -8677,7 +8710,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         if (hypoSessionAttempt && !nextExperiment) throw new Error("HypoPlanner must explicitly call hypothesis_select before the next experiment")
         if (nextExperiment?.action === "experiment" && !sessionPoolHypotheses?.some((h) => h.id === nextExperiment.hypothesisID && isOpenHypothesis(h)) && hypoSessionAttempt)
           throw new Error(`HypoPlanner selection is no longer open: ${nextExperiment.hypothesisID}`)
-        if (isFirstHypoPlannerCall && nextExperiment?.action === "experiment" && !toolReferenceBaseline)
+        if (!isZeroResearch(task.taskSpec) && isFirstHypoPlannerCall && nextExperiment?.action === "experiment" && !toolReferenceBaseline)
           throw new Error("HypoPlanner must explicitly pick a reference baseline before the first experiment")
         let result = buildHypoPlannerResult({
 	          task,
@@ -9994,8 +10027,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           "## 搜索空间已确认，等待确认后开始模型搜索",
           "",
           ...ssPreferencesSection,
-          "**计划 Baseline 方案：**",
-          baselineList,
+          isZeroResearch(currentTask.taskSpec) ? "**自主模型设计：**" : "**计划 Baseline 方案：**",
+          isZeroResearch(currentTask.taskSpec)
+            ? `由 hypoPlanner 选择假设并交给 ModelDesigner 设计首个模型。当前选择：${JSON.stringify(hypoPlanning.plan.nextExperiment ?? null)}`
+            : baselineList,
           "",
           "**建议操作：** 确认搜索方向正确后 approve，或 reject 并调整 taskSpec 后重新运行。",
         ].join("\n")

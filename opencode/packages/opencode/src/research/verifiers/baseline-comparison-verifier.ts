@@ -1,5 +1,6 @@
 import type { VerifierContext, VerifierResult } from "./types"
 import { comparablePreviousRuns, metricOf, objectiveMetricName } from "./types"
+import { isZeroResearch } from "../research-variant"
 
 const REGRESSION_THRESHOLD = 0.2
 
@@ -38,6 +39,7 @@ export function runBaselineComparisonVerifier(ctx: VerifierContext): VerifierRes
   }
 
   const bestBaseline = direction === "minimize" ? Math.min(...baselineMetrics) : Math.max(...baselineMetrics)
+  const referenceLabel = isZeroResearch(ctx.task.taskSpec) ? "previous comparable run" : "baseline"
 
   const degradation = direction === "minimize" ? currentMetric - bestBaseline : bestBaseline - currentMetric
   const regressed = degradation > Math.abs(bestBaseline) * REGRESSION_THRESHOLD
@@ -48,7 +50,7 @@ export function runBaselineComparisonVerifier(ctx: VerifierContext): VerifierRes
       name,
       accepted: false,
       status: "failed",
-      reason: `Current ${metricName}=${Number(currentMetric.toFixed(6))} is ${pct.toFixed(1)}% worse than best baseline ${Number(bestBaseline.toFixed(6))} (threshold ${REGRESSION_THRESHOLD * 100}%).`,
+      reason: `Current ${metricName}=${Number(currentMetric.toFixed(6))} is ${pct.toFixed(1)}% worse than best ${referenceLabel} ${Number(bestBaseline.toFixed(6))} (threshold ${REGRESSION_THRESHOLD * 100}%).`,
       evidence: { currentMetric, bestBaseline, regressionPct: pct, threshold: REGRESSION_THRESHOLD * 100 },
     }
   }
@@ -57,7 +59,7 @@ export function runBaselineComparisonVerifier(ctx: VerifierContext): VerifierRes
     name,
     accepted: true,
     status: "passed",
-    reason: `Current ${metricName}=${Number(currentMetric.toFixed(6))} is within acceptable range of best baseline ${Number(bestBaseline.toFixed(6))}.`,
+    reason: `Current ${metricName}=${Number(currentMetric.toFixed(6))} is within acceptable range of best ${referenceLabel} ${Number(bestBaseline.toFixed(6))}.`,
     evidence: { currentMetric, bestBaseline },
   }
 }

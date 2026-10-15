@@ -17,8 +17,8 @@ import { createFileResearchRuntime } from "../../src/research/runtime"
 import { Database, eq } from "../../src/storage"
 import { resetDatabase } from "../fixture/db"
 import { tmpdir } from "../fixture/fixture"
-import { pickReferenceBaseline } from "../../src/research/baseline-store"
-import { addHypothesisToPool, selectNextExperimentInPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
+import { pickReferenceBaseline, loadBaselineOptions } from "../../src/research/baseline-store"
+import { addHypothesisToPool, updateHypothesisInPool, selectNextExperimentInPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
 import { validateCandidateAgainstHypothesis } from "../../src/research/execution-contract"
 import { readDesignHistory } from "../../src/research/design-history"
 
@@ -6050,3 +6050,229 @@ exit 1
     })
   })
 }
+
+
+async function createZeroTask(root?: string, datasetPath?: string) {
+  const taskSpec = validTsfTaskSpec({ bridgeOnly: true, ...(datasetPath ? { datasetPath } : {}), ...(root ? { neoCastProjectRoot: root, pythonExecutable: "bash" } : {}) })
+  return runResearch(Research.Service.use((svc) => svc.createTask({
+    title: "NeoResearch-zero", domainID: "tsf", mode: "autonomous",
+    taskSpec: { ...taskSpec, metadata: { ...taskSpec.metadata, researchVariant: "zero" } },
+    objective: { primaryMetric: "val_avg_mse", direction: "minimize", errorPreferences: "balanced" },
+    budget: { maxRuns: 20, latencyBudget: "no_constraint", parameterBudget: "no_constraint", loop: { maxIterations: 2, maxNoImprove: 2 } },
+  })))
+}
+
+function zeroHypothesis(id: string) {
+  return { id, statement: `自主设计 MLP 模型 ${id}`, motivation: ["数据的上下文长度为 96。"],
+    expectedOutcome: "获得有效的 val_avg_mse", suggestedBackbones: ["mlp"], suggestedPreprocessing: [],
+    requiredMechanisms: [], experimentContract: { mode: "exploratory" as const, changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
+    risk: "可能过拟合", testable: true, datasetEvidencePaths: [], literatureEvidence: [],
+    applicabilityAssumptions: [], falsificationCriteria: ["完整评估未获得有效的主指标。"], evidenceLevel: "data_only" as const }
+}
+
+function installZeroFixture(invalidDesign = false, invalidPlanner = false) {
+  installPlannerFixture()
+  const reflectionFetch = globalThis.fetch
+  const calls: { system: string; user: Record<string, any> }[] = []
+  let plannerCalls = 0
+  let designerCalls = 0
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body))
+    const system = body.messages[0].content as string
+    const user = JSON.parse(body.messages[1].content)
+    calls.push({ system, user })
+    let result: unknown
+    if (system.startsWith("You are the NeoResearch HypoPlanner")) {
+      plannerCalls++
+      const hypotheses = [zeroHypothesis("H_zero_first"), zeroHypothesis("H_zero_second")]
+      result = { hypotheses, nextExperiment: { action: "experiment", hypothesisID: plannerCalls === 1 ? hypotheses[0]!.id : hypotheses[1]!.id, rationale: "直接执行自主设计的模型。" },
+        ...(invalidPlanner ? { referenceBaseline: "tsf_linear_raw_baseline", referenceBaselineRationale: "Unexpected preset" } : {}) }
+    } else if (user.taskFingerprint?.selectedHypothesis) {
+      designerCalls++
+      result = invalidDesign ? { invalid: true } : {
+        ...validTsfCandidateSpec(), recipeID: `zero_designed_${designerCalls}`,
+        hypothesis: "测试自主设计的 MLP 表示。", notes: "依据周期结构设计模型，不使用预置模板。",
+        embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 64 },
+        backbone: { type: "mlp", depth: 2, hiddenDim: designerCalls === 1 ? 64 : 128, activation: "gelu", dropout: 0 },
+      }
+    } else return reflectionFetch(url, init)
+    const content = JSON.stringify(result)
+    if (body.stream) return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  return { calls, plannerCalls: () => plannerCalls, designerCalls: () => designerCalls }
+}
+
+test("zero loop designs and runs its first model from an empty pool, then plans the second experiment", async () => {
+  const fixture = installZeroFixture()
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeTrainingFakeNeoCastRunner(root)
+    const task = await createZeroTask(root)
+    const loop = await runResearch(Research.Service.use((svc) => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 2 })))
+    expect(loop.iterations).toHaveLength(2)
+    expect(loop.stoppedReason).toBe("max_iterations")
+    expect(fixture.plannerCalls()).toBe(2)
+    expect(fixture.designerCalls()).toBe(2)
+    for (const [index, iteration] of loop.iterations.entries()) {
+      expect(iteration.candidate.generatedBy).toBe("llm")
+      expect(iteration.candidate.hypothesisID).toBe(index === 0 ? "H_zero_first" : "H_zero_second")
+      expect(iteration.candidate.candidateSpec.recipeID).toBe(`zero_designed_${index + 1}`)
+      expect(iteration.run.stage).toBe("full")
+      expect(iteration.run.status).toBe("succeeded")
+      expect(iteration.run.resourceUsage.executionContract).toMatchObject({ status: "verified" })
+      expect(iteration.seededCandidates).toEqual([])
+      expect(iteration.managerTrace[0]!.metadata).toMatchObject({ researchVariant: "zero" })
+      expect(iteration.managerTrace[0]!.metadata.initializationPhase).toBeUndefined()
+    }
+    const planners = fixture.calls.filter((call) => call.system.startsWith("You are the NeoResearch HypoPlanner"))
+    expect(planners[0]!.user.existingHypotheses).toBeNull()
+    expect(planners[1]!.user.existingHypotheses).toHaveLength(2)
+    for (const call of planners) {
+      expect(call.system).toContain("NeoResearch-zero")
+      expect(call.user.baselineOptions).toBeUndefined()
+      expect(call.user.researchVariant).toBe("zero")
+    }
+    const designers = fixture.calls.filter((call) => call.user.taskFingerprint?.selectedHypothesis)
+    expect(designers[0]!.user.currentChampion).toBeNull()
+    expect(designers[0]!.user.taskFingerprint.selectedHypothesis.id).toBe("H_zero_first")
+    const candidates = await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))
+    expect(candidates).toHaveLength(2)
+    expect((await listHypothesesInPool(task.id)).every((h) => h.experimentContract?.mode !== "baseline")).toBe(true)
+    const runs = await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))
+    expect(runs.every((run) => candidates.some((candidate) => candidate.id === run.candidateID))).toBe(true)
+    const current = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+    expect(current.taskSpec.metadata).toMatchObject({ researchVariant: "zero", baselineStrategy: "autonomous_from_scratch" })
+    expect((current.taskSpec.metadata as Record<string, unknown>).referenceBaseline).toBeUndefined()
+    expect(await runResearch(Research.Service.use((svc) => svc.getChampion(task.id)))).toBeDefined()
+    expect(loop.artifact.metadata).toMatchObject({ researchVariant: "zero" })
+    const nas = Research.buildNASAgentResult({ taskID: task.id, loop, taskFingerprint: { researchVariant: "zero" } })
+    expect(nas.experimentLogMarkdown).toContain("+initial")
+    expect(nas.leaderboardMarkdown).not.toContain("+baseline")
+  } })
+})
+
+test("zero resumes a planned first experiment without rebuilding the hypothesis pool or seeding candidates", async () => {
+  const fixture = installZeroFixture()
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeTrainingFakeNeoCastRunner(root)
+    const task = await createZeroTask(root)
+    await runResearch(Research.Service.use((svc) => svc.runHypoPlannerAgent({ taskID: task.id })))
+    const before = await listHypothesesInPool(task.id)
+    const resumed = await runResearch(Research.Service.use((svc) => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 1 })))
+    expect(fixture.plannerCalls()).toBe(1)
+    expect(resumed.iterations[0]!.candidate.hypothesisID).toBe("H_zero_first")
+    expect(resumed.iterations[0]!.seededCandidates).toEqual([])
+    expect((await listHypothesesInPool(task.id)).map((h) => h.id)).toEqual(before.map((h) => h.id))
+  } })
+})
+
+test("zero rejects baseline tools, baseline contracts and changing an active task's variant", async () => {
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const task = await createZeroTask()
+    await expect(loadBaselineOptions(task.id)).rejects.toThrow("disables preset baselines")
+    await expect(pickReferenceBaseline(task.id, "tsf_linear_raw_baseline")).rejects.toThrow("disables preset baselines")
+    await expect(runResearch(Research.Service.use((svc) => svc.seedBaselines({ taskID: task.id })))).rejects.toThrow("disables preset baselines")
+    const draft = zeroHypothesis("H_zero_guard")
+    await expect(addHypothesisToPool(task.id, { ...draft, experimentContract: { ...draft.experimentContract, mode: "baseline" } })).rejects.toThrow("exploratory or controlled")
+    await addHypothesisToPool(task.id, draft)
+    await expect(updateHypothesisInPool(task.id, draft.id, { experimentContract: { ...draft.experimentContract, mode: "baseline" } })).rejects.toThrow("exploratory or controlled")
+    const updated = await runResearch(Research.Service.use((svc) => svc.updateTaskSpec({ taskID: task.id, taskSpec: { ...task.taskSpec, metadata: {} } })))
+    expect(updated.taskSpec.metadata).toMatchObject({ researchVariant: "zero" })
+    await expect(runResearch(Research.Service.use((svc) => svc.updateTaskSpec({ taskID: task.id, taskSpec: { ...task.taskSpec, metadata: { researchVariant: "standard" } } })))).rejects.toThrow("cannot change")
+    expect(await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))).toEqual([])
+  } })
+})
+
+test("zero exhausts bounded model-design retries without heuristic or baseline fallback", async () => {
+  const fixture = installZeroFixture(true)
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const task = await createZeroTask()
+    await runResearch(Research.Service.use((svc) => svc.runHypoPlannerAgent({ taskID: task.id })))
+    await expect(runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" })))).rejects.toThrow()
+    expect(fixture.designerCalls()).toBe(3)
+    expect(await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))).toEqual([])
+    expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toEqual([])
+    expect((await listHypothesesInPool(task.id)).map((h) => h.id)).toEqual(["H_zero_first", "H_zero_second"])
+  } })
+})
+
+test("zero rejects direct planner output that tries to select a preset baseline", async () => {
+  const fixture = installZeroFixture(false, true)
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const task = await createZeroTask()
+    await expect(runResearch(Research.Service.use((svc) => svc.runHypoPlannerAgent({ taskID: task.id })))).rejects.toThrow("explicit HypoPlanner result")
+    expect(fixture.plannerCalls()).toBe(2)
+    expect(fixture.designerCalls()).toBe(0)
+    expect(await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))).toEqual([])
+    expect(await listHypothesesInPool(task.id)).toEqual([])
+  } })
+})
+
+
+test("zero retries a failed first training run using its persisted hypothesis and candidate", async () => {
+  const fixture = installZeroFixture()
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeTrainingFakeNeoCastRunner(root)
+    await writeFile(path.join(root, "py", "runner.py"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "init" ]]; then
+  mkdir -p .neo-cast
+  echo '{"session_id":"zero-test","candidate_counter":0,"crash_streak":0,"no_improve_streak":0,"keep_count":0}' > .neo-cast/runner_state.json
+  exit 0
+fi
+${fakeContractEvents}
+printf '{"event":"done","status":"failed"}\\n'
+exit 1
+`, "utf8")
+    const task = await createZeroTask(root)
+    await runResearch(Research.Service.use((svc) => svc.runHypoPlannerAgent({ taskID: task.id })))
+    const failed = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" })))
+    expect(failed.run.status).toBe("failed")
+    await writeTrainingFakeNeoCastRunner(root)
+    const retry = await runResearch(Research.Service.use((svc) => svc.runAutonomousIteration({ taskID: task.id, stage: "full" })))
+    expect(retry.run.status).toBe("succeeded")
+    expect(retry.candidate.id).toBe(failed.candidate.id)
+    expect(retry.candidate.hypothesisID).toBe("H_zero_first")
+    expect(retry.seededCandidates).toEqual([])
+    expect(fixture.plannerCalls()).toBe(1)
+    expect(fixture.designerCalls()).toBe(1)
+    expect(await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id)))).toHaveLength(1)
+  } })
+})
+
+
+test("zero full pipeline preserves its variant through intent, data analysis, training and export", async () => {
+  installZeroFixture()
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  const datasetPath = await writeProfileDataset()
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeTrainingFakeNeoCastRunner(root)
+    const task = await createZeroTask(root, datasetPath)
+    const result = await runFullPipelineAfterIntentConfirmation({ taskID: task.id, stage: "full", maxIterations: 1, targetMetricValue: 0.2 })
+    expect(result.hypoPlanning.plan.baselineStrategy).toBe("autonomous_from_scratch")
+    expect(result.hypoPlanning.plan.referenceBaseline).toBeUndefined()
+    expect(result.nas.loop.iterations).toHaveLength(1)
+    expect(result.nas.loop.iterations[0]!.candidate.hypothesisID).toBe("H_zero_first")
+    expect(result.nas.loop.iterations[0]!.candidate.generatedBy).toBe("llm")
+    expect(result.nas.loop.iterations[0]!.seededCandidates).toEqual([])
+    expect(result.nas.experimentLogMarkdown).toContain("+initial")
+    expect(result.nas.experimentLogMarkdown).not.toContain("+baseline")
+    expect(result.publish.artifact.kind).toBe("model_export_package")
+    const current = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
+    expect(current.status).toBe("completed")
+    expect(current.taskSpec.metadata).toMatchObject({ researchVariant: "zero" })
+    expect((await runResearch(Research.Service.use((svc) => svc.listCandidates(task.id))))).toHaveLength(1)
+    const artifacts = await runResearch(Research.Service.use((svc) => svc.listArtifacts(task.id)))
+    expect(artifacts.filter((artifact) => artifact.metadata.researchVariant !== "zero").map((artifact) => artifact.kind)).toEqual([])
+  } })
+})

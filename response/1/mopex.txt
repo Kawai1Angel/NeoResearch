@@ -1,0 +1,1 @@
+预测对象是流域日径流量 daily streamflow discharge，其余四个气象变量 mean areal precipitation（流域平均降水量）、climatic potential evaporation（气候潜在蒸发量）、daily maximum air temperature（日最高气温）和 daily minimum air temperature（日最低气温）作为外生变量，用于刻画降水、蒸发和气温变化对流域径流的影响，服务于流域水文状态监测、水资源调度和洪水预警。date 为时间列，数据时间间隔为 1 天，target 只包含 daily streamflow discharge，四个气象变量仅作为辅助输入，不作为预测目标。

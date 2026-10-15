@@ -12,6 +12,7 @@ import { isOpenHypothesis, type NextExperimentDecision } from "./agents/hypo-pla
 import { validMechanisms, unsupportedMechanisms } from "./model-capabilities"
 import type { HypothesisObject, HypothesisStatus } from "./agents/hypo-planner-agent"
 import { TaskEvidenceBundleSchema, type TaskEvidenceBundle } from "./retrieve/contract"
+import { isZeroResearch } from "./research-variant"
 
 const VALID_STATUSES: readonly HypothesisStatus[] = [
   "pending",
@@ -79,6 +80,13 @@ function assertConsistentMechanisms(hypothesis: Pick<HypothesisObject, "required
   if (conflicts.length) throw new Error(
     `The candidate arm cannot both require and forbid mechanisms: ${conflicts.join(", ")}. requiredMechanisms describes the generated arm, not the treatment in its comparison.`,
   )
+}
+
+function assertVariantContract(taskID: ResearchTaskID, hypothesis: Pick<HypothesisObject, "experimentContract">) {
+  const row = Database.use((d) => d.select({ taskSpec: ResearchTaskTable.task_spec })
+    .from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get())
+  if (row && isZeroResearch(row.taskSpec) && (!hypothesis.experimentContract || hypothesis.experimentContract.mode === "baseline"))
+    throw new Error("NeoResearch-zero hypotheses require exploratory or controlled experiment contracts")
 }
 
 const executionFields = ["experimentContract", "requiredMechanisms", "suggestedBackbones", "suggestedPreprocessing"] as const
@@ -180,6 +188,7 @@ export async function addHypothesisToPool(
   hypothesis: HypothesisDraft,
 ): Promise<HypothesisObject> {
   const experimentContract = hypothesis.experimentContract ? ExperimentConstraints.parse(hypothesis.experimentContract) : undefined
+  assertVariantContract(taskID, hypothesis)
   assertConsistentMechanisms(hypothesis)
   const now = Date.now()
   const id = ResearchHypothesisID.ascending()
@@ -239,6 +248,7 @@ export async function updateHypothesisInPool(
       .get(),
   )
   if (!existingRow) throw new HypothesisNotFoundError(hypoID)
+  assertVariantContract(taskID, { ...mapRow(existingRow), ...patch })
 
   // Compare with executed evidence, not the mutable row, so legacy corruption can be restored.
   if (executionFields.some((field) => patch[field] !== undefined))
@@ -404,6 +414,7 @@ export async function selectNextExperimentInPool(taskID: ResearchTaskID, decisio
     const hypothesis = (await listHypothesesInPool(taskID)).find((h) => h.id === decision.hypothesisID)
     if (!hypothesis || !isOpenHypothesis(hypothesis))
       throw new Error(`Hypothesis ${decision.hypothesisID} is not open and testable`)
+    assertVariantContract(taskID, hypothesis)
     assertConsistentMechanisms(hypothesis)
     const unsupported = unsupportedMechanisms(hypothesis.requiredMechanisms ?? [])
     if (unsupported.length)

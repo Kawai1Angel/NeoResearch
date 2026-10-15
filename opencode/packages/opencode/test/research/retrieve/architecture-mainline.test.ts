@@ -188,6 +188,6 @@ test("a malformed sibling review does not discard an independently reviewed fami
   expect(packet.decisions).toHaveLength(1)
   expect(packet.sourceCards.map((c) => c.knowledgeID)).toEqual([good.knowledgeID])
   expect(packet.exclusions.some((e) => e.stage === "source_review_failed")).toBe(true)
-  expect(fixture.calls.filter((stage) => stage === "architecture_review")).toHaveLength(5)
+  expect(fixture.calls.filter((stage) => stage === "architecture_review")).toHaveLength(3)
   expect(citableTaskEvidence({ entries: [], architectureKnowledge: packet } as any).map((e) => e.cardID)).toEqual([good.knowledgeID])
 })

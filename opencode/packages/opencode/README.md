@@ -22,6 +22,32 @@ neo-research cockpit
 
 Use `neo-research serve` for the local API server and `neo-research dashboard` for the web UI.
 
+## NeoResearch-zero
+
+Create a zero variant task to start model search without preset baselines:
+
+```bash
+neo-research research create --mode autonomous --research-variant zero \
+  --dataset-path /absolute/path/to/data.csv --target-cols OT \
+  --context-length 336 --prediction-lengths 96 --neo-cast-root /absolute/path/to/neo_cast
+neo-research research pipeline <taskID> --max-iterations 10
+```
+
+`research vibe <goal...> --research-variant zero` also supports this variant. For API-created tasks,
+set `taskSpec.metadata.researchVariant` to `"zero"`. Omitting the setting preserves the standard workflow.
+
+HypoPlanner creates the initial hypothesis pool and selects an experiment immediately; ModelDesigner
+generates its model recipe, followed by the usual compilation, smoke verification, training, evaluation,
+and reflection. No baseline options, baseline selection tools, seeded control candidates, or heuristic
+recipe fallback are available. If model design fails, bounded retries and the existing design feedback
+or validation checkpoint report the failure instead of substituting a preset model. A simple model
+chosen autonomously remains valid. The first experiment uses an exploratory contract; later controlled
+experiments can reference verified full runs from the same task. Dataset protocols and resource limits
+are shared with the standard workflow.
+
+The variant persists across task recovery and cannot change once planning or execution starts. Start
+a fresh task for each variant. Zero artifacts carry `researchVariant: "zero"` for experiment tracking.
+
 ## Local Source Install
 
 ```bash

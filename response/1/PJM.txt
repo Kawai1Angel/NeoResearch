@@ -1,0 +1,1 @@
+预测对象是美国 PJM 电力市场 COMED 区域的小时级日前电价 OT，System load forecast（全系统负荷预测）和 Zonal COMED load foecast（COMED 区域负荷预测，列名沿用原文件拼写）作为外生变量，用于刻画系统整体需求和区域需求变化对电价的影响，服务于区域电力市场运行监测和购售电计划制定。date 为时间列，target 只包含 OT，两个负荷预测变量仅作为辅助输入，不作为预测目标。

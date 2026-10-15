@@ -3,6 +3,7 @@ import type { TaskEvidenceBundle, TaskEvidenceEntry, TaskEvidenceRole } from "..
 import type { ModelMechanism } from "../model-capabilities"
 import { NAS_DEFAULT_MAX_ITERATIONS, NAS_DEFAULT_MAX_NO_IMPROVE } from "../defaults"
 import { citableTaskEvidence } from "../retrieve/evidence-handoff"
+import { isZeroResearch } from "../research-variant"
 
 export type HypothesisStatus = "pending" | "active" | "testing" | "confirmed" | "rejected" | "abandoned"
 
@@ -562,6 +563,7 @@ export const TSF_BASELINE_RECIPE_IDS = {
 // The set of baseline recipe IDs HypoPlanner may pick as referenceBaseline for a given task —
 // mirrors the candidates buildTSFBaselines() will emit for that task.
 export function referenceBaselineOptions(task: ResearchTask): readonly string[] {
+  if (isZeroResearch(task.taskSpec)) return []
   return isBridgeOnly(task)
     ? [TSF_BASELINE_RECIPE_IDS.linear]
     : [TSF_BASELINE_RECIPE_IDS.patchtst, TSF_BASELINE_RECIPE_IDS.dlinear, TSF_BASELINE_RECIPE_IDS.itransformer]
@@ -596,7 +598,7 @@ export function buildExperimentPlan(input: {
   return {
     hypotheses: input.hypotheses,
     ...(input.nextExperiment ? { nextExperiment: input.nextExperiment } : {}),
-    baselineStrategy: "planner_selected_experiments",
+    baselineStrategy: isZeroResearch(input.task.taskSpec) ? "autonomous_from_scratch" : "planner_selected_experiments",
     searchBiases,
     stopConditions: {
       maxTrials,
@@ -693,7 +695,7 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
     "",
     `- Agent: ${result.agent}`,
     `- Task ID: ${result.taskID}`,
-    `- Baseline strategy: ${plan.baselineStrategy}`,
+    `- ${plan.baselineStrategy === "autonomous_from_scratch" ? "Initialization" : "Baseline"} strategy: ${plan.baselineStrategy}`,
     ...(plan.referenceBaseline === undefined
       ? []
       : [
@@ -749,6 +751,17 @@ export function buildHypoPlanMarkdown(result: HypoPlannerResult): string {
 }
 
 export function buildHypoPlannerResult(input: HypoPlannerInput): HypoPlannerResult {
+  if (isZeroResearch(input.task.taskSpec)) {
+    if (input.toolReferenceBaseline) throw new Error("NeoResearch-zero cannot select a reference baseline")
+    if (!input.llmHypotheses || !input.nextExperiment)
+      throw new Error("NeoResearch-zero requires an explicit HypoPlanner result; deterministic hypothesis fallback is disabled")
+    validateHypothesisEvidence(input.llmHypotheses, input.taskEvidence)
+    if (input.llmHypotheses.some((h) => !h.experimentContract || h.experimentContract.mode === "baseline"))
+      throw new Error("NeoResearch-zero hypotheses require exploratory or controlled experiment contracts")
+    const decision = input.nextExperiment
+    if (decision.action === "experiment" && !input.llmHypotheses.some((h) => h.id === decision.hypothesisID && isOpenHypothesis(h)))
+      throw new Error("NeoResearch-zero requires selection of an open hypothesis from the planner result")
+  }
   const evidenceSummary = [
     extractEvidenceSummary(input.dataAnalysisSummary),
     input.taskEvidence

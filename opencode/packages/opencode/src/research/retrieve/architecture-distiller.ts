@@ -14,7 +14,7 @@ import { ARCHITECTURE_SELECTION_POLICY, ArchitectureEligibilitySchema, architect
 import { TSFCandidateRecipe } from "../domains/tsf"
 
 export const ARCHITECTURE_LIMITS = { recalledCards: 128, readCards: 40, batchCards: 4, batchChars: 220_000,
-  readingSelection: "llm_global_family_shortlist_v1", reviewRecovery: "bounded_isolated_v1",
+  readingSelection: "llm_global_family_shortlist_v1", reviewRecovery: "preserve_valid_isolated_v2",
   witnessDeclarations: "runtime_owned_adapter_v1", extractionCriteria: "family_pure_data_conditions_v3",
   semanticRevisionRounds: 2, conditionAssessment: "source_bound_and_or_input_output_v1" } as const
 const checks = z.object({
@@ -43,22 +43,26 @@ export async function distillArchitectureKnowledge(input: {
   if (!input.model) { packet.warnings.push("Architecture extraction requires a configured LLM; raw cards do not become architectural decisions."); return packet }
   await mkdir(input.auditRoot, { recursive: true })
   const abort = () => input.signal?.throwIfAborted()
-  async function ask<T>(name: string, stage: "recall" | "extract" | "review" | "revise" | "curate", schema: z.ZodType<T>, data: object, validate: (value: T) => void): Promise<T> {
+  async function ask<T>(name: string, stage: "recall" | "extract" | "review" | "revise" | "curate", schema: z.ZodType<T>, data: object, validate: (value: T) => void,
+    options?: { attempts?: 1 | 2; parse?: (raw: unknown) => T; retryInvalidCache?: boolean }): Promise<T> {
     let repair: object = {}
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    const attempts = options?.attempts ?? 2
+    for (let attempt = 1; attempt <= attempts; attempt++) {
       abort()
       const request = { ...data, task: architectureSelectionContext(input.task), ...repair, outputSchema: z.toJSONSchema(schema) }
       const digest = createHash("sha256").update(JSON.stringify({ version: ARCHITECTURE_KNOWLEDGE_VERSION,
         model: input.model!.modelIdentifier, prompt: architectureKnowledgePrompt(stage), request })).digest("hex")
       const file = path.join(input.auditRoot, `${name}-${attempt}-${digest.slice(0, 16)}.json`)
       const cached = await readFile(file, "utf8").then(JSON.parse).catch(() => undefined)
-      const response = cached?.digest === digest ? cached.response : await input.model!.request(`architecture_${stage}` as PrincipleStage, request)
+      const response = cached?.digest === digest && !(options?.retryInvalidCache && cached.validationError)
+        ? cached.response : await input.model!.request(`architecture_${stage}` as PrincipleStage, request)
       abort()
       const temporary = `${file}.tmp-${process.pid}`
       await writeFile(temporary, JSON.stringify({ digest, model: packet.model, stage, request, response }, null, 2))
       await rename(temporary, file)
       try {
-        const result = schema.parse(parseArchitectureJSON(response.text))
+        const raw = parseArchitectureJSON(response.text)
+        const result = options?.parse ? options.parse(raw) : schema.parse(raw)
         validate(result)
         return result
       } catch (error) {
@@ -67,7 +71,7 @@ export async function distillArchitectureKnowledge(input: {
         await writeFile(temporary, JSON.stringify({ digest, model: packet.model, stage, request, response,
           validationError: String(error) }, null, 2))
         await rename(temporary, file)
-        if (attempt === 2) throw error
+        if (attempt === attempts) throw error
         repair = { previousResponse: response.text, repairError: String(error),
           repairInstruction: "Repair JSON, references and complete partitions only; never change scientific content to evade an error. For acceptance inspect all cited sources and ensure all checks are true." }
       }
@@ -151,11 +155,16 @@ export async function distillArchitectureKnowledge(input: {
       packet.exclusions.push(...extracted.unused.map((x) => ({ id: x.cardID, stage: "extract", reason: x.reason })))
       const decisions = extracted.decisions.map((d, i) => ({ ...d, decisionID: `architecture_${index}_${i}` }))
       if (!decisions.length) continue
-      const reviewData = (items: ArchitectureDecision[]) => ({ task: input.task, cards: sources, decisions: items,
+      const relatedCards = (items: ArchitectureDecision[]) => {
+        const ids = new Set(items.flatMap(decisionCardIDs))
+        return batch.filter((card) => ids.has(card.knowledgeID))
+      }
+      const reviewData = (items: ArchitectureDecision[], cards = relatedCards(items)) => ({ task: input.task,
+        cards: cards.map(projectArchitectureSourceCard), decisions: items,
         instruction: "Evaluate each checks field independently. An accepted verdict requires all checks true. A resource bottleneck or the choice to use a module is not a data condition. No required number of accepted rules.",
       })
-      const validateReviews = (items: ArchitectureDecision[]) => (value: z.infer<typeof sourceReview>) => {
-        validateArchitectureReview(value, items, batch)
+      const validateReviews = (items: ArchitectureDecision[], cards = relatedCards(items)) => (value: z.infer<typeof sourceReview>) => {
+        validateArchitectureReview(value, items, cards)
         if (value.reviews.some((r) => r.verdict === "accepted" && Object.values(r.checks).some((v) => !v))) throw new Error("Accepted review has failed semantic checks")
         for (const review of value.reviews) {
           // The library illustration is not an executable experiment. Runtime
@@ -175,26 +184,72 @@ export async function distillArchitectureKnowledge(input: {
           }
         }
       }
-      let reviewed: z.infer<typeof sourceReview>
-      try {
-        reviewed = await ask(`review-${index}`, "review", sourceReview, reviewData(decisions), validateReviews(decisions))
-      } catch (error) {
-        abort()
-        if (decisions.length === 1) throw error
-        // One malformed review must not erase independently reviewable siblings.
-        // Each recovery still reads original sources and passes the same gates.
-        const recovered: z.infer<typeof sourceReview>["reviews"] = []
-        for (const d of decisions) {
-          try {
-            const single = await ask(`review-${index}-${d.decisionID}`, "review", sourceReview, reviewData([d]), validateReviews([d]))
-            recovered.push(...single.reviews)
-          } catch (error) {
-            failed(`architecture decision ${d.decisionID}`, error)
-            packet.exclusions.push({ id: d.decisionID, stage: "source_review_failed", reason: "No valid independent review after bounded isolated recovery" })
-          }
-        }
-        reviewed = { reviews: recovered }
+      type SourceReview = z.infer<typeof sourceReview>["reviews"][number]
+      const retained = new Map<string, SourceReview>()
+      const receipt = (decision: ArchitectureDecision) => {
+        const digest = createHash("sha256").update(JSON.stringify({ version: ARCHITECTURE_KNOWLEDGE_VERSION,
+          model: packet.model, prompt: architectureKnowledgePrompt("review"),
+          request: { ...reviewData([decision]), task: architectureSelectionContext(input.task), outputSchema: z.toJSONSchema(sourceReview) },
+        })).digest("hex")
+        return { digest, file: path.join(input.auditRoot, `source-review-${decision.decisionID}-${digest.slice(0, 16)}.json`) }
       }
+      const saveReview = async (decision: ArchitectureDecision) => {
+        const { digest, file } = receipt(decision)
+        const temporary = `${file}.tmp-${process.pid}`
+        await writeFile(temporary, JSON.stringify({ digest, review: retained.get(decision.decisionID) }, null, 2))
+        await rename(temporary, file)
+      }
+      // Revalidate receipts against the exact model, prompt, decision, task and
+      // complete source context. Failed responses never become review receipts.
+      for (const decision of decisions) {
+        const { digest, file } = receipt(decision)
+        const cached = await readFile(file, "utf8").then(JSON.parse).catch(() => undefined)
+        if (cached?.digest !== digest) continue
+        try {
+          const value = sourceReview.parse({ reviews: [cached.review] })
+          validateReviews([decision])(value)
+          retained.set(decision.decisionID, value.reviews[0]!)
+        } catch { /* Invalid receipts must be independently reviewed again. */ }
+      }
+      const pending = decisions.filter((decision) => !retained.has(decision.decisionID))
+      if (pending.length > 1) {
+        try {
+          await ask(`review-${index}`, "review", sourceReview, reviewData(pending), () => {}, {
+            attempts: 1,
+            parse(raw) {
+              const envelope = z.object({ reviews: z.array(z.unknown()) }).strict().parse(raw)
+              const failures: string[] = []
+              for (const decision of pending) {
+                const entries = envelope.reviews.filter((entry) => entry && typeof entry === "object" &&
+                  "decisionID" in entry && entry.decisionID === decision.decisionID)
+                try {
+                  if (entries.length !== 1) throw new Error("Review must occur exactly once")
+                  const value = sourceReview.parse({ reviews: entries })
+                  validateReviews([decision])(value)
+                  retained.set(decision.decisionID, value.reviews[0]!)
+                } catch (error) { failures.push(`${decision.decisionID}: ${String(error)}`) }
+              }
+              if (failures.length) throw new Error(failures.join("\n"))
+              return { reviews: pending.map((decision) => retained.get(decision.decisionID)!) }
+            },
+          })
+        } catch { abort() }
+        // Save qualified siblings before attempting any failed entry, including
+        // when the batch envelope was valid but one review failed its gates.
+        for (const decision of pending) if (retained.has(decision.decisionID)) await saveReview(decision)
+      }
+      for (const decision of pending.filter((decision) => !retained.has(decision.decisionID))) {
+        try {
+          const single = await ask(decisions.length === 1 ? `review-${index}` : `review-${index}-${decision.decisionID}`,
+            "review", sourceReview, reviewData([decision]), validateReviews([decision]), { retryInvalidCache: true })
+          retained.set(decision.decisionID, single.reviews[0]!)
+          await saveReview(decision)
+        } catch (error) {
+          failed(`architecture decision ${decision.decisionID}`, error)
+          packet.exclusions.push({ id: decision.decisionID, stage: "source_review_failed", reason: "No valid independent review after bounded isolated recovery" })
+        }
+      }
+      const reviewed = { reviews: decisions.flatMap((decision) => retained.has(decision.decisionID) ? [retained.get(decision.decisionID)!] : []) }
       for (const original of decisions) {
         let d = original
         let r = reviewed.reviews.find((r) => r.decisionID === d.decisionID)
@@ -207,16 +262,17 @@ export async function distillArchitectureKnowledge(input: {
           if (r.verdict === "accepted" && !admissionIssues.length) break
           if (r.revisionAdvice.action === "none") break
           try {
+            const revisionCards = relatedCards([d, original])
             const revision = await ask(`revise-${index}-${d.decisionID}-${round}`, "revise", ArchitectureRevisionSchema, {
-              cards: sources, previousDecision: d, originalDecision: original,
+              cards: revisionCards.map(projectArchitectureSourceCard), previousDecision: d, originalDecision: original,
               independentReview: r, admissionIssues,
             }, (value) => {
               if (!value.decision) return
               if (value.decision.decisionID !== original.decisionID) throw new Error("Revision must preserve decisionID")
               const used = new Set(decisionCardIDs(value.decision))
               validateArchitectureExtraction({ decisions: [value.decision],
-                unused: batch.filter((c) => !used.has(c.knowledgeID)).map((c) => ({ cardID: c.knowledgeID, reason: "Not cited by this revision" })),
-              }, batch)
+                unused: revisionCards.filter((c) => !used.has(c.knowledgeID)).map((c) => ({ cardID: c.knowledgeID, reason: "Not cited by this revision" })),
+              }, revisionCards)
             })
             if (!revision.decision) {
               packet.exclusions.push({ id: d.decisionID, stage: "revision_withdrawn", reason: revision.reason })
@@ -225,7 +281,7 @@ export async function distillArchitectureKnowledge(input: {
             }
             d = revision.decision
             const fresh = await ask(`review-revision-${index}-${d.decisionID}-${round}`, "review", sourceReview,
-              reviewData([d]), validateReviews([d]))
+              reviewData([d], revisionCards), validateReviews([d], revisionCards), { retryInvalidCache: true })
             r = fresh.reviews[0]!
           } catch (error) {
             failed(`architecture semantic revision ${d.decisionID}`, error)
@@ -274,8 +330,8 @@ export async function distillArchitectureKnowledge(input: {
   }
   const cited = new Set(packet.decisions.flatMap(decisionCardIDs))
   packet.sourceCards = selected.filter((c) => cited.has(c.knowledgeID))
-  // Reviewers may inspect siblings in a batch. Keep that full audit on disk,
-  // while the handoff authorizes only source cards of selected decisions.
+  // Keep complete batch/revision evidence in the audit, while the handoff
+  // authorizes only source cards of selected decisions.
   packet.reviews = packet.reviews.map((r) => ({ ...r, reviewedSources: r.reviewedSources.filter((s) => cited.has(s.cardID)) }))
   packet.historicalCardIDs = input.corpus.historicalCardIDs.filter((id) => cited.has(id))
   await input.onProgress?.({ step: "review_architecture", status: packet.status, counts: { decisions: packet.decisions.length, source_cards: packet.sourceCards.length } })

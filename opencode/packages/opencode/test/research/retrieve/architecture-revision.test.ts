@@ -184,13 +184,18 @@ for (const mode of ["withdraw", "exhaust", "fabricated_source", "review_failure"
   })
 }
 
-test("inspected sibling cards remain in the full review audit without breaking the final handoff", async () => {
+test("single reviews cannot claim to inspect an unrelated sibling card", async () => {
   await using tmp = await tmpdir()
   const first = principleFixture().card
   const sibling = principleFixture((c) => { c.candidateID = "sibling"; c.transferableInsight = "A distinct source lead" }).card
   const fixture = fixtureModel(first.knowledgeID)
   const model: PrincipleModel = { modelIdentifier: "sibling-audit", async request(stage, payload) {
     const value = JSON.parse((await fixture.model.request(stage, payload)).text)
+    if (stage === "architecture_extract") {
+      value.decisions = [value.decisions[0]]
+      value.unused = [{ cardID: sibling.knowledgeID, reason: "Unrelated source lead" }]
+    }
+    if (stage === "architecture_review") expect((payload.cards as any[]).map((card) => card.cardID)).toEqual([first.knowledgeID])
     if (stage === "architecture_review") for (const r of value.reviews) r.reviewedSources = [
       ...r.reviewedSources, { cardID: sibling.knowledgeID, sourceIDs: [sibling.sources[0]!.sourceID] },
     ]
@@ -199,9 +204,9 @@ test("inspected sibling cards remain in the full review audit without breaking t
   const auditRoot = path.join(tmp.path, "audit")
   const packet = await distillArchitectureKnowledge({ corpus: { cards: [first, sibling], historicalCardIDs: [], digest: "siblings", warnings: [] }, model,
     task: { quantitativeReport: report() }, datasetEvidencePaths: [], maxDecisions: 12, auditRoot })
-  expect(packet.decisions).toHaveLength(1)
-  expect(packet.sourceCards.map((c) => c.knowledgeID)).toEqual([first.knowledgeID])
-  expect(packet.reviews[0]!.reviewedSources.map((r) => r.cardID)).toEqual([first.knowledgeID])
+  expect(packet.decisions).toEqual([])
+  expect(packet.sourceCards).toEqual([])
+  expect(packet.exclusions.some((entry) => entry.stage === "source_review_failed")).toBe(true)
   const file = (await readdir(auditRoot)).find((f) => f.startsWith("review-"))!
   const full = JSON.parse(await readFile(path.join(auditRoot, file), "utf8"))
   expect(JSON.parse(full.response.text).reviews[0].reviewedSources.some((r: any) => r.cardID === sibling.knowledgeID)).toBe(true)

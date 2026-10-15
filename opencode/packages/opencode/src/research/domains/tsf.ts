@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { analyzeSeasonality } from "../seasonality"
+import { BaselineDisabledError, isZeroResearch, researchVariant, validateResearchVariant } from "../research-variant"
 import z from "zod"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
@@ -1145,6 +1146,7 @@ export function createTSFRunPlan(input: {
 }): DomainRunPlan {
   const task = TSFTaskSpec.parse(input.taskSpec)
   const stage = DomainRunStage.parse(input.stage ?? "smoke")
+  if (stage === "baseline" && isZeroResearch(task)) throw new BaselineDisabledError()
   const validation = validateTSFCandidate(task as unknown as JsonRecord, input.candidateSpec)
   const parsedCandidate = TSFCandidateRecipe.safeParse(input.candidateSpec)
   const recipe = parsedCandidate.success ? parsedCandidate.data : undefined
@@ -1693,6 +1695,7 @@ export function summarizeTSFTask(taskSpec: unknown, context?: DomainSummaryConte
 
   return {
     taskType: task.taskType,
+    researchVariant: researchVariant(task),
     forecastMode: task.forecastMode,
     seriesType: effectiveSeriesType,
     loaderID: task.dataset.loaderID,
@@ -1750,6 +1753,7 @@ function withOptimizer(
 
 export function buildTSFBaselines(taskSpec: unknown): DomainCandidateProposal[] {
   const task = TSFTaskSpec.parse(taskSpec)
+  if (isZeroResearch(task)) return []
 
   if (task.runtime.bridgeOnly) {
     const candidates = [
@@ -2871,6 +2875,7 @@ function proposalRationale(hypothesis: string, taskFingerprint: JsonRecord, late
 }
 
 export function rankTSFCandidateProposals(input: DomainProposalContext): DomainCandidateRanking[] {
+  if (isZeroResearch(input.taskSpec)) return []
   const task = TSFTaskSpec.parse(input.taskSpec)
   const taskFingerprint = input.taskFingerprint ?? summarizeTSFTask(task)
   const features = rankFeatureVector(taskFingerprint, input)
@@ -2924,6 +2929,7 @@ export function rankTSFCandidateProposals(input: DomainProposalContext): DomainC
 }
 
 export function proposeTSFCandidate(input: DomainProposalContext): DomainCandidateProposal | undefined {
+  if (isZeroResearch(input.taskSpec)) return undefined
   const task = TSFTaskSpec.parse(input.taskSpec)
   const taskFingerprint = input.taskFingerprint ?? summarizeTSFTask(task)
   const existingRecipeIDs = new Set(
@@ -3200,7 +3206,9 @@ export const TSFDomain: ResearchDomain = {
     actionRegistry: ACTION_REGISTRY,
   },
   createTaskSpec(input) {
-    return TSFTaskSpec.parse(input) as unknown as JsonRecord
+    const taskSpec = TSFTaskSpec.parse(input) as unknown as JsonRecord
+    validateResearchVariant(taskSpec)
+    return taskSpec
   },
   summarizeTask(taskSpec, context) {
     return summarizeTSFTask(taskSpec, context)

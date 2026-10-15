@@ -112,7 +112,16 @@ characters. Sources are not silently truncated. The independent reviewer checks 
 condition, non-circularity, structural choice, source fidelity, counterevidence and task
 applicability. Final curation removes redundant or unhelpful rules; it does not fill a
 quota. Complete JSON fences are accepted; malformed JSON or references receive one repair
-attempt. Invalid output is never salvaged by guessing truncated content.
+attempt. Batch reviews are validated entry by entry: qualified results are retained,
+and only missing, duplicated or invalid entries receive bounded single-decision retries.
+Valid rejections also remain final reviews unless their explicit semantic revision advice
+requires a revision. Invalid JSON is never salvaged by guessing truncated content.
+
+Single-decision review and revision requests contain only the associated cards. Their full
+sources, assertions, support/refutation links, experiments and boundaries are retained;
+evidence is not limited to the extractor's cited source IDs or truncated to save context.
+Revision and fresh review retain the original associated cards too, so removing a citation
+cannot hide original counterevidence. Unrelated sibling cards are not sent or authorized.
 
 Artifacts under `.neo-cast/literature-retrieval/runs/<retrieveRunID>/` include:
 
@@ -145,7 +154,11 @@ Original v2 bundles without an architecture packet retain their legacy citation 
 Corpus, model/output budget, prompts, pipeline version and selection limits participate in cache
 identity. Completed packets qualify for a full-run cache hit. No-model unavailable packets
 can be reused only while no model is configured (adding a model changes the run ID).
-Partial runs can recover using per-request audit caches. Progress exposes `new_papers`,
+Validated per-decision review receipts are keyed by the model, review prompt, decision,
+task context and complete related source evidence. Partial runs reuse these receipts and
+retry only unresolved entries; cached invalid review responses never suppress a fresh retry.
+Changing any of that review context requires a new review. Partial runs also recover using
+per-request audit caches. Progress exposes `new_papers`,
 `reused_papers`, `reused_cards`, followed by `recall_architecture`, `distill_architecture`
 and `review_architecture` with their separate card/decision counts.
 

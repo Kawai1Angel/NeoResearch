@@ -871,6 +871,8 @@ export async function proposeLLMCandidate(input: {
   readonly task: ResearchTask
   readonly proposalContext: DomainProposalContext
   readonly workspaceRoot: string
+  /** The coordinator can own retries across session and direct transports. */
+  readonly maxAttempts?: number
   /** Fallback key+baseURL resolved from the opencode auth.json when env vars are absent. */
   readonly authJsonKey?: { readonly key: string; readonly baseURL: string; readonly model: string }
   readonly dataAnalysisMarkdown?: string
@@ -922,7 +924,7 @@ export async function proposeLLMCandidate(input: {
     requestedEvidence: input.requestedEvidence,
   }
   let user = buildUserPrompt(promptInput)
-  const maxAttempts = 3
+  const maxAttempts = input.maxAttempts ?? 3
   let lastError: unknown
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {

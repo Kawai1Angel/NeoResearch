@@ -58,6 +58,7 @@ export function buildNASAgentResult(input: {
   const { loop, taskID } = input
   const primaryMetricName = input.primaryMetricName ?? "val_avg_mse"
   const direction = input.direction ?? "minimize"
+  const initialLabel = input.taskFingerprint?.researchVariant === "zero" ? "+initial" : "+baseline"
 
   const searchBiasesApplied: string[] = (() => {
     if (!input.taskFingerprint) return []
@@ -95,7 +96,7 @@ export function buildNASAgentResult(input: {
             ? bestSoFar - primaryMetric
             : primaryMetric - bestSoFar
       } else {
-        // First iteration with a metric — it is the baseline
+        // The first metric establishes an observed reference.
         deltaVsChampion = undefined
       }
 
@@ -143,6 +144,7 @@ export function buildNASAgentResult(input: {
     failedCount,
     searchBiasesApplied,
     summaries: iterationSummaries,
+    initialLabel,
     primaryMetricName,
   })
   const best = bestIteration(iterationSummaries, direction)
@@ -153,7 +155,7 @@ export function buildNASAgentResult(input: {
     searchBiasesApplied,
     summaries: iterationSummaries,
   })
-  const leaderboardMarkdown = buildLeaderboardMarkdown({ summaries: iterationSummaries, primaryMetricName, direction })
+  const leaderboardMarkdown = buildLeaderboardMarkdown({ summaries: iterationSummaries, primaryMetricName, direction, initialLabel })
   const searchSpaceYaml = buildSearchSpaceYaml({
     taskID,
     primaryMetricName,
@@ -192,8 +194,8 @@ function fmtMetric(value: number | undefined): string {
   return Number(value.toPrecision(6)).toString()
 }
 
-function fmtDelta(value: number | undefined, isFirst: boolean): string {
-  if (isFirst) return "+baseline"
+function fmtDelta(value: number | undefined, isFirst: boolean, initialLabel = "+baseline"): string {
+  if (isFirst) return initialLabel
   if (value === undefined) return "-"
   const sign = value >= 0 ? "+" : ""
   return `${sign}${Number(value.toPrecision(4))}`
@@ -205,6 +207,7 @@ function truncate(text: string, maxLen: number): string {
 }
 
 function buildExperimentLogMarkdown(input: {
+  initialLabel: string
   taskID: ResearchTaskID
   iterationCount: number
   succeededCount: number
@@ -235,7 +238,7 @@ function buildExperimentLogMarkdown(input: {
     const recipe = s.recipeID ?? s.candidateID.slice(0, 20)
     const hyp = truncate(s.hypothesis, 60)
     const isFirst = s.iterationIndex === 1
-    return `| ${s.iterationIndex} | ${recipe} | ${s.generatedBy} | ${s.runStatus} | ${fmtMetric(s.primaryMetric)} | ${fmtDelta(s.deltaVsChampion, isFirst)} | ${fmtDelta(s.deltaVsPrevious, false)} | ${hyp} |`
+    return `| ${s.iterationIndex} | ${recipe} | ${s.generatedBy} | ${s.runStatus} | ${fmtMetric(s.primaryMetric)} | ${fmtDelta(s.deltaVsChampion, isFirst, input.initialLabel)} | ${fmtDelta(s.deltaVsPrevious, false)} | ${hyp} |`
   })
 
   const hypothesisBlocks = summaries
@@ -309,6 +312,7 @@ function buildModelSearchPlanMarkdown(input: {
 }
 
 function buildLeaderboardMarkdown(input: {
+  initialLabel: string
   summaries: NASIterationSummary[]
   primaryMetricName: string
   direction: "minimize" | "maximize"
@@ -328,7 +332,7 @@ function buildLeaderboardMarkdown(input: {
     ...(ranked.length
       ? ranked.map(
           (item, index) =>
-            `| ${index + 1} | ${item.candidateID} | ${item.recipeID ?? "-"} | ${item.runStatus} | ${fmtMetric(item.primaryMetric)} | ${fmtDelta(item.deltaVsChampion, item.iterationIndex === 1)} |`,
+            `| ${index + 1} | ${item.candidateID} | ${item.recipeID ?? "-"} | ${item.runStatus} | ${fmtMetric(item.primaryMetric)} | ${fmtDelta(item.deltaVsChampion, item.iterationIndex === 1, input.initialLabel)} |`,
         )
       : ["| - | - | - | - | - | - |"]),
     "",

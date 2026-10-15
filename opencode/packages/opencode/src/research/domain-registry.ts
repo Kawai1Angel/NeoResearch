@@ -13,6 +13,7 @@ import {
 } from "./domain"
 import { TSFDomain } from "./domains/tsf"
 import type { JsonRecord } from "./schema"
+import { isZeroResearch, validateResearchVariant } from "./research-variant"
 
 const BUILTIN_DOMAINS = [TSFDomain] as const satisfies readonly ResearchDomain[]
 const BY_ID = new Map<string, ResearchDomain>(BUILTIN_DOMAINS.map((domain) => [domain.info.id, domain]))
@@ -54,7 +55,9 @@ export function getInfo(domainID: string): DomainInfo {
 }
 
 export function createTaskSpec(domainID: string, input: unknown): JsonRecord {
-  return get(domainID).createTaskSpec(input)
+  const taskSpec = get(domainID).createTaskSpec(input)
+  validateResearchVariant(taskSpec)
+  return taskSpec
 }
 
 export function summarizeTask(domainID: string, taskSpec: JsonRecord, context?: DomainSummaryContext): JsonRecord {
@@ -62,15 +65,21 @@ export function summarizeTask(domainID: string, taskSpec: JsonRecord, context?: 
 }
 
 export function buildBaselines(domainID: string, taskSpec: JsonRecord) {
-  return get(domainID).buildBaselines(taskSpec)
+  const domain = get(domainID)
+  if (isZeroResearch(taskSpec)) return []
+  return domain.buildBaselines(taskSpec)
 }
 
 export function rankCandidateProposals(domainID: string, input: DomainProposalContext) {
-  return get(domainID).rankCandidateProposals?.(input) ?? []
+  const domain = get(domainID)
+  if (isZeroResearch(input.taskSpec)) return []
+  return domain.rankCandidateProposals?.(input) ?? []
 }
 
 export function proposeCandidate(domainID: string, input: DomainProposalContext) {
-  return get(domainID).proposeCandidate?.(input)
+  const domain = get(domainID)
+  if (isZeroResearch(input.taskSpec)) return undefined
+  return domain.proposeCandidate?.(input)
 }
 
 export function validateCandidate(

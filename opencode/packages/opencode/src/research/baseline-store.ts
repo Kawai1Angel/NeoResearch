@@ -6,6 +6,7 @@ import { Event } from "./event"
 import { referenceBaselineOptions } from "./agents/hypo-planner-agent"
 import { DomainRegistry } from "./domain-registry"
 import type { JsonRecord, ResearchTaskID } from "./schema"
+import { BaselineDisabledError, isZeroResearch } from "./research-variant"
 
 // Standalone module (no service.ts dependency) — same rationale as task-mapper.ts /
 // taskspec-store.ts: service.ts calls into this module, so importing service.ts back
@@ -51,6 +52,7 @@ export async function pickReferenceBaseline(
   const row = Database.use((d) => d.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get())
   if (!row) throw new TaskNotFoundError(taskID)
   const task = mapTask(row)
+  if (isZeroResearch(task.taskSpec)) throw new BaselineDisabledError()
   const options = referenceBaselineOptions(task)
   if (!options.includes(recipeID)) throw new InvalidBaselineError(recipeID, options)
 
@@ -102,6 +104,7 @@ export async function loadBaselineOptions(taskID: ResearchTaskID): Promise<{
   const row = Database.use((d) => d.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get())
   if (!row) throw new TaskNotFoundError(taskID)
   const task = mapTask(row)
+  if (isZeroResearch(task.taskSpec)) throw new BaselineDisabledError()
   const validRecipeIDs = new Set(referenceBaselineOptions(task))
   const options = DomainRegistry.buildBaselines(task.domainID, task.taskSpec)
     .map((proposal) => {

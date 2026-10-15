@@ -16,6 +16,7 @@ import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import PROMPT_RESEARCH_DATA_ANALYSIS from "./prompt/research-data-analysis.txt"
 import PROMPT_RESEARCH_INTENT_AGENT from "./prompt/research-intent-agent.txt"
+import PROMPT_RESEARCH_HYPO_PLANNER_ZERO from "./prompt/research-hypo-planner-zero.txt"
 import PROMPT_RESEARCH_HYPO_PLANNER from "./prompt/research-hypo-planner.txt"
 import PROMPT_RESEARCH_REFLECTION from "./prompt/research-reflection.txt"
 import PROMPT_RESEARCH_MODEL_DESIGNER from "./prompt/research-model-designer.txt"
@@ -330,6 +331,38 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_RESEARCH_HYPO_PLANNER,
+          },
+          "research-hypo-planner-zero": {
+            name: "research-hypo-planner-zero",
+            description: "NeoResearch autonomous loop — hypothesis planning stage. Invoked programmatically.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                read: "allow",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                webfetch: "allow",
+                hypothesis_add: "allow",
+                hypothesis_update: "allow",
+                hypothesis_abandon: "allow",
+                hypothesis_list: "allow",
+                read_task_evidence: "allow",
+                hypothesis_select: "allow",
+                pick_baseline: "deny",
+                load_baseline: "deny",
+                experiment_results: "allow",
+                read_reflection: "allow",
+                read_experiences: "allow",
+              }),
+              user,
+            ),
+            prompt: PROMPT_RESEARCH_HYPO_PLANNER_ZERO,
           },
           "research-reflection": {
             name: "research-reflection",

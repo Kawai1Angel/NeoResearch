@@ -13,6 +13,7 @@ export type ResearchOutputFormat = "table" | "json"
 export type ResearchInteractionMode = "companion" | "socratic"
 
 export type TsfResearchTaskDefaults = {
+  researchVariant?: "standard" | "zero"
   datasetPath?: string
   datasetPreset?: string
   targetCols?: string[]
@@ -58,6 +59,7 @@ function tsfTaskSpec(input: TsfResearchTaskDefaults & { neoCastProjectRoot?: str
     interpretability: "prefer simple explainable candidates when metrics are close",
     deploymentTarget: "local research runtime",
     ...(input.metadata ?? {}),
+    ...(input.researchVariant ? { researchVariant: input.researchVariant } : {}),
     interactionMode,
   }
   const constraints = {
@@ -209,6 +211,7 @@ function goalTitle(value: string, defaults: TsfResearchTaskDefaults) {
 
 export function buildDefaultTsfResearchTaskInputFromGoal(input: {
   goal: string
+  researchVariant?: "standard" | "zero"
   mode: Research.ResearchMode
   title?: string
   neoCastProjectRoot?: string
@@ -219,6 +222,7 @@ export function buildDefaultTsfResearchTaskInputFromGoal(input: {
   const defaults = parseTsfResearchGoalInput(input.goal)
   return buildDefaultTsfResearchTaskInput({
     ...defaults,
+    researchVariant: input.researchVariant,
     ...(input.maxIterations === undefined ? {} : { maxIterations: input.maxIterations }),
     ...(input.maxNoImprove === undefined ? {} : { maxNoImprove: input.maxNoImprove }),
     mode: input.mode,

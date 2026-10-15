@@ -385,6 +385,11 @@ export const ResearchCreateCommand = cmd({
   describe: "create a TSF research task",
   builder: (yargs: Argv) =>
     outputFormat(yargs)
+      .option("research-variant", {
+        describe: "research variant: zero designs its first model without preset baselines",
+        type: "string",
+        choices: ["standard", "zero"] as const,
+      })
       .option("mode", {
         describe: "research interaction mode",
         type: "string",
@@ -445,10 +450,12 @@ export const ResearchCreateCommand = cmd({
       contextLength?: number
       predictionLengths?: string
       fullRecipeSpace?: boolean
+      researchVariant?: "standard" | "zero"
     },
   ) => {
     const interactionMode = args.interactionMode ?? (args.mode === "autonomous" ? "socratic" : "companion")
     const input = buildDefaultTsfResearchTaskInput({
+      researchVariant: args.researchVariant,
       mode: args.interactionMode ? researchModeForInteractionMode(interactionMode) : args.mode,
       interactionMode,
       title: args.title,
@@ -949,6 +956,11 @@ export const ResearchVibeCommand = cmd({
   builder: (yargs: Argv) =>
     outputFormat(
       yargs
+        .option("research-variant", {
+          describe: "research variant: zero designs its first model without preset baselines",
+          type: "string",
+          choices: ["standard", "zero"] as const,
+        })
         .positional("goal", {
           describe: "forecasting goal, optionally including /path/to/data.csv and target/horizon/context options",
           type: "string",
@@ -985,6 +997,7 @@ export const ResearchVibeCommand = cmd({
       maxNoImprove?: number
       exploration?: number
       runnerRoot?: string
+      researchVariant?: "standard" | "zero"
       interactionMode?: ResearchInteractionMode
     },
   ) => {
@@ -995,6 +1008,7 @@ export const ResearchVibeCommand = cmd({
       Effect.gen(function* () {
         const task = yield* svc.createTask(
           buildDefaultTsfResearchTaskInputFromGoal({
+            researchVariant: args.researchVariant,
             goal,
             mode: researchModeForInteractionMode(interactionMode),
             interactionMode,
