@@ -12,7 +12,7 @@ import { SessionPrompt } from "../../src/session/prompt"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { Research } from "../../src/research"
-import { ResearchRunTable, ResearchHypothesisTable } from "../../src/research/research.sql"
+import { ResearchRunTable, ResearchHypothesisTable, ResearchCycleTable } from "../../src/research/research.sql"
 import { createFileResearchRuntime } from "../../src/research/runtime"
 import { Database, eq } from "../../src/storage"
 import { resetDatabase } from "../fixture/db"
@@ -21,6 +21,7 @@ import { pickReferenceBaseline, loadBaselineOptions } from "../../src/research/b
 import { addHypothesisToPool, updateHypothesisInPool, selectNextExperimentInPool, listHypothesesInPool } from "../../src/research/hypothesis-store"
 import { validateCandidateAgainstHypothesis } from "../../src/research/execution-contract"
 import { readDesignHistory } from "../../src/research/design-history"
+import { resumeState } from "../../src/research/recovery"
 
 function saveExperimentFact(taskID: Research.ResearchTaskID, runID: string) {
   return writeExperience(taskID, { level: "experiment_fact", polarity: "mixed", claimType: "observation",
@@ -2217,12 +2218,14 @@ fi`))
 
         const taskA = await createTSFTask("Dataset A", { datasetPath: pathA })
         const candidateA = await createCandidate({ taskID: taskA.id })
-        const runA = await createRun({ taskID: taskA.id, candidateID: candidateA.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+        const runA = await createRun({ taskID: taskA.id, candidateID: candidateA.id, status: "succeeded", metrics: { val_avg_mse: 1 },
+          resourceUsage: { executionContract: { status: "verified", manifest: { actual: { backbone: "linear" } } } } })
         await saveExperimentFact(taskA.id, runA.id)
 
         const taskB = await createTSFTask("Dataset B", { datasetPath: pathB })
         const candidateB = await createCandidate({ taskID: taskB.id })
-        const runB = await createRun({ taskID: taskB.id, candidateID: candidateB.id, status: "succeeded", metrics: { val_avg_mse: 1 } })
+        const runB = await createRun({ taskID: taskB.id, candidateID: candidateB.id, status: "succeeded", metrics: { val_avg_mse: 1 },
+          resourceUsage: { executionContract: { status: "verified", manifest: { actual: { backbone: "linear" } } } } })
         await saveExperimentFact(taskB.id, runB.id)
 
         const [memoryA] = await runResearch(Research.Service.use((svc) => svc.listMemory(taskA.id)))
@@ -2403,6 +2406,7 @@ fi`))
         const run = await createRun({
           taskID: task.id, candidateID: candidate.id, status: "succeeded",
           metrics: { val_avg_mse: 0.12 },
+          resourceUsage: { executionContract: { status: "verified", manifest: { actual: { backbone: "rnn", embedding: "invert" } } } },
         })
 
         expect(await runResearch(Research.Service.use((svc) => svc.listMemory(task.id)))).toEqual([])
@@ -6276,3 +6280,111 @@ test("zero full pipeline preserves its variant through intent, data analysis, tr
     expect(artifacts.filter((artifact) => artifact.metadata.researchVariant !== "zero").map((artifact) => artifact.kind)).toEqual([])
   } })
 })
+
+test("selection preflight rejects an incomplete fusion switch without replacing the current decision", async () => {
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeTrainingFakeNeoCastRunner(root)
+    const task = await createTSFTask("Contract selection preflight", { bridgeOnly: false, neoCastProjectRoot: root, pythonExecutable: "bash" }, "autonomous")
+    const draft = { statement: "Test channel mixing for correlated inputs.", motivation: ["Observed correlation 0.5"],
+      expectedOutcome: "Lower val_avg_mse", suggestedBackbones: ["linear"], suggestedPreprocessing: [], risk: "Overfit", testable: true }
+    const anchor = await addHypothesisToPool(task.id, { ...draft, experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] } })
+    await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: anchor.id, rationale: "Establish an independent observation" })
+    const candidate = await runResearch(Research.Service.use(svc => svc.createCandidate({ taskID: task.id, domainID: "tsf", hypothesisID: anchor.id,
+      candidateSpec: { ...validTsfCandidateSpec(), fusion: { type: "temporal", channelMode: "independent" } },
+      generatedBy: "llm", rationale: "Observation", riskLevel: "low", approvalStatus: "auto_approved" })))
+    await runResearch(Research.Service.use(svc => svc.executeRun({ taskID: task.id, candidateID: candidate.id, stage: "smoke" })))
+    const executed = await runResearch(Research.Service.use(svc => svc.executeRun({ taskID: task.id, candidateID: candidate.id, stage: "full" })))
+    expect(executed.run.status).toBe("succeeded")
+    const contract = { mode: "controlled" as const, comparisonRunID: executed.run.id,
+      changes: [{ operation: "set" as const, path: "fusion.type", before: "temporal", after: "feature_mlp" }],
+      frozenPaths: ["trainingStrategy"], requiredValues: [{ path: "fusion.type", value: "feature_mlp" }], forbiddenMechanisms: [] }
+    const trial = await addHypothesisToPool(task.id, { ...draft, experimentContract: contract })
+    await expect(selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: trial.id, rationale: "Test mixing" }))
+      .rejects.toThrow("experiment_contract_preflight")
+    expect((await runResearch(Research.Service.use(svc => svc.getTask(task.id)))).taskSpec.metadata).toMatchObject({ nextExperiment: { hypothesisID: anchor.id } })
+    await updateHypothesisInPool(task.id, trial.id, { experimentContract: { ...contract, changes: [...contract.changes,
+      { operation: "remove", path: "fusion.channelMode", before: "independent" },
+    ] } })
+    await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: trial.id, rationale: "Complete component switch" })
+    expect((await runResearch(Research.Service.use(svc => svc.getTask(task.id)))).taskSpec.metadata).toMatchObject({ nextExperiment: { hypothesisID: trial.id } })
+  } })
+}, 30_000)
+
+for (const plannerFailure of [false, true]) {
+test(`exhausted design repair ${plannerFailure ? "with a failed planner" : "with unavailable designs"} pauses NAS and resumes the same cycle`, async () => {
+  installPlannerFixture()
+  const fixtureFetch = globalThis.fetch
+  let plannerCalls = 0
+  let designerCalls = 0
+  let repaired = false
+  const draft = { statement: "Test a data-grounded linear temporal model.", motivation: ["Observed trend strength 0.8"],
+    expectedOutcome: "Lower val_avg_mse", suggestedBackbones: ["linear"], suggestedPreprocessing: [], requiredMechanisms: [],
+    risk: "Underfit", testable: true, datasetEvidencePaths: [], literatureEvidence: [], applicabilityAssumptions: [],
+    falsificationCriteria: ["No improvement in val_avg_mse"], evidenceLevel: "data_only" as const,
+    experimentContract: { mode: "exploratory" as const, changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] } }
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body))
+    const system = body.messages[0].content as string
+    const user = JSON.parse(body.messages[1].content)
+    let result: unknown
+    if (system.startsWith("You are the NeoResearch HypoPlanner")) {
+      const hypothesis = { ...draft, id: `H_replan_${++plannerCalls}` }
+      if (plannerFailure && !repaired) throw new Error("Planner fixture failed during design repair")
+      result = { hypotheses: [hypothesis], nextExperiment: { action: "experiment", hypothesisID: hypothesis.id, rationale: "Resolve the reported design blocker" } }
+    } else if (system.startsWith("You are the NeoResearch TSF model-design planner")) {
+      designerCalls++
+      result = repaired ? validTsfCandidateSpec() : { status: "unavailable", hypothesisID: user.taskFingerprint.selectedHypothesis.id,
+        reason: "The selected contract cannot be implemented without an explicit component-field removal.",
+        conflicts: [{ field: "fusion.channelMode", requested: "Preserve obsolete component field", supported: "New component rejects this field" }],
+        suggestedRevision: "Declare complete component replacement." }
+    } else return fixtureFetch(url, init)
+    const content = JSON.stringify(result)
+    return new Response(body.stream
+      ? `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`
+      : JSON.stringify({ choices: [{ message: { content } }] }),
+      { headers: { "content-type": body.stream ? "text/event-stream" : "application/json" } })
+  }) as typeof fetch
+  await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+  await Instance.provide({ directory: tmp.path, fn: async () => {
+    const root = path.join(tmp.path, "runner")
+    await writeTrainingFakeNeoCastRunner(root)
+    const task = await runResearch(Research.Service.use(svc => svc.createTask({ title: "Design repair recovery", domainID: "tsf", mode: "autonomous",
+      taskSpec: { ...validTsfTaskSpec({ bridgeOnly: false, neoCastProjectRoot: root, pythonExecutable: "bash" }), metadata: { researchVariant: "zero" } },
+      objective: { primaryMetric: "val_avg_mse", direction: "minimize" }, budget: { maxRuns: 50, loop: { maxIterations: 25, maxNoImprove: 7 } } })))
+    const first = await addHypothesisToPool(task.id, draft)
+    await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: first.id, rationale: "Autonomous first observation" })
+    await expect(runResearch(Research.Service.use(svc => svc.runNASAgent({ taskID: task.id, stage: "full", maxIterations: 25, targetMetricValue: 0.2 }))))
+      .rejects.toMatchObject({ name: "ResearchPipelineBlockedError", data: { checkpointPhase: "model_design_repair" } })
+    expect(designerCalls).toBe(plannerFailure ? 1 : 4)
+    expect(plannerCalls).toBe(plannerFailure ? 1 : 3)
+    const state = resumeState(Instance.project.id, task.id)!
+    expect(state.recoveryState).toBe("waiting_input")
+    expect(state.currentPhase).toBe("paused")
+    expect(state.pendingApproval?.reason).toContain("[checkpoint:model_design_repair]")
+    await expect(runResearch(Research.Service.use(svc => svc.runNASAgent({ taskID: task.id, stage: "full", maxIterations: 25 }))))
+      .rejects.toMatchObject({ name: "ResearchPipelineBlockedError", data: { checkpointPhase: "model_design_repair" } })
+    expect(designerCalls).toBe(plannerFailure ? 1 : 4)
+    const cycle = Database.use(d => d.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.task_id, task.id)).get())!
+    expect(cycle.iterations).toBe(0)
+    expect(cycle.policy.maxIterations).toBe(25)
+    const artifacts = await runResearch(Research.Service.use(svc => svc.listArtifacts(task.id)))
+    expect(artifacts.filter(a => a.kind === "model_design_unavailable_json")).toHaveLength(plannerFailure ? 1 : 4)
+    expect(artifacts.some(a => a.kind === "model_design_blocker_json")).toBe(true)
+    expect(artifacts.some(a => ["nas_result_json", "model_export_package"].includes(a.kind))).toBe(false)
+    expect(await runResearch(Research.Service.use(svc => svc.listRuns(task.id)))).toEqual([])
+    repaired = true
+    const next = await addHypothesisToPool(task.id, { ...draft, statement: "Repaired feasible linear experiment." })
+    await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: next.id, rationale: "Design conflict resolved" })
+    await runResearch(Research.Service.use(svc => svc.replyApproval({ approvalID: state.pendingApproval!.id as any, status: "approved", replyMessage: "Design repaired" })))
+    const resumed = await runResearch(Research.Service.use(svc => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 25, targetMetricValue: 0.2 })))
+    expect(resumed.stoppedReason).toBe("target_reached")
+    expect(resumed.iterations).toHaveLength(1)
+    const restored = Database.use(d => d.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.task_id, task.id)).get())!
+    expect(restored.id).toBe(cycle.id)
+    expect(restored.iterations).toBe(1)
+    expect(restored.policy.maxIterations).toBe(25)
+  } })
+}, 30_000)
+}

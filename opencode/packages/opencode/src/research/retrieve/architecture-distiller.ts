@@ -28,6 +28,17 @@ const sourceReview = z.object({ reviews: z.array(ArchitectureReviewSchema.shape.
 })) }).strict()
 const curation = z.object({ selectedDecisionIDs: z.array(z.string()), excluded: z.array(z.object({ decisionID: z.string(), reason: z.string() }).strict()) }).strict()
 
+export function validateArchitectureCuration(value: z.infer<typeof curation>, expected: readonly string[], maxDecisions: number) {
+  const ids = [...value.selectedDecisionIDs, ...value.excluded.map((item) => item.decisionID)]
+  const missing = expected.filter((id) => !ids.includes(id))
+  const unknown = [...new Set(ids.filter((id) => !expected.includes(id)))]
+  const duplicate = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))]
+  if (missing.length || unknown.length || duplicate.length)
+    throw new Error(`Curation must account for every decision exactly once: ${JSON.stringify({ missingDecisionIDs: missing, duplicateDecisionIDs: duplicate, unknownDecisionIDs: unknown, expectedCount: expected.length, accountedCount: ids.length })}. Place each missing ID in selectedDecisionIDs or excluded with a reason; do not change scientific claims to repair the partition.`)
+  if (value.selectedDecisionIDs.length > maxDecisions)
+    throw new Error(`Curation exceeds decision budget: selected=${value.selectedDecisionIDs.length}, maximum=${maxDecisions}. Exclude excess decisions with source-based reasons.`)
+}
+
 export async function distillArchitectureKnowledge(input: {
   corpus: ArchitectureCorpus; model?: PrincipleModel; task: Record<string, unknown>;
   datasetEvidencePaths: string[]; maxDecisions: number; auditRoot: string; signal?: AbortSignal;
@@ -318,15 +329,22 @@ export async function distillArchitectureKnowledge(input: {
   if (proposals.length) {
     try {
       // Only executable, matched prediction rules reach deduplication.
-      const final = await ask("curate", "curate", curation, { maxDecisions: input.maxDecisions, decisions: proposals }, (value) => {
-        const ids = [...value.selectedDecisionIDs, ...value.excluded.map((x) => x.decisionID)]
-        if (ids.length !== proposals.length || new Set(ids).size !== ids.length || ids.some((id) => !proposals.some((d) => d.decisionID === id))) throw new Error("Curation must account for every decision exactly once")
-        if (value.selectedDecisionIDs.length > input.maxDecisions) throw new Error("Curation exceeds decision budget")
-      })
+      const final = await ask("curate", "curate", curation, { maxDecisions: input.maxDecisions, decisions: proposals },
+        (value) => validateArchitectureCuration(value, proposals.map((decision) => decision.decisionID), input.maxDecisions),
+        { retryInvalidCache: true })
       packet.decisions = proposals.filter((d) => final.selectedDecisionIDs.includes(d.decisionID))
       packet.reviews = reviews.filter((r) => final.selectedDecisionIDs.includes(r.decisionID))
       packet.exclusions.push(...final.excluded.map((x) => ({ id: x.decisionID, stage: "curate", reason: x.reason })))
-    } catch (error) { failed("architecture usefulness audit", error) }
+    } catch (error) {
+      abort()
+      // A valid complete partition selecting zero is allowed. A failed partition
+      // is a recoverable workflow error, never a successful data-only handoff.
+      await writeFile(path.join(input.auditRoot, "curation-recovery.json"), JSON.stringify({
+        stage: "curate", status: "needs_repair", reviewedDecisionIDs: proposals.map((decision) => decision.decisionID),
+        reviewedDecisionCount: proposals.length, auditRoot: input.auditRoot,
+      }, null, 2))
+      throw new Error("Architecture final curation failed after repair; reviewed decisions remain in the audit. Retry literature curation before planning; a failed partition cannot become ready_data_only.")
+    }
   }
   const cited = new Set(packet.decisions.flatMap(decisionCardIDs))
   packet.sourceCards = selected.filter((c) => cited.has(c.knowledgeID))

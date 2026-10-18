@@ -398,6 +398,23 @@ class SampleReweightingAction(nn.Module):
         return y
 
 
+class PatchFlattenReadout(nn.Module):
+    """Normalize token features, then retain feature-major token positions."""
+
+    def __init__(self, width: int, token_count: int, latent_dim: int) -> None:
+        super().__init__()
+        if token_count < 1:
+            raise ValueError("Patch readout requires at least one token")
+        self.width, self.token_count = width, token_count
+        self.norm = nn.LayerNorm(width)
+        self.projection = nn.Linear(width * token_count, latent_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim < 3 or x.shape[-2:] != (self.token_count, self.width):
+            raise ValueError(f"Patch readout requires [...,{self.token_count},{self.width}], got {tuple(x.shape)}")
+        return self.projection(self.norm(x).transpose(-1, -2).flatten(start_dim=-2))
+
+
 class PatchEmbedding(nn.Module):
     def __init__(self, *, input_len: int, patch_len: int, stride: int, d_model: int) -> None:
         super().__init__()
@@ -756,10 +773,12 @@ class TCNCore(nn.Module):
         kernel_size: int,
         dropout: float,
         activation: str | None,
+        input_channels: int = 1,
+        token_count: int | None = None,
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
-        in_channels = 1
+        in_channels = input_channels
         for layer_index in range(n_layers):
             layers.append(
                 TemporalConvBlock(
@@ -773,11 +792,13 @@ class TCNCore(nn.Module):
             )
             in_channels = hidden_dim
         self.blocks = nn.Sequential(*layers)
-        self.head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, horizon))
+        self.patch_tokens = token_count
+        self.head = (PatchFlattenReadout(hidden_dim, token_count, horizon) if token_count is not None
+                     else nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, horizon)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.blocks(x.unsqueeze(1)).transpose(1, 2)
-        return self.head(features[:, -1, :])
+        features = self.blocks(x.unsqueeze(1) if self.patch_tokens is None else x.transpose(1, 2)).transpose(1, 2)
+        return self.head(features[:, -1, :] if self.patch_tokens is None else features)
 
 
 class NBeatsBlock(nn.Module):
@@ -1432,7 +1453,9 @@ class RecipeModel(nn.Module):
                 "blocks": nn.Sequential(
                     *[ResidualMLPBlock(hidden_dim, dropout, activation) for _ in range(depth)]
                 ),
-                "head": nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.latent_dim)),
+                "head": (PatchFlattenReadout(hidden_dim, self._embedding_token_count(), self.latent_dim)
+                         if self.embedding_type in {"patch", "multiscale_patch"}
+                         else nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.latent_dim))),
             }
         )
 
@@ -1471,7 +1494,9 @@ class RecipeModel(nn.Module):
                     nn.Sequential(TokenAttention(d_model, n_heads, self.backbone_cfg["attention"], float(self.backbone_cfg["dropout"])), ResidualMLPBlock(d_model, float(self.backbone_cfg["dropout"]), "gelu", float(self.backbone_cfg.get("ffn_mult", 4.0))))
                     for _ in range(int(self.backbone_cfg["n_layers"]))
                 ]),
-                "head": nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.latent_dim)),
+                "head": (PatchFlattenReadout(d_model, token_count, self.latent_dim)
+                         if self.embedding_type in {"patch", "multiscale_patch"}
+                         else nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.latent_dim))),
             }
         )
 
@@ -1491,15 +1516,20 @@ class RecipeModel(nn.Module):
         )
 
     def _build_tcn_model(self) -> nn.Module:
-        self._require_raw_embedding("tcn")
-        return TCNCore(
+        if self.embedding_type not in {"none", "patch", "multiscale_patch"}:
+            raise ValueError("backbone.type='tcn' supports embedding none, patch or multiscale_patch")
+        patched = self.embedding_type != "none"
+        core = TCNCore(
             horizon=self.latent_dim,
             hidden_dim=int(self.backbone_cfg["hidden_dim"]),
             n_layers=int(self.backbone_cfg["n_layers"]),
             kernel_size=int(self.backbone_cfg["kernel_size"]),
             dropout=float(self.backbone_cfg["dropout"]),
             activation=self.backbone_cfg.get("activation", "gelu"),
+            input_channels=self._embedding_d_model() if patched else 1,
+            token_count=self._embedding_token_count() if patched else None,
         )
+        return nn.Sequential(self._build_temporal_embedding(), core) if patched else core
 
     def _build_nbeats_model(self) -> nn.Module:
         self._require_raw_embedding("nbeats")
@@ -1747,7 +1777,7 @@ class RecipeModel(nn.Module):
             return module(series)
 
         def output(module: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
-            values = module(tokens if self.embedding_type == "invert" else tokens.mean(dim=1))
+            values = module(tokens if self.embedding_type == "invert" or isinstance(module, PatchFlattenReadout) else tokens.mean(dim=1))
             return values.reshape(-1, self.latent_dim)
 
         if self.backbone_type == "linear":

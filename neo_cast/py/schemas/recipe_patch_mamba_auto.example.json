@@ -1,0 +1,80 @@
+{
+  "recipe_version": "recipe_schema_v3",
+  "recipe_id": "recipe_patch_mamba_auto",
+  "hypothesis": "Encode single-scale per-channel Patch tokens with mamba, preserving all token positions in the flatten readout.",
+  "preprocessing": {
+    "actions": [
+      {
+        "type": "instance_norm",
+        "affine": false,
+        "eps": 1e-05
+      }
+    ]
+  },
+  "embedding": {
+    "type": "patch",
+    "patch_len": 8,
+    "stride": 4,
+    "d_model": 16
+  },
+  "backbone": {
+    "type": "mamba",
+    "d_model": 16,
+    "d_state": 8,
+    "d_conv": 4,
+    "expand": 2,
+    "depth": 1,
+    "dropout": 0.1,
+    "backend": "auto"
+  },
+  "fusion": {
+    "type": "temporal",
+    "channel_mode": "independent"
+  },
+  "prediction_head": {
+    "type": "linear",
+    "output_distribution": "point"
+  },
+  "post_processing": {
+    "type": "auto"
+  },
+  "training_strategy": {
+    "loss": {
+      "base": "mae",
+      "horizon_weighting": "uniform"
+    },
+    "optimizer": {
+      "type": "adamw",
+      "lr": 0.001,
+      "weight_decay": 0.0001
+    },
+    "scheduler": {
+      "type": "cosine",
+      "warmup_steps": 0
+    },
+    "regularization": {
+      "grad_clip": 1
+    },
+    "budget": {
+      "max_epochs": 2,
+      "time_budget_s": 120,
+      "batch_size": 16,
+      "patience": 2,
+      "seed": 42
+    }
+  },
+  "constraints": {
+    "max_params": 1000000,
+    "max_latency_ms": 80,
+    "latency_priority": "medium"
+  },
+  "notes": "Mamba-1 with explicit auto execution: official CUDA selective scan when available; documented reference fallback on CPU or an unavailable extension. Actual backend is recorded.",
+  "representation": {
+    "layout": "channel_sequence",
+    "readout": "flatten",
+    "latent_dim": 16
+  },
+  "composition": {
+    "type": "single"
+  }
+}

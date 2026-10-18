@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test"
+import { Database as SQLite } from "bun:sqlite"
 import { Effect, Layer } from "effect"
-import { writeFile } from "node:fs/promises"
+import { readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Research } from "../../src/research"
@@ -8,6 +9,7 @@ import { Agent } from "../../src/agent/agent"
 import { Permission } from "../../src/permission"
 import * as Truncate from "../../src/tool/truncate"
 import { ReadExperiencesTool, WriteExperienceTool } from "../../src/tool/research-experience"
+import { ReadMemoryLessonsTool } from "../../src/tool/research-context"
 import {
   ExperienceDraftSchema,
   experienceFromMemory,
@@ -16,15 +18,15 @@ import {
   type ExperienceDraft,
   type ExperimentFact,
 } from "../../src/research/experience"
-import { readExperiences, writeExperience } from "../../src/research/experience-store"
+import { migrateProjectExperiences, readExperiences, writeExperience } from "../../src/research/experience-store"
+import { ExperienceLibrary, experienceLibraryPath } from "../../src/research/experience-library"
+import { groundedExperienceInterpretation, experienceSourceDigest } from "../../src/research/experience-curation"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
 import { testEffect } from "../lib/effect"
 import { Database, eq } from "../../src/storage"
-import { ProjectTable } from "../../src/project/project.sql"
-import { ProjectID } from "../../src/project/schema"
-import { ResearchTaskTable } from "../../src/research/research.sql"
+import { ResearchMemoryTable, ResearchTaskTable } from "../../src/research/research.sql"
 
 afterEach(resetDatabase)
 const it = testEffect(CrossSpawnSpawner.defaultLayer)
@@ -204,6 +206,74 @@ const seed = (directory: string, name: string, values: string) =>
     return { task, candidate: trial, run, comparison }
   })
 
+it.live("duplicate attempts cannot write new experience and local copies cannot resurrect quarantined global records", () =>
+  provideTmpdirInstance(directory => Effect.gen(function* () {
+    const svc = yield* Research.Service
+    const a = yield* seed(directory, "curation-local", "2024-01-01,1\n2024-01-02,2\n2024-01-03,3")
+    for (const resourceUsage of [{ ...a.run.resourceUsage, duplicateExperiment: true }, a.run.resourceUsage]) {
+      const duplicate = yield* svc.createRun({ taskID: a.task.id, candidateID: a.candidate.id, stage: "full",
+        status: "rejected", metrics: {}, resourceUsage })
+      yield* Effect.promise(async () => {
+        await expect(writeExperience(a.task.id, {
+          ...draft(duplicate.id), level: "experiment_fact", claimType: "observation",
+        })).rejects.toThrow("new independent observation")
+      })
+    }
+    const written = yield* Effect.promise(() => writeExperience(a.task.id, draft(a.run.id, a.comparison.id)))
+    const memory = written.memory
+    Database.use(db => db.insert(ResearchMemoryTable).values({
+      id: memory.id, task_id: memory.taskID, domain_id: memory.domainID,
+      fingerprint_summary: memory.fingerprintSummary, candidate_summary: memory.candidateSummary,
+      outcome: memory.outcome, lesson: memory.lesson, time_created: memory.time.created, time_updated: memory.time.updated,
+    }).run())
+    const library = new ExperienceLibrary(experienceLibraryPath(directory))
+    try {
+      const sqlite = new SQLite(library.databasePath, { readonly: true })
+      const raw = (sqlite.query("SELECT memory_json FROM research_experience WHERE id=?").get(memory.id) as { memory_json: string }).memory_json
+      sqlite.close()
+      library.curate([{ experienceID: memory.id, review: {
+        schemaVersion: "experience_curation.v1", status: "quarantined", sourceDigest: experienceSourceDigest(raw),
+        reviewer: "regression-test", reviewedAt: Date.now(), reasons: ["test-quarantine"], notes: [],
+        interpretation: groundedExperienceInterpretation(experienceFromMemory(JSON.parse(raw))!),
+      } }])
+      expect(readExperiences(a.task.id)).toEqual([])
+      expect(yield* svc.listMemory(a.task.id)).toEqual([])
+      expect(library.list({ experienceID: memory.id, includeOriginal: true })).toHaveLength(1)
+    } finally { library.close() }
+  }).pipe(Effect.provide(layer)), { git: true, config: { formatter: false, lsp: false } }), 30_000)
+
+it.live("explicit claims evolve through the real writer across datasets without copying or relabeling parent evidence", () =>
+  provideTmpdirInstance(directory => Effect.gen(function* () {
+    const svc = yield* Research.Service
+    const a = yield* seed(directory, "evolution-a", "2024-01-01,1\n2024-01-02,2\n2024-01-03,3")
+    const b = yield* seed(directory, "evolution-b", "2024-01-01,4\n2024-01-02,7\n2024-01-03,10")
+    const c = yield* seed(directory, "evolution-c", "2024-01-01,3\n2024-01-02,9\n2024-01-03,12")
+    const root = yield* Effect.promise(() => writeExperience(a.task.id, { ...draft(a.run.id, a.comparison.id),
+      evolution: { relation: "supports", claim: {
+        statement: "Under the captured source recipe, halving the learning rate increases validation MSE.",
+        dataConditions: ["Local univariate CSV tasks with context 96 and horizon 24; inspect source profiles."],
+        operation: "Halve Adam learning rate", interventionPaths: ["training_strategy.optimizer.lr"],
+        expectedOutcome: { metric: "val_avg_mse", direction: "higher" },
+        boundaries: ["Applies only to the recorded recipe and evaluation settings."],
+        validationPlan: "Repeat the local paired contrast on different dataset contents; retain opposite outcomes.",
+      } } }))
+    yield* Effect.promise(() => writeExperience(b.task.id, { ...draft(b.run.id, b.comparison.id),
+      evolution: { parentExperienceID: root.memory.id, relation: "supports" } }))
+    const counter = yield* svc.createRun({ taskID: c.task.id, candidateID: c.candidate.id, stage: "full", status: "succeeded",
+      metrics: { val_avg_mse: .3 }, resourceUsage: c.run.resourceUsage })
+    const written = yield* Effect.promise(() => writeExperience(c.task.id, { ...draft(counter.id, c.comparison.id),
+      derivedFrom: [root.memory.id], evolution: { parentExperienceID: root.memory.id, relation: "refutes" } }))
+    expect(experienceFromMemory(written.memory)!.facts).toHaveLength(2)
+    const updated = readExperiences(a.task.id, { experienceID: root.memory.id })[0]!
+    const organization = updated.candidateSummary.experienceOrganization as any
+    expect(organization.revision).toBe(3)
+    expect(organization.validatedRegularity.status).toBe("contested")
+    expect(organization.validatedRegularity.supportDatasetContentCount).toBe(2)
+    expect(organization.validatedRegularity.counterexampleDatasets).toHaveLength(1)
+    expect(organization.experimentFacts.facts).toHaveLength(6)
+    expect(experienceFromMemory(updated)).toEqual(experienceFromMemory(root.memory))
+  }).pipe(Effect.provide(layer)), { git: true, config: { formatter: false, lsp: false } }), 30_000)
+
 it.live(
   "Reflection writes are optional, grounded, idempotent and available to HypoPlanner across tasks",
   () =>
@@ -274,6 +344,16 @@ it.live(
             relationship: "same_domain",
             polarity: "negative",
           })
+          const searched = JSON.parse((yield* reader.execute({ scope: "shared", query: "学习率 learning rate intervention", limit: 1 }, context(b.task, "research-hypo-planner"))).output)
+          expect(searched.experiences[0].id).toBe(saved.experience.id)
+          expect(searched.experiences[0].facts).toBeUndefined()
+          expect(searched.experiences[0].sourceRuns[0].runID).toBe(a.run.id)
+          expect(searched.experiences[0].detailAccess).toMatchObject({ experienceID: saved.experience.id, includeFacts: true })
+          expect(searched.retrieval).toMatchObject({ method: "intent_grounded_bm25_v3", scope: "shared", returnedCount: 1 })
+          const unmatched = JSON.parse((yield* reader.execute({ scope: "shared", query: "quasar archaeology" }, context(b.task, "research-hypo-planner"))).output)
+          expect(unmatched.available).toBe(true)
+          expect(unmatched.retrieval.returnedCount).toBe(0)
+          expect(reader.description).not.toContain("no structured experience has been saved yet")
           expect(
             JSON.parse((yield* reader.execute({ scope: "task" }, context(b.task, "research-hypo-planner"))).output)
               .experiences,
@@ -331,6 +411,27 @@ it.live(
           expect(Permission.evaluate("read_experiences", "*", planner.permission).action).toBe("allow")
           expect(Permission.evaluate("write_experience", "*", planner.permission).action).toBe("deny")
           expect(Permission.evaluate("write_experience", "*", reflection.permission).action).toBe("allow")
+          const large = JSON.parse((yield* writer.execute({ ...draft(a.run.id),
+            conditions: Array.from({ length: 20 }, (_, index) => `Oversized scope ${index}: ` + "q".repeat(3900)),
+          }, context(a.task, "research-reflection"))).output)
+          const largeRead = yield* reader.execute({ experienceID: large.experience.id }, context(b.task, "research-hypo-planner"))
+          const largeResult = JSON.parse(largeRead.output)
+          expect(largeRead.metadata).toMatchObject({ truncated: false })
+          expect(largeResult.experiences[0]).toMatchObject({ id: large.experience.id, summaryOmitted: true,
+            detailAccess: { experienceID: large.experience.id, includeFacts: true } })
+          expect(largeResult.retrieval.contextLimited).toBe(true)
+          for (const suffix of ["a", "b", "c"]) {
+            expect((yield* writer.execute({ ...draft(a.run.id),
+              conditions: Array.from({ length: 8 }, (_, index) => `budgetprobe ${suffix} ${index}: ` + "q".repeat(2800)),
+            }, context(a.task, "research-reflection"))).metadata.saved).toBe(true)
+          }
+          const batch = yield* reader.execute({ scope: "shared", limit: 50 }, context(b.task, "research-hypo-planner"))
+          const batchResult = JSON.parse(batch.output)
+          expect(batch.metadata).toMatchObject({ truncated: false })
+          expect(Buffer.byteLength(batch.output, "utf8")).toBeLessThan(45_000)
+          expect(batchResult.retrieval.contextLimited).toBe(true)
+          expect(batchResult.retrieval.matchedRecordsInBatch).toBeGreaterThan(batchResult.experiences.length)
+          expect(batchResult.experiences).toHaveLength(batchResult.retrieval.returnedCount)
         }).pipe(Effect.provide(layer)),
       { git: true, config: { formatter: false, lsp: false } },
     ),
@@ -338,7 +439,7 @@ it.live(
 )
 
 it.live(
-  "copied datasets cannot promote a principle and experience remains project-scoped",
+  "copied datasets cannot promote a principle",
   () =>
     provideTmpdirInstance(
       (directory) =>
@@ -357,28 +458,99 @@ it.live(
             ),
           )
           expect(failed).toContain("at least two distinct datasets")
-          const foreign = yield* Effect.promise(() => writeExperience(b.task.id, draft(b.run.id)))
-          Database.use((db) => {
-            const project = db.select().from(ProjectTable).where(eq(ProjectTable.id, a.task.projectID)).get()!
-            const foreignID = ProjectID.make("project_experience_foreign")
-            db.insert(ProjectTable)
-              .values({ ...project, id: foreignID })
-              .run()
-            db.update(ResearchTaskTable).set({ project_id: foreignID }).where(eq(ResearchTaskTable.id, b.task.id)).run()
-          })
           expect(readExperiences(a.task.id).map((memory) => memory.id)).toEqual([stored.memory.id])
-          const foreignWrite = yield* Effect.promise(() =>
-            writeExperience(a.task.id, { ...draft(a.run.id), derivedFrom: [foreign.memory.id] }).then(
-              () => "unexpected",
-              (error: Error) => error.message,
-            ),
-          )
-          expect(foreignWrite).toContain("current project")
         }).pipe(Effect.provide(layer)),
       { git: true, config: { formatter: false, lsp: false } },
     ),
   30_000,
 )
+
+it.live("experience is directly readable and refinable across projects with independent task databases", () =>
+  Effect.gen(function* () {
+    const source = yield* provideTmpdirInstance((directory) => Effect.gen(function* () {
+      const svc = yield* Research.Service
+      const seeded = yield* seed(directory, "source-project", "2024-01-01,1\n2024-01-02,2\n2024-01-03,3")
+      const counter = yield* svc.createRun({ taskID: seeded.task.id, candidateID: seeded.candidate.id,
+        stage: "full", status: "succeeded", metrics: { val_avg_mse: 0.4 }, resourceUsage: seeded.run.resourceUsage })
+      const entry = draft(seeded.run.id, seeded.comparison.id)
+      entry.evidence.push({ runID: counter.id, comparisonRunID: seeded.comparison.id, relation: "refutes" })
+      const saved = yield* Effect.promise(() => writeExperience(seeded.task.id, entry))
+      // New experiences go directly to the library, with no task-table foreign key or duplicate memory write.
+      expect(Database.use((db) => db.select().from(ResearchMemoryTable).all())).toEqual([])
+      return { ...seeded, memory: saved.memory, counter }
+    }), { config: { formatter: false, lsp: false } })
+
+    Database.close() // The next project has a fresh in-memory main database; the library remains intact.
+    const standalone = new ExperienceLibrary()
+    try {
+      expect(standalone.list({ experienceID: source.memory.id })[0]?.taskID).toBe(source.task.id)
+    } finally { standalone.close() }
+
+    yield* provideTmpdirInstance((directory) => Effect.gen(function* () {
+      const svc = yield* Research.Service
+      const target = yield* seed(directory, "target-project", "2024-01-01,8\n2024-01-02,5\n2024-01-03,1")
+      expect(target.task.projectID).not.toBe(source.task.projectID)
+      const recalled = readExperiences(target.task.id)
+      expect(recalled.map((memory) => memory.id)).toEqual([source.memory.id])
+      expect(recalled[0]!.candidateSummary.experienceSource).toMatchObject({ projectID: source.task.projectID })
+      expect(readExperiences(target.task.id, { scope: "project" })).toEqual([])
+      expect(readExperiences(target.task.id, { scope: "task" })).toEqual([])
+      expect(readExperiences(target.task.id, { query: "does not exist" })).toEqual([])
+      expect(readExperiences(target.task.id, { polarity: "positive" })).toEqual([])
+
+      const reader = yield* (yield* ReadExperiencesTool).init()
+      const context = { sessionID: SessionID.make(target.task.sessionID!), messageID: MessageID.make("msg_shared_experience"),
+        agent: "research-hypo-planner", abort: AbortSignal.any([]), messages: [], metadata: () => Effect.void, ask: () => Effect.void }
+      const output = JSON.parse((yield* reader.execute({ includeFacts: true }, context)).output)
+      expect(output.experiences[0]).toMatchObject({ id: source.memory.id, relationship: "cross_project",
+        source: { projectID: source.task.projectID } })
+      expect(output.experiences[0].facts).toEqual(experienceFromMemory(source.memory)!.facts.map(experienceFactForPrompt))
+      yield* Effect.promise(async () => { await expect(writeExperience(target.task.id, draft(source.run.id, source.comparison.id)))
+        .rejects.toThrow("Unknown experiment run") })
+      yield* Effect.promise(async () => { await expect(writeExperience(target.task.id, { ...draft(target.run.id, target.comparison.id),
+        derivedFrom: [source.memory.id], evidence: [...draft(target.run.id, target.comparison.id).evidence,
+          { runID: source.counter.id, comparisonRunID: source.comparison.id, relation: "supports" }] }))
+        .rejects.toThrow("cannot be relabeled") })
+      const promoted = yield* Effect.promise(() => writeExperience(target.task.id, {
+        ...draft(target.run.id, target.comparison.id), level: "validated_principle", derivedFrom: [source.memory.id],
+      }))
+      const experience = experienceFromMemory(promoted.memory)!
+      expect(experience.supportDatasetCount).toBe(2)
+      expect(experience.draft.evidence).toContainEqual({ runID: source.counter.id, comparisonRunID: source.comparison.id, relation: "refutes" })
+      expect(experience.facts.filter((fact) => fact.taskID === source.task.id)).toEqual(experienceFromMemory(source.memory)!.facts)
+      expect((yield* svc.listMemory(target.task.id)).map((memory) => memory.id)).toEqual([promoted.memory.id])
+      const lessons = yield* (yield* ReadMemoryLessonsTool).init()
+      const lessonResult = JSON.parse((yield* lessons.execute({}, context)).output)
+      expect(lessonResult.recentLessons).toEqual([promoted.memory.lesson])
+      const exported = yield* svc.exportTaskArtifact({ taskID: target.task.id, kind: "research_final_bundle", outputDir: path.join(directory, "export") })
+      const memories = yield* Effect.promise(() => readFile(path.join(exported.path, "results", "memory.json"), "utf8").then(JSON.parse))
+      expect(memories.map((memory: { id: string }) => memory.id)).toEqual([promoted.memory.id])
+      Database.use((db) => db.update(ResearchTaskTable).set({ domain_id: "another-domain" })
+        .where(eq(ResearchTaskTable.id, target.task.id)).run())
+      expect(readExperiences(target.task.id)).toEqual([])
+    }), { git: true, config: { formatter: false, lsp: false } })
+  }).pipe(Effect.provide(layer)), 30_000)
+
+it.live("existing structured memory migrates idempotently while legacy summaries stay local", () =>
+  provideTmpdirInstance((directory) => Effect.gen(function* () {
+    const svc = yield* Research.Service
+    const source = yield* seed(directory, "legacy-project", "2024-01-01,1\n2024-01-02,3\n2024-01-03,7")
+    const { memory } = yield* Effect.promise(() => writeExperience(source.task.id, draft(source.run.id, source.comparison.id)))
+    Database.use((db) => db.insert(ResearchMemoryTable).values({
+      id: memory.id, task_id: memory.taskID, domain_id: memory.domainID, fingerprint_summary: memory.fingerprintSummary,
+      candidate_summary: memory.candidateSummary, outcome: memory.outcome, lesson: memory.lesson,
+      time_created: memory.time.created, time_updated: memory.time.updated,
+    }).run())
+    yield* svc.createMemory({ taskID: source.task.id, domainID: "tsf", fingerprintSummary: {},
+      candidateSummary: {}, outcome: "accepted", lesson: "Unstructured legacy summary" })
+    const library = new ExperienceLibrary(path.join(directory, "migrated.db"))
+    try {
+      expect(migrateProjectExperiences(library).migrated).toBe(1)
+      expect(migrateProjectExperiences(library).migrated).toBe(0)
+      expect(library.list().map((entry) => entry.id)).toEqual([memory.id])
+      expect(experienceFromMemory(library.list()[0]!)!.facts).toEqual(experienceFromMemory(memory)!.facts)
+    } finally { library.close() }
+  }).pipe(Effect.provide(layer)), { git: true, config: { formatter: false, lsp: false } }), 30_000)
 
 it.live(
   "direct Reflection saves only requested experiences and direct HypoPlanner receives their evidence",
@@ -410,6 +582,7 @@ it.live(
           const fetch = globalThis.fetch
           let writes: ExperienceDraft[] | undefined
           let plannerInput: Record<string, any> | undefined
+          let plannerReads = 0
           const analysis = {
             trainingHealthAssessment: "Full metrics are available.",
             hypothesisValidation: "Limited support.",
@@ -434,7 +607,9 @@ it.live(
                 expect(input.sourceRuns.some((run: { runID: string }) => run.runID === source.run.id)).toBe(true)
               }
               const content = JSON.stringify(
-                planning
+                planning && plannerReads++ === 0
+                  ? { status: "experience_request", request: { scope: "shared", limit: 3, includeFacts: true } }
+                  : planning
                   ? {
                       hypotheses: [],
                       nextExperiment: {
@@ -464,6 +639,9 @@ it.live(
             expect(planned.llm.status).toBe("used")
             expect(plannerInput!.experiences).toBeUndefined()
             expect(plannerInput!.historyAccess.tool).toBe("experiment_results")
+            expect(plannerReads).toBe(2)
+            expect(plannerInput!.requestedHistory[0].result.experiences[0].sourceRuns.some((run: { runID: string }) => run.runID === source.run.id)).toBe(true)
+            expect(plannerInput!.requestedHistory[0].result.experiences[0].facts[0].dataset.contentHash).toBeDefined()
             writes = [draft("rrun_unknown")]
             const rejected = yield* svc.runReflectionAgent({ taskID: source.task.id, stoppedReason: "max_iterations" })
             expect(rejected.llm.status).toBe("used")

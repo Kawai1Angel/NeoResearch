@@ -120,7 +120,8 @@
           "enum": [
             "mean",
             "last",
-            "none"
+            "none",
+            "flatten"
           ]
         },
         "latent_dim": {
@@ -191,7 +192,8 @@
                       "enum": [
                         "mean",
                         "last",
-                        "none"
+                        "none",
+                        "flatten"
                       ]
                     },
                     "latent_dim": {
@@ -259,7 +261,8 @@
                       "enum": [
                         "mean",
                         "last",
-                        "none"
+                        "none",
+                        "flatten"
                       ]
                     },
                     "latent_dim": {
@@ -1175,7 +1178,8 @@
             "backend": {
               "enum": [
                 "torch_reference",
-                "cuda_optimized"
+                "cuda_optimized",
+                "auto"
               ]
             }
           }

@@ -5,6 +5,9 @@ import path from "path"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Instance } from "@/project/instance"
 import { Research } from "@/research"
+import { ExperienceLibrary, experienceLibraryPath } from "@/research/experience-library"
+import { EXPERIENCE_QUERY_INTENTS } from "@/research/experience-query"
+import { migrateProjectExperiences } from "@/research/experience-store"
 import {
   createFileResearchRuntime,
   executeSubprocessResearchJob,
@@ -323,6 +326,7 @@ export const ResearchCommand = cmd({
       .command(ResearchExportCommand)
       .command(ResearchArtifactsCommand)
       .command(ResearchMemoryCommand)
+      .command(ResearchExperiencesCommand)
       .command(ResearchSeedCommand)
       .command(ResearchApprovalsCommand)
       .command(ResearchRequestRefTestCommand)
@@ -1141,6 +1145,39 @@ export const ResearchMemoryCommand = cmd({
     const taskID = Research.ResearchTaskID.make(args.taskID)
     const memory = await runResearch((svc) => svc.listMemory(taskID))
     print(memory, args.format, () => formatResearchMemoryTable(memory))
+  },
+})
+
+export const ResearchExperiencesCommand = cmd({
+  command: "experiences",
+  describe: "query the shared experience library without a research task",
+  builder: (yargs: Argv) => yargs
+    .option("path", { type: "boolean", describe: "print the shared SQLite library path" })
+    .option("domain", { type: "string", describe: "filter by research domain" })
+    .option("level", { choices: ["experiment_fact", "conditional_experience", "validated_principle"] as const })
+    .option("polarity", { choices: ["positive", "negative", "mixed", "inconclusive"] as const })
+    .option("experience-id", { type: "string", describe: "read one complete experience by ID" })
+    .option("thread-id", { type: "string", describe: "read the evidence and revisions of one conditional claim" })
+    .option("include-archived", { type: "boolean", default: false, describe: "include merged/quarantined experience for audit" })
+    .option("include-original", { type: "boolean", default: false, describe: "load original prose for an exact experience ID, for audit only" })
+    .option("query", { type: "string", describe: "rank factual interventions, observed errors and executed configurations" })
+    .option("include-background", { type: "boolean", default: false, describe: "include explicitly labeled unverified/background leads" })
+    .option("intent", { choices: EXPERIENCE_QUERY_INTENTS, default: "auto" as const, describe: "interpret the query as an error, configuration, intervention, comparison, or discovery question" })
+    .option("limit", { type: "number", default: 20, describe: "maximum returned experiences (1–100)" }),
+  handler: async (args) => {
+    if (args.path) {
+      console.log(experienceLibraryPath())
+      return
+    }
+    await Instance.provide({ directory: process.cwd(), fn: async () => migrateProjectExperiences() })
+    const library = new ExperienceLibrary()
+    try {
+      console.log(JSON.stringify({ databasePath: library.databasePath, experiences: library.list({
+        domainID: args.domain, level: args.level, polarity: args.polarity,
+        experienceID: args.experienceId, threadID: args.threadId, includeArchived: args.includeArchived, includeOriginal: args.includeOriginal,
+        query: args.query, includeBackground: args.includeBackground, intent: args.intent, limit: args.limit,
+      }) }, null, 2))
+    } finally { library.close() }
   },
 })
 

@@ -1,5 +1,5 @@
 import { z } from "zod"
-import { conflictingMechanismRequirements, declaredExperimentTarget, normalizeExperimentConstraints, fieldValue, type ExperimentConstraints } from "./experiment-constraints"
+import { checkExperimentConstraints, conflictingMechanismRequirements, declaredExperimentTarget, normalizeExperimentConstraints, fieldValue, type ExperimentConstraints } from "./experiment-constraints"
 import type { DomainValidationResult } from "./domain"
 import type { JsonRecord } from "./schema"
 
@@ -24,6 +24,47 @@ export const DesignUnavailable = z
   })
   .strict()
 export type DesignUnavailable = z.infer<typeof DesignUnavailable>
+
+// Apply only the declared intervention to factual history. A candidate must not
+// be invented to fill gaps in an incomplete or contradictory contract.
+export function experimentContractUnavailable(input: {
+  hypothesisID: string
+  contract: ExperimentConstraints
+  comparison?: JsonRecord
+  validate: (spec: JsonRecord) => DomainValidationResult
+}): DesignUnavailable | undefined {
+  if (input.contract.mode !== "controlled") return undefined
+  const contract = normalizeExperimentConstraints(input.contract)
+  const report = (reason: string, conflicts: DesignUnavailable["conflicts"], suggestedRevision: string): DesignUnavailable => ({
+    status: "unavailable", hypothesisID: input.hypothesisID, reason, conflicts: conflicts.slice(0, 20), suggestedRevision,
+  })
+  if (!input.comparison) return report("The controlled experiment has no verified comparable full run in this task.",
+    [{ field: "comparisonRunID", requested: contract.comparisonRunID!, supported: "A completed independent full run under the same task and evaluation protocol." }],
+    "Retrieve a valid comparison run and declare its exact configuration. Do not substitute a different task's run or relabel the controlled question exploratory.")
+  const target = declaredExperimentTarget(contract, input.comparison)
+  if (!target) return report("The declared intervention cannot be applied to the comparison recipe.",
+    contract.changes.map(change => ({ field: change.path, requested: JSON.stringify(change),
+      supported: `Comparison value: ${JSON.stringify(fieldValue(input.comparison, change.path)) ?? "absent"}. Parent paths must exist and before values must match exactly.` })),
+    "Read the comparison recipe and correct the change paths and before values. Preserve the scientific question.")
+  const validation = input.validate(target)
+  if (!validation.ok || !validation.normalizedCandidateSpec) return report(
+    "Applying the declared changes leaves a schema-invalid target recipe; the experiment contract is incomplete or incompatible.",
+    validation.issues.length ? validation.issues.map(issue => ({ field: issue.path, requested: "Keep all undeclared comparison fields and apply only changes.", supported: issue.message }))
+      : [{ field: "experimentContract", requested: "A normalized target recipe", supported: "Target recipe validation did not return a normalized configuration." }],
+    "For a component type switch, explicitly remove obsolete old-component fields with their exact before values, or declare replacement of the complete component. For example temporal→feature_mlp requires removing fusion.channelMode; instance_norm→none requires removing affine/eps. Do not add forbidden fields to the new component or remove requiredValues that are not present. Preserve supported shared fields and all other frozen settings.")
+  const issues = checkExperimentConstraints(contract, validation.normalizedCandidateSpec, input.comparison)
+  if (!issues.length) return undefined
+  return report("The normalized declared target contradicts its experiment contract.",
+    issues.map(issue => ({ field: issue.path, requested: `${issue.rule}: expected=${JSON.stringify(issue.expected)}`,
+      supported: `actual=${JSON.stringify(issue.actual)}. ${issue.message}` })),
+    issues.map(issue => issue.repairHint ?? "Resolve the named contract requirement against the normalized comparison and target; do not change the scientific question.").filter((hint, index, all) => all.indexOf(hint) === index).join(" "))
+}
+
+export function designConstraintFeedback(issue: {
+  path: string; expected: unknown; actual: unknown; source?: string; rule?: string; message?: string; repairHint?: string
+}) {
+  return { ...issue, message: issue.message ?? "Candidate does not satisfy the selected hypothesis" }
+}
 
 export function mechanismRequirementsUnavailable(input: {
   hypothesisID: string
@@ -111,11 +152,13 @@ export function formatDesignValidationIssue(issue: {
   message: string
   expected?: unknown
   actual?: unknown
+  rule?: string
+  repairHint?: string
 }) {
   const values = Object.hasOwn(issue, "expected") || Object.hasOwn(issue, "actual")
     ? ` (expected=${JSON.stringify(issue.expected ?? null)}, actual=${JSON.stringify(issue.actual ?? null)})`
     : ""
-  return `${issue.path}: ${issue.message}${values}`
+  return `${issue.path}: ${issue.message}${values}${issue.rule ? ` [${issue.rule}]` : ""}${issue.repairHint ? ` ${issue.repairHint}` : ""}`
 }
 
 export const HistoryRequest = z

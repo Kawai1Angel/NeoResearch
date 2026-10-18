@@ -111,8 +111,14 @@ test("CV horizons use actual runtime keys, arbitrary lengths, and do not mix val
     previousRuns: [],
   } as any
   const report = runVerifiers(ctx)
-  expect(report.results.find((x) => x.name === "horizon_verifier")?.status).toBe("failed")
-  expect(report.results.find((x) => x.name === "overfitting_verifier")?.status).toBe("insufficient_evidence")
+  expect(report.results.find((x) => x.name === "horizon_verifier")).toMatchObject({
+    status: "passed",
+    accepted: true,
+    evidence: { advisory: true, shortestHorizon: 24, shortestMse: 0.1, longestHorizon: 48, longestMse: 10, ratio: 100 },
+  })
+  expect(report.results.find((x) => x.name === "overfitting_verifier")).toMatchObject({
+    status: "skipped", evidence: { scope: "cv", valMetric: 1 },
+  })
   expect(report.results.find((x) => x.name === "cost_perf_verifier")?.accepted).toBe(false)
 })
 

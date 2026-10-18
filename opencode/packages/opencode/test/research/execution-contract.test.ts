@@ -18,7 +18,7 @@ import {
 } from "../../src/research/execution-contract"
 import { addHypothesisToPool, listHypothesesInPool, selectNextExperimentInPool, updateHypothesisInPool } from "../../src/research/hypothesis-store"
 import { Database, eq } from "../../src/storage"
-import { ResearchHypothesisTable } from "../../src/research/research.sql"
+import { ResearchHypothesisTable, ResearchTaskTable } from "../../src/research/research.sql"
 import { analyzeReflection } from "../../src/research/agents/reflection-agent"
 import { candidateAttemptStateFromRuns } from "../../src/research/agents/model-designer-agent"
 import { MODEL_CAPABILITIES, candidateMechanisms } from "../../src/research/model-capabilities"
@@ -98,7 +98,12 @@ test("a persisted snake_case frequency contract resumes through explicit mode re
       // Simulate an existing task written before alias normalization was available.
       Database.use((d) => d.update(ResearchHypothesisTable).set({ experiment_contract: legacy })
         .where(eq(ResearchHypothesisTable.hypo_id, original.id)).run())
-      await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: original.id, rationale: "Test the amplitude-only intervention." })
+      await expect(selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: original.id, rationale: "Test the amplitude-only intervention." }))
+        .rejects.toThrow("experiment_contract_preflight")
+      // A legacy selection may already be persisted before preflight existed.
+      Database.use(d => d.update(ResearchTaskTable).set({ task_spec: { ...task.taskSpec,
+        metadata: { ...task.taskSpec.metadata as object, nextExperiment: { action: "experiment", hypothesisID: original.id, rationale: "Legacy selection" } },
+      } }).where(eq(ResearchTaskTable.id, task.id)).run())
       let replans = 0
       let designs = 0
       globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
@@ -649,11 +654,11 @@ test("contradictory candidate-arm mechanisms are rejected on write and legacy pl
           : JSON.stringify({ choices: [{ message: { content } }] }),
           { headers: { "content-type": body.stream ? "text/event-stream" : "application/json" } })
       }) as typeof fetch
-      const result = await run((svc) => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 2 }))
-      expect(result.stoppedReason).toBe("planner_stopped")
+      await expect(run((svc) => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 2 })))
+        .rejects.toMatchObject({ name: "ResearchPipelineBlockedError", data: { checkpointPhase: "model_design_repair" } })
       expect(calls).toBe(1)
-      expect(result.iterations).toHaveLength(0)
-      expect(await run((svc) => svc.listApprovals({ taskID: task.id }))).toHaveLength(0)
+      expect((await run((svc) => svc.getTask(task.id))).status).toBe("paused")
+      expect((await run((svc) => svc.listApprovals({ taskID: task.id })))[0]?.reason).toContain("[checkpoint:model_design_repair]")
       expect((await listHypothesesInPool(task.id)).find((h) => h.id === hypothesis.id)?.status).not.toBe("abandoned")
     } })
   } finally {
@@ -678,7 +683,8 @@ test("ModelDesigner checkpoint reports the last response failure instead of stal
     await Instance.provide({ directory: tmp.path, fn: async () => {
       const { task, candidate } = await setup(path.join(tmp.path, "runner"))
       const anchor = await run((svc) => svc.createRun({ taskID: task.id, candidateID: candidate.id,
-        stage: "full", status: "succeeded", metrics: { cv_avg_mse: 0.5 } }))
+        stage: "full", status: "succeeded", metrics: { cv_avg_mse: 0.5 },
+        resourceUsage: { executionContract: { status: "verified", manifest: { actual: { backbone: "timesnet_lite" } } } } }))
       await updateHypothesisInPool(task.id, hypothesis.id, { experimentContract: ExperimentConstraints.parse({
         mode: "controlled", comparisonRunID: anchor.id,
         changes: [{ operation: "set", path: "backbone.hiddenDim", before: 8, after: 9 }],
@@ -710,7 +716,7 @@ test("ModelDesigner checkpoint reports the last response failure instead of stal
 })
 
 for (const mode of ["stop", "repeat"] as const) {
-  test(`unavailable design ${mode} stops without proxy runs or refutation`, async () => {
+  test(`unavailable design ${mode} blocks for repair without proxy runs or refutation`, async () => {
     await using tmp = await tmpdir({ git: true })
     const previousFetch = globalThis.fetch
     const keys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"] as const
@@ -747,14 +753,14 @@ for (const mode of ["stop", "repeat"] as const) {
             : JSON.stringify({ choices: [{ message: { content } }] }),
             { headers: { "content-type": body.stream ? "text/event-stream" : "application/json" } })
         }) as typeof fetch
-        const result = await run((svc) => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 2 }))
-        expect(result.stoppedReason).toBe("planner_stopped")
-        expect(result.iterations).toHaveLength(0)
+        await expect(run((svc) => svc.runAutonomousLoop({ taskID: task.id, stage: "full", maxIterations: 2 })))
+          .rejects.toMatchObject({ name: "ResearchPipelineBlockedError", data: { checkpointPhase: "model_design_repair" } })
+        expect((await run((svc) => svc.getTask(task.id))).status).toBe("paused")
         expect(designs).toBe(mode === "stop" ? 1 : 4)
         expect(replans).toBe(mode === "stop" ? 1 : 3)
         expect(await run((svc) => svc.listRuns(task.id))).toHaveLength(1)
         expect(await run((svc) => svc.listCandidates(task.id))).toHaveLength(1)
-        expect(await run((svc) => svc.listApprovals({ taskID: task.id }))).toHaveLength(0)
+        expect((await run((svc) => svc.listApprovals({ taskID: task.id })))[0]?.reason).toContain("[checkpoint:model_design_repair]")
         const original = (await listHypothesesInPool(task.id)).find((h) => h.id === candidate.hypothesisID)
         expect(original?.testable).toBe(false)
         expect(original?.status).not.toBe("abandoned")
@@ -827,7 +833,12 @@ test("schema-restored bias removal replans before design and trains the correcte
         suggestedBackbones: ["linear"], requiredMechanisms: [],
         experimentContract: ExperimentConstraints.parse({ mode: "controlled", comparisonRunID: comparison.id, changes }),
       })
-      await selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: invalid.id, rationale: "Isolate decomposition." })
+      await expect(selectNextExperimentInPool(task.id, { action: "experiment", hypothesisID: invalid.id, rationale: "Isolate decomposition." }))
+        .rejects.toThrow("experiment_contract_preflight")
+      // Preserve coverage for old tasks that selected this invalid contract.
+      Database.use(d => d.update(ResearchTaskTable).set({ task_spec: { ...task.taskSpec,
+        metadata: { ...task.taskSpec.metadata as object, nextExperiment: { action: "experiment", hypothesisID: invalid.id, rationale: "Legacy selection" } },
+      } }).where(eq(ResearchTaskTable.id, task.id)).run())
       let designs = 0
       let replans = 0
       globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {

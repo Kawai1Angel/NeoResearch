@@ -116,15 +116,17 @@ test("baseline_comparison_verifier accepts when current is better than previous"
   expect(result.accepted).toBe(true)
 })
 
-test("baseline_comparison_verifier rejects when current is >20% worse than best previous", () => {
+test("baseline comparison records a large regression without rejecting the model", () => {
   const prev = run({ id: "prev_1", status: "succeeded", metrics: { val_avg_mse: 0.3 } })
   const report = runVerifiers(ctx({
     run: run({ id: "curr", status: "succeeded", metrics: { val_avg_mse: 0.42 } }),
     previousRuns: [prev],
   }))
   const result = report.results.find((r) => r.name === "baseline_comparison_verifier")!
-  expect(result.accepted).toBe(false)
-  expect(result.reason).toContain("worse than best baseline")
+  expect(result.accepted).toBe(true)
+  expect(result.evidence.regressionPct).toBeCloseTo(40)
+  expect(report.rejectReason).toBeUndefined()
+  expect(report.eligibleForRanking).toBe(true)
 })
 
 // --- horizon_verifier ---
@@ -152,7 +154,7 @@ test("horizon_verifier accepts when ratio is within threshold", () => {
   expect(result.evidence["ratio"]).toBeLessThan(8)
 })
 
-test("horizon_verifier rejects when long-horizon collapses (ratio > 8)", () => {
+test("horizon comparison records a large error ratio without rejecting the model", () => {
   const report = runVerifiers(ctx({
     run: run({
       id: "r",
@@ -161,8 +163,9 @@ test("horizon_verifier rejects when long-horizon collapses (ratio > 8)", () => {
     }),
   }))
   const result = report.results.find((r) => r.name === "horizon_verifier")!
-  expect(result.accepted).toBe(false)
-  expect(result.reason).toContain("Long-horizon collapse")
+  expect(result.accepted).toBe(true)
+  expect(result.evidence.ratio).toBe(15)
+  expect(report.rejectReason).toBeUndefined()
 })
 
 // --- cost_perf_verifier ---
@@ -190,10 +193,10 @@ test("overfitting_verifier does not reject small MSE without a comparable traini
   }))
   const result = report.results.find((r) => r.name === "overfitting_verifier")!
   expect(result.accepted).toBe(false)
-  expect(result.status).toBe("insufficient_evidence")
+  expect(result.status).toBe("skipped")
 })
 
-test("overfitting_verifier rejects when val/train ratio exceeds 3x", () => {
+test("overfitting diagnostics retain a large train/validation gap without rejecting the model", () => {
   const report = runVerifiers(ctx({
     run: run({
       id: "r",
@@ -202,8 +205,9 @@ test("overfitting_verifier rejects when val/train ratio exceeds 3x", () => {
     }),
   }))
   const result = report.results.find((r) => r.name === "overfitting_verifier")!
-  expect(result.accepted).toBe(false)
-  expect(result.reason).toContain("Val/train MSE ratio")
+  expect(result.accepted).toBe(true)
+  expect(result.evidence.ratio).toBeCloseTo(12)
+  expect(report.rejectReason).toBeUndefined()
 })
 
 // --- full report + markdown ---
@@ -238,7 +242,7 @@ test("buildEvaluationResultMarkdown renders verdict and verifier sections", () =
 })
 
 test("buildVerifierDecisionRecord emits a standardized decision artifact", () => {
-  const current = run({ id: "curr", status: "succeeded", metrics: { val_avg_mse: 0.9 } })
+  const current = run({ id: "curr", status: "succeeded", metrics: { val_avg_mse: -0.9 } })
   const report = runVerifiers(
     ctx({
       run: current,
@@ -262,17 +266,17 @@ test("buildVerifierDecisionRecord emits a standardized decision artifact", () =>
     accepted: false,
     decision: "reject",
     failure: {
-      category: "regression",
-      sourceVerifier: "baseline_comparison_verifier",
+      category: "metric_missing",
+      sourceVerifier: "metric_verifier",
       recoveryAction: {
-        type: "try_safer_candidate",
+        type: "fix_metric_reporting",
       },
     },
   })
   expect(record.checks).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
-        name: "baseline_comparison_verifier",
+        name: "metric_verifier",
         accepted: false,
       }),
     ]),
@@ -280,6 +284,23 @@ test("buildVerifierDecisionRecord emits a standardized decision artifact", () =>
 })
 
 // --- data_leakage_verifier ---
+
+test("finite completed models remain eligible despite regression, training gaps, horizon ratios and poor parameter efficiency", () => {
+  const t = { ...task(), taskSpec: { evaluation: { protocol: "fixed_split" }, predictionLengths: [96, 720] } } as ResearchTask
+  const current = run({ id: "observation", status: "succeeded", metrics: {
+    val_avg_mse: 6, train_avg_mse: 0.1, val_h96_mse: 0.1, val_h720_mse: 15, params_M: 100,
+  } })
+  const report = runVerifiers(ctx({ task: t, run: current,
+    previousRuns: [run({ id: "control", status: "succeeded", metrics: { val_avg_mse: 0.1, params_M: 1 } })] }))
+  expect(report.status).toBe("passed")
+  expect(report.accepted).toBe(true)
+  expect(report.eligibleForRanking).toBe(true)
+  expect(report.rejectReason).toBeUndefined()
+  expect(report.results.find(item => item.name === "cost_perf_verifier")?.evidence).toMatchObject({ extraParamsM: 99 })
+  expect(buildVerifierDecisionRecord({ task: t, run: current, candidate: candidate(), report }))
+    .toMatchObject({ decision: "accept", failure: null })
+  expect(current.metrics.val_avg_mse).toBe(6)
+})
 
 test("data_leakage_verifier passes a clean run", () => {
   const report = runVerifiers(ctx({

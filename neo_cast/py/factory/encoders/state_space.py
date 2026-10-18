@@ -42,11 +42,35 @@ class DiagonalSSM(nn.Module):
         return self.out_proj(torch.stack(outputs, 1).to(u.dtype)), state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_state(x)[0]
+        # A and B are input-independent, so the zero-state recurrence is a
+        # causal convolution. Keep forward_state as the explicit streaming
+        # reference; training can process all time steps in parallel.
+        u = self.in_proj(x)
+        length = u.size(1)
+        if length == 0:
+            raise ValueError("DiagonalSSM requires at least one time step")
+        a = -self.A_log.float().exp()
+        dt = F.softplus(self.dt_raw.float())[:, None]
+        z = dt * a
+        bbar = (torch.expm1(z) / a.clamp_max(-torch.finfo(a.dtype).tiny)) * self.B.float()
+        steps = torch.arange(length, device=x.device, dtype=z.dtype)
+        powers = (z.unsqueeze(-1) * steps).exp()
+        # Keep the state reduction in float32 even when the caller enables
+        # TF32 matmul; it replaces float32 elementwise recurrent updates.
+        kernel = (powers * (bbar * self.C.float()).unsqueeze(-1)).sum(dim=1)
+        # Padding to >= 2L-1 prevents circular wraparound; power-of-two FFTs
+        # work well for short histories and do not change the causal operator.
+        fft_size = 1 << (2 * length - 1).bit_length()
+        values = u.float().transpose(1, 2)
+        spectrum = torch.fft.rfft(values, n=fft_size)
+        response = torch.fft.rfft(kernel, n=fft_size)
+        y = torch.fft.irfft(spectrum * response, n=fft_size)[..., :length]
+        y = y + values * self.D.float().unsqueeze(-1)
+        return self.out_proj(y.transpose(1, 2).to(u.dtype))
 
 
 class Mamba1(nn.Module):
-    """Mamba-1 CPU/device reference; canonical official parameter names."""
+    """Mamba-1 with explicit reference and official CUDA scan execution."""
 
     backend = "torch_reference"
     variant = "mamba1"
@@ -54,8 +78,12 @@ class Mamba1(nn.Module):
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2,
                  backend: str = "torch_reference") -> None:
         super().__init__()
-        if backend != "torch_reference":
-            raise ValueError("UNSUPPORTED_BACKEND: Mamba CUDA backend has not been reference-verified; use torch_reference")
+        from factory.encoders.mamba_scan import BACKENDS
+        if backend not in BACKENDS:
+            raise ValueError(f"UNSUPPORTED_BACKEND: {backend}")
+        if backend == "cuda_optimized" and d_state > 256:
+            raise ValueError("UNSUPPORTED_BACKEND: CUDA selective scan requires d_state<=256")
+        self.backend = backend
         self.d_model, self.d_state, self.d_conv = d_model, d_state, d_conv
         self.d_inner, self.dt_rank = d_model * expand, math.ceil(d_model / 16)
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
@@ -94,4 +122,21 @@ class Mamba1(nn.Module):
         return self.out_proj(torch.stack(values, 1).to(xz.dtype)), (conv, hidden)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from factory.encoders.mamba_scan import select_backend, selective_scan
+        selected, _ = select_backend(self.backend, x.device, self.d_state)
+        if selected == "cuda_optimized":
+            # Preserve the original projection, causal convolution, dynamic
+            # delta/B/C and gate. Only the recurrence's execution is replaced.
+            xz = self.in_proj(x)
+            u, gate = xz.chunk(2, dim=-1)
+            history = F.pad(u.transpose(1, 2), (self.d_conv - 1, 0))
+            u = F.silu(self.conv1d(history).transpose(1, 2))
+            dt, b, c = torch.split(self.x_proj(u), [self.dt_rank, self.d_state, self.d_state], -1)
+            dt = F.softplus(self.dt_proj(dt).float())
+            y = selective_scan(u.float().transpose(1, 2), dt.transpose(1, 2),
+                               -self.A_log.float().exp(), b.float().transpose(1, 2),
+                               c.float().transpose(1, 2), self.D.float(), gate.float().transpose(1, 2))
+            # Match the reference stack's contiguous [B,L,D] layout so TF32
+            # projection selects the same matrix-multiplication layout.
+            return self.out_proj(y.transpose(1, 2).to(xz.dtype).contiguous())
         return self.forward_state(x)[0]

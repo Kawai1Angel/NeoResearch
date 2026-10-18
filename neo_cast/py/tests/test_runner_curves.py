@@ -254,7 +254,7 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
                 patch.object(runner, "STATE_PATH", state_path),
                 patch.object(runner, "RESULTS_PATH", results_path),
                 patch.object(runner, "_resolve_candidate") as resolve_candidate,
-                patch.object(runner, "_run_and_capture", return_value=(0, train_records)),
+                patch.object(runner, "_run_and_capture", return_value=(0, train_records)) as capture,
                 patch.object(runner, "_export_artifact", return_value=0),
             ):
                 runner.ensure_results_file(force=True)
@@ -262,6 +262,9 @@ class RunnerTrainingCurvesTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         resolve_candidate.assert_not_called()
+        train_command = capture.call_args.args[0]
+        self.assertIn("cv_train.py", Path(train_command[1]).name)
+        self.assertNotIn("--max-parallel-folds", train_command)
 
     def test_full_train_candidate_failure_returns_continue_safe_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

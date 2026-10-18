@@ -76,6 +76,17 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
         primary_core = next((module for module in model.model.modules() if type(module) in sequence_types), None)
         base = describe_model(model, _typed=False)
         backbone = sequence_types.get(type(primary_core), base["backbone"])
+        execution = {}
+        if isinstance(primary_core, Mamba1):
+            from factory.encoders.mamba_scan import select_backend, extension_fingerprint
+            device = next(primary_core.parameters()).device
+            try:
+                selected, reason = select_backend(primary_core.backend, device, primary_core.d_state)
+            except RuntimeError as error:
+                selected, reason = "unavailable", str(error)
+            execution = {"requested_backend": primary_core.backend, "backend": selected,
+                         "backend_fallback_reason": reason,
+                         "backend_provenance": extension_fingerprint() if selected == "cuda_optimized" else None}
         return {
             **base,
             "runtime_semantics_revision": 3, "recipe_version": "recipe_schema_v3",
@@ -84,6 +95,7 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
             "composition": model.composition_config,
             "implementation_status": "paper_derived" if backbone == "timesblock_encoder" else "native",
             "backend": "torch_reference", "horizon_sharing": False,
+            **execution,
             "target_channels": model.num_target_channels, "past_exogenous_channels": model.num_past_covariate_channels,
             "future_exogenous_channels": 0, "output_channels": model.num_output_channels,
             "num_parameters": sum(p.numel() for p in model.parameters()),
@@ -126,7 +138,7 @@ def describe_model(model: Any, _typed: bool = True) -> dict[str, Any]:
     backbone = cores.get(type(core), "unknown")
     if isinstance(core, nn.Sequential):
         embedding = embeddings.get(type(core[0]), "none")
-        backbone = (
+        backbone = "tcn" if len(core) == 2 and type(core[-1]) is factory.TCNCore else (
             "linear"
             if embedding != "none" and len(core) in {2, 3} and type(core[-1]) in {nn.Linear, factory.ChannelLinear}
             else (

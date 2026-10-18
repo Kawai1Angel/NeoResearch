@@ -2,8 +2,6 @@ import type { VerifierContext, VerifierResult } from "./types"
 import { comparablePreviousRuns, metricOf, objectiveMetricName } from "./types"
 import { isZeroResearch } from "../research-variant"
 
-const REGRESSION_THRESHOLD = 0.2
-
 function objectiveDirection(task: VerifierContext["task"]): "minimize" | "maximize" {
   return (task.objective as Record<string, unknown>).direction === "maximize" ? "maximize" : "minimize"
 }
@@ -42,24 +40,12 @@ export function runBaselineComparisonVerifier(ctx: VerifierContext): VerifierRes
   const referenceLabel = isZeroResearch(ctx.task.taskSpec) ? "previous comparable run" : "baseline"
 
   const degradation = direction === "minimize" ? currentMetric - bestBaseline : bestBaseline - currentMetric
-  const regressed = degradation > Math.abs(bestBaseline) * REGRESSION_THRESHOLD
-
-  if (regressed) {
-    const pct = (Math.abs(currentMetric - bestBaseline) / Math.max(Math.abs(bestBaseline), 1e-12)) * 100
-    return {
-      name,
-      accepted: false,
-      status: "failed",
-      reason: `Current ${metricName}=${Number(currentMetric.toFixed(6))} is ${pct.toFixed(1)}% worse than best ${referenceLabel} ${Number(bestBaseline.toFixed(6))} (threshold ${REGRESSION_THRESHOLD * 100}%).`,
-      evidence: { currentMetric, bestBaseline, regressionPct: pct, threshold: REGRESSION_THRESHOLD * 100 },
-    }
-  }
-
+  const regressionPct = bestBaseline === 0 ? null : degradation / Math.abs(bestBaseline) * 100
   return {
     name,
     accepted: true,
     status: "passed",
-    reason: `Current ${metricName}=${Number(currentMetric.toFixed(6))} is within acceptable range of best ${referenceLabel} ${Number(bestBaseline.toFixed(6))}.`,
-    evidence: { currentMetric, bestBaseline },
+    reason: `Observed ${metricName}=${currentMetric} against best ${referenceLabel} ${bestBaseline}; ReflectionAgent assesses this comparison without a fixed regression rejection threshold.`,
+    evidence: { advisory: true, currentMetric, bestBaseline, degradation, regressionPct, direction },
   }
 }

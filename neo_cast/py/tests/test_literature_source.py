@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -264,6 +265,13 @@ class LiteratureSourceTest(unittest.TestCase):
         self.assertEqual(papers[0]["publication_verification"], "publisher_metadata")
         self.assertEqual(papers[0]["publication_track"], "journal")
         self.assertIsNone(papers[0]["open_access"]["pdf_url"])
+        evidence = papers[0]["official_proceedings"]
+        schema = json.loads((PY_ROOT.parent / "literature_source" / "paper_record.schema.json").read_text())
+        contract = schema["properties"]["official_proceedings"]
+        self.assertEqual(set(evidence), set(contract["properties"]))
+        self.assertTrue(set(contract["required"]).issubset(evidence))
+        self.assertEqual(evidence["title"], record.title)
+        self.assertIsNone(evidence["pdf_url"])
 
     def test_citation_expansion_audits_missing_api_key(self) -> None:
         config = {

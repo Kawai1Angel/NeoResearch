@@ -5,6 +5,9 @@ import os
 import types
 import io
 import json
+import threading
+import tempfile
+import textwrap
 from contextlib import redirect_stdout
 import sys
 import unittest
@@ -17,16 +20,30 @@ if str(PY_ROOT) not in sys.path:
 
 from cv_train import _run_standard_train, _run_train, aggregate_cv_metrics, build_ratio_folds, default_max_parallel_folds, run_cv_folds_parallel, validate_folds
 from prepare_tsf import _split_bounds_with_cv_override
+from runtime_config import HORIZONS
 
 
 class CvTrainTest(unittest.TestCase):
     @patch("torch.cuda.is_available", return_value=True)
+    @patch.dict(os.environ, {}, clear=True)
     def test_default_parallelism_serializes_cuda_folds(self, _cuda) -> None:
         self.assertEqual(default_max_parallel_folds(), 1)
 
     @patch("torch.cuda.is_available", return_value=False)
+    @patch.dict(os.environ, {}, clear=True)
     def test_default_parallelism_keeps_cpu_folds_parallel(self, _cuda) -> None:
         self.assertEqual(default_max_parallel_folds(), 4)
+
+    @patch("torch.cuda.is_available", return_value=True)
+    def test_configured_parallelism_overrides_cuda_default(self, _cuda) -> None:
+        with patch.dict(os.environ, {"NEO_CAST_CV_MAX_PARALLEL_FOLDS": "4"}):
+            self.assertEqual(default_max_parallel_folds(), 4)
+
+    def test_invalid_configured_parallelism_is_rejected(self) -> None:
+        for value in ["0", "-1", "four", "1.5", ""]:
+            with self.subTest(value=value), patch.dict(os.environ, {"NEO_CAST_CV_MAX_PARALLEL_FOLDS": value}):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    default_max_parallel_folds()
 
     def test_standard_fit_reuses_parent_and_keeps_live_evidence(self) -> None:
         def entry(argv):
@@ -106,6 +123,64 @@ class CvTrainTest(unittest.TestCase):
         folds = build_ratio_folds((0, 1000), num_folds=4, initial_train_ratio=0.6)
         with self.assertRaisesRegex(ValueError, "max_workers"):
             run_cv_folds_parallel(folds, train_cmd=["train"], temp_root=Path("/tmp/cv"), max_workers=0)
+
+    @patch("cv_train.run_cv_fold")
+    def test_all_four_folds_can_be_active_together(self, run_fold) -> None:
+        barrier = threading.Barrier(4, timeout=10)
+        def concurrent_fold(fold, **_):
+            barrier.wait()
+            return fold.fold_index, {"val_avg_mse": float(fold.fold_index)}
+        run_fold.side_effect = concurrent_fold
+        folds = build_ratio_folds((0, 1000), num_folds=4, initial_train_ratio=0.6)
+        result = run_cv_folds_parallel(folds, train_cmd=["train"], temp_root=Path("/tmp/cv"), max_workers=4)
+        self.assertEqual([item["val_avg_mse"] for item in result], [0.0, 1.0, 2.0, 3.0])
+
+    def test_four_subprocesses_keep_splits_artifacts_and_output_separate(self) -> None:
+        folds = build_ratio_folds((0, 1000), num_folds=4, initial_train_ratio=0.6)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "train_fixture.py"
+            script.write_text(textwrap.dedent('''
+                import argparse, json, os, time
+                from pathlib import Path
+                parser = argparse.ArgumentParser()
+                parser.add_argument('--artifacts-dir', type=Path)
+                args = parser.parse_args()
+                fold = int(os.environ['NEO_CAST_CV_FOLD_INDEX'])
+                args.artifacts_dir.mkdir()
+                marker = args.artifacts_dir.parent / ('started_' + str(fold) + '.json')
+                marker.write_text(json.dumps({
+                    'train': os.environ['NEO_CAST_TRAIN_ROWS'],
+                    'val': os.environ['NEO_CAST_VAL_ROWS'],
+                    'artifact_dir': str(args.artifacts_dir),
+                }))
+                deadline = time.monotonic() + 10
+                while len(list(args.artifacts_dir.parent.glob('started_*.json'))) < 4:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError('All four subprocesses must overlap')
+                    time.sleep(0.01)
+                for epoch in range(20):
+                    print(json.dumps({'event': 'epoch_end', 'epoch': epoch}), flush=True)
+                metrics = {'val_avg_mse': fold + 1.0}
+                for horizon in HORIZONS:
+                    metrics['val_h' + str(horizon) + '_mse'] = fold + 1.0
+                print(json.dumps({'event': 'eval_done', **metrics}), flush=True)
+                print(json.dumps({'event': 'artifact_ready', 'artifact_dir': str(args.artifacts_dir)}), flush=True)
+            ''').replace('for horizon in HORIZONS:', f'for horizon in {HORIZONS!r}:'))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                metrics = run_cv_folds_parallel(folds, train_cmd=[sys.executable, str(script)], temp_root=root, max_workers=4)
+            records = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(len(records), 4 * 22)
+            self.assertEqual([item['val_avg_mse'] for item in metrics], [1.0, 2.0, 3.0, 4.0])
+            for fold in folds:
+                marker = json.loads((root / f'started_{fold.fold_index}.json').read_text())
+                self.assertEqual(marker['train'], ':'.join(map(str, fold.train_rows)))
+                self.assertEqual(marker['val'], ':'.join(map(str, fold.val_rows)))
+                self.assertEqual(marker['artifact_dir'], str(root / f'fold_{fold.fold_index}'))
+                evidence = [x for x in records if x['cv_fold_index'] == fold.fold_index]
+                self.assertEqual(len(evidence), 22)
+                self.assertTrue(evidence[-1]['ephemeral'])
 
     def test_split_override_requires_pair_and_stays_before_ref_test(self) -> None:
         with patch.dict("os.environ", {"NEO_CAST_TRAIN_ROWS": "0:600"}, clear=True):

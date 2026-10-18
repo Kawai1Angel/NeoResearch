@@ -92,7 +92,7 @@ class StateSpaceTests(unittest.TestCase):
         for model in (DiagonalSSM(4, 3), Mamba1(4, 3)):
             self.assertTrue(torch.isfinite(model(torch.randn(1, 1024, 4))).all())
         with self.assertRaisesRegex(ValueError, "UNSUPPORTED_BACKEND"):
-            Mamba1(4, backend="cuda_optimized")
+            Mamba1(4, backend="unknown_backend")
 
     def test_timesblock_single_sample_reference_and_gradient(self):
         # Official TimesBlock mechanism on one sample, with identical local weights.

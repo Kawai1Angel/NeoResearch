@@ -32,6 +32,13 @@ export const ResumeInput = z
   .object({ expectedRevision: z.number().int().nonnegative(), requestKey: z.string().min(1).max(200) })
   .strict()
 
+function localArtifactPath(uri: string) {
+  if (uri.startsWith("file:")) {
+    try { return fileURLToPath(uri) } catch { return undefined }
+  }
+  return uri.startsWith("/") ? uri : undefined
+}
+
 export function researchHistory(projectID: string, input: z.infer<typeof HistoryQuery>) {
   const cursor = input.cursor ? Cursor.parse(JSON.parse(Buffer.from(input.cursor, "base64url").toString())) : undefined
   return Database.transaction(() => {
@@ -112,21 +119,27 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
       blockers.push("输入数据或评估协议已变更，请显式创建新研究周期")
     const artifacts = db.select().from(ResearchArtifactTable).where(eq(ResearchArtifactTable.task_id, taskID)).all()
     for (const artifact of artifacts) {
-      const local = artifact.uri.startsWith("file:")
-        ? (() => {
-            try {
-              return fileURLToPath(artifact.uri)
-            } catch {
-              return undefined
-            }
-          })()
-        : artifact.uri.startsWith("/")
-          ? artifact.uri
-          : undefined
+      const local = localArtifactPath(artifact.uri)
       // Older runners registered temporary CV checkpoints as permanent artifacts.
       // Their durable metrics and progress remain available after temp cleanup.
       const transientCV = artifact.kind === "runner_artifact" && local && /(?:^|\/)neo-cast-cv-[^/]+\/fold_\d+\//.test(local)
-      if (local && !transientCV && !existsSync(local)) blockers.push(`产物缺失：${local}`)
+      // Neo-Cast keeps only the latest 30 smoke directories. A collected smoke
+      // checkpoint is optional only when its finished, verified run still has
+      // durable progress, execution and contract receipts. Full/test artifacts
+      // and missing durable evidence remain blockers.
+      const run = runs.find((item) => item.id === artifact.run_id)
+      const contract = run?.resource_usage.executionContract
+      const retainedSmoke = artifact.kind === "runner_artifact" && artifact.metadata.stage === "smoke" &&
+        local && /\/\.neo-cast\/artifacts\/smoke\/run_[^/]+\/?$/.test(local) &&
+        run?.stage === "smoke" && run.status === "succeeded" && run.artifact_refs.includes(artifact.id) &&
+        contract && typeof contract === "object" && "status" in contract && contract.status === "verified" &&
+        ["runner_progress_jsonl", "runner_execution_log_json", "execution_contract_verified_json"].every((kind) =>
+          artifacts.some((receipt) => {
+            const file = localArtifactPath(receipt.uri)
+            return receipt.run_id === run.id && receipt.kind === kind && run.artifact_refs.includes(receipt.id) && file && existsSync(file)
+          }),
+        )
+      if (local && !transientCV && !retainedSmoke && !existsSync(local)) blockers.push(`产物缺失：${local}`)
     }
     if (!task.session_id) blockers.push("原研究对话已删除，研究结果仍保留")
     const unknown =

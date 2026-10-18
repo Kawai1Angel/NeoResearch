@@ -26,7 +26,7 @@ Current capabilities:
 Current Model Recipe DSL and native factory action space:
 
 - ModelDesigner now emits `model_recipe.v2`, compiled into typed `recipe_schema_v3`. Explicit legacy `model_recipe.v1` / `recipe_schema_v2` inputs remain supported with their original semantics.
-- V3 adds real `diagonal_ssm`, `timesblock_encoder`, and CPU-reference Mamba-1, explicit sequence readout, bounded two-branch composition, and content-addressed experiment reuse. Each horizon remains independently trained. See the [v3 contract and limitations](docs/recipe_runtime_v3_contract.md).
+- V3 adds real `diagonal_ssm`, `timesblock_encoder`, and Mamba-1 with reference/optional official CUDA scan execution, explicit sequence readout, bounded two-branch composition, and content-addressed experiment reuse. Each horizon remains independently trained. See the [v3 contract and limitations](docs/recipe_runtime_v3_contract.md).
 
 - Preprocessing: `none`, `instance_norm`, `series_decomposition`.
 - Embedding: `none`, `patch`, `multiscale_patch`.
@@ -451,3 +451,37 @@ The shortest path to a release-ready version is:
 3. Test exported `mcp_server.py` with a real MCP client.
 4. Add a release smoke command that runs `doctor`, mock design, and `runner ref-test`.
 5. Keep `README.md` and `ROADMAP.md` aligned as contracts evolve.
+
+## Patch token execution
+
+Single-scale slicing uses `unfold` without end padding: `N = floor((L - patch_len) / stride) + 1`. Each channel uses the same `Linear(patch_len, d_model)` embedding. Multi-scale embeddings slice/project each scale separately and concatenate tokens in recipe scale order; their total token count is the sum across scales.
+
+For Patch or multi-scale Patch with MLP, Transformer or TCN, readout preserves every encoded position: `[B,C,N,D] -> LayerNorm(D) -> transpose(D,N) -> flatten(D*N) -> Linear(D*N,latent_dim)`. MLP uses its encoded `hidden_dim`; TCN uses convolution `hidden_dim`; Transformer uses `d_model`. This readout belongs to the encoder. The independent prediction head still maps latent features to each separately trained horizon and retains its point/quantile/Gaussian contract.
+
+TCN accepts `none`, `patch` and `multiscale_patch`. Patch tokens feed the original convolution blocks as `[B*C,d_model,N]`. Multi-scale convolution crosses scale boundaries, so these tokens are not one uniformly spaced time axis. Existing GroupNorm does not guarantee strict token causality. Raw TCN keeps its original blocks and final-position readout.
+
+Mamba and Diagonal SSM additionally accept **single-scale** Patch with `representation.layout=channel_sequence`, `readout=flatten`, `fusion=temporal/independent` and matching embedding/backbone `d_model`. Channels are encoded separately with shared parameters and no cross-channel mixing; the recurrent cores are unchanged. TimesBlock keeps raw input. A `history_time_gate` requires identical embeddings and token grids in both branches.
+
+Examples: `py/schemas/recipe_patch_tcn.example.json`, `recipe_multiscale_tcn.example.json`, `recipe_patch_mamba.example.json`, and `recipe_patch_diagonal_ssm.example.json`. Parameter counts include the flatten projections; sequence activation budgets use actual Patch token counts. Old mean-token checkpoints cannot load into these new readouts and are not converted automatically. Retrain Patch models; raw sequence structures and checkpoint keys retain their prior layout.
+
+`python py/patch_sanity.py --source /path/to/ETTh1.csv --steps 30 --output /path/to/report.json` performs small CPU training checks using only rows 0–8639. Its internal holdout is part of the benchmark training interval; its metrics are not benchmark validation/test results or a matched-capacity claim of improvement.
+
+## Parallel encoder execution
+
+Diagonal SSM evaluates its zero-state sequence using an equivalent causal FFT convolution; the explicit recurrence remains available through `forward_state` for streaming. TimesBlock batches equal-period arms across samples, then restores the original sample/rank order and weights. Each sample still selects its own periods; selection is not shared across the batch. Repeated periods remain distinct weighted arms, and convolution batches are bounded by the input batch size. Mamba's reference scan is unchanged.
+
+These changes preserve recipe fields, parameter names/shapes, preprocessing, readout and prediction heads. Existing checkpoints load directly. CPU/CUDA output and gradient checks cover the original operators, including short optimizer trajectories and the runtime's precision settings. Floating-point reduction order and cuDNN algorithm selection can change, so training is not bitwise identical. Runtime source digests distinguish new evaluations from previous executions. Fixed wall-clock budgets can allow more epochs after acceleration; compare actual stopping reasons as well as requested budgets. Benchmark batch speedups do not imply equal speedups for an entire research round.
+
+## Mamba-1 CUDA scan
+
+Use `backbone.backend="auto"` in new Mamba recipes: regular CUDA forward uses the optional official selective-scan extension when available and `d_state<=256`; CPU, larger states or a missing extension use the reference path with an explicit manifest reason. `torch_reference` always requests the reference; `cuda_optimized` strictly requires CUDA plus the matched extension and supported state size. It never silently falls back. This policy covers raw input and the existing single-scale Patch path. `forward_state` retains streaming/reference behavior. Parameter names/shapes and the local Mamba-1 equations are preserved; this is not a switch to Mamba-2/3 or a full pretrained forecasting model.
+
+The optional extension is built from pinned, unchanged Apache-2.0 upstream sources in `py/vendor/mamba_selective_scan`. Build with the same Python, PyTorch and CUDA toolkit used by training, plus setuptools, wheel, ninja and packaging:
+
+```bash
+CUDA_HOME=/path/to/matching/cuda TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=2 \
+  python scripts/build-mamba-cuda.py bdist_wheel --dist-dir .neo-cast/runtime/mamba-wheels
+python -m pip install --no-deps .neo-cast/runtime/mamba-wheels/neo_cast_mamba_scan-*.whl
+```
+
+Adjust the GPU architecture for your hardware. Rebuild after changing PyTorch/CUDA; the adapter checks recorded build versions. The scan binary/source digests and actual backend enter experiment identity, preventing reuse across different accelerated runtimes. Examples: `py/schemas/recipe_mamba_auto.example.json` and `recipe_patch_mamba_auto.example.json`. The adapter uses the standard PyTorch causal convolution and projections plus the official fused scan, rather than the complete fused `mamba_inner_fn` path. Equivalence tests allow floating-point roundoff; faster execution does not establish better prediction quality.

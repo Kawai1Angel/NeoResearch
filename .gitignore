@@ -1,4 +1,8 @@
 .env.local
+.env
+.env.*
+!.env.example
+/opencode.json
 .neo-research/
 .neo-cast/
 .DS_Store
@@ -7,7 +11,7 @@
 .claude/
 
 # Local runtimes and generated artifacts
-node_modules/
+node_modules
 dist/
 *.tgz
 *.log

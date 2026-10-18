@@ -23,6 +23,9 @@ test("direct reflection synthesizes inline evidence without requesting session t
   expect(prompt).toContain("training_strategy.scheduler.warmup_steps")
   expect(prompt).toContain("these 7 analysis keys, optionally followed by experienceWrites")
   expect(prompt).toContain("Omit it or return [] when nothing merits saving")
+  expect(prompt).toContain("status:experience_request")
+  expect(prompt).toContain("requestedExperiences")
+  expect(prompt).toContain("parentExperienceID")
   expect(prompt).not.toContain("Call `experiment_results")
   expect(prompt).not.toContain("After completing the four tool calls")
   expect(prompt).not.toContain("Before EVERY tool call")
@@ -133,6 +136,16 @@ test("analyzeReflection requests human review after consecutive failures", () =>
   expect(analysis.failedRuns).toBe(3)
   expect(analysis.failures.map((item) => item.category)).toEqual(["oom", "oom", "nan"])
   expect(analysis.decision).toBe("request_human")
+})
+
+test("reflection does not replace the configured search patience with a fixed four-round plateau stop", () => {
+  const t = { ...task(), budget: { loop: { maxIterations: 100, maxNoImprove: 100 } } } as ResearchTask
+  const observations = Array.from({ length: 10 }, (_, index) =>
+    run({ id: `plateau_${index}`, status: "succeeded", metric: index === 0 ? 0.1 : 0.5, created: index + 1 }))
+  const analysis = analyzeReflection({ task: t, candidates: [], runs: observations })
+  expect(analysis.plateauStreak).toBe(9)
+  expect(analysis.decision).toBe("continue")
+  expect(analysis.ineffectiveChanges).toHaveLength(9)
 })
 
 test("reflection evaluates completed observations independently of post-training rejection", () => {

@@ -266,7 +266,7 @@ const EMBEDDING_REQUIRED_DEFAULTS: Record<string, Record<string, number>> = {
 }
 
 // Backbones that only support embedding.type='none' (domain constraint in tsf.ts).
-const BACKBONE_REQUIRES_NONE_EMBEDDING = new Set(["timesnet_lite", "dlinear", "tcn", "nbeats"])
+const BACKBONE_REQUIRES_NONE_EMBEDDING = new Set(["timesnet_lite", "dlinear", "nbeats"])
 
 const FUSION_ALLOWED_KEYS: Record<string, readonly string[]> = {
   temporal: ["type", "channelMode"],
@@ -346,6 +346,9 @@ export function pruneCandidateSpec(value: unknown): JsonRecord {
 
   // Normalize embedding: strip unknown keys, fill required number defaults.
   // Certain backbones require embedding.type='none' (domain constraint).
+  if (backboneType === "tcn" && !("embedding" in spec)) spec.embedding = { type: "none" }
+  if (backboneType === "tcn" && isRecord(spec.embedding) && !["none", "patch", "multiscale_patch"].includes(String(spec.embedding.type)))
+    throw new Error("tcn supports embedding none, patch or multiscale_patch")
   if (backboneType !== undefined && BACKBONE_REQUIRES_NONE_EMBEDDING.has(backboneType)) {
     if (!("embedding" in spec)) spec.embedding = { type: "none" }
     else if (!isRecord(spec.embedding) || spec.embedding.type !== "none") {
@@ -420,6 +423,9 @@ export function buildUserPrompt(input: {
       readonly message: string
       readonly expected?: unknown
       readonly actual?: unknown
+      readonly source?: string
+      readonly rule?: string
+      readonly repairHint?: string
     }[]
     readonly rejectedCandidate?: JsonRecord
   }
@@ -807,6 +813,7 @@ export function candidateGovernance(candidateSpec: JsonRecord) {
  * return validation details for a repair attempt.
  */
 export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, config: NeoCastLLMConfig): LLMProposalResult {
+  let attemptedCandidate: Record<string, unknown> | undefined
   try {
     const response = extractDesignerResponse(text)
     if (response.status === "evidence_request") {
@@ -822,6 +829,7 @@ export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, con
       return { historyRequest: request.request, metadata: llmMetadata(config, "used", { designStatus: "history_request" }, usage) }
     }
     const raw = camelizeKnown(response.status === "proposed" ? response.candidate : response) as Record<string, any>
+    attemptedCandidate = raw
     if (raw.recipeVersion === "recipe_schema_v3") {
       for (const [prefix, branch] of [["backbone", raw.backbone], ["composition.secondary.backbone", raw.composition?.secondary?.backbone]] as const) {
         if (branch?.type === "linear" && typeof branch.shared !== "boolean")
@@ -846,7 +854,15 @@ export function buildLLMProposalFromText(text: string, usage: LLMTokenUsage, con
     }
   } catch (error) {
     const issues = error instanceof z.ZodError
-      ? error.issues.map((issue) => ({ path: issue.path.join(".") || "candidateSpec", message: issue.message }))
+      ? error.issues.map((issue) => ({ path: issue.path.join(".") || "candidateSpec",
+        message: issue.path.length === 1 && issue.path[0] === "recipeID"
+          ? `${issue.message}. recipe_id must be 3–64 ASCII characters, start with a letter or digit, and otherwise contain only letters, digits, dot, underscore or hyphen. ` +
+            `Received ${JSON.stringify(attemptedCandidate?.recipeID)?.slice(0, 160)} (${typeof attemptedCandidate?.recipeID === "string" ? attemptedCandidate.recipeID.length : "unknown"} characters). ` +
+            `Use a short identifier such as recipe_tcn_rf_v1; preserve the exact architecture and training configuration.`
+          : issue.code === "unrecognized_keys" && issue.path.length === 0
+            ? `${issue.message}. Allowed recipe root fields: ${[...RECIPE_ALLOWED_KEYS].join(", ")}. ` +
+              `Decision criteria belong to the existing hypothesis, not new recipe fields; concise non-executable explanations may go in notes. Preserve all actual model and training fields.`
+            : issue.message }))
       : [{ path: "candidateSpec", message: error instanceof Error ? error.message : String(error) }]
     return {
       metadata: llmMetadata(config, "invalid", {

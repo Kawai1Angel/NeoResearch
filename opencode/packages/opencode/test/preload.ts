@@ -77,6 +77,7 @@ delete process.env["OPENCODE_SERVER_USERNAME"]
 
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"
+process.env["NEO_RESEARCH_EXPERIENCE_DB"] = path.join(dir, "experience.db")
 
 // Now safe to import from src/
 const { Log } = await import("../src/util")

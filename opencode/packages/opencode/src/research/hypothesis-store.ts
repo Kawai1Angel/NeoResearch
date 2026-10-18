@@ -13,6 +13,10 @@ import { validMechanisms, unsupportedMechanisms } from "./model-capabilities"
 import type { HypothesisObject, HypothesisStatus } from "./agents/hypo-planner-agent"
 import { TaskEvidenceBundleSchema, type TaskEvidenceBundle } from "./retrieve/contract"
 import { isZeroResearch } from "./research-variant"
+import { comparisonRecipe } from "./comparison-run"
+import { experimentContractUnavailable, frequencyModeUnavailable } from "./design-feedback"
+import { TSFDomain } from "./domains/tsf"
+import type { ResearchTask } from "./schema"
 
 const VALID_STATUSES: readonly HypothesisStatus[] = [
   "pending",
@@ -407,6 +411,20 @@ export async function abandonHypothesisInPool(
   return abandoned
 }
 
+// Validate a declared controlled target before committing a planner decision.
+export function assertHypothesisExperimentFeasible(
+  task: Pick<ResearchTask, "id" | "domainID" | "taskSpec">,
+  hypothesis: Pick<HypothesisObject, "id" | "experimentContract">,
+) {
+  if (task.domainID !== "tsf" || hypothesis.experimentContract?.mode !== "controlled") return
+  const input = { hypothesisID: hypothesis.id, contract: hypothesis.experimentContract,
+    comparison: comparisonRecipe(task.id, hypothesis.experimentContract.comparisonRunID) }
+  const conflict = frequencyModeUnavailable(input) ?? experimentContractUnavailable({ ...input,
+    validate: candidateSpec => TSFDomain.validateCandidate({ taskSpec: task.taskSpec, candidateSpec }),
+  })
+  if (conflict) throw new Error(JSON.stringify({ code: "experiment_contract_preflight", ...conflict }))
+}
+
 // Selection is task metadata so it survives service restarts and is visible in
 // task artifacts. No hypothesis is promoted implicitly by add/update operations.
 export async function selectNextExperimentInPool(taskID: ResearchTaskID, decision: NextExperimentDecision) {
@@ -421,6 +439,10 @@ export async function selectNextExperimentInPool(taskID: ResearchTaskID, decisio
       throw new Error(
         `Unsupported mechanisms remain untested: ${unsupported.join(", ")}. Select an executable hypothesis.`,
       )
+    const task = Database.use(d => d.select({ id: ResearchTaskTable.id, domainID: ResearchTaskTable.domain_id, taskSpec: ResearchTaskTable.task_spec })
+      .from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get())
+    if (!task) throw new Error(`Research task ${taskID} was not found`)
+    assertHypothesisExperimentFeasible(task, hypothesis)
   }
   Database.use((d) =>
     d.transaction((tx) => {

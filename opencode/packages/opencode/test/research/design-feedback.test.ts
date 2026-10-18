@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { schemaRemovalUnavailable, mechanismRequirementsUnavailable, formatDesignValidationIssue } from "../../src/research/design-feedback"
+import { schemaRemovalUnavailable, mechanismRequirementsUnavailable, experimentContractUnavailable, designConstraintFeedback, formatDesignValidationIssue } from "../../src/research/design-feedback"
 import { ExperimentConstraints, checkExperimentConstraints } from "../../src/research/experiment-constraints"
 import { TSFDomain } from "../../src/research/domains/tsf"
 
@@ -80,4 +80,54 @@ test("validation diagnostics preserve null, false and the normalized actual valu
   expect(formatDesignValidationIssue({ path: "backbone.bias", message: "Contract mismatch", expected: false, actual: true }))
     .toContain("expected=false")
   expect(formatDesignValidationIssue({ path: "backbone", message: "Invalid type" })).toBe("backbone: Invalid type")
+})
+
+test("fusion switching reports implicit freezing separately from requiredValues and rejects incomplete contracts before design", () => {
+  const anchor = validate({ ...comparison, backbone: { type: "linear", shared: true, bias: true },
+    fusion: { type: "temporal", channelMode: "independent" } }).normalizedCandidateSpec!
+  const contract = ExperimentConstraints.parse({ mode: "controlled", comparisonRunID: "anchor", changes: [
+    { operation: "set", path: "fusion.type", before: "temporal", after: "feature_mlp" },
+  ], requiredValues: [{ path: "fusion.type", value: "feature_mlp" }], frozenPaths: ["trainingStrategy"] })
+  const candidate = validate({ ...anchor, fusion: { type: "feature_mlp" } })
+  expect(candidate.ok).toBe(true)
+  const issues = checkExperimentConstraints(contract, candidate.normalizedCandidateSpec!, anchor)
+  expect(issues).toHaveLength(1)
+  const feedback = designConstraintFeedback(issues[0]!)
+  expect(feedback).toMatchObject({ path: "fusion.channelMode", source: "experiment_constraints", rule: "implicit_freeze", expected: "independent", actual: null })
+  expect(feedback.message).toContain("not an explicit requiredValues")
+  expect(feedback.repairHint).toContain("remove operation")
+  expect(formatDesignValidationIssue(feedback)).toContain("[implicit_freeze]")
+  const report = experimentContractUnavailable({ hypothesisID: "H-mix", contract, comparison: anchor, validate })!
+  expect(report.status).toBe("unavailable")
+  expect(report.reason).toContain("schema-invalid target")
+  expect(report.conflicts.some(c => c.supported.includes("channelMode"))).toBe(true)
+  expect(report.suggestedRevision).toContain("removing fusion.channelMode")
+
+  const removals = ExperimentConstraints.parse({ ...contract, changes: [...contract.changes,
+    { operation: "remove", path: "fusion.channelMode", before: "independent" },
+  ] })
+  const replacement = ExperimentConstraints.parse({ ...contract, changes: [
+    { operation: "set", path: "fusion", before: anchor.fusion, after: { type: "feature_mlp" } },
+  ] })
+  for (const fixed of [removals, replacement]) {
+    expect(experimentContractUnavailable({ hypothesisID: "H-mix", contract: fixed, comparison: anchor, validate })).toBeUndefined()
+    expect(checkExperimentConstraints(fixed, candidate.normalizedCandidateSpec!, anchor)).toEqual([])
+    const altered = structuredClone(candidate.normalizedCandidateSpec!) as any
+    altered.trainingStrategy.optimizer.lr *= 2
+    expect(checkExperimentConstraints(fixed, altered, anchor).some(i => i.rule === "implicit_freeze")).toBe(true)
+  }
+  const required = checkExperimentConstraints({ ...removals, requiredValues: [{ path: "fusion.type", value: "temporal" }] }, candidate.normalizedCandidateSpec!, anchor)
+  expect(required[0]).toMatchObject({ rule: "required_value", path: "fusion.type" })
+})
+
+test("contract preflight checks comparison existence, before values, restored defaults and contradictory required values", () => {
+  const contract = ExperimentConstraints.parse({ mode: "controlled", comparisonRunID: "anchor", changes })
+  expect(experimentContractUnavailable({ hypothesisID: "H", contract, validate })?.conflicts[0]?.field).toBe("comparisonRunID")
+  const stale = ExperimentConstraints.parse({ ...contract, changes: [{ operation: "set", path: "backbone.bias", before: false, after: true }] })
+  expect(experimentContractUnavailable({ hypothesisID: "H", contract: stale, comparison, validate })?.reason).toContain("cannot be applied")
+  const removal = ExperimentConstraints.parse({ ...contract, changes: [...changes, { operation: "remove", path: "backbone.bias", before: true }] })
+  expect(experimentContractUnavailable({ hypothesisID: "H", contract: removal, comparison, validate })?.conflicts[0]?.requested).toContain("change_after")
+  const conflict = ExperimentConstraints.parse({ ...contract, requiredValues: [{ path: "backbone.type", value: "dlinear" }] })
+  expect(experimentContractUnavailable({ hypothesisID: "H", contract: conflict, comparison, validate })?.conflicts[0]?.requested).toContain("required_value")
+  expect(experimentContractUnavailable({ hypothesisID: "H", contract: ExperimentConstraints.parse({ mode: "exploratory" }), validate })).toBeUndefined()
 })

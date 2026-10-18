@@ -27,7 +27,7 @@ BACKBONE_MAP = {
     "mixer": "mixer",
 }
 
-RAW_BACKBONES = {"dlinear", "tcn", "nbeats", "timesnet_lite"}
+RAW_BACKBONES = {"dlinear", "nbeats", "timesnet_lite"}
 
 
 def is_model_recipe_payload(payload: dict[str, Any]) -> bool:
@@ -126,6 +126,8 @@ def _compile_preprocessing(architecture: dict[str, Any]) -> dict[str, Any]:
 
 def _compile_embedding(architecture: dict[str, Any], low_backbone: str, input_len: int) -> dict[str, Any]:
     requested = architecture.get("embedding", "auto")
+    if low_backbone == "tcn" and requested not in {"auto", "none", "patch", "multiscale_patch"}:
+        raise ValueError(f"embedding={requested} is incompatible with backbone=tcn")
     if low_backbone in RAW_BACKBONES and requested not in {"auto", "none"}:
         raise ValueError(f"embedding={requested} is incompatible with backbone={low_backbone}")
     blocks = int(architecture.get("multiscale_blocks", 0))
@@ -154,7 +156,7 @@ def _compile_embedding(architecture: dict[str, Any], low_backbone: str, input_le
         return {"type": "frequency", "n_freq": 16, "d_model": d_model, "complex_mode": "magnitude"}
     if requested == "calendar":
         return {"type": "calendar", "fields": ["hour", "dayofweek", "month"], "embed_dim": d_model}
-    if low_backbone == "linear" and requested == "auto":
+    if low_backbone in {"linear", "tcn"} and requested == "auto":
         return {"type": "none"}
     return {
         "type": "patch",

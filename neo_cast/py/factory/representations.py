@@ -14,13 +14,26 @@ def validate_typed_recipe(recipe: dict, input_len: int | None = None) -> list[st
     representation = recipe["representation"]
     layout = representation["layout"]
     sequence = backbone["type"] in SEQUENCE_ENCODERS
+    if backbone["type"] == "mamba" and backbone.get("backend") == "cuda_optimized" and backbone["d_state"] > 256:
+        errors.append("backbone.d_state: CUDA selective scan supports at most 256 states; auto/reference support up to 512")
     if sequence:
         if layout not in {"sequence_latent", "channel_sequence"}:
             errors.append("representation.layout: sequence encoders require sequence_latent or channel_sequence")
-        if representation["readout"] not in {"mean", "last"}:
-            errors.append("representation.readout: sequence encoders require explicit mean or last")
-        if recipe["embedding"]["type"] != "none":
-            errors.append("embedding: typed sequence encoders currently accept only none (their explicit input projection)")
+        embedding = recipe["embedding"]
+        if embedding["type"] == "patch":
+            if backbone["type"] not in {"mamba", "diagonal_ssm"}:
+                errors.append("embedding: single-scale Patch sequence scanning supports only mamba or diagonal_ssm")
+            if layout != "channel_sequence" or representation["readout"] != "flatten":
+                errors.append("representation: Patch sequence encoders require channel_sequence with readout=flatten")
+            if recipe["fusion"] != {"type": "temporal", "channel_mode": "independent"}:
+                errors.append("fusion: Patch sequence encoders require temporal/independent (shared per-channel encoding)")
+            if embedding["d_model"] != backbone["d_model"]:
+                errors.append("embedding.d_model must match backbone.d_model for Patch sequence encoders")
+        else:
+            if representation["readout"] not in {"mean", "last"}:
+                errors.append("representation.readout: raw sequence encoders require explicit mean or last")
+            if embedding["type"] != "none":
+                errors.append("embedding: sequence encoders support none or single-scale patch only")
         if backbone["type"] == "timesblock_encoder" and input_len is not None and backbone["top_k"] > input_len // 2:
             errors.append("backbone.top_k exceeds floor(input_len/2)")
     elif layout != "channel_latent" or representation["readout"] != "none":
@@ -63,6 +76,8 @@ def validate_typed_recipe(recipe: dict, input_len: int | None = None) -> list[st
                 errors.append("history_time_gate requires equal axis layout and d_model")
             if representation != other["representation"]:
                 errors.append("history_time_gate requires the same explicit readout/adapter contract")
+            if recipe["embedding"] != other["embedding"]:
+                errors.append("history_time_gate requires identical embedding and token grid in both branches")
         if composition["type"] == "decomposition_two_branch":
             if composition["kernel_size"] % 2 == 0:
                 errors.append("composition.kernel_size must be odd")

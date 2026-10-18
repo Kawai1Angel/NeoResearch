@@ -1,4 +1,5 @@
 import { readDesignHistory } from "../research/design-history"
+import { taskMemories } from "../research/experience-store"
 import { readReflectionHistory } from "../research/reflection-context"
 import { extractTrainingCurve } from "../research/runner-evidence"
 export { extractTrainingCurve } from "../research/runner-evidence"
@@ -10,7 +11,6 @@ import { resolveTaskIDBySessionID } from "@/research/hypothesis-store"
 import { Database, and, desc, eq } from "@/storage"
 import {
   ResearchArtifactTable,
-  ResearchMemoryTable,
   ResearchRunTable,
   ResearchTaskTable,
 } from "@/research/research.sql"
@@ -298,14 +298,7 @@ export const ReadMemoryLessonsTool = Tool.define(
         const recentLimit = Math.min(10, Math.max(1, Math.floor(args.recentLimit ?? 2)))
         const includeBest = args.includeBest !== false
 
-        const memories = Database.use((d) =>
-          d
-            .select()
-            .from(ResearchMemoryTable)
-            .where(eq(ResearchMemoryTable.task_id, taskID))
-            .orderBy(desc(ResearchMemoryTable.time_created))
-            .all(),
-        )
+        const memories = taskMemories(taskID).sort((a, b) => b.time.created - a.time.created)
 
         const recentLessons = memories.slice(0, recentLimit).map((m) => m.lesson)
 
@@ -326,7 +319,7 @@ export const ReadMemoryLessonsTool = Tool.define(
           let bestMemoryLesson: string | undefined
 
           for (const m of memories) {
-            const cs = m.candidate_summary as Record<string, unknown> | null | undefined
+            const cs = m.candidateSummary as Record<string, unknown> | null | undefined
             const mv = cs && typeof cs.bestMetric === "number" && Number.isFinite(cs.bestMetric) ? cs.bestMetric : undefined
             if (mv === undefined) continue
             if (

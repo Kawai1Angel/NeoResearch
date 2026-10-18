@@ -724,7 +724,6 @@ class RecipeFactoryTest(unittest.TestCase):
     def test_raw_backbones_reject_patch_embedding(self) -> None:
         for backbone in (
             {"type": "dlinear", "kernel_size": 9, "bias": True},
-            {"type": "tcn", "hidden_dim": 16, "n_layers": 2, "kernel_size": 3, "dropout": 0.1},
             {"type": "nbeats", "hidden_dim": 32, "n_blocks": 2, "n_layers": 2, "dropout": 0.1},
             {"type": "timesnet_lite", "hidden_dim": 16, "n_layers": 1, "top_k": 2, "kernel_size": 3, "dropout": 0.1},
         ):

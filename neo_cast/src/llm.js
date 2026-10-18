@@ -119,7 +119,7 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
 function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   const text = String(requirement || "").toLowerCase();
   const fastMode = Boolean(process.env.NEO_CAST_FAST_E2E);
-  const channelMode = (
+  const channelMode = /channel[-_ ]independent|independent[-_ ]channels?|通道独立/.test(text) ? "independent" : (
     text.includes("channel") ||
     text.includes("cross") ||
     text.includes("correlation") ||
@@ -202,13 +202,19 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   };
 
   const newEncoder = text.includes("mamba") ? "mamba" : text.includes("timesblock") ? "timesblock_encoder" : (text.includes("diagonal") || text.includes("ssm")) ? "diagonal_ssm" : null;
+  const wantsPatch = /patch|切片/.test(text);
   if (newEncoder) {
+    if (wantsPatch && (newEncoder === "timesblock_encoder" || useMultiscale)) {
+      throw new Error("Patch sequence scanning supports single-scale Mamba/Diagonal SSM only");
+    }
     const common = { type: newEncoder, d_model: 16, depth: 1, dropout: 0.1 };
-    const backbone = newEncoder === "mamba" ? { ...common, d_state: 8, d_conv: 4, expand: 2, backend: "torch_reference" }
+    const backbone = newEncoder === "mamba" ? { ...common, d_state: 8, d_conv: 4, expand: 2, backend: "auto" }
       : newEncoder === "timesblock_encoder" ? { ...common, d_ff: 32, top_k: 1, num_kernels: 3 }
         : { ...common, state_dim: 8 };
-    return _candidateRecipeToModelRecipe({ ...baseRecipe, hypothesis: `Evaluate a real ${newEncoder} with an explicit history readout.`, embedding: { type: "none" }, backbone,
-      fusion: { type: "temporal", channel_mode: "independent" }, representation: { layout: "sequence_latent", readout: "mean", latent_dim: 16 } },
+    return _candidateRecipeToModelRecipe({ ...baseRecipe, hypothesis: `Evaluate a real ${newEncoder} with an explicit history readout.`,
+      embedding: wantsPatch ? { type: "patch", patch_len: 16, stride: 8, d_model: 16 } : { type: "none" }, backbone,
+      fusion: { type: "temporal", channel_mode: "independent" },
+      representation: { layout: wantsPatch ? "channel_sequence" : "sequence_latent", readout: wantsPatch ? "flatten" : "mean", latent_dim: 16 } },
       taskContext, { modelFamily: newEncoder, requirement });
   }
 
@@ -258,7 +264,8 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   if (modelFamily === "tcn") {
     return _candidateRecipeToModelRecipe({
       ...baseRecipe,
-      embedding: { type: "none" },
+      embedding: wantsPatch ? (useMultiscale ? { type: "multiscale_patch", scales: [{ patch_len: 8, stride: 4 }, { patch_len: 16, stride: 8 }], d_model: 16 }
+        : { type: "patch", patch_len: 16, stride: 8, d_model: 16 }) : { type: "none" },
       backbone: { type: "tcn", hidden_dim: 16, n_layers: useMultiscale ? 3 : 1, kernel_size: 3, activation: "gelu", dropout: 0.1 },
     }, taskContext, { modelFamily, requirement, useMultiscale });
   }
@@ -293,7 +300,7 @@ function _formatTaskContext(taskContext = {}) {
   const targetColumns = Array.isArray(taskContext.target_columns) ? taskContext.target_columns : taskContext.feature_columns;
   const pastCovariates = Array.isArray(taskContext.observed_past_covariates) ? taskContext.observed_past_covariates : [];
   const featureColumns = Array.isArray(targetColumns)
-    ? [...new Set([...targetColumns, ...pastCovariates, ...futureCovariates])]
+    ? [...new Set([...targetColumns, ...pastCovariates])]
     : ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"];
   const inputLen = taskContext.input_len || 512;
   const horizons = Array.isArray(taskContext.horizons) ? taskContext.horizons : [96, 192, 336, 720];
@@ -368,7 +375,7 @@ Action parameters:
 - backbone transformer: { "type": "transformer", "d_model": 32|64|128, "n_heads": 1|2|4|8, "n_layers": 1|2|3, "dropout": 0.0|0.1|0.2, "ffn_mult": 2.0|4.0 }
 - backbone rnn: { "type": "rnn", "cell": "gru"|"lstm"|"rnn", "hidden_dim": 32|64|128, "num_layers": 1|2|3, "dropout": 0.0|0.1|0.2 }
 - backbone dlinear: { "type": "dlinear", "kernel_size": 25, "bias": true } and requires embedding none
-- backbone tcn: { "type": "tcn", "hidden_dim": 16|32|64, "n_layers": 1|2|3, "kernel_size": 3|5, "activation": "gelu", "dropout": 0.0|0.1|0.2 } and requires embedding none
+- backbone tcn: { "type": "tcn", "hidden_dim": 16|32|64, "n_layers": 1|2|3, "kernel_size": 3|5, "activation": "gelu", "dropout": 0.0|0.1|0.2 } and supports embedding none, patch or multiscale_patch
 - backbone nbeats: { "type": "nbeats", "hidden_dim": 64|128|256, "n_blocks": 2|3|4, "n_layers": 2|3, "activation": "gelu", "dropout": 0.0|0.1|0.2 } and requires embedding none
 - backbone timesnet_lite: { "type": "timesnet_lite", "hidden_dim": 8|16|32, "n_layers": 1|2, "top_k": 1|2, "kernel_size": 3|5, "dropout": 0.0|0.1|0.2 } and requires embedding none
 - backbone gated_depthwise_conv: { "type": "gated_depthwise_conv", "hidden_dim": 32|64|128, "depth": 1|2|3, "kernel_size": 3|5, "dropout": 0.0|0.1|0.2 }
@@ -443,9 +450,11 @@ ${actions.map((name, i) => `- ${name}: ${schema.$defs[definitions[i]].oneOf.map(
 - loss: mse, mae, huber, quantile, distillation, gaussian_nll
 - scheduler: none, cosine, one_cycle, plateau, lradj_type1, lradj_type2, lradj_type3, lradj_3, lradj_4, lradj_5, lradj_6
 Use only fields applicable to the selected backbone. Never repeat a recipe by changing its name.
-diagonal_ssm and mamba are real state-space encoders. mamba uses Mamba-1 torch_reference; CUDA is not verified.
+diagonal_ssm and mamba are real state-space encoders. mamba uses Mamba-1 with backend auto (official CUDA selective scan when available, explicitly reported reference fallback otherwise), torch_reference, or strict cuda_optimized (d_state<=256). Prefer auto for new recipes; preserve declared controlled changes.
 timesblock_encoder is sample-local TimesBlock, not native TimesNet. gated_depthwise_conv and timesnet_lite remain distinct lightweight baselines.
-Sequence encoders require embedding none, representation layout sequence_latent or channel_sequence, explicit mean/last readout and latent_dim.
+Raw sequence encoders use embedding none and mean/last readout. Single-scale Patch is additionally supported for Mamba/Diagonal SSM with channel_sequence/flatten and temporal/independent fusion.
+Patch semantics: unfold without tail padding; N=floor((L-patch_len)/stride)+1. Patch/multiscale_patch + MLP/Transformer/TCN: encoder tokens -> LayerNorm over feature width -> transpose D/N -> flatten D*N -> Linear to latent -> unchanged prediction head. MLP uses encoded hidden_dim; TCN uses convolution hidden_dim; Transformer uses d_model. Scales concatenate in recipe order. TCN convolves across scale boundaries, which are not an equally spaced time axis, and GroupNorm does not guarantee strict token causality. Single-scale Patch+Mamba/Diagonal SSM requires channel_sequence/readout=flatten, temporal/independent fusion and matching embedding/backbone d_model. Channels encode independently with shared parameters. TimesBlock accepts raw input only. Raw paths retain their structure/weights and mean/last readouts. history_time_gate requires identical embeddings/token grids. Recompute parameter/activation budgets and retrain Patch configurations; old mean-readout results do not validate the new flatten readout.
+
 Legacy encoders use channel_latent/readout none. Prefer temporal/independent fusion with joint sequence_latent.
 Use feature_mlp instead of the equivalent temporal/shared alias. Missing masks require a cross-variable path.
 Composition is single, parallel_two_branch or decomposition_two_branch; no nesting. Forecast-space merges only support point output.

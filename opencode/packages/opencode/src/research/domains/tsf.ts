@@ -345,7 +345,7 @@ const Embedding = z.discriminatedUnion("type", [
 const Backbone = z.discriminatedUnion("type", [
   z.object({ type: z.literal("diagonal_ssm"), dModel: PositiveInt.max(512), stateDim: PositiveInt.max(512), depth: PositiveInt.max(8), dropout: z.number().min(0).lt(1) }).strict(),
   z.object({ type: z.literal("timesblock_encoder"), dModel: PositiveInt.max(512), dFf: PositiveInt.max(2048), depth: PositiveInt.max(8), topK: PositiveInt.max(16), numKernels: PositiveInt.max(8), dropout: z.number().min(0).lt(1) }).strict(),
-  z.object({ type: z.literal("mamba"), dModel: PositiveInt.max(512), dState: PositiveInt.max(512), dConv: PositiveInt.max(32), expand: PositiveInt.max(4), depth: PositiveInt.max(8), dropout: z.number().min(0).lt(1), backend: z.enum(["torch_reference", "cuda_optimized"]) }).strict(),
+  z.object({ type: z.literal("mamba"), dModel: PositiveInt.max(512), dState: PositiveInt.max(512), dConv: PositiveInt.max(32), expand: PositiveInt.max(4), depth: PositiveInt.max(8), dropout: z.number().min(0).lt(1), backend: z.enum(["torch_reference", "cuda_optimized", "auto"]) }).strict(),
   z.object({ type: z.literal("linear"), attention: z.enum(["none", "lightweight", "full"]).optional(), shared: z.boolean().default(false), bias: z.boolean().default(true) }).strict(),
   z
     .object({
@@ -516,7 +516,7 @@ const PredictionHead = z.discriminatedUnion("type", [
 
 const Representation = z.object({
   layout: z.enum(["channel_latent", "sequence_latent", "channel_sequence"]),
-  readout: z.enum(["mean", "last", "none"]), latentDim: PositiveInt.max(512),
+  readout: z.enum(["mean", "last", "none", "flatten"]), latentDim: PositiveInt.max(512),
 }).strict()
 const SecondaryBranch = z.object({ backbone: Backbone, embedding: Embedding, representation: Representation }).strict()
 const Composition = z.discriminatedUnion("type", [
@@ -610,11 +610,29 @@ export const TSFCandidateRecipe = z
     }
     if (recipe.recipeVersion === "recipe_schema_v3") {
       const repr = recipe.representation
-      if (!repr || (sequence ? repr.layout === "channel_latent" || repr.readout === "none" : repr.layout !== "channel_latent" || repr.readout !== "none")) {
-        ctx.addIssue({ code: "custom", path: ["representation"], message: "Declare a compatible explicit layout, readout and latentDim" })
-      }
-      if (sequence && recipe.embedding.type !== "none") ctx.addIssue({ code: "custom", path: ["embedding"], message: "Sequence encoders require none embedding" })
       const comp = recipe.composition
+      const branches = [{ prefix: [] as string[], backbone: recipe.backbone, embedding: recipe.embedding, representation: repr },
+        ...(comp && comp.type !== "single" ? [{ prefix: ["composition", "secondary"], ...comp.secondary }] : [])]
+      for (const branch of branches) {
+        const seq = ["diagonal_ssm", "timesblock_encoder", "mamba"].includes(branch.backbone.type)
+        const representation = branch.representation
+        const add = (path: string, message: string) => ctx.addIssue({ code: "custom", path: [...branch.prefix, path], message })
+        if (!representation || (seq ? !["sequence_latent", "channel_sequence"].includes(representation.layout)
+          : representation.layout !== "channel_latent" || representation.readout !== "none"))
+          add("representation", "Declare a compatible explicit layout, readout and latentDim")
+        if (!seq) continue
+        if (branch.backbone.type === "mamba" && branch.backbone.backend === "cuda_optimized" && branch.backbone.dState > 256)
+          add("backbone", "CUDA selective scan supports dState<=256; use auto/reference for larger state dimensions")
+        if (branch.embedding.type === "patch") {
+          if (!["mamba", "diagonal_ssm"].includes(branch.backbone.type)) add("embedding", "Single-scale Patch scanning supports only Mamba or Diagonal SSM")
+          if (representation?.layout !== "channel_sequence" || representation.readout !== "flatten") add("representation", "Patch sequence encoders require channel_sequence with readout=flatten")
+          if (recipe.fusion.type !== "temporal" || recipe.fusion.channelMode !== "independent") add("fusion", "Patch sequence encoders require temporal/independent (shared per-channel encoding)")
+          if (!("dModel" in branch.backbone) || branch.embedding.dModel !== branch.backbone.dModel) add("embedding", "Patch embedding.dModel must match backbone.dModel")
+        } else {
+          if (branch.embedding.type !== "none") add("embedding", "Sequence encoders support none or single-scale patch only")
+          if (representation && !["mean", "last"].includes(representation.readout)) add("representation", "Raw sequence encoders require mean or last readout")
+        }
+      }
       if (comp && comp.type !== "single") {
         if (recipe.fusion.type !== "temporal" || recipe.fusion.channelMode !== "independent") ctx.addIssue({ code: "custom", path: ["fusion"], message: "Composition requires temporal/independent" })
         if (comp.type === "decomposition_two_branch" || comp.merge === "forecast_step_gate") {
@@ -622,6 +640,14 @@ export const TSFCandidateRecipe = z
         }
         if (comp.type === "decomposition_two_branch" && comp.kernelSize % 2 === 0) ctx.addIssue({ code: "custom", path: ["composition", "kernelSize"], message: "Kernel must be odd" })
         if (comp.type === "parallel_two_branch" && comp.merge !== "forecast_step_gate" && repr?.latentDim !== comp.secondary.representation.latentDim) ctx.addIssue({ code: "custom", path: ["composition"], message: "Adapter output widths must match" })
+        if (comp.type === "parallel_two_branch" && comp.merge === "history_time_gate") {
+          if (!sequence || !["diagonal_ssm", "timesblock_encoder", "mamba"].includes(comp.secondary.backbone.type) ||
+            !("dModel" in recipe.backbone) || !("dModel" in comp.secondary.backbone) || recipe.backbone.dModel !== comp.secondary.backbone.dModel ||
+            JSON.stringify(repr) !== JSON.stringify(comp.secondary.representation))
+            ctx.addIssue({ code: "custom", path: ["composition"], message: "history_time_gate requires matching sequence layouts, dModel and readout adapters" })
+          if (JSON.stringify(recipe.embedding) !== JSON.stringify(comp.secondary.embedding))
+            ctx.addIssue({ code: "custom", path: ["composition"], message: "history_time_gate requires identical embedding and token grid in both branches" })
+        }
       }
     }
     const types = recipe.preprocessing.actions.map((action) => action.type)
@@ -826,8 +852,11 @@ export function validateTSFCandidate(taskSpec: unknown, candidateSpec: unknown):
     }
   }
 
-  if (["dlinear", "tcn", "nbeats", "timesnet_lite"].includes(recipe.backbone.type) && recipe.embedding.type !== "none") {
+  if (["dlinear", "nbeats", "timesnet_lite"].includes(recipe.backbone.type) && recipe.embedding.type !== "none") {
     issues.push(issue("embedding.type", `backbone.type='${recipe.backbone.type}' requires embedding.type='none'`))
+  }
+  if (recipe.backbone.type === "tcn" && !["none", "patch", "multiscale_patch"].includes(recipe.embedding.type)) {
+    issues.push(issue("embedding.type", "TCN supports embedding none, patch or multiscale_patch"))
   }
 
   if (recipe.trainingStrategy.scheduler.warmupSteps >= recipe.trainingStrategy.budget.maxEpochs) {
@@ -1100,7 +1129,10 @@ function commandTimeoutForRecipe(stage: DomainRunStage, recipe?: TSFCandidateRec
   if (stage !== "low_fidelity" && stage !== "full") return undefined
   const timeBudgetS = recipe?.trainingStrategy.budget.timeBudgetS
   if (typeof timeBudgetS !== "number" || !Number.isFinite(timeBudgetS)) return undefined
-  const recipeTimeoutMs = Math.max(120, timeBudgetS + 120) * 1000
+  // runner.py full runs execute four serial CV fits, then one standard fit.
+  // The recipe budget is enforced separately inside each train.py process.
+  const trainingPasses = stage === "full" ? 5 : 1
+  const recipeTimeoutMs = trainingPasses * Math.max(120, timeBudgetS + 120) * 1000
   return stage === "full" ? Math.max(3_600_000, recipeTimeoutMs) : recipeTimeoutMs
 }
 

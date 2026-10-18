@@ -33,9 +33,9 @@ PYTHONPATH=py .neo-cast/runtime/.venv/bin/python py/recipe_identity.py migrate p
 
 ## 验证与边界
 
-覆盖状态递推、分块/逐步一致性、因果性、梯度、长序列稳定性、TimesBlock 批次独立性、mask/过去协变量、概率头、组合参数有效性、资源限制、迁移、缓存及三个新模型的独立进程导出回载。Mamba 数值和梯度对照独立公式参考，不宣称官方 CUDA kernel parity。
+覆盖状态递推、分块/逐步一致性、因果性、梯度、长序列稳定性、TimesBlock 批次独立性、mask/过去协变量、概率头、组合参数有效性、资源限制、迁移、缓存及三个新模型的独立进程导出回载。Mamba 保留独立公式参考，并为可选官方 CUDA selective scan 增加输出、全部参数/输入梯度、短程训练和旧权重加载对照。
 
-Mamba 当前可用后端为 `torch_reference`；请求 `cuda_optimized` 会显式报 `UNSUPPORTED_BACKEND`，没有静默替换。资源预算包含参数数目及激活元素上限，但后者不是完整峰值显存预测。自动 mutation 对新编码器目前仅作有界 depth / learning-rate 变动，未实现广泛组合拓扑搜索。
+Mamba 支持 `torch_reference`、`auto` 与 `cuda_optimized`。`auto` 在 CUDA 设备、扩展可用且 d_state<=256 时使用官方扫描内核，否则显式记录参考路径及原因；`cuda_optimized` 对这些前置条件严格报错，不能静默回退。原有显式 `torch_reference` 配方保持参考执行。原始序列与单尺度 Patch 都支持新后端，streaming 的 `forward_state` 仍是参考递推。实际后端、请求后端、二进制及源码摘要进入执行清单和实验身份。资源预算包含参数数目及激活元素上限，但后者不是完整峰值显存预测。自动 mutation 对新编码器目前仅作有界 depth / learning-rate 变动，未实现广泛组合拓扑搜索。
 
 小样本三种子训练结果见 [v3 sanity](recipe_runtime_v3_sanity.md)。新模型机制成立不等于预测效果更好；当前短预算结果没有显示其优于线性基线。没有原生 TimesNet、跨 H 共享或论文指标复现。
 

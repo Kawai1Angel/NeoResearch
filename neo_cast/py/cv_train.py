@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from runtime_config import ACTIVE_SPEC, HORIZONS, INPUT_LEN
 
 PY_ROOT = Path(__file__).resolve().parent
 OVERRIDE_ENV = ("NEO_CAST_TRAIN_ROWS", "NEO_CAST_VAL_ROWS", "NEO_CAST_CV_FOLD_INDEX")
+OUTPUT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -92,7 +94,8 @@ def _run_train(cmd: list[str], env: dict[str, str]) -> tuple[int, list[dict[str,
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
-            print(line.rstrip("\n"), flush=True)
+            with OUTPUT_LOCK:
+                print(line.rstrip("\n"), flush=True)
             continue
         if isinstance(record, dict):
             records.append(record)
@@ -101,9 +104,11 @@ def _run_train(cmd: list[str], env: dict[str, str]) -> tuple[int, list[dict[str,
                 forwarded["cv_fold_index"] = int(env["NEO_CAST_CV_FOLD_INDEX"])
                 if "artifact_dir" in forwarded:
                     forwarded["ephemeral"] = True
-            print(json.dumps(forwarded), flush=True)
+            with OUTPUT_LOCK:
+                print(json.dumps(forwarded), flush=True)
         else:
-            print(line.rstrip("\n"), flush=True)
+            with OUTPUT_LOCK:
+                print(line.rstrip("\n"), flush=True)
     return process.wait(), records
 
 
@@ -206,7 +211,16 @@ def run_cv_folds_parallel(
 
 
 def default_max_parallel_folds() -> int:
-    """Avoid competing training processes on a single CUDA device."""
+    """Honor explicit concurrency; otherwise avoid competing CUDA processes."""
+    configured = os.environ.get("NEO_CAST_CV_MAX_PARALLEL_FOLDS")
+    if configured is not None:
+        try:
+            workers = int(configured)
+        except ValueError as exc:
+            raise ValueError("NEO_CAST_CV_MAX_PARALLEL_FOLDS must be a positive integer") from exc
+        if workers < 1:
+            raise ValueError("NEO_CAST_CV_MAX_PARALLEL_FOLDS must be a positive integer")
+        return workers
     import torch
 
     return 1 if torch.cuda.is_available() else 4
@@ -240,7 +254,7 @@ def main() -> int:
         "--max-parallel-folds",
         type=int,
         default=None,
-        help="Concurrent CV folds; defaults to 1 with CUDA and 4 on CPU",
+        help="Concurrent CV folds; overrides NEO_CAST_CV_MAX_PARALLEL_FOLDS (default: 1 with CUDA, 4 on CPU)",
     )
     parser.add_argument("--initial-train-ratio", type=float, default=0.6)
     parser.add_argument("--min-train-windows", type=int, default=1)

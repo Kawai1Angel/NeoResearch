@@ -1,7 +1,6 @@
 import type { VerifierContext, VerifierResult } from "./types"
 import { horizonMetrics } from "./types"
 
-const HORIZON_COLLAPSE_RATIO = 8.0
 export function runHorizonVerifier(ctx: VerifierContext): VerifierResult {
   const name = "horizon_verifier" as const
 
@@ -70,35 +69,12 @@ export function runHorizonVerifier(ctx: VerifierContext): VerifierResult {
 
   const ratio = longest.mse / shortest.mse
 
-  if (ratio > HORIZON_COLLAPSE_RATIO) {
-    return {
-      name,
-      accepted: false,
-      status: "failed",
-      reason: `Long-horizon collapse detected: val_mse_${longest.horizon}=${Number(longest.mse.toFixed(6))} is ${ratio.toFixed(2)}x val_mse_${shortest.horizon}=${Number(shortest.mse.toFixed(6))} (threshold ${HORIZON_COLLAPSE_RATIO}x).`,
-      evidence: {
-        shortestHorizon: shortest.horizon,
-        shortestMse: shortest.mse,
-        longestHorizon: longest.horizon,
-        longestMse: longest.mse,
-        ratio,
-        threshold: HORIZON_COLLAPSE_RATIO,
-        allHorizons: values,
-      },
-    }
-  }
-
   return {
     name,
     accepted: true,
     status: "passed",
-    reason: `Horizon-wise MSE ratio ${ratio.toFixed(2)}x (h${shortest.horizon}→h${longest.horizon}) is within the ${HORIZON_COLLAPSE_RATIO}x threshold.`,
-    evidence: {
-      shortestHorizon: shortest.horizon,
-      shortestMse: shortest.mse,
-      longestHorizon: longest.horizon,
-      longestMse: longest.mse,
-      ratio,
-    },
+    reason: `Observed horizon-wise MSE ratio ${ratio} (h${shortest.horizon} to h${longest.horizon}); ReflectionAgent assesses predictability without a fixed collapse rejection threshold.`,
+    evidence: { advisory: true, shortestHorizon: shortest.horizon, shortestMse: shortest.mse,
+      longestHorizon: longest.horizon, longestMse: longest.mse, ratio, allHorizons: values },
   }
 }

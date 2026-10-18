@@ -15,6 +15,12 @@ This document records the deployment boundary for moving that flow into queue-ba
 - Artifact references are passed back as local paths and recorded by OpenCode as `file://` URIs.
 - Blind-test scoring remains behind the sidecar protocol described in `blind_test_sidecar.md`.
 
+## Cross-validation Concurrency
+
+Set `NEO_CAST_CV_MAX_PARALLEL_FOLDS=4` in the worker environment to train all four folds concurrently. The runner preserves this setting. Direct `cv_train.py --max-parallel-folds N` takes precedence over the environment; without either setting, concurrency defaults to 1 on CUDA and 4 on CPU. Values must be positive integers.
+
+Each fold uses an independent training process, split overrides, scaler and artifact directory. JSONL output carries `cv_fold_index`, and metrics are aggregated in fold order. The standard fit starts after all folds complete. The `cv_parallelism` event records the selected concurrency.
+
 ## Future Worker Mode
 
 The production worker should consume a prepared OpenCode research job and run the same Neo-Cast commands. The command contract should remain compatible with the current `DomainRunPlan` fields:

@@ -3,11 +3,32 @@ import { reflectionExecutionEvidence } from "./runner-evidence"
 import z from "zod"
 import { isDeepStrictEqual } from "node:util"
 import type { ResearchMemory } from "./schema"
+import { experienceRepresentation } from "./experience-representation"
+import { EXPERIENCE_QUERY_INTENTS } from "./experience-query"
+import { ExperienceEvolutionSchema, compactExperienceOrganization, organizeExperienceThread, type ExperienceOrganization } from "./experience-evolution"
 
 const text = z.string().trim().min(1).max(4000)
 const json = z.record(z.string(), z.unknown())
 export const ExperienceLevel = z.enum(["experiment_fact", "conditional_experience", "validated_principle"])
 export const ExperiencePolarity = z.enum(["positive", "negative", "mixed", "inconclusive"])
+export const DirectExperienceRequestSchema = z.object({
+  status: z.literal("experience_request"),
+  request: z.object({
+    experienceID: z.string().optional(),
+    threadID: z.string().optional(),
+    includeArchived: z.boolean().optional(),
+    includeOriginal: z.boolean().optional(),
+    includeHistory: z.boolean().optional(),
+    scope: z.enum(["shared", "project", "task"]).optional(),
+    level: ExperienceLevel.optional(),
+    polarity: ExperiencePolarity.optional(),
+    query: z.string().optional(),
+    includeBackground: z.boolean().optional(),
+    intent: z.enum(EXPERIENCE_QUERY_INTENTS).optional(),
+    limit: z.number().int().min(1).max(20).optional(),
+    includeFacts: z.boolean().optional(),
+  }).strict(),
+}).strict()
 export const ExperienceEvidenceReference = z
   .object({
     runID: text,
@@ -32,6 +53,7 @@ export const ExperienceDraftSchema = z
     validationPlan: text.optional(),
     evidence: z.array(ExperienceEvidenceReference).min(1).max(20),
     derivedFrom: z.array(text).max(20).optional(),
+    evolution: ExperienceEvolutionSchema.optional(),
   })
   .strict()
   .superRefine((draft, ctx) => {
@@ -74,6 +96,7 @@ export const ExperimentFactSchema = z
     primaryValue: z.number().finite().optional(),
     direction: z.enum(["minimize", "maximize"]),
     error: z.string().optional(),
+    runtimeContext: json.optional(),
     artifactIDs: z.array(z.string()),
     timeFinished: z.number().optional(),
   })
@@ -111,6 +134,7 @@ export function completeQualityFact(fact: ExperimentFact) {
 
 export function validateExperienceEvidence(draft: ExperienceDraft, facts: ExperimentFact[]) {
   const byID = new Map(facts.map((fact) => [fact.runID, fact]))
+  if (byID.size !== facts.length) throw new Error("Experiment facts must have unique run IDs; duplicate evidence cannot count as replication")
   const supports = draft.evidence.filter((ref) => ref.relation === "supports")
   if (!supports.length)
     throw new Error("Experience requires at least one supporting run; negative results can support a negative claim")
@@ -180,9 +204,22 @@ export function experiencePromptRecord(memory: ResearchMemory) {
       lesson: memory.lesson,
       limitation: "Legacy summary without structured evidence; inspect the source runs before reuse.",
     }
+  const original = memory.candidateSummary.experienceOriginal as unknown as ResearchExperience | undefined
   return {
     id: memory.id,
+    canonicalExperienceID: (memory.candidateSummary.experienceOrganization as unknown as ExperienceOrganization | undefined)?.threadID ?? memory.id,
+    sourceEntryID: memory.id,
     sourceTaskID: memory.taskID,
+    source: memory.candidateSummary.experienceSource,
+    retrievalMatch: memory.candidateSummary.experienceRetrieval,
+    curation: memory.candidateSummary.experienceCuration,
+    ...(memory.candidateSummary.experienceHistory ? { history: memory.candidateSummary.experienceHistory,
+      historyNotice: "Historical versions are audit records and may contain withdrawn interpretations. Use the current curated organization for guidance; source run references remain traceable." } : {}),
+    ...(original ? { originalForAuditOnly: { draft: original.draft, unverifiedInterpretation: original.unverifiedInterpretation,
+      notice: "Archived source prose only. Use the curated interpretation; factual snapshots are unchanged." } } : {}),
+    organization: (memory.candidateSummary.experienceOrganization as unknown as ExperienceOrganization | undefined) ??
+      organizeExperienceThread({ id: memory.id, domainID: memory.domainID, time: memory.time, experience },
+        [{ id: memory.id, domainID: memory.domainID, time: memory.time, experience }]),
     ...projectExperience(experience),
   }
 }
@@ -190,8 +227,19 @@ export function experiencePromptRecord(memory: ResearchMemory) {
 /** Keep the conditional lesson and run IDs; detailed factual snapshots are opt-in. */
 export function experienceSummaryForPrompt(memory: ResearchMemory) {
   const value = experiencePromptRecord(memory)
-  const { facts, ...summary } = value as Record<string, unknown>
-  return { ...summary, sourceRuns: Array.isArray(facts) ? facts.map((fact) => ({
+  const { facts, representation, organization, ...summary } = value as Record<string, unknown>
+  const view = representation as ReturnType<typeof experienceRepresentation> | undefined
+  const { interpretation, ...observedView } = view ?? {}
+  return { ...summary,
+    history: memory.candidateSummary.experienceHistory,
+    curation: "curation" in value ? value.curation : undefined,
+    originalForAuditOnly: "originalForAuditOnly" in value ? value.originalForAuditOnly : undefined,
+    ...(organization ? { organization: compactExperienceOrganization(organization as ExperienceOrganization) } : {}), ...(view ? { representation: { ...observedView,
+    configurations: view.configurations.map(config => ({ runID: config.runID, status: config.status,
+      backbone: config.actual?.backbone, embedding: config.actual?.embedding, fusion: config.actual?.fusion,
+      preprocessing: config.actual?.preprocessing, representation: config.actual?.representation })),
+    scope: view.scope.map(({ taskFingerprint, ...scope }) => scope),
+  } } : {}), sourceRuns: Array.isArray(facts) ? facts.map((fact) => ({
     runID: fact.runID, taskID: fact.taskID, stage: fact.stage, status: fact.status,
     primaryMetric: fact.primaryMetric, primaryValue: fact.primaryValue, direction: fact.direction,
     executionVerified: fact.executionVerified, independentEvidence: fact.independentEvidence,
@@ -213,9 +261,13 @@ export function experienceFactForPrompt(fact: ExperimentFact) {
 }
 
 export function projectExperience(experience: ResearchExperience) {
+  const representation = experienceRepresentation(experience)
   return {
-    ...experience.draft,
-    interpretationStatus: "Only recorded interventions and metric contrasts are factual; mechanism explanations and transferability remain hypotheses.",
+    level: experience.draft.level, polarity: experience.draft.polarity, claimType: experience.draft.claimType,
+    evidence: experience.draft.evidence, derivedFrom: experience.draft.derivedFrom,
+    statement: representation.summary,
+    representation,
+    interpretationStatus: "Model-authored claims, conditions, diagnoses and plans are unverified interpretations. Inspect representation for factual scope and changes.",
     supportDatasetCount: experience.supportDatasetCount,
     facts: experience.facts.map(experienceFactForPrompt).map((fact) => ({
       attribution: assessAttribution(fact, experience.facts.find((x) => x.runID === (fact.hypothesisSnapshot?.experimentContract as { comparisonRunID?: string } | undefined)?.comparisonRunID)),

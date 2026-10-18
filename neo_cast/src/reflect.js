@@ -55,7 +55,7 @@ function formatTaskContext(taskContext = {}) {
   const targetColumns = Array.isArray(taskContext.target_columns) ? taskContext.target_columns : taskContext.feature_columns;
   const pastCovariates = Array.isArray(taskContext.observed_past_covariates) ? taskContext.observed_past_covariates : [];
   const featureColumns = Array.isArray(targetColumns)
-    ? [...new Set([...targetColumns, ...pastCovariates, ...futureCovariates])]
+    ? [...new Set([...targetColumns, ...pastCovariates])]
     : ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"];
   const inputLen = taskContext.input_len || 512;
   const horizons = Array.isArray(taskContext.horizons) ? taskContext.horizons : [96, 192, 336, 720];
@@ -132,7 +132,7 @@ ${formatTaskContext(taskContext)}
 - { "type": "transformer", "d_model": 32|64|128, "n_heads": 1|2|4|8, "n_layers": 1|2|3, "dropout": 0.0|0.1, "ffn_mult": 2.0|4.0 }
 - { "type": "rnn", "cell": "gru"|"lstm", "hidden_dim": 32|64|128, "num_layers": 1|2, "dropout": 0.0|0.1 }
 - { "type": "dlinear", "kernel_size": 25, "bias": true } [requires embedding none]
-- { "type": "tcn", "hidden_dim": 16|32|64, "n_layers": 1|2|3, "kernel_size": 3|5, "activation": "gelu", "dropout": 0.0|0.1 } [requires embedding none]
+- { "type": "tcn", "hidden_dim": 16|32|64, "n_layers": 1|2|3, "kernel_size": 3|5, "activation": "gelu", "dropout": 0.0|0.1 } [supports none, patch, multiscale_patch]
 - { "type": "nbeats", "hidden_dim": 64|128|256, "n_blocks": 2|3|4, "n_layers": 2|3, "activation": "gelu", "dropout": 0.0|0.1 } [requires embedding none]
 - { "type": "timesnet_lite", "hidden_dim": 8|16|32, "n_layers": 1|2, "top_k": 1|2, "kernel_size": 3|5, "dropout": 0.0|0.1 } [requires embedding none]
 - { "type": "gated_depthwise_conv", "hidden_dim": 16|32|64, "depth": 1|2|3, "dropout": 0.0|0.1 }
@@ -168,8 +168,10 @@ schema_version: "model_recipe.v2"
 model_name, hypothesis, input, architecture, training, constraints
 architecture contains preprocessing, embedding, backbone (typed object), fusion, prediction_head, representation and composition.
 For the exact v3 module contract and available actions follow the current model-design schema; never emit the old flat architecture fields.
-Sequence encoders diagonal_ssm, timesblock_encoder and mamba use embedding none, explicit sequence_latent/channel_sequence layout, mean/last readout, latent_dim.
-Legacy encoders use channel_latent, readout none. Mamba backend must be torch_reference; TimesBlock is not native TimesNet. No cross-H sharing.
+Raw diagonal_ssm, timesblock_encoder and mamba use embedding none and mean/last. Mamba/Diagonal SSM additionally support single-scale Patch with channel_sequence/flatten and temporal/independent fusion.
+Patch semantics: unfold without tail padding; N=floor((L-patch_len)/stride)+1. Patch/multiscale_patch + MLP/Transformer/TCN: encoder tokens -> LayerNorm over feature width -> transpose D/N -> flatten D*N -> Linear to latent -> unchanged prediction head. MLP uses encoded hidden_dim; TCN uses convolution hidden_dim; Transformer uses d_model. Scales concatenate in recipe order. TCN convolves across scale boundaries, which are not an equally spaced time axis, and GroupNorm does not guarantee strict token causality. Single-scale Patch+Mamba/Diagonal SSM requires channel_sequence/readout=flatten, temporal/independent fusion and matching embedding/backbone d_model. Channels encode independently with shared parameters. TimesBlock accepts raw input only. Raw paths retain their structure/weights and mean/last readouts. history_time_gate requires identical embeddings/token grids. Recompute parameter/activation budgets and retrain Patch configurations; old mean-readout results do not validate the new flatten readout.
+
+Legacy encoders use channel_latent, readout none. Mamba backend auto records official CUDA selective scan or explicit reference fallback; torch_reference remains explicit and cuda_optimized is strict (d_state<=256). Inspect actual backend and stopping reasons before comparing runtime; TimesBlock is not native TimesNet. No cross-H sharing.
 
 The hypothesis field MUST follow this format, max 1200 chars:
 "Previous [backbone+embedding]: [observed metric pattern]. Diagnosis: [root cause]. Proposed change: [what changed] because [why this addresses the bottleneck]."

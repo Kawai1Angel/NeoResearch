@@ -2,6 +2,9 @@
 
 核对日期：2026-10-15。面向操作 NeoResearch 的执行 agent，适用于当前仓库的源码版本。数据集位于研究项目根目录的 `dataset/`，用户预先准备的两阶段回复位于 `response/1/` 和 `response/2/`。标准实验和 NeoResearch-zero 消融实验全程使用 DeepSeek API，请求模型名固定为 `deepseek-v4-flash`。
 
+
+**新增实验：** 当前 `response/1/` 和 `response/2/` 已切换为 [zero 广架构与知识经验验证 100 轮实验](实验方案_zero_广架构与知识经验验证_100轮.md)：变体仍为 `zero`，明确扩大架构、知识卡片与共享经验验证范围，搜索预算和搜索连续无提升轮数均为 100；单模型训练 patience 保持原 zero 设置。下文创建示例中的 25/7 为基础协议示例，执行新实验时以新协议、当前回复及 Intent 实际回读的 100/100 为准，监控间隔为 5 分钟。历史 25 轮结果保持独立，不覆盖或续接。
+
 ## 1. 任务与执行约定
 
 你的任务是启动 NeoResearch，为指定数据集建立一个研究任务，在 Intent 阶段依次提交对应的 `response/1/<数据集名>.txt` 和 `response/2/<数据集名>.txt`，确认两次修改已落库后 approve 最新 Intent checkpoint，然后持续运行到模型、评估结果和最终报告全部生成。
@@ -26,7 +29,7 @@
 | 目标列、时间列 | 从用户要求与 CSV 表头确认 | `OT`、`date` |
 | context / horizon | 输入窗口 / 预测长度，以文件修改后的值为准 | ETTh1 context 96；NP/PJM context 168、horizon 24 |
 | 切分、主指标 | 用户最终确认的评估协议 | ETTh1 时间顺序 `6:2:2`；主指标沿用已确认值 |
-| 搜索轮数 | NAS 迭代上限，以第二阶段文本为准 | 当前四组第二阶段回复均指定 `25` 轮 |
+| 搜索轮数 | NAS 迭代上限，以第二阶段文本为准 | 基础示例为 `25` 轮；当前回复已按新增协议设置为 `100` 轮 |
 | 两阶段内容 | 用户已准备的回复与修改 | 读取两个同名 txt 的完整内容 |
 | 研究变体 | `standard` 或 `zero`，创建时显式设置 | zero 消融设为 `zero` |
 | 模型与运行环境 | 全阶段固定 API 模型、实际 Neo-Cast runtime | `deepseek/deepseek-v4-flash` |
@@ -57,10 +60,10 @@ test -s "$RESPONSE_2"
 
 | 数据集 | 第一阶段回复 | 第二阶段修改 | 第二阶段明确设置 |
 |---|---|---|---|
-| `dataset/ETTh1.csv` | `response/1/ETTh1.txt` | `response/2/ETTh1.txt` | context 96、时间顺序切分 6:2:2、25 轮 |
-| `dataset/NP.csv` | `response/1/NP.txt` | `response/2/NP.txt` | context 168、horizon 24、25 轮 |
-| `dataset/PJM.csv` | `response/1/PJM.txt` | `response/2/PJM.txt` | context 168、horizon 24、25 轮 |
-| `dataset/mopex.csv` | `response/1/mopex.txt` | `response/2/mopex.txt` | context 96、25 轮 |
+| `dataset/ETTh1.csv` | `response/1/ETTh1.txt` | `response/2/ETTh1.txt` | context 96、时间顺序切分 6:2:2、100 轮、搜索 patience 100 |
+| `dataset/NP.csv` | `response/1/NP.txt` | `response/2/NP.txt` | context 168、horizon 24、100 轮、搜索 patience 100 |
+| `dataset/PJM.csv` | `response/1/PJM.txt` | `response/2/PJM.txt` | context 168、horizon 24、100 轮、搜索 patience 100 |
+| `dataset/mopex.csv` | `response/1/mopex.txt` | `response/2/mopex.txt` | context 96、100 轮、搜索 patience 100 |
 
 `mopex` 使用三处同名文件匹配。文件缺失或为空时，记录明确阻塞并补齐对应文件，不能借用另一个数据集的回复。
 
@@ -176,7 +179,7 @@ export NEO_CAST_CV_MAX_PARALLEL_FOLDS=4
 
 `{env:DEEPSEEK_API_KEY}` 是配置引用，不是密钥明文。启动后核对 provider 注册表中存在精确的 `deepseek/deepseek-v4-flash`；若本地目录未收录该模型，按实际 API 能力补充 `provider.deepseek.models` 注册，不能用另一个模型名顶替。TUI 切换模型只影响默认选择，已有任务可能仍绑定旧 `metadata.sessionModel`，必须回读核对。本手册创建的新实验任务在第 4.2 节显式绑定模型；混用过模型的历史任务不能作为本次“全程同模型”的实验结果。
 
-本次实验并发设为 `budget.maxParallel=1`，四折 CV 并发为 `4`，四个数据集依次运行。更新预算时提交完整原预算，只修改目标字段，保留 25 轮及其他约束。用户要求暂停时，配置修改完成后保持暂停，等待续跑指令。
+本次实验并发设为 `budget.maxParallel=1`，四折 CV 并发为 `4`，四个数据集依次运行。更新预算时提交完整原预算，只修改目标字段，保留最终确认的搜索上限及其他约束（当前新增实验为 100 轮）。用户要求暂停时，配置修改完成后保持暂停，等待续跑指令。
 
 ### 3.2 文献策略与证据读取
 
@@ -184,7 +187,7 @@ export NEO_CAST_CV_MAX_PARALLEL_FOLDS=4
 
 审核保留格式及上下文校验合格的逐条结果，包括合格的否决意见，仅重试失败或缺失条目。单条审核发送该条相关卡片的完整证据与反证；其他无关卡片不重复拼接。同模型配置下也不能跨不匹配的证据版本复用审核收据。
 
-缺省 `NEO_RESEARCH_LITERATURE_PAPER_MODE=extract_missing` 保留原来的补充提取流程；本次任务采用 `reuse_only`，四个数据集仍保持 25 轮搜索上限。配置修改不等于续跑，已暂停任务应保留暂停状态，等待用户明确恢复。
+缺省 `NEO_RESEARCH_LITERATURE_PAPER_MODE=extract_missing` 保留原来的补充提取流程；本次任务采用 `reuse_only`，四个数据集的搜索上限以当前第二轮回复为准（新增实验为 100 轮）。配置修改不等于续跑，已暂停任务应保留暂停状态，等待用户明确恢复。
 
 规划与模型设计默认接收已审核并准入的架构结论、适用条件及 AND/OR 关系、限制、可实现建模类别与迁移边界，以及卡片 ID、版本和可引用角色。完整卡片、原文引用、作者实验和审核历史保存在已有证据 artifact 中，不在每轮默认重复发送。需要核对具体原文时，使用 `read_task_evidence` 指定 `cardID`、`cardRevision` 和 `section=knowledge|sources|review`，可用 `sourceIDs` 选择来源；每次默认读取 4000 字符、最多 12000 字符，按 `nextOffset` 翻页。这只读已有证据，不启动新论文读取或建库。摘要超过 120000 字符会在调用模型前报错，不能静默删掉条件或放宽引用准入。
 
@@ -233,7 +236,7 @@ bun run dev "$PROJECT_ROOT" --model deepseek/deepseek-v4-flash --hostname 127.0.
 
 在交互模式弹窗选择 **苏格拉底 / Socratic**。该模式适合前期澄清、后续自主执行；Companion 会额外产生多个人工 checkpoint。
 
-初始 context、horizon 和切分仅为本示例的初始值，最终以两份回复处理后的 taskSpec 为准。当前 TUI 的 CSV 文本解析器直接解析 `target/context/horizon/runs/time` 等字段，但不直接解析迭代数。**第二阶段文本中的搜索轮数必须由 IntentAgent 写入 `budget.loop.maxIterations`；当前四份第二阶段文件均要求 25 轮。** 不要使用 `runs=25` 表示 25 轮。
+初始 context、horizon 和切分仅为本示例的初始值，最终以两份回复处理后的 taskSpec 为准。当前 TUI 的 CSV 文本解析器直接解析 `target/context/horizon/runs/time` 等字段，但不直接解析迭代数。**第二阶段文本中的搜索轮数必须由 IntentAgent 写入 `budget.loop.maxIterations`；当前四份第二阶段文件均要求 100 轮，并将搜索连续无提升轮数设为 100。** 不要使用 `runs=25` 表示 25 轮。
 
 创建成功后获取完整 taskID、rootSessionID 和实际 dataset path，立即写入执行状态文件。可用第 7 节的小工具列出任务，结合标题、时间、数据集路径和 TUI 选中项匹配；不能直接取历史任务列表第一条而不核对。
 
@@ -243,7 +246,7 @@ zero 的唯一变体开关是 `taskSpec.metadata.researchVariant="zero"`，默�
 
 在 TUI 自然语言消息中写“zero”不等于设置开关；`--mode zero` 也无效。CLI 支持 `research create --research-variant zero` 和 `research vibe --research-variant zero`，但本手册需要保留两次 Intent 回复，采用下面的 API 创建流程，避免直接进入自动搜索。
 
-为保证消融条件一致，推荐标准组也使用此流程，仅将第 2 节的 `RESEARCH_VARIANT` 设为 `standard`，并使用独立 `CONTROL_DIR`。同一数据集两组的初始 taskSpec、两份回复、最终切分/窗口/指标、25 轮预算、训练配置及随机种子、文献卡库快照、`reuse_only` 策略、API 模型和并发设置均保持一致。两组任务各自运行并产出模型，不共享候选或运行结果；分别报告实际训练次数与 API 用量，25 轮上限不表示两组计算量完全相等。
+为保证消融条件一致，推荐标准组也使用此流程，仅将第 2 节的 `RESEARCH_VARIANT` 设为 `standard`，并使用独立 `CONTROL_DIR`。基础 25 轮对照实验中，同一数据集两组的初始 taskSpec、两份回复、最终切分/窗口/指标、25 轮预算、训练配置及随机种子、文献卡库快照、`reuse_only` 策略、API 模型和并发设置均保持一致。两组任务各自运行并产出模型，不共享候选或运行结果；分别报告实际训练次数与 API 用量，25 轮上限不表示两组计算量完全相等。
 
 以下在另一个已设置第 2 节变量的控制终端执行，连接第 3 节启动的同一个服务。`TARGET_COLS` 按本次 CSV 与第一阶段回复核对；示例初始值与第 4.1 节一致，之后仍必须独立处理两份回复：
 
@@ -366,6 +369,7 @@ POST /research/tasks/<taskID>/intent/modify
 | `horizon` | `prediction_horizon` | `taskSpec.predictionLengths` |
 | 时间顺序比例切分 | `data_split_method=ratio`、`data_split_ratios` | `taskSpec.dataset.split` |
 | 实验搜索预算 N 轮 | `max_iterations` | `budget.loop.maxIterations=N` |
+| 研究搜索连续无提升 N 轮（搜索 patience） | `max_no_improve` | `budget.loop.maxNoImprove=N`，与单模型训练 patience 独立 |
 
 切分比例可能被归一化，`6:2:2` 与 `[0.6,0.2,0.2]` 等价。第二份文件没提到的 horizon、切分等字段保留已有设置，不擅自从另一个数据集的文件补充。
 
@@ -385,7 +389,7 @@ POST /research/tasks/<taskID>/intent/modify
 - `task.mode=autonomous`，交互模式是 `socratic`。
 - 变体与本组一致，`metadata.sessionModel={"providerID":"deepseek","modelID":"deepseek-v4-flash"}`；通用与文献接口也使用该模型和 DeepSeek API。
 - zero 任务没有 reference baseline 元数据、预置候选或 baseline 运行，后续按第 4.2 节检查首轮自主设计。
-- context、horizon、切分和搜索预算符合对应 `response/2/` 文件；当前四组文件均要求 `budget.loop.maxIterations=25`，ETTh1 还需核对 context 96、切分 6:2:2。
+- context、horizon、切分和搜索预算符合对应 `response/2/` 文件；当前四组文件均要求 `budget.loop.maxIterations=100`、`budget.loop.maxNoImprove=100`，ETTh1 还需核对 context 96、切分 6:2:2。
 - 缺失必填 slot 已清空，最新 checkpoint 摘要与最新 taskSpec 一致，待批准的是第二阶段处理后的有效 approval。
 
 确认当前 pending approval 的 reason 是 `[checkpoint:intent_confirmed]`，再在 TUI 输入：
@@ -632,7 +636,7 @@ while 尚未满足全部完成标准:
 - `search_space_confirmed`、`final_model_selection`、`report_release`：仅在数据、预算和结果符合既定要求时 approve。本手册的发布范围是本地报告和模型包。
 - `reflection_review`：先分析建议和证据；可自行解决的实现问题先修复验证，再批准继续。
 - 执行契约异常：先核实 candidate、代码、源摘要和模型一致性；实现错误修复后再 approve，设计本身不合法时 reject 并交给原流程重新设计。
-- `experiment_budget_extended`：以 `response/2/` 最终确认的迭代上限为准（当前四组均为 25 轮），**reject 扩展，接受当前结果继续后续阶段**；approve 会增加 5 轮。
+- `experiment_budget_extended`：以 `response/2/` 最终确认的迭代上限为准（当前四组均为 100 轮，搜索连续无提升阈值也为 100），**reject 扩展，接受当前结果继续后续阶段**；approve 会增加 5 轮。
 - 普通 `budget` 用尽：先判断失败/重复运行消耗原因，不自动增加轮数、运行次数或新建 cycle。
 
 示例操作，执行前必须已核对 reason：

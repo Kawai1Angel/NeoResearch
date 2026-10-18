@@ -22,13 +22,22 @@ def training_identity(candidate: dict, *, protocol: dict | None = None):
     if recipe.get("fusion", {}).get("topology_artifact"):
         # canonical identity hashes the external adjacency bytes as well.
         input_spec["topology_sha256"] = file_digest(recipe["fusion"]["topology_artifact"])
+    optional_backends = []
+    branches = [recipe, recipe.get("composition", {}).get("secondary", {})]
+    for branch in branches:
+        backbone = branch.get("backbone", {})
+        if backbone.get("type") == "mamba" and backbone.get("backend") in {"auto", "cuda_optimized"}:
+            from factory.encoders.mamba_scan import select_backend, extension_fingerprint
+            selected, reason = select_backend(backbone["backend"], torch.device("cuda" if torch.cuda.is_available() else "cpu"), backbone["d_state"])
+            optional_backends.append({"requested": backbone["backend"], "selected": selected, "fallbackReason": reason,
+                                      "extension": extension_fingerprint() if selected == "cuda_optimized" else None})
     return recipe_identity(recipe, input_spec=input_spec, experiment={
         "data_digest": {"train": file_digest(data.TRAIN_DATA_PATH), "visible": file_digest(data.VISIBLE_DATA_PATH)},
         "split_protocol": {"preprocess": data.build_preprocess_spec(), "protocol": protocol,
                            "overrides": {k: v for k, v in os.environ.items() if k.startswith("NEO_CAST_") and ("ROWS" in k or "FOLD" in k)}},
         "backend": {"device": "cuda" if torch.cuda.is_available() else "cpu", "torch": str(torch.__version__),
                     "cuda": torch.version.cuda, "device_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-                    "threads": torch.get_num_threads()},
+                    "threads": torch.get_num_threads(), **({"mamba_scans": optional_backends} if optional_backends else {})},
         "precision": "float32", "runtime_digest": runtime,
         "resolved_training": candidate["train_config"], "resolved_constraints": candidate["constraints"],
     })
@@ -52,6 +61,15 @@ def verify_cached_contract(candidate, kwargs, result):
         model.load_state_dict(state)
         models.append(model)
     manifests, mismatches = verify_models(contract, models, kwargs.get("candidate_path") or os.environ.get("NEO_CAST_CONTRACT_CANDIDATE"), candidate)
+    for manifest, horizon in zip(manifests, checkpoint["state_dicts"]):
+        actual = manifest.get("actual", {})
+        if actual.get("backbone") == "mamba":
+            # This validates loaded weights on CPU; it does not rerun training
+            # on the CPU fallback. Keep the source training backend visible.
+            actual["cache_verification_device"] = "cpu"
+            source = checkpoint.get("model_manifests", {}).get(horizon, {})
+            actual["source_training_backend"] = source.get("backend")
+            actual["source_training_backend_provenance"] = source.get("backend_provenance")
     if mismatches:
         raise ValueError(f"Cached contract mismatch: {mismatches}")
     return [*manifests, {"event": "execution_contract_verified", "status": "verified", "candidate_id": contract["candidate_id"],

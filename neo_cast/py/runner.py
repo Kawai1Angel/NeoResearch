@@ -606,8 +606,6 @@ def run_experiment(state: RunnerState, *, description: str, skip_smoke: bool) ->
         str(ARTIFACTS_DIR),
         "--num-folds",
         "4",
-        "--max-parallel-folds",
-        "1",
     ]
     train_exit, train_records = _run_and_capture(train_cmd)
     if any(record.get("event") in {"experiment_reused", "experiment_duplicate_running"} and "cv_fold_index" not in record for record in train_records):

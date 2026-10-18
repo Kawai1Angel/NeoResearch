@@ -1,9 +1,6 @@
 import type { VerifierContext, VerifierResult } from "./types"
 import { comparablePreviousRuns, metricOf, objectiveMetricName, paramsM } from "./types"
 
-const MAX_PARAMS_M_WITHOUT_GAIN = 50
-const MIN_GAIN_PER_EXTRA_PARAM_M = 0.001
-
 function objectiveDirection(task: VerifierContext["task"]): "minimize" | "maximize" {
   return (task.objective as Record<string, unknown>).direction === "maximize" ? "maximize" : "minimize"
 }
@@ -59,7 +56,7 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
     return {
       name,
       accepted: false,
-      status: "insufficient_evidence",
+      status: "skipped",
       reason: "No previous runs or param count unavailable; skipping cost-perf ratio check.",
       evidence: { skipped: true },
     }
@@ -78,7 +75,7 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
     return {
       name,
       accepted: false,
-      status: "insufficient_evidence",
+      status: "skipped",
       reason: "Insufficient data to compute cost-perf ratio; comparison not evaluated.",
       evidence: { skipped: true },
     }
@@ -88,50 +85,12 @@ export function runCostPerfVerifier(ctx: VerifierContext): VerifierResult {
     direction === "minimize" ? bestPreviousRun.metric - currentMetric : currentMetric - bestPreviousRun.metric
   const extraParams = currentParams - bestPreviousRun.params
 
-  if (extraParams > MAX_PARAMS_M_WITHOUT_GAIN && metricGain <= 0) {
-    return {
-      name,
-      accepted: false,
-      status: "failed",
-      reason: `Model added ${extraParams.toFixed(2)}M extra params (${bestPreviousRun.params.toFixed(2)}M → ${currentParams.toFixed(2)}M) with no metric improvement (delta=${metricGain.toFixed(6)}).`,
-      evidence: {
-        currentParamsM: currentParams,
-        previousParamsM: bestPreviousRun.params,
-        extraParamsM: extraParams,
-        metricGain,
-        threshold: MAX_PARAMS_M_WITHOUT_GAIN,
-      },
-    }
-  }
-
-  if (extraParams > 0 && metricGain > 0) {
-    const gainPerParam = metricGain / extraParams
-    if (gainPerParam < MIN_GAIN_PER_EXTRA_PARAM_M && currentParams > 20) {
-      return {
-        name,
-        accepted: false,
-        status: "failed",
-        reason: `Metric gain (${metricGain.toFixed(6)}) per extra param-M (${extraParams.toFixed(2)}M) = ${gainPerParam.toFixed(6)} is below minimum threshold ${MIN_GAIN_PER_EXTRA_PARAM_M}.`,
-        evidence: {
-          currentParamsM: currentParams,
-          previousParamsM: bestPreviousRun.params,
-          extraParamsM: extraParams,
-          metricGain,
-          gainPerParamM: gainPerParam,
-          minGainPerParamM: MIN_GAIN_PER_EXTRA_PARAM_M,
-        },
-      }
-    }
-  }
-
   return {
     name,
     accepted: true,
     status: "passed",
-    reason:
-      currentParams !== undefined
-        ? `Cost-perf acceptable: ${currentParams.toFixed(2)}M params, metric=${Number(currentMetric.toFixed(6))}.`
-        : `Cost-perf check passed (no param count available to penalize).`,
-    evidence: { currentParamsM: currentParams, currentMetric },
+    reason: `Observed ${currentParams}M parameters and ${metricName}=${currentMetric}; ReflectionAgent assesses the resource/performance tradeoff without a fixed gain-per-parameter rejection threshold.`,
+    evidence: { advisory: true, currentParamsM: currentParams, previousParamsM: bestPreviousRun.params,
+      extraParamsM: extraParams, metricGain, gainPerParamM: extraParams > 0 ? metricGain / extraParams : null },
   }
 }

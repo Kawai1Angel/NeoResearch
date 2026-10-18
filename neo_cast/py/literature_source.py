@@ -1375,11 +1375,14 @@ def verify_against_official(
         override = config.get("official_paper_overrides", {}).get(paper["title"])
         if override and paper["official_proceedings"] is None:
             evidence = {
+                "source_id": override["source_id"],
                 "record_id": override.get("record_id", title_key(paper["title"])),
                 "authority": override.get("authority", "official_proceedings"),
+                "title": override.get("title", paper["title"]),
+                "landing_url": override["landing_url"],
+                "pdf_url": override.get("pdf_url"),
                 "track": override.get("track", "Main proceedings"),
                 "snapshot_sha256": override.get("snapshot_sha256"),
-                **override,
                 "title_similarity": 1.0,
             }
             paper["publication_verification"] = evidence["authority"]

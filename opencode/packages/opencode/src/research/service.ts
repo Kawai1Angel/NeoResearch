@@ -1,13 +1,15 @@
 import { finalMetrics, finalEvaluationRecords } from "./runner-evidence"
 import { copyModelExportRuntime } from "./model-export-runtime"
 import { ExperimentConstraints, conflictingMechanismRequirements } from "./experiment-constraints"
-import { DesignUnavailable, DesignHistoryRequest, designTaskSpec, schemaRemovalUnavailable, frequencyModeUnavailable, mechanismRequirementsUnavailable, formatDesignValidationIssue } from "./design-feedback"
+import { DesignUnavailable, DesignHistoryRequest, designTaskSpec, schemaRemovalUnavailable, frequencyModeUnavailable, mechanismRequirementsUnavailable, experimentContractUnavailable, designConstraintFeedback, formatDesignValidationIssue } from "./design-feedback"
 import { comparisonRecipe } from "./comparison-run"
 import { readDesignHistory } from "./design-history"
 import { KnowledgeValidationDraftSchema } from "./literature/knowledge-confidence"
 import { confirmKnowledgeExperiment, readReflectionKnowledge, reflectionKnowledgeForPrompt } from "./literature/knowledge-feedback"
-import { ExperienceDraftSchema, experienceFromMemory, experienceSummaryForPrompt } from "./experience"
-import { captureExperienceContext, readExperiences, writeExperience } from "./experience-store"
+import { DirectExperienceRequestSchema, ExperienceDraftSchema, experienceFactForPrompt, experienceFromMemory, experienceSummaryForPrompt } from "./experience"
+import { captureExperienceContext, readExperiences, taskMemories, writeExperience } from "./experience-store"
+import { parseExperienceQuery } from "./experience-query"
+import { EXPERIENCE_SEARCH_METHOD } from "./experience-search"
 import { citableTaskEvidence } from "./retrieve/evidence-handoff"
 import { projectPlanningTaskEvidence, readTaskEvidencePage, DirectEvidenceRequestSchema } from "./retrieve/planning-evidence"
 import { readReflectionHistory } from "./reflection-context"
@@ -120,7 +122,7 @@ import {
 import { MODEL_CAPABILITIES, validMechanisms, unsupportedMechanisms } from "./model-capabilities"
 import { Event } from "./event"
 import { pickReferenceBaseline } from "./baseline-store"
-import { addHypothesisToPool, updateHypothesisInPool, bindTaskEvidenceToSession, loadTaskEvidenceForTask } from "./hypothesis-store"
+import { addHypothesisToPool, updateHypothesisInPool, bindTaskEvidenceToSession, loadTaskEvidenceForTask, assertHypothesisExperimentFeasible } from "./hypothesis-store"
 import {
   type DomainCandidateProposal,
   DomainRunPlan as DomainRunPlanSchema,
@@ -351,7 +353,9 @@ export const ApprovalRequiredError = NamedError.create(
   }),
 )
 
-const DesignUnavailableError = NamedError.create("ResearchDesignUnavailable", z.object({ report: DesignUnavailable }))
+const DesignUnavailableError = NamedError.create("ResearchDesignUnavailable", z.object({
+  report: DesignUnavailable, validationIssues: z.array(z.record(z.string(), z.unknown())).optional(),
+}))
 const DesignPlanningStopped = NamedError.create("ResearchDesignPlanningStopped", z.object({ reason: z.string() }))
 
 export const PipelineBlockedError = NamedError.create(
@@ -2392,7 +2396,7 @@ async function generateLLMHypotheses(
         ...(authEntry.baseURL ? { baseURL: authEntry.baseURL } : {}),
       }
     }
-    const system = buildHypoPlannerSystemPrompt(task) + "\nDirect mode: no native tool calls. To read historical facts return {status:history_request,request:{runID:...}} first; the coordinator returns the requested history. Otherwise return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms. " + (isZeroResearch(task.taskSpec) ? " NeoResearch-zero: omit referenceBaseline and referenceBaselineRationale; select an exploratory hypothesis for immediate model design on the first call." : " When baselineOptions are supplied, explicitly return referenceBaseline and referenceBaselineRationale. The selected baseline completes full evaluation before later hypothesis experiments.")
+    const system = buildHypoPlannerSystemPrompt(task) + "\nDirect mode: no native tool calls. To read historical facts return {status:history_request,request:{runID:...}} first. To query shared experience across projects return {status:experience_request,request:{scope:shared,query:...,limit:3}}; optional experienceID, level, polarity and includeFacts filters are supported. The coordinator returns requested results on demand. Otherwise return exactly one JSON object with hypotheses and nextExperiment (action=experiment with hypothesisID/rationale, or action=stop with rationale). Omit priority; include requiredMechanisms. " + (isZeroResearch(task.taskSpec) ? " NeoResearch-zero: omit referenceBaseline and referenceBaselineRationale; select an exploratory hypothesis for immediate model design on the first call." : " When baselineOptions are supplied, explicitly return referenceBaseline and referenceBaselineRationale. The selected baseline completes full evaluation before later hypothesis experiments.")
     const requestedHistory: unknown[] = []
     const requestedEvidence: unknown[] = []
     let validationFeedback: string | undefined
@@ -2405,6 +2409,19 @@ async function generateLLMHypotheses(
       let timer: ReturnType<typeof setTimeout> | undefined
       const result = await Promise.race([llmPromise, new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 120_000) })]).finally(() => clearTimeout(timer))
       if (!result) return undefined
+      const experienceRequest = DirectExperienceRequestSchema.safeParse(extractJsonObject(result.text))
+      if (experienceRequest.success) {
+        if (historyRound === 5) return undefined
+        const args = experienceRequest.data.request
+        requestedHistory.push({ experienceRequest: args, result: {
+          retrieval: { method: args.query?.trim() ? EXPERIENCE_SEARCH_METHOD : "recent",
+            queryPlan: args.query?.trim() ? parseExperienceQuery(args.query, args.intent) : undefined },
+          experiences: readExperiences(task.id, { ...args, limit: args.limit ?? 3 })
+          .map((memory) => ({ ...experienceSummaryForPrompt(memory),
+            ...(args.includeFacts ? { facts: experienceFromMemory(memory)!.facts.map(experienceFactForPrompt) } : {}),
+          })) } })
+        continue
+      }
       const evidenceRequest = DirectEvidenceRequestSchema.safeParse(extractJsonObject(result.text))
       if (evidenceRequest.success) {
         if (historyRound === 5) return undefined
@@ -2418,7 +2435,18 @@ async function generateLLMHypotheses(
         continue
       }
       const parsed = parseLLMHypothesesResult(result.text, result.usage)
-      if (parsed && (!isZeroResearch(task.taskSpec) || (!parsed.referenceBaseline && !parsed.referenceBaselineRationale && parsed.hypotheses.every((h) => h.experimentContract && h.experimentContract.mode !== "baseline")))) return parsed
+      if (parsed && (!isZeroResearch(task.taskSpec) || (!parsed.referenceBaseline && !parsed.referenceBaselineRationale && parsed.hypotheses.every((h) => h.experimentContract && h.experimentContract.mode !== "baseline")))) {
+        try {
+          const decision = parsed.nextExperiment
+          const selected = decision?.action === "experiment" ? parsed.hypotheses.find(h => h.id === decision.hypothesisID) : undefined
+          if (selected) assertHypothesisExperimentFeasible(task, selected)
+          return parsed
+        } catch (error) {
+          if (++repairAttempts > 1) return undefined
+          validationFeedback = String(error)
+          continue
+        }
+      }
       if (++repairAttempts > 1) return undefined
       validationFeedback = "Previous response was invalid. Return hypotheses with a valid predeclared experimentContract for EACH hypothesis, requiredMechanisms for its candidate arm, id and statement, plus nextExperiment selecting one of these IDs or explicitly stopping. Never require and forbid the same mechanism; a control removing decomposition must not require decomposition. Do not silently change a controlled hypothesis into exploration. Retrieve the comparison run if needed."
     }
@@ -2449,6 +2477,7 @@ interface ReflectionLLMContext {
   readonly bestMemoryLesson?: string
   readonly sourceRuns?: readonly unknown[]
   readonly experiences?: readonly unknown[]
+  readonly requestedExperiences?: readonly unknown[]
   readonly literatureKnowledge?: Awaited<ReturnType<typeof readReflectionKnowledge>>
   readonly requestedEvidence?: readonly unknown[]
   readonly evidenceArtifactID?: ResearchArtifactID
@@ -2556,6 +2585,7 @@ function buildReflectionLLMUserPrompt(analysis: ReflectionAnalysis, context: Ref
       },
       sourceRuns: context.sourceRuns ?? [],
       experiences: context.experiences ?? [],
+      ...(context.requestedExperiences?.length ? { requestedExperiences: context.requestedExperiences } : {}),
       experienceWriteSchema: z.toJSONSchema(ExperienceDraftSchema),
       knowledgeValidationSchema: z.toJSONSchema(KnowledgeValidationDraftSchema),
     })), literatureKnowledge: context.literatureKnowledge ? reflectionKnowledgeForPrompt(context.literatureKnowledge) : undefined,
@@ -2651,10 +2681,11 @@ async function generateLLMReflectionSynthesis(
   try {
     const system = buildReflectionLLMSystemPrompt()
     const requestedEvidence: unknown[] = []
+    const requestedExperiences: unknown[] = []
     let llmResult: Awaited<ReturnType<typeof requestNeoCastLLM>> | undefined
     let usage = { ...ZERO_USAGE }
     for (let round = 0; round <= 3; round++) {
-      const user = buildReflectionLLMUserPrompt(result.analysis, { ...context, requestedEvidence })
+      const user = buildReflectionLLMUserPrompt(result.analysis, { ...context, requestedEvidence, requestedExperiences })
       let timer: ReturnType<typeof setTimeout> | undefined
       llmResult = await Promise.race([
         requestNeoCastLLM(effectiveConfig, apiKey, system, user),
@@ -2665,6 +2696,17 @@ async function generateLLMReflectionSynthesis(
         outputTokens: usage.outputTokens + llmResult.usage.outputTokens,
         cacheReadTokens: usage.cacheReadTokens + llmResult.usage.cacheReadTokens,
         cacheWriteTokens: usage.cacheWriteTokens + llmResult.usage.cacheWriteTokens }
+      const experienceRequest = DirectExperienceRequestSchema.safeParse(extractJsonObject(llmResult.text))
+      if (experienceRequest.success) {
+        if (round === 3) throw new Error("Reflection exhausted the bounded source/experience-reading budget")
+        const { includeFacts, ...options } = experienceRequest.data.request
+        requestedExperiences.push({ request: experienceRequest.data.request,
+          experiences: readExperiences(task.id, { scope: "shared", ...options, limit: options.limit ?? 3 }).map(memory => ({
+            ...experienceSummaryForPrompt(memory),
+            ...(includeFacts ? { facts: experienceFromMemory(memory)!.facts.map(experienceFactForPrompt) } : {}),
+          })) })
+        continue
+      }
       const request = DirectEvidenceRequestSchema.safeParse(extractJsonObject(llmResult.text))
       if (!request.success) break
       if (round === 3) throw new Error("Reflection exhausted the bounded source-reading budget")
@@ -4678,6 +4720,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       candidateID?: ResearchCandidateID,
       stage?: string,
     ) {
+      const designCheckpoint = (yield* listApprovals({ taskID, limit: 10000 }))
+        .find(approval => approval.kind === "protocol" && approval.reason.includes("[checkpoint:model_design_repair]"))
+      if (designCheckpoint && designCheckpoint.status !== "approved") throw new PipelineBlockedError({
+        taskID, reason: designCheckpoint.status === "rejected" ? "human_checkpoint_rejected" : "human_checkpoint_required",
+        checkpointPhase: "model_design_repair",
+      })
       const blocker = yield* latestExecutionBlocker(taskID)
       if (!blocker) return undefined
       const approvals = yield* listApprovals({ taskID, limit: 10000 })
@@ -6083,6 +6131,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             validate: (candidateSpec) => DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec }),
           })
           if (unavailable) throw new DesignUnavailableError({ report: unavailable })
+          const contractConflict = experimentContractUnavailable({
+            hypothesisID: selectedHypothesis.id, contract: selectedHypothesis.experimentContract, comparison,
+            validate: candidateSpec => DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec }),
+          })
+          if (contractConflict) throw new DesignUnavailableError({ report: contractConflict })
         }
         const memory: ResearchMemory[] = []
         const champion = yield* getChampion(task.id)
@@ -6205,7 +6258,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               validationFeedback = { attempt, issues: [{ path: "hypothesisID", message: "Unavailable report must name the selected hypothesis ID." }] }
               continue
             }
-            throw new DesignUnavailableError({ report: llmResult.unavailable })
+            throw new DesignUnavailableError({ report: llmResult.unavailable, validationIssues: validationFeedback ? [...validationFeedback.issues] : [] })
           }
 
           if (!llmResult.proposal) {
@@ -6242,12 +6295,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
           const issues = [
             ...validation.issues.map((item) => ({ path: item.path, message: item.message })),
-            ...hypothesisMismatches.map((item) => ({
-              path: item.path,
-              message: "Candidate does not satisfy the selected hypothesis",
-              expected: item.expected,
-              actual: item.actual,
-            })),
+            ...hypothesisMismatches.map(designConstraintFeedback),
           ]
           validationFeedback = {
             attempt,
@@ -6746,6 +6794,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
     })
 
+    const blockModelDesign = Effect.fn("Research.blockModelDesign")(function* (taskID: ResearchTaskID, reason: string) {
+      const task = yield* getTask(taskID)
+      const payload = { status: "needs_repair", taskID, reason,
+        designFeedback: recordValue(task.taskSpec.metadata).designFeedback ?? null,
+        recovery: "Repair the experiment contract or design implementation, approve this checkpoint and resume the same task/cycle. No training iteration was charged for the unavailable design." }
+      const file = path.join(Instance.directory, ".neo-research", "sessions", taskID, "design-feedback", `blocker-${Date.now()}.json`)
+      yield* Effect.promise(async () => { await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, JSON.stringify(payload, null, 2) + "\n") })
+      const artifact = yield* createArtifact({ taskID, kind: "model_design_blocker_json", uri: `file://${file}`,
+        metadata: { status: "needs_repair", reason, checkpointPhase: "model_design_repair" } })
+      yield* ensurePendingApproval({ taskID, kind: "protocol",
+        reason: `[checkpoint:model_design_repair]\n${reason}\nBlocker artifact: ${artifact.id}\n模型设计修复未完成，搜索未正常结束；保留原任务、cycle、预算和已验证结果。修复契约或实现后 approve，再续跑原任务。` })
+      yield* updateTaskStatus({ taskID, status: "paused" })
+      recordResearchEvent(Instance.directory, "research.design.repair_blocked", { taskID, reason, blockerArtifactID: artifact.id })
+      throw new PipelineBlockedError({ taskID, reason: "human_checkpoint_required", checkpointPhase: "model_design_repair", blockerArtifactID: artifact.id })
+    })
+
     const runAutonomousIteration = logPhaseMethod("runAutonomousIteration", Effect.fn("Research.runAutonomousIteration")(function* (
       input: AutonomousIterationInput,
     ) {
@@ -6780,11 +6844,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         }
         const cause = outcome.cause!
         const error = Cause.squash(cause)
+        if (DesignPlanningStopped.isInstance(error)) return yield* blockModelDesign(input.taskID, error.data.reason)
         if (DesignUnavailableError.isInstance(error)) {
           const current = yield* getTask(input.taskID)
           const unavailable = error.data.report
           const hypothesis = (yield* listHypotheses(input.taskID)).find((h) => h.id === unavailable.hypothesisID)
-          const designFeedback = { ...unavailable, hypothesisSnapshot: JSON.parse(JSON.stringify(hypothesis ?? null)), replanAttempt: ++designReplans }
+          const designFeedback = { ...unavailable, validationIssues: JSON.parse(JSON.stringify(error.data.validationIssues ?? [])) as JsonRecord[],
+            hypothesisSnapshot: JSON.parse(JSON.stringify(hypothesis ?? null)), replanAttempt: ++designReplans }
           yield* Effect.promise(() => updateHypothesisInPool(input.taskID, unavailable.hypothesisID, { testable: false }))
           const dir = path.join(Instance.directory, ".neo-research", "sessions", input.taskID, "design-feedback")
           const file = path.join(dir, `${Date.now()}-${designReplans}.json`)
@@ -6799,10 +6865,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           recoveryArtifacts.length = 0
           feedback = undefined
           hypothesisID = undefined
-          if (designReplans > 3) throw new DesignPlanningStopped({ reason: "Three hypothesis regenerations still produced unavailable designs; no proxy experiment was submitted." })
-          const replanned = yield* runHypoPlannerAgent({ taskID: input.taskID })
+          if (designReplans > 3) return yield* blockModelDesign(input.taskID, "Three hypothesis regenerations still produced unavailable designs; no proxy experiment was submitted.")
+          const replanned = yield* runHypoPlannerAgent({ taskID: input.taskID }).pipe(Effect.catchCause(cause => {
+            const failure = Cause.squash(cause)
+            if (Cause.hasInterruptsOnly(cause) || PipelineBlockedError.isInstance(failure)) return Effect.failCause(cause)
+            return blockModelDesign(input.taskID, "HypoPlanner failed while repairing an unavailable design; inspect the saved design feedback and planner failure before resuming.")
+          }))
           if (replanned.llm.status !== "used" || replanned.plan.nextExperiment?.action !== "experiment")
-            throw new DesignPlanningStopped({ reason: "HypoPlanner could not select a feasible replacement after ModelDesigner feedback." })
+            return yield* blockModelDesign(input.taskID, "HypoPlanner could not select a feasible replacement after ModelDesigner feedback.")
           yield* updateTaskStatus({ taskID: input.taskID, status: "searching" })
           continue
         }
@@ -6974,10 +7044,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           Effect.catchCause((cause) => {
             const error = Cause.squash(cause)
             if (DesignPlanningStopped.isInstance(error)) {
-              recordResearchEvent(Instance.directory, "research.design.planning_stopped", { taskID: task.id, reason: error.data.reason })
-              return finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "planner_stopped" }).pipe(
-                Effect.map((result) => ({ status: "stopped" as const, result })),
-              )
+              return blockModelDesign(task.id, error.data.reason)
             }
             if (ApprovalRequiredError.isInstance(error)) {
               return finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: "approval_required" }).pipe(
@@ -7298,7 +7365,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               runs: runRows.map(mapRun),
               approvals: approvalRows.map(mapApproval),
               artifacts: artifactRows.map(mapArtifact),
-              memory: memoryRows.map(mapMemory),
+              memory: taskMemories(taskID, memoryRows.map(mapMemory)),
               champion: championRow ? mapChampion(championRow) : undefined,
             }
           }),
@@ -10282,7 +10349,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .orderBy(desc(ResearchMemoryTable.time_updated))
           .all(),
       )
-      return rows.map(mapMemory)
+      return taskMemories(taskID, rows.map(mapMemory))
     })
 
     const listRelatedMemory = Effect.fn("Research.listRelatedMemory")(function* (task: ResearchTask) {

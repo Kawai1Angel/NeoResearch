@@ -5,7 +5,7 @@ import path from "path"
 import { buildUserPrompt, proposeLLMCandidate, camelizeKnown, pruneCandidateSpec, buildLLMProposalFromText, ZERO_USAGE } from "../../src/research/llm-proposal"
 import type { DomainProposalContext } from "../../src/research/domain"
 import { tmpdir as testTmpdir } from "../fixture/fixture"
-import type { ResearchTask } from "../../src/research/schema"
+import type { ResearchTask, JsonRecord } from "../../src/research/schema"
 
 const previousEnv = {
   provider: process.env.NEO_CAST_LLM_PROVIDER,
@@ -495,9 +495,10 @@ test("v2 never replaces malformed preprocessing, head or incompatible embedding 
   for (const correctionDim of [null, "64", NaN, 0, -1]) {
     expect(() => pruneCandidateSpec({ ...base, predictionHead: { type: "residual_correction", correctionDim } })).toThrow()
   }
-  for (const type of ["timesnet_lite", "dlinear", "tcn", "nbeats"]) {
+  for (const type of ["timesnet_lite", "dlinear", "nbeats"]) {
     expect(() => pruneCandidateSpec({ ...base, backbone: { type } })).toThrow(`${type} requires embedding.type=none`)
   }
+  expect(() => pruneCandidateSpec({ ...base, backbone: { type: "tcn" } })).toThrow("tcn supports embedding none, patch or multiscale_patch")
 })
 
 test("removed direct head is rejected in v2 and v3 without conversion", () => {
@@ -517,6 +518,25 @@ test("proposal errors carry the actual invalid field back to ModelDesigner", () 
   })
   expect(result?.proposal).toBeUndefined()
   expect(result?.metadata.llmError).toContain("backbone.hiddenDim")
+})
+
+test("identifier length and extra planning-field feedback explain a format-only repair without changing the recipe", () => {
+  const config = { provider: "openai-compatible" as const, model: "test", maxTokens: 1000, temperature: 0 }
+  const recipe = { ...bridgeSafeLLMRecipe(), recipe_version: "recipe_schema_v3",
+    recipe_id: "recipe_tcn128x4k7_gelu_drop01_featuremlp_lvc_latent256_rescorr32_v1",
+    representation: { layout: "channel_latent", readout: "none", latent_dim: 64 }, composition: { type: "single" },
+    decision_conditions: [{ when: "a prospective observation", then: "review the scoped hypothesis" }] }
+  const result = buildLLMProposalFromText(JSON.stringify(recipe), ZERO_USAGE, config)
+  expect(result.proposal).toBeUndefined()
+  expect(result.metadata.llmError).toContain("67 characters")
+  expect(result.metadata.llmError).toContain("3–64 ASCII")
+  expect(result.metadata.llmError).toContain("decision_conditions")
+  expect(result.metadata.llmError).toContain("Allowed recipe root fields")
+  const { decision_conditions, ...withoutPlanningField } = recipe
+  const repaired = buildLLMProposalFromText(JSON.stringify({ ...withoutPlanningField, recipe_id: "recipe_tcn_rf_v1" }), ZERO_USAGE, config)
+  expect(repaired.proposal).toBeDefined()
+  expect(repaired.proposal!.candidateSpec.backbone).toEqual(camelizeKnown(recipe.backbone) as JsonRecord)
+  expect(repaired.proposal!.candidateSpec.trainingStrategy).toEqual(camelizeKnown(recipe.training_strategy) as JsonRecord)
 })
 
 test("direct transport feeds validation errors to the agent before retrying", async () => {

@@ -73,7 +73,12 @@ export const ExperimentConstraints = z
       ctx.addIssue({ code: "custom", message: "Required values for the same normalized path must agree" })
   })
 export type ExperimentConstraints = z.infer<typeof ExperimentConstraints>
-export type ConstraintIssue = { path: string; expected: unknown; actual: unknown; source: string }
+export type ConstraintIssue = {
+  path: string; expected: unknown; actual: unknown; source: string
+  rule: "required_value" | "forbidden_mechanism" | "comparison" | "change_before" | "change_after" | "implicit_freeze" | "explicit_freeze"
+  message: string
+  repairHint?: string
+}
 
 // Also normalize captured/legacy contracts used directly by validation and attribution.
 // This changes field spelling only: it does not add defaults or change scalar values.
@@ -177,18 +182,18 @@ function checkNormalizedExperimentConstraints(
   comparison?: Record<string, unknown>,
 ): ConstraintIssue[] {
   const issues: ConstraintIssue[] = []
-  const add = (path: string, expected: unknown, actual: unknown) =>
-    issues.push({ path, expected: expected ?? null, actual: actual ?? null, source: "experiment_constraints" })
+  const add = (path: string, expected: unknown, actual: unknown, rule: ConstraintIssue["rule"], message: string, repairHint?: string) =>
+    issues.push({ path, expected: expected ?? null, actual: actual ?? null, source: "experiment_constraints", rule, message, ...(repairHint ? { repairHint } : {}) })
   for (const requirement of contract.requiredValues) {
     const actual = fieldValue(spec, requirement.path)
-    if (!isDeepStrictEqual(actual, requirement.value)) add(requirement.path, requirement.value, actual)
+    if (!isDeepStrictEqual(actual, requirement.value)) add(requirement.path, requirement.value, actual, "required_value", "An explicit requiredValues entry is not satisfied.")
   }
   const mechanisms = candidateMechanisms(spec)
   for (const mechanism of contract.forbiddenMechanisms)
-    if (mechanisms.includes(mechanism as any)) add(`forbiddenMechanisms.${mechanism}`, false, true)
+    if (mechanisms.includes(mechanism as any)) add(`forbiddenMechanisms.${mechanism}`, false, true, "forbidden_mechanism", "The candidate implements an explicitly forbidden mechanism.")
   if (contract.mode !== "controlled") return issues
   if (!comparison) {
-    add("comparisonRunID", contract.comparisonRunID, "comparison unavailable")
+    add("comparisonRunID", contract.comparisonRunID, "comparison unavailable", "comparison", "A verified, comparable full run from this task is required.")
     return issues
   }
   const diffs = changedFields(recipeFields(comparison), recipeFields(spec))
@@ -197,17 +202,19 @@ function checkNormalizedExperimentConstraints(
     const before = fieldValue(comparison, change.path)
     const after = fieldValue(spec, change.path)
     const expectedBefore = change.operation === "add" ? undefined : change.before
-    if (!isDeepStrictEqual(before, expectedBefore)) add(`${change.path}.before`, expectedBefore, before)
+    if (!isDeepStrictEqual(before, expectedBefore)) add(`${change.path}.before`, expectedBefore, before, "change_before", "The declared before value does not match the comparison recipe.")
     const expected = change.operation === "remove" ? undefined : implied ? fieldValue(implied.expected, change.path) : change.after
-    if (!isDeepStrictEqual(after, expected)) add(change.path, expected, after)
-    if (isDeepStrictEqual(before, after)) add(change.path, "an actual intervention", "unchanged")
+    if (!isDeepStrictEqual(after, expected)) add(change.path, expected, after, "change_after", "The candidate does not implement the declared intervention.")
+    if (isDeepStrictEqual(before, after)) add(change.path, "an actual intervention", "unchanged", "change_after", "The declared intervention leaves the comparison value unchanged.")
   }
   for (const path of diffs)
     if (!contract.changes.some((x) => path === x.path || path.startsWith(`${x.path}.`)) &&
       !(implied?.defaults.includes(path) && isDeepStrictEqual(fieldValue(spec, path), fieldValue(implied.expected, path))))
-      add(path, fieldValue(comparison, path), fieldValue(spec, path))
+      add(path, fieldValue(comparison, path), fieldValue(spec, path), "implicit_freeze",
+        "This field is frozen because no changes entry authorizes modifying it; this is not an explicit requiredValues entry.",
+        "If a component switch removes this old component-only field, HypoPlanner must declare its remove operation with the exact before value, or replace the complete component. Otherwise restore the comparison value. Do not add unsupported fields to the candidate or delete unrelated requiredValues.")
   for (const path of contract.frozenPaths)
     if (!isDeepStrictEqual(fieldValue(comparison, path), fieldValue(spec, path)))
-      add(path, fieldValue(comparison, path), fieldValue(spec, path))
+      add(path, fieldValue(comparison, path), fieldValue(spec, path), "explicit_freeze", "An explicit frozenPaths entry was modified.")
   return issues
 }

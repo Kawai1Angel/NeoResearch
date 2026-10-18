@@ -316,8 +316,10 @@ def validate_recipe_against_registry(
         embedding_d_model = embedding.get("embed_dim") if embedding_type == "calendar" else embedding.get("d_model")
         if embedding_type != "none" and int(embedding_d_model or d_model) != d_model:
             errors.append("embedding.d_model/embed_dim must match backbone.d_model for transformer recipes")
-    if backbone_type in {"dlinear", "tcn", "nbeats", "timesnet_lite"} and embedding_type != "none":
+    if backbone_type in {"dlinear", "nbeats", "timesnet_lite"} and embedding_type != "none":
         errors.append(f"backbone.type='{backbone_type}' requires embedding.type='none'")
+    if backbone_type == "tcn" and embedding_type not in {"none", "patch", "multiscale_patch"}:
+        errors.append("backbone.type='tcn' supports embedding none, patch or multiscale_patch")
     if backbone_type == "rnn" and str(backbone.get("cell", "gru")) not in {"gru", "lstm", "rnn"}:
         errors.append("backbone.cell must be one of: gru, lstm, rnn")
     if backbone_type == "mixer":

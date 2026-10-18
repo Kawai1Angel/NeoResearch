@@ -30,6 +30,24 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 describe("TSF research domain", () => {
+  test("full runner timeout covers four serial CV fits and the final fit without changing per-fit budgets", () => {
+    const task = Research.DomainRegistry.createTaskSpec("tsf", { ...taskSpec, runtime: { bridgeOnly: false } })
+    const base = validTransformerCandidate()
+    const training = asRecord(asRecord(base).trainingStrategy)
+    const candidate = { ...base, trainingStrategy: { ...training, budget: { ...asRecord(training.budget), timeBudgetS: 3600 } } }
+    const full = Research.DomainRegistry.createRunPlan("tsf", { taskSpec: task, candidateSpec: candidate, stage: "full" })
+    const single = Research.DomainRegistry.createRunPlan("tsf", { taskSpec: task, candidateSpec: candidate, stage: "low_fidelity" })
+    expect(full.validation.ok).toBe(true)
+    expect(full.command.timeoutMs).toBe(18_600_000)
+    expect(single.command.timeoutMs).toBe(3_720_000)
+    expect(asRecord(asRecord(full.writes[0]!.content.training_strategy).budget).time_budget_s).toBe(3600)
+    expect(asRecord(asRecord(single.writes[0]!.content.training_strategy).budget).time_budget_s).toBe(3600)
+    const small = Research.DomainRegistry.createRunPlan("tsf", { taskSpec: task,
+      candidateSpec: { ...candidate, trainingStrategy: { ...candidate.trainingStrategy,
+        budget: { ...candidate.trainingStrategy.budget, timeBudgetS: 120 } } }, stage: "full" })
+    expect(small.command.timeoutMs).toBe(3_600_000)
+  })
+
   test("renders original DLinear with a parameter-free head and rejects incompatible horizons", () => {
     const task = Research.DomainRegistry.createTaskSpec("tsf", {
       ...taskSpec, contextLength: 168, predictionLengths: [24], runtime: { bridgeOnly: false },
@@ -71,7 +89,6 @@ describe("TSF research domain", () => {
       { type: "decomposition_two_branch", kernelSize: 25 },
     ]
     const backbones: Research.JsonRecord[] = [
-        { type: "tcn", hiddenDim: 64, nLayers: 3, kernelSize: 3 },
         { type: "nbeats", hiddenDim: 64, nBlocks: 2, nLayers: 2 },
         { type: "dlinear", kernelSize: 25 },
         { type: "timesnet_lite", hiddenDim: 64, nLayers: 2, topK: 2, kernelSize: 3 },

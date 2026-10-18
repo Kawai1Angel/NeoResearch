@@ -107,7 +107,13 @@ export function buildInlineReflectionSystemPrompt(sessionPrompt: string): string
     "experiment_fact records an observed run; conditional_experience states conditions, intervention, observation, " +
     "boundaries and a falsifiable validationPlan. Performance experiences need verified independent full runs and " +
     "same-task comparisonRunID evidence. validated_principle needs support from at least two distinct dataset contents. " +
-    "Use derivedFrom to refine prior experience while retaining counterevidence; cite only supplied run IDs. " +
+    "Every entry has three parts: experimentFacts, conditionalExperience and validatedRegularity. The level is a legacy maturity label, not a choice of parts. " +
+    "For a new hypothesis supply evolution={relation,claim:{statement,dataConditions,operation,interventionPaths,expectedOutcome:{metric,direction,equivalenceMargin?},boundaries,validationPlan}}. " +
+    "For an existing explicit hypothesis supply evolution={parentExperienceID,relation:supports|refutes|qualifies|observes} and only the new local run evidence; the parent claim and all earlier counterevidence accumulate automatically. " +
+    "Before starting a root, retrieve shared experiences for this conditional proposition and read the exact matching ID. Reuse it when only the dataset, observed result or future validation plan changed; append evidence and update the existing experience. " +
+    "For this bounded lookup, return {status:experience_request,request:{scope:shared,query:...,limit:3}} or an exact experienceID with includeFacts:true; the coordinator returns requestedExperiences before final synthesis. An exact experienceID with includeHistory:true returns previous versions. At most three source/experience requests are allowed in total. " +
+    "Relation refers to the parent's expected outcome, independently of local positive/negative polarity. An execution failure is inconclusive for a performance hypothesis. " +
+    "Legacy records without a structured claim must be reformulated as a new explicit thread with derivedFrom provenance; do not invent cross-dataset validation. Cite only supplied run IDs. " +
     "Inspect literatureKnowledge.entries assertions/conditions/boundaries and sourceRuns current/comparison execution evidence to decide whether the current experiment supports the supplied literature assertions. " +
     "Optionally include knowledgeValidations (at most 3, using knowledgeValidationSchema) only for supported claims. " +
     "Use literatureKnowledge.currentRunID as runID, the supplied cardID/cardRevision, assertionIDs, conditionsAssessment, implementationAssessment, rationale and limitations. " +
@@ -234,11 +240,10 @@ function describeCandidate(candidate: ResearchCandidate | undefined) {
 
 function decide(input: {
   readonly stoppedReason?: string
-  readonly plateauStreak: number
   readonly failedStreak: number
   readonly succeededRuns: number
 }): { decision: ReflectionDecision; reason: string } {
-  const { stoppedReason, plateauStreak, failedStreak, succeededRuns } = input
+  const { stoppedReason, failedStreak, succeededRuns } = input
   if (stoppedReason === "target_reached") return { decision: "stop", reason: "已达到目标指标，反思建议停止迭代并发布。" }
   if (stoppedReason === "budget_exhausted")
     return { decision: "stop", reason: "预算已耗尽，反思建议停止迭代并整理产物。" }
@@ -253,11 +258,6 @@ function decide(input: {
     return {
       decision: "request_human",
       reason: "尚无成功 run，先确认数据准备与训练脚本是否健康。",
-    }
-  if (plateauStreak >= 4)
-    return {
-      decision: "stop",
-      reason: "已连续多轮 plateau，建议固化当前 champion 并发布。",
     }
   return { decision: "continue", reason: "继续执行下一步实验。" }
 }
@@ -365,7 +365,6 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
 
   const { decision, reason } = decide({
     stoppedReason: input.stoppedReason,
-    plateauStreak,
     failedStreak,
     succeededRuns: succeededCount,
   })

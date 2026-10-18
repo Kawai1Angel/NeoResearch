@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from factory.build_model import RecipeModel, OrderedChannelMixer, HybridLatentFusion
+from factory.build_model import RecipeModel, OrderedChannelMixer, HybridLatentFusion, PatchEmbedding
 from factory.adapters import SequenceReadout
 from factory.encoders import DiagonalSSM, Mamba1, TimesBlock
 from factory.representations import SEQUENCE_ENCODERS, validate_typed_recipe
@@ -66,7 +66,9 @@ class TypedRecipeModel(RecipeModel):
         width = cfg["d_model"]
         channels = self._require_num_channels("typed sequence encoder")
         layout = self.representation["layout"]
-        self.readout_adapter = SequenceReadout(layout, self.representation["readout"], width, self.latent_dim, channels)
+        patched = self.embedding_type == "patch"
+        self.readout_adapter = SequenceReadout(layout, self.representation["readout"], width, self.latent_dim, channels,
+                                               self._embedding_token_count() if patched else None)
         layers = []
         for _ in range(cfg["depth"]):
             if cfg["type"] == "diagonal_ssm":
@@ -76,10 +78,14 @@ class TypedRecipeModel(RecipeModel):
             else:
                 core = TimesBlock(width, cfg["d_ff"], cfg["top_k"], cfg["num_kernels"])
             layers.append(ResidualSequenceLayer(core, width, cfg["dropout"]))
-        return nn.Sequential(nn.Linear(channels if layout == "sequence_latent" else 1, width), *layers)
+        projection = (PatchEmbedding(input_len=self.input_len, patch_len=int(self.embedding_cfg["patch_len"]),
+                                     stride=int(self.embedding_cfg["stride"]), d_model=width) if patched
+                      else nn.Linear(channels if layout == "sequence_latent" else 1, width))
+        return nn.Sequential(projection, *layers)
 
     def _sequence_tokens(self, flat, batch, channels):
-        expanded = batch * self.input_len * self.backbone_cfg["d_model"]
+        token_count = self._embedding_token_count() if self.embedding_type == "patch" else self.input_len
+        expanded = batch * token_count * self.backbone_cfg["d_model"]
         if self.representation["layout"] == "channel_sequence":
             expanded *= channels
         limit = int(self.recipe.get("constraints", {}).get("max_activation_elements", 16_777_216))
@@ -87,6 +93,8 @@ class TypedRecipeModel(RecipeModel):
             raise ValueError("RESOURCE_LIMIT: sequence representation exceeds max_activation_elements")
         if self.representation["layout"] == "sequence_latent":
             return self.model(flat.reshape(batch, channels, self.input_len).transpose(1, 2))
+        if self.embedding_type == "patch":
+            return self.model(flat).reshape(batch, channels, token_count, -1)
         return self.model(flat.reshape(batch * channels, self.input_len, 1)).reshape(batch, channels, self.input_len, -1)
 
     def _single_latent(self, flat, batch, channels, calendar_features):

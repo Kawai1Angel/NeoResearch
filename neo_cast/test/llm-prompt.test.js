@@ -224,3 +224,21 @@ test("OpenAI-compatible candidate generation honors llm timeout", async () => {
     else process.env.NEO_CAST_LLM_API_KEY = originalKey;
   }
 });
+
+test("mock Patch candidates preserve TCN and channel-independent state-space contracts", () => {
+  const { _buildHeuristicCandidate } = require("../src/llm");
+  for (const name of ["mamba", "diagonal ssm", "tcn"]) {
+    const result = _buildHeuristicCandidate(`${name} patch channel independent`, 1, { input_len: 32, horizons: [4] });
+    assert.equal(result.architecture.embedding.type, "patch");
+    assert.equal(result.architecture.fusion.type, "temporal");
+    assert.equal(result.architecture.fusion.channel_mode, "independent");
+    if (name !== "tcn") {
+      assert.equal(result.architecture.representation.layout, "channel_sequence");
+      assert.equal(result.architecture.representation.readout, "flatten");
+      assert.equal(result.architecture.embedding.d_model, result.architecture.backbone.d_model);
+    }
+  }
+  assert.equal(_buildHeuristicCandidate("tcn multiscale patch", 1, { input_len: 32 }).architecture.embedding.type, "multiscale_patch");
+  assert.throws(() => _buildHeuristicCandidate("mamba multiscale patch", 1), /single-scale/);
+  assert.throws(() => _buildHeuristicCandidate("timesblock patch", 1), /single-scale/);
+});

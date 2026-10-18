@@ -10,6 +10,9 @@ export interface ContractMismatch {
   expected: unknown
   actual: unknown
   source?: string
+  rule?: string
+  message?: string
+  repairHint?: string
 }
 
 // Sorted object keys, preserved array order, UTF-8, ECMAScript JSON number encoding.
@@ -73,6 +76,7 @@ export function buildExecutionContract(
       preprocessing: spec.preprocessing.actions.map((action: any) => action.type),
       embedding: spec.embedding.type,
       backbone: spec.backbone.type,
+      ...(spec.backbone.type === "mamba" ? { requested_backend: spec.backbone.backend } : {}),
       ...(spec.backbone.type === "linear" ? { linear_shared: spec.backbone.shared ?? false } : {}),
       fusion: spec.fusion.type,
       ...(spec.fusion.type === "gated_hybrid" ? { fusion_gate_type: spec.fusion.gateType ?? "channel" } : {}),

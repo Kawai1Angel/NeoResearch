@@ -1,0 +1,26 @@
+{
+  "repository": "https://github.com/state-spaces/mamba",
+  "tag": "v2.3.2.post1",
+  "commit": "a14b1df",
+  "archiveSHA256": "a49423a64dfccc5c46d8ba6c0fb50a3a8e48eee3e4c65b880b9fad5ac47383c2",
+  "sourceFiles": {
+    "csrc/reverse_scan.cuh": "b7ee5369cc6a3cc12b6dda6da7d456249442002901d1c0d35f7cb967244ec316",
+    "csrc/selective_scan.cpp": "c9cd8b171580a3440a757238aae597a02682d368bfc86e66012197fb35e8176f",
+    "csrc/selective_scan.h": "ac873dba2c17acca77957e938724b7850ee98645c9052c7c897d1eb2e71f2e5c",
+    "csrc/selective_scan_bwd_bf16_complex.cu": "d3191c1308b455c4576938a656b26a9434bb35e06746077de0dcad262d92a6c9",
+    "csrc/selective_scan_bwd_bf16_real.cu": "6c7c3d8fc74d46103f4cc05d273437f451945db5e92f0aba6c25dd7e8a4a59d1",
+    "csrc/selective_scan_bwd_fp16_complex.cu": "cf749e40690f9c2131cfe9b23ac42da4446bc747e6fd8f1aed45124d2cd5b74b",
+    "csrc/selective_scan_bwd_fp16_real.cu": "ce5a8f9bb9e485be8ca70fec63b084f908598f6a1cdd47d754290f2057ee2f61",
+    "csrc/selective_scan_bwd_fp32_complex.cu": "9462ad461cde1bded09a0ef236ae4b070ccb7aadae61e27b78a3dc6e1a5a033d",
+    "csrc/selective_scan_bwd_fp32_real.cu": "142e266e024f53f41c65f8f114fbc21b1d873a262a2e9743f9965ba069eda4e9",
+    "csrc/selective_scan_bwd_kernel.cuh": "4aa885e6e06e2263fc995173a3088df85e9be49cfe18ef641d3c795eb191cb11",
+    "csrc/selective_scan_common.h": "e3efa8931564a7d724e1b35af877923aa7c348b8ac1aa15715a514130c531ed0",
+    "csrc/selective_scan_fwd_bf16.cu": "a3b0256715f39866274d9c9ef7e9791d2b22c71a5efd451c384ad8211ad2d7b6",
+    "csrc/selective_scan_fwd_fp16.cu": "f5b32ea6a10c755032e469754adbfbb554fab562eede31d33d99f746f5991a8c",
+    "csrc/selective_scan_fwd_fp32.cu": "2ae10cb46816a25caa9711fd8b0aa9252763cda46f7f1765c11ca29bf57944b1",
+    "csrc/selective_scan_fwd_kernel.cuh": "43086729c79d56975a482f8d3a0211eef6161a93b099da34a43145701bb72b1c",
+    "csrc/static_switch.h": "1eb3ebf9f2f231be1bfad83ad15612031e24980336c0019f2d742bce599f704c",
+    "csrc/uninitialized_copy.cuh": "00138cc4f97dfc0bfb9a8956d54560a5627c61ec0893eebb54cf1e59c3b3a3f8"
+  },
+  "modifications": "CUDA/C++ sources unchanged. Build targets only the chosen device architecture; local Python adapter wraps the official fwd/bwd ABI."
+}

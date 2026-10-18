@@ -113,8 +113,14 @@ test("failed semantic checks or an incomplete final curation cannot authorize so
       else value.selectedDecisionIDs = [] // Missing exclusion breaks the final complete partition.
       return { text: JSON.stringify(value) }
     } }
-    const packet = await distillArchitectureKnowledge({ corpus: { cards: [card], historicalCardIDs: [], digest: "fixture", warnings: [] },
+    const request = distillArchitectureKnowledge({ corpus: { cards: [card], historicalCardIDs: [], digest: "fixture", warnings: [] },
       model, task: { quantitativeReport: report() }, datasetEvidencePaths: [], maxDecisions: 12, auditRoot: path.join(tmp.path, stage) })
+    if (stage === "architecture_curate") {
+      await expect(request).rejects.toThrow("cannot become ready_data_only")
+      expect(fixture.calls.filter((s) => s === stage)).toHaveLength(2)
+      continue
+    }
+    const packet = await request
     expect(packet.status).toBe("partial")
     expect(packet.decisions).toEqual([])
     expect(packet.sourceCards).toEqual([])

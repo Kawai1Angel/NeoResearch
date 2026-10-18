@@ -1,1 +1,2 @@
-context_length 使用 96，数据集按时间顺序划分为训练集、验证集和测试集，比例使用 6:2:2，实验搜索预算设置为 25 轮。
+context_length 使用 96，数据集按时间顺序划分为训练集、验证集和测试集，比例使用 6:2:2，实验搜索预算设置为 100 轮。
+研究搜索连续无提升轮数（搜索 patience）也设置为 100，对应 max_no_improve=100、budget.loop.maxNoImprove=100；搜索预算对应 max_iterations=100、budget.loop.maxIterations=100。单模型训练的 trainingStrategy.budget.patience 保持原 zero 设置。

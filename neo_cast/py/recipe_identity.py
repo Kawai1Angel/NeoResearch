@@ -88,6 +88,13 @@ def canonical_recipe(payload: dict, *, input_len: int) -> dict:
 def recipe_identity(payload: dict, *, input_spec: dict, experiment: dict | None = None) -> dict:
     canonical = canonical_recipe(payload, input_len=input_spec["input_len"])
     architecture = {key: value for key, value in canonical.items() if key not in {"training_strategy", "constraints"}}
+    secondary = canonical.get("composition", {}).get("secondary")
+    branches = [canonical] + ([secondary] if secondary else [])
+    if any(branch.get("embedding", {}).get("type") in {"patch", "multiscale_patch"} and
+           branch.get("backbone", {}).get("type") in {"mlp", "transformer", "tcn", "mamba", "diagonal_ssm"}
+           for branch in branches):
+        # Old mean-token experiments are not cache hits for the new readout.
+        architecture = {**architecture, "patch_readout_revision": "feature_token_flatten_v1"}
     # A referenced topology is identified by bytes, never only by path.
     topology = architecture.get("fusion", {}).get("topology_artifact")
     if topology:
