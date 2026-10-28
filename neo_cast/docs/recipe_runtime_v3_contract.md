@@ -1,50 +1,50 @@
-# ModelRecipe v3 实施说明
+# ModelRecipe v3 Implementation Notes
 
 
-> 2026-09-27 更新：删除 `direct_multi_horizon`（schema、registry、工厂及搜索入口）；旧配置明确拒绝，不转换为其他 head。`gated_depthwise_conv` / `timesnet_lite` 保留请求的偶数卷积核，以非对称 padding 保持长度。候选仅对缺失字段补默认值，显式非法值和不兼容 embedding 返回校验错误供 agent 修正。旧偶数核 checkpoint 不自动转换，需重训。
-日期：2026-09-23。高层版本为 `model_recipe.v2`，执行版本为 `recipe_schema_v3`，运行时 revision 为 3。旧 v1/v2 输入和旧 revision 2 checkpoint 不作静默升级。
+> 2026-09-27 update: Removed `direct_multi_horizon` from schemas, registry, factory, and search entrypoints; legacy configurations are explicitly rejected rather than converted to another head. `gated_depthwise_conv` / `timesnet_lite` preserve requested even kernel sizes with asymmetric padding. Defaults apply only to missing fields; explicit invalid values and incompatible embedding return validation errors for agent correction. Old even-kernel checkpoints require retraining and are not converted automatically.
+Date: 2026-09-23. The high-level version is `model_recipe.v2`, execution version `recipe_schema_v3`, and runtime revision 3. Old v1/v2 inputs and revision-2 checkpoints are not silently upgraded.
 
-## 模型与组合
+## Models and Compositions
 
-- `diagonal_ssm`：稳定负对角状态矩阵、可学习时间步长、ZOH 离散化及显式状态递推，不是卷积代理。
-- `mamba`：Mamba-1 的因果 depthwise convolution、输入相关 Δ/B/C、selective scan、D skip 和 SiLU gate。实现提供完整、分块和逐步计算；窗口默认重置状态。
-- `timesblock_encoder`：FFT 非 DC 频率选择、周期二维重排、多核二维卷积、幅值加权和残差。使用逐样本周期选择，避免同批其他样本改变预测；不是完整 TimesNet。
-- 新编码器要求 `embedding.type=none`，`representation.layout` 为 `sequence_latent` 或 `channel_sequence`，`readout` 显式选择 `mean`/`last`，`latent_dim` 显式配置。旧编码器使用 `channel_latent` / `none`。
-- `parallel_two_branch` 支持 `latent_gate`、`history_time_gate`、`forecast_step_gate`；`decomposition_two_branch` 将历史拆成主支 trend、次支 residual 后分别预测求和。禁止嵌套组合及重复 decomposition。
-- history gate 要求相同序列轴、宽度及表示；forecast gate 与 decomposition 当前只支持 point 输出。两支参数独立，但共享 head 配置类型，暂不支持每支任意不同 head 配置。
-- 每个 H 独立模型、优化器和 checkpoint；本轮没有跨 H 共享。
+- `diagonal_ssm`: stable negative diagonal state matrix, learnable time step, ZOH discretization, and explicit state recurrence; not a convolution proxy.
+- `mamba`: Mamba-1 causal depthwise convolution, input-dependent delta/B/C, selective scan, D skip, and SiLU gating. Full, chunked, and stepwise computation are provided; state resets between windows by default.
+- `timesblock_encoder`: FFT non-DC frequency selection, periodic 2D rearrangement, multikernel 2D convolution, amplitude weighting, and residuals. Periods are selected per sample to avoid batch-dependent predictions; this is not full TimesNet.
+- New encoders require embedding.type=none, representation.layout=`sequence_latent` or `channel_sequence`, explicit mean/last readout, and explicit latent_dim. Older encoders use `channel_latent` / `none`.
+- `parallel_two_branch` supports `latent_gate`, `history_time_gate`, and `forecast_step_gate`; `decomposition_two_branch` splits history into primary trend and secondary residual branches and sums their predictions. Nested compositions and repeated decomposition are prohibited.
+- History gates require matching sequence axes, widths, and representations. Forecast gates and decomposition currently support point outputs only. Branches have independent parameters but share the head configuration type; arbitrary separate head configurations are not supported yet.
+- Each H has its own model, optimizer, and checkpoint. Cross-H sharing is outside this iteration.
 
-三个可执行样例位于 `py/schemas/recipe_{diagonal_ssm,timesblock_encoder,mamba}.example.json`，高层样例为 `py/schemas/model_recipe_v2.example.json`。组合的 `secondary` 显式给出 `embedding`、`backbone`、`representation`；其余配置继承主支。
+Executable examples: `py/schemas/recipe_{diagonal_ssm,timesblock_encoder,mamba}.example.json`; high-level example: `py/schemas/model_recipe_v2.example.json`. Composition secondary explicitly supplies embedding, backbone, and representation; other settings inherit from the primary branch.
 
-## 搜索身份与复用
+## Search Identity and Reuse
 
-`py/recipe_identity.py` 是权威身份实现。architecture identity 排除说明文字和训练配置；experiment identity 纳入数据内容、时间切分、训练配置、随机种子、精度、后端及运行时代码摘要。仅归一已知等价配置，不把行为相似当作数学等价。
+`py/recipe_identity.py` is authoritative. Architecture identity excludes explanatory text and training settings; experiment identity includes dataset contents, time splits, training settings, seeds, precision, backend, and runtime code digest. Only known equivalent configurations are normalized; behavioral similarity is not mathematical equivalence.
 
-完整训练和 CV 在训练前检查 SQLite 记录，以事务占位、租约心跳及 owner token 防止并发重复执行与过期写入。完成记录须通过 artifact 哈希和当前执行契约校验才复用；失败、过期或损坏产物允许重试。重复结果不作为新独立证据，不新增 runner 结果行、不推进 plateau；Node/OpenCode 连续三次重复后停止并报告 `no_new_candidate`。
+Full training and CV check SQLite before training. Transactional reservations, lease heartbeats, and owner tokens prevent concurrent duplicates and stale writes. Completed records are reused only after artifact hashes and the current execution contract pass validation. Failed, expired, or corrupted results may retry. Duplicates are not independent evidence, add no runner result row, and do not advance plateau counters. Node/OpenCode stops after three consecutive duplicates with `no_new_candidate`.
 
-Smoke 不复用，v3 smoke 另存 `behavior_probe.json`，包含固定输入的输出/输入梯度摘要、权重摘要及设备精度。此诊断不参与结果缓存或自动等价合并。
+Smoke runs are not reused. V3 smoke saves `behavior_probe.json` with fixed-input output/input-gradient summaries, weight digests, device, and precision. This diagnostic does not affect caching or automatic equivalence merging.
 
 ```bash
 PYTHONPATH=py .neo-cast/runtime/.venv/bin/python py/recipe_identity.py identity py/schemas/recipe_mamba.example.json --input-len 96 --channels 7 --horizon 24
 PYTHONPATH=py .neo-cast/runtime/.venv/bin/python py/recipe_identity.py migrate py/schemas/recipe_native.example.json --input-len 96
 ```
 
-迁移输出新配置及 provenance，要求重新训练；保留旧 latent 宽度和旧 decomposition wrapper，不将已有 checkpoint 转换成新模型。未实现任意表达式的语义等价检测。
+Migration emits a new configuration and provenance and requires retraining. It preserves old latent widths and decomposition wrappers rather than converting existing checkpoints. Arbitrary expression equivalence detection is not implemented.
 
-## 验证与边界
+## Validation and Boundaries
 
-覆盖状态递推、分块/逐步一致性、因果性、梯度、长序列稳定性、TimesBlock 批次独立性、mask/过去协变量、概率头、组合参数有效性、资源限制、迁移、缓存及三个新模型的独立进程导出回载。Mamba 保留独立公式参考，并为可选官方 CUDA selective scan 增加输出、全部参数/输入梯度、短程训练和旧权重加载对照。
+Coverage includes state recurrence, chunked/stepwise equivalence, causality, gradients, long-sequence stability, TimesBlock batch independence, masks/past covariates, probabilistic heads, composition parameter effectiveness, resource limits, migration, caching, and standalone-process export reload for all three new models. Mamba retains an independent formula reference; optional official CUDA selective scan is compared for outputs, all parameter/input gradients, short training, and old-weight loading.
 
-Mamba 支持 `torch_reference`、`auto` 与 `cuda_optimized`。`auto` 在 CUDA 设备、扩展可用且 d_state<=256 时使用官方扫描内核，否则显式记录参考路径及原因；`cuda_optimized` 对这些前置条件严格报错，不能静默回退。原有显式 `torch_reference` 配方保持参考执行。原始序列与单尺度 Patch 都支持新后端，streaming 的 `forward_state` 仍是参考递推。实际后端、请求后端、二进制及源码摘要进入执行清单和实验身份。资源预算包含参数数目及激活元素上限，但后者不是完整峰值显存预测。自动 mutation 对新编码器目前仅作有界 depth / learning-rate 变动，未实现广泛组合拓扑搜索。
+Mamba supports `torch_reference`, `auto`, and `cuda_optimized`. Auto uses the official scan kernel on CUDA when the extension is available and d_state<=256; otherwise it records the reference path and fallback reason. Explicit cuda_optimized fails on unmet prerequisites without silent fallback. Explicit torch_reference recipes retain reference execution. Both raw sequences and single-scale patches support the backend; streaming forward_state remains reference recurrence. Actual/requested backends and binary/source digests contribute to execution manifests and experiment identity. Budgets bound parameters and activation elements; the latter is not a full peak-VRAM estimate. Automatic mutation for new encoders currently bounds depth/learning-rate changes rather than exploring broad composition topologies.
 
-小样本三种子训练结果见 [v3 sanity](recipe_runtime_v3_sanity.md)。新模型机制成立不等于预测效果更好；当前短预算结果没有显示其优于线性基线。没有原生 TimesNet、跨 H 共享或论文指标复现。
+See [v3 sanity](recipe_runtime_v3_sanity.md) for small-sample, three-seed results. Correct mechanisms do not imply better forecasts; short-budget results did not outperform the linear baseline. Native TimesNet, cross-H sharing, and reproduced paper metrics are not provided.
 
-参考来源和固定版本见 `py/factory/encoders/PROVENANCE.md`。
+References and pinned versions: `py/factory/encoders/PROVENANCE.md`.
 
-## 本轮回归记录
+## Regression Record
 
-- `neo_cast/npm test`：通过（71 项 Node 测试及完整 Python unittest wrapper）。后续新增 CLI 去重测试与自主循环测试的定向运行共 16 项全部通过。
-- `tests.test_recipe_v3`：16 项通过，包含三种独立导出回载、参考公式对照及并发占位。`tests.test_training_identity_v3` 验证同配置不再训练、换种子重新训练、跨 H 参数独立。
-- OpenCode `bun run typecheck`：通过。
-- OpenCode `bun test test/research`：328 通过、2 失败；与修改前已有失败相同：`hypothesis-evidence-tools` 缺少测试 fixture `quantitative.json`；`service` 的默认 plateau 测试预期 25、实际 7。未将这两项记作通过。另增缓存结果不成为独立指标证据的 service 定向测试通过。
-- `git diff --check`：通过。CUDA 后端、论文 benchmark、组合拓扑搜索不在上述通过结论内。
+- `neo_cast/npm test`: passed (71 Node tests and the complete Python unittest wrapper). A later targeted run of new CLI deduplication and autonomous-loop tests passed all 16 tests.
+- `tests.test_recipe_v3`: 16 passed, including three standalone export reloads, reference-formula comparisons, and concurrent reservation. `tests.test_training_identity_v3` checks reuse of identical configurations, retraining for changed seeds, and independent cross-H parameters.
+- OpenCode `bun run typecheck`: passed.
+- OpenCode `bun test test/research`: 328 passed, 2 failed, matching preexisting failures: hypothesis-evidence-tools lacks quantitative.json; service default plateau expects 25 but gets 7. These are not counted as passing. An additional targeted service test confirms cached results are not independent metric evidence.
+- `git diff --check`: passed. These results do not cover the CUDA backend, paper benchmarks, or composition topology search.

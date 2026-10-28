@@ -1,35 +1,35 @@
-# NeoResearch TSF 架构对齐工作计划
+# NeoResearch TSF Structure Alignment Workplan
 
-生成日期：2026-04-28
+Generating date: 2026-04-28
 
-## 对比对象
+## Contrast Object
 
-- 最新思考稿：`/Users/chengmingyue/Desktop/NeoResearch-TSF-v2.md`
-- 当前架构稿：`/Users/chengmingyue/human_agent_collaboration/research_working/idea/neo_research_for_tsf/neo_cast/neo_research_tsf_architecture.md`
+- Latest design draft: `/path/to/design-documents/NeoResearch-TSF-v2.md`
+- Current architecture draft: `/path/to/NeoResearch/neo_cast/neo_research_tsf_architecture.md`
 
-## 总体判断
+## Overall judgement
 
-当前 `neo_research_tsf_architecture.md` 与 `NeoResearch-TSF-v2.md` 的方向大体一致，已经覆盖了 Time-Series Profiler、模块化 Action Space、CandidateRecipe、实验闭环、研究记忆、约束执行和阶段路线图。
+The current `neo_research_tsf_architecture.md`, which is broadly consistent with the direction of `NeoResearch-TSF-v2.md`, already covers Time-Series Profiler, Modular Action Space, CandidateRecipe, Experimental closed loops, research memory, binding implementation and phase road maps.
 
-但当前架构文档更偏 **engineering execution architecture / autoresearch-style MVP**，而最新思考稿更强调 **Action-Space-Based Auto Model Construction for Time-Series Forecasting**。
+The current architecture document, however, is more focused on **engineering analysis / autoresearch-style MVP**, while the most recent reflection paper places greater emphasis on **Action-Space-Based Auto Model Construction for Time-Series Forecasting**.
 
-因此当前文档的问题不是“方向错”，而是几个核心研究主张还没有被提升为一等模块：
+The problem with the current document is therefore not " wrong direction " , but rather several core research ideas have not been elevated to first-class modules:
 
-1. 用户研究意图形式化不足。
-2. action trajectory 没有成为核心数据结构。
-3. Model Compiler 的角色不够突出。
-4. hybrid / router / expert 等 meta-architecture 创新线不够清晰。
-5. 最终 research artifact / report 还不是核心产物接口。
+1. The formalization of user research intentions is inadequate.
+2. Action projectory does not form the core data structure.
+3. Model Compiler's role is not prominent enough.
+4. The meta-architecture innovation line is not clear enough.
+5. Ultimately, research artific/report is not a core product interface.
 
-可以粗略判断：当前架构与最新思考约 **70% 一致**，剩余 30% 主要集中在“论文主张”和“研究贡献表达”层面。
+A rough judgement can be made: the current structure is in line with recent thinking about **70%,** and the remaining 30% focuses mainly on "discussions" and "expression of research contributions".
 
 ---
 
-## 1. 缺少 Requirement Formalizer / ResearchIntent 层
+## 1. Missing Requirement Formalizer/ ResearchIntent Layer
 
-### 最新思考中的主张
+### The idea in the latest thinking.
 
-最新思考稿的系统输入不是单纯数据集，而是完整 forecasting research task：
+The system input for the latest thought is not just a data set, but a complete database:
 
 ```yaml
 dataset:
@@ -58,7 +58,7 @@ constraints:
   max_latency: 20ms
 ```
 
-总体流程中也明确包含：
+The overall process also explicitly includes:
 
 ```text
 User Intent + Dataset
@@ -68,31 +68,31 @@ Requirement Formalizer
 Time-Series Profiler
 ```
 
-### 当前架构中的状态
+### Status in the current architecture
 
-当前架构从 `TaskSpec`、`EvalSpec`、`BudgetSpec`、`SearchSpaceSpec` 开始，强调协议、预算、切分和评测安全。这是工程上正确的，但没有把 `user_intent`、自然语言偏好、soft objectives 和 search priors 作为单独层来建模。
+The current structure starts with `TaskSpec`, `EvalSpec`, `BudgetSpec`, and `SearchSpaceSpec`, emphasizing protocol, budget, split and rating security. This is the correct project, but it does not model `user_intent`, natural language preferences, soft objects and search projects as separate layers.
 
-当前人类角色中有“设定研究目标与迭代方向”，但主要落在 `program.md`，还没有形成结构化的 `ResearchIntent`。
+The current human role consists of "setting research goals and an iterative direction", but mainly falls on `program.md`, which has not yet formed a structured `ResearchIntent`.
 
-### 影响
+### Impact
 
-如果没有 Requirement Formalizer，系统会更像一个“给定固定任务后的自动实验系统”，而不是能从用户研究偏好出发构建模型的 AutoResearch agent。
+Without Requirement Formalizer, the system would be more like an "Autonomous Experimental System for Fixed Tasks" rather than a AutoResearch agent capable of building models based on user research preferences.
 
-它会削弱以下卖点：
+It weakens the following sales points:
 
-- 自然语言研究目标到可执行搜索目标的转化。
-- hard constraints / soft objectives / search priors 的分离。
-- 用户偏好对 action space 裁剪和 reward 权重的影响。
+- Conversion of natural language research objectives to implementable search targets.
+- The separation of hard subjects/soft objects/search priorities.
+- The effect of user preferences on action space cropping and reward weights.
 
-### 建议补充
+### Suggested addition
 
-在当前架构中新增一节：
+Add a new section to the current structure:
 
 ```text
 Research Intent Layer
 ```
 
-建议数据结构：
+Recommended data structure:
 
 ```python
 @dataclass
@@ -105,32 +105,32 @@ class ResearchIntent:
     report_preferences: list[str]
 ```
 
-并在 `TaskSpec` 中增加：
+And add in `TaskSpec`:
 
 ```python
 research_intent: ResearchIntent
 ```
 
-Requirement Formalizer 的输出应至少包括：
+The output of Requirement Formalizer should include at least:
 
-- `hard_constraints`：参数量、延迟、实验次数、训练时间、显存。
-- `soft_objectives`：轻量、可解释、稳定、长 horizon 鲁棒。
-- `search_priors`：patch、invert embedding、feature fusion、decomposition、router、distillation。
-- `reward_weights`：accuracy、latency、params、robustness、simplicity 的权重。
+- `hard_constraints`: Arguments, delay, number of experiments, training time, visibility.
+- `soft_objectives`: Lightweight, interpretable, stable, long horizon rod.
+- `search_priors`:patch,invert embedding,feature fusion,decomposition,router,distillation.
+- `reward_weights`: the weight of accuracy, latency, params, robustness, simplity.
 
 ---
 
-## 2. Action Trajectory 没有成为一等数据结构
+## 2. Action Trackory does not become a first-class data structure
 
-### 最新思考中的主张
+### The idea in the latest thinking.
 
-最新思考明确强调：
+The latest reflection clearly emphasizes that:
 
 ```text
 Architecture A = a_1 ∘ a_2 ∘ ... ∘ a_T
 ```
 
-agent 的输出不是模型名，也不只是最终 recipe，而是一条 construction trajectory：
+Angent's output is not a model name, and it's not just a final recipe, but a control projectory:
 
 ```text
 AddPreprocess(RevIN)
@@ -144,37 +144,37 @@ SetHead(LinearHead)
 SetLoss(HorizonWeightedMSE)
 ```
 
-这是 v2 的核心贡献之一：把 forecasting architecture design 形式化为 typed modular action space 上的 sequential architecture construction problem。
+This is one of the core contributions of v2: transforming the format of V2 into a typed mobile action space-based regional regulation protocol.
 
-### 当前架构中的状态
+### Status in the current architecture
 
-当前架构已经有 `CandidateRecipe`，也有 action registry，但主要表达的是最终 recipe 状态：
+The current structure already has `CandidateRecipe` and an action response, but mainly expresses the final state:
 
 ```text
 preprocessing -> embedding -> backbone -> fusion -> head -> training_strategy
 ```
 
-它没有显式记录：
+It has no prominent record of:
 
-- 每一步 action 是什么。
-- action 的 parent state 是什么。
-- action 为什么被提出。
-- action 是否通过 compiler / validator。
-- action 对最终结构贡献了什么。
+- Every step of action is what it is.
+- What is an action's parent state?
+- Why is action being raised?
+- Action through compiler / Validat.
+- What action has contributed to the final structure.
 
-因此当前更像 “recipe search”，而不是 “action-space construction”。
+So it's more like "recide search" than "action-space control."
 
-### 影响
+### Impact
 
-缺少 action trajectory 会影响三件事：
+The absence of an action projectory affects three things:
 
-1. 论文贡献不够尖：难以强调 sequential architecture construction。
-2. 反思闭环不够细：无法分析是哪一步 action 导致收益或失败。
-3. report 不够强：不能输出完整 action trajectory 和结构演化过程。
+1. The paper was not very cutting-edge: it was difficult to stress the importance of the topic.
+2. Rethinking that the closed circle is not sufficiently detailed: it is impossible to analyse which step action leads to gain or failure.
+3. Report is not strong enough: cannot output complete action projectory and structure evolution.
 
-### 建议补充
+### Suggested addition
 
-新增数据结构：
+Add data structure:
 
 ```python
 @dataclass
@@ -206,13 +206,13 @@ class ActionTrajectory:
     hypothesis: str
 ```
 
-并让 `Proposal` 从：
+And get `Proposal` from:
 
 ```python
 candidate_recipe: CandidateRecipe
 ```
 
-扩展为：
+Expand to:
 
 ```python
 action_trajectory: ActionTrajectory
@@ -221,11 +221,11 @@ candidate_recipe: CandidateRecipe
 
 ---
 
-## 3. Model Compiler 的角色不够突出
+## 3. Model Compiler's role is not prominent enough
 
-### 最新思考中的主张
+### The idea in the latest thinking.
 
-v2 把 Model Compiler 放在核心位置：
+v2 Place Model Compiler at its core:
 
 ```text
 Model Recipe DSL
@@ -235,22 +235,22 @@ Model Compiler
 Training / Evaluation Engine
 ```
 
-Compiler 不只是 `build_model`，还要负责：
+Compiler is not just `build_model`, but also responsible for:
 
 ```text
-1. 检查 action sequence 是否合法
-2. 检查 tensor shape 是否匹配
-3. 自动调整 hidden dimension
-4. 自动连接 branch input/output
-5. 自动处理 normalization/post-processing 配对
-6. 自动生成 PyTorch model
-7. 自动生成 training script
-8. 自动记录 architecture graph
+1. Checks whether an action security is valid
+2. Checks whether tensor Shape matches
+3. Automatically adjust idden dimension
+4. Automatically connect lanch input/output
+5. Automatically process normalization/post-processing pairs
+6. Auto Generate PyTorch Model
+7. Automatically generating script
+8. Autorecord
 ```
 
-### 当前架构中的状态
+### Status in the current architecture
 
-当前架构有：
+The current structure is as follows:
 
 - `Search Space Registry`
 - `build_model(candidate_recipe)`
@@ -258,39 +258,39 @@ Compiler 不只是 `build_model`，还要负责：
 - `Patch Generator`
 - `ModelSpec`
 
-这些模块已经接近 compiler 的组成部分，但没有把它们统一命名和组织成 **Executable Model Recipe Compiler**。
+These modules are close to the components of the compiler, but they are not uniformly named and organized as **Executable Model Recipe Company**.
 
-当前表达更像：
+The current expression is more like:
 
 ```text
-recipe -> runtime 组装 PyTorch 模型
+recipe - > runtime assembly PyTorch model
 ```
 
-而不是：
+Instead of:
 
 ```text
 typed action sequence -> recipe graph -> shape-checked architecture graph -> executable model
 ```
 
-### 影响
+### Impact
 
-如果 compiler 不够突出，系统容易被理解为“带 registry 的 AutoML DSL”，而不是一个能把 agent actions 编译成合法 architecture 的研究系统。
+Ifcompiler is not prominent enough, the system can easily be understood as "AutoML DSL with registry", rather than a research system that can codify an individual actions into a legitimate architecture.
 
-这会削弱 v2 的 Contribution 3：
+Contribution 3:
 
 ```text
 Executable Model Recipe Compiler
 ```
 
-### 建议补充
+### Suggested addition
 
-新增一节：
+Add a new section:
 
 ```text
 Model Compiler Layer
 ```
 
-建议接口：
+Suggested interface:
 
 ```python
 def compile_actions(
@@ -313,7 +313,7 @@ def emit_model_spec(
     ...
 ```
 
-建议数据结构：
+Recommended data structure:
 
 ```python
 @dataclass
@@ -329,7 +329,7 @@ class CompiledRecipeGraph:
     estimated_latency_ms: float | None
 ```
 
-Compiler 应明确承担以下职责：
+Compiler should clearly assume the following responsibilities:
 
 - action sequence legality check
 - branch graph construction
@@ -341,11 +341,11 @@ Compiler 应明确承担以下职责：
 
 ---
 
-## 4. Meta-Architecture / Hybrid Construction 主线不够突出
+## 4. Meta-Architecture / Hybrid Construction does not feature prominently enough
 
-### 最新思考中的主张
+### The idea in the latest thinking.
 
-v2 把 Level 6 Meta-Architecture Actions 视为与 TimeRecipe 拉开差距的地方：
+V2 views Level 6 Meta-Architecture Actions as a gap with TimeRecipe:
 
 ```text
 A6.1  SplitTrendSeasonalBranches
@@ -360,13 +360,13 @@ A6.9  AddEnsembleHead
 A6.10 PruneBranch
 ```
 
-并且提出第三阶段个人创新点：
+And the third stage of personal innovation is proposed:
 
 ```text
 Profile-Conditioned Forecasting Router
 ```
 
-它让不同变量、窗口或时序模式路由到不同 expert：
+It gives different variables, windows or time-series modes a different route.
 
 ```text
 router(z) -> {
@@ -378,39 +378,39 @@ router(z) -> {
 }
 ```
 
-### 当前架构中的状态
+### Status in the current architecture
 
-当前架构中已有一些相关元素：
+There are some relevant elements in the current architecture:
 
 - `gated_hybrid`
 - `temporal_then_feature`
 - `feature_then_temporal`
 - `residual_correction`
-- 多尺度 branch 的研究方向提示
+- Research directional tips for multiscale Branch
 
-但这些目前是零散 action 或提示，没有形成清晰的阶段性创新主线。
+However, these are currently fragmented accelerations or tips that do not create clear milestones for innovation.
 
-当前路线图中的 Milestone 2 仍主要是 TimeRecipe 风格模块组合搜索；Milestone 6 才轻描淡写提到 template patch、distillation、多任务迁移。Profile-conditioned router 没有作为明确阶段目标出现。
+In the current road map, Milestone 2 is still primarily a TimeRecipe-style modular combination search; It is only in the case of militone 6 that we are downplayed about template catch, distillation and multitasking. Profile-condited moder did not appear as a clear stage target.
 
-### 影响
+### Impact
 
-当前文档能说明“系统可以组合模块”，但还不够说明“系统能构建超出现有模型库和 TimeRecipe 固定组合的新结构”。
+The current document indicates that " the system can combine modules " , but it is not sufficient to state that " the system can construct new structures beyond the existing model library and TimeRecipe fixed combinations.
 
-这会削弱 v2 的 Contribution 5：
+Contribution 5:
 
 ```text
 Hybrid Forecasting Architectures
 ```
 
-### 建议补充
+### Suggested addition
 
-在 Search Space Layer 中新增：
+Add the following to the Search Space Layer:
 
 ```text
 Meta-Architecture Action Space
 ```
 
-初始 action：
+Initial action:
 
 ```text
 split_trend_seasonal_branches
@@ -423,58 +423,58 @@ add_expert_branch
 prune_branch
 ```
 
-新增阶段路线：
+New phase route:
 
 ```text
 Milestone 3: Hybrid Architecture Construction
 ```
 
-目标：
+Objectives:
 
-- 支持 dual-branch architecture。
-- 支持 trend / seasonal / dependency expert。
-- 支持 gated fusion。
-- 支持 branch pruning。
+- Supports the dual-branch atchitecure.
+- Supports the transfer/seasonal/dependency input.
+- Supported gad fusion.
+- Support for lanch pruning.
 
-再新增：
+Add:
 
 ```text
 Milestone 4: Profile-Conditioned Forecasting Router
 ```
 
-目标：
+Objectives:
 
-- 为变量或窗口计算 profile vector。
-- 根据 profile router 选择 expert。
-- 比较 fixed architecture vs profile-conditioned architecture。
-- 验证 router 是否提升跨变量、跨 horizon、跨数据集鲁棒性。
+- Calculates the variable vector for a variable or window.
+- Select an example according to the profile router.
+- Compared with adjusted vs profile-conditions.
+- Validates whether router enhances cross-variant, cross-horizon and cross-data.
 
 ---
 
-## 5. Research Artifact / Report Generator 没有成为核心接口
+## 5. Research Artifact / Report Generator does not become the core interface
 
-### 最新思考中的主张
+### The idea in the latest thinking.
 
-v2 明确输出不是模型名，而是完整 research artifact：
+v2 clearly output is not a model name, but complete
 
 ```text
-1. 自动构建出的 best model recipe
-2. 可运行的 PyTorch model code
-3. 训练配置
-4. 实验排行榜
-5. 每轮 action trajectory
-6. 每轮假设与失败分析
+1. Bust model automatically
+2. Runable PyTorch model code
+3. Training Configuration
+4. Experiment Highlights
+5. Each round action projectory
+6. Analysis of assumptions and failures per round
 7. per-horizon / per-variable error analysis
-8. 消融实验
-9. 最终 research report
-10. 下一步研究建议
+8. Absorption experiments
+9. Ultimately, research report
+10. Recommendations for the next study
 ```
 
-### 当前架构中的状态
+### Status in the current architecture
 
-当前架构只在研究产物、Milestone 5 和 `AnalysisReport` 中提到报告。
+The current structure refers to reports only in research products, Milestone 5 and `AnalysisReport`.
 
-当前 `AnalysisReport` 比较轻：
+Current `AnalysisReport` light:
 
 ```python
 @dataclass
@@ -485,32 +485,32 @@ class AnalysisReport:
     next_suggestions: list[str]
 ```
 
-它不足以承载完整 research artifact。
+It's not enough to carry the whole story.
 
-### 影响
+### Impact
 
-如果报告只是最后的附属产物，系统会更像自动实验平台，而不是 AutoResearch。
+If the report is only a final subsidiary, the system will be more like an automated experimental platform than AutoResearch.
 
-AutoResearch 的研究价值需要通过报告体现：
+The research value of AutoResearch needs to be reflected in the report:
 
-- 为什么这样设计？
-- 每轮 hypothesis 是什么？
-- 哪些 action 有效？
-- 哪些失败了？
-- 结构如何演化？
-- 是否做了消融？
-- 与 baseline 和 oracle 差多少？
-- 下一步研究方向是什么？
+- Why do you design it like this?
+- What's every hypothesis?
+- Which action works?
+- What failed?
+- How does the structure evolve?
+- Did you do it?
+- What's the difference with baseline and oracle?
+- What's the next course of study?
 
-### 建议补充
+### Suggested addition
 
-新增：
+Add:
 
 ```text
 Research Artifact Layer
 ```
 
-建议数据结构：
+Recommended data structure:
 
 ```python
 @dataclass
@@ -531,7 +531,7 @@ class ResearchArtifact:
     next_research_suggestions: list[str]
 ```
 
-同时扩展 Report Generator：
+Extension:
 
 ```python
 def generate_research_artifact(
@@ -548,39 +548,39 @@ def generate_research_artifact(
 
 ---
 
-## 建议的文档改写优先级
+## Suggested Document Rewrite Priority
 
-### P0：必须补
+### P0: Must be completed
 
 1. `Research Intent Layer`
 2. `ActionTrajectory`
 3. `Model Compiler Layer`
 
-这些决定当前文档是否真正对齐 v2 的核心主张。
+These determine whether the current document is really aligned with the v2 core proposition.
 
-### P1：强烈建议补
+### P1: Strong proposal to supplement
 
 1. `Meta-Architecture Action Space`
 2. `Profile-Conditioned Forecasting Router`
 3. `ResearchArtifact / Report Generator`
 
-这些决定方案是否具备论文贡献感。
+These determine whether the programme has a sense of paper contribution.
 
-### P2：后续扩展
+### P2: Follow-up expansion
 
-1. 完整文献/benchmark prior library。
-2. 训练 surrogate predictor。
-3. 多数据集 profile-conditioned routing 验证。
-4. 自动生成消融实验计划。
+1. Full literature/benchmark prior library.
+2. Training surrogate predictor.
+3. Multiple dataset program-condiving validation.
+4. Automatically generate digestion experiments.
 
 ---
 
-## 建议加入当前架构文档的新目录结构
+## Suggests a new directory structure for the current architecture document
 
-可以把当前 `neo_research_tsf_architecture.md` 调整为：
+You can adjust the current `neo_research_tsf_architecture.md` to:
 
 ```text
-1. 系统定位与核心主张
+1. System positioning and core propositions
 2. Research Intent Layer
 3. Time-Series Profiler Layer
 4. Modular Action Space Layer
@@ -598,10 +598,10 @@ def generate_research_artifact(
 16. Expected Contributions
 ```
 
-这样会让文档从“工程架构说明”更接近 v2 的“研究方案 + 系统设计 + 论文贡献”。
+This will bring the document closer to v2 "Research Program + System Design + Paper Contribution" from the Project Structure Description.
 
 ---
 
-## 一句话总结
+## Summary of the sentence
 
-当前 `neo_research_tsf_architecture.md` 已经具备可落地的工程闭环，但还需要把 **Requirement Formalizer、Action Trajectory、Executable Compiler、Hybrid/Router Construction、Research Artifact** 五个模块补上，才能完全对齐 `NeoResearch-TSF-v2.md` 中 “Action-Space-Based Auto Model Construction for Time-Series Forecasting” 的最新主张。
+The current `neo_research_tsf_architecture.md` has a closed project loop to land, but the latest claim in `NeoResearch-TSF-v2.md` for "Action-Space-Based Auto Model Control for Time-Series Forecasting" needs to be added to **Requirement Force, Exportable Company, Hybrid/Router Construction, Research Act**.

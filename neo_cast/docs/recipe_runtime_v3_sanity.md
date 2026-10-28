@@ -1,10 +1,10 @@
-# V3 小样本训练验证
+# V3 Small-sample Training Validation
 
-2026-09-23，ETTh1，原始文件 SHA256 `aaf53becad03ad8a7e93cf96452244f423480df960d769e12d66d4a5c570ddb0`。
+2026-09-23, ETTh1, source SHA256 `aaf53becad03ad8a7e93cf96452244f423480df960d769e12d66d4a5c570ddb0`.
 
-训练行 `[0,7000)`，独立留出行 `[7000,8640)`，T=96，H=24，batch=16；CPU 单线程，Adam lr=0.001，30 次更新，种子 42/43/44。相同采样窗口和更新次数，参数量没有配平。全部使用 revision 3；不访问 ref_test。
+Train rows `[0,7000)`, independent holdout `[7000,8640)`, T=96, H=24, batch=16; single-threaded CPU, Adam lr=0.001, 30 updates, seeds 42/43/44. Sampled windows and update counts match; parameter counts are not balanced. All use revision 3 and never access ref_test.
 
-| 模型/组合 | 参数数 | 留出 MSE 均值 ± 标准差 |
+| Model/composition | Parameters | Holdout MSE mean +/- standard deviation |
 | --- | ---: | ---: |
 | linear | 7768 | 0.5656 ± 0.0243 |
 | gated_depthwise_conv | 2360 | 0.9491 ± 0.0278 |
@@ -18,6 +18,6 @@
 | diagonal_ssm + mamba, latent gate | 2784 | 1.4461 ± 0.0256 |
 | diagonal_ssm + mamba, history gate | 2161 | 1.4610 ± 0.0277 |
 
-标准差为三个种子的总体标准差。本次仅确认训练机制和评估流程可运行；新模型没有超过线性基线，不能据此宣称预测收益，也不能作为充分收敛后的模型排名。未进行超参搜索、参数预算配平、长预算或论文复现。
+Standard deviation is the population standard deviation across three seeds. This checks execution of training and evaluation only. New models did not beat the linear baseline; these results establish neither forecasting gains nor rankings after adequate convergence. No hyperparameter search, parameter balancing, long training, or paper reproduction was performed.
 
-复现入口：`PYTHONPATH=py .neo-cast/runtime/.venv/bin/python py/recipe_sanity.py --help`，默认种子为 42、43、44，结果 JSON 包含每个种子的指标、参数图和耗时。`process_peak_rss_kib` 是整个进程累计高水位，不可当作每个模型独立峰值内存。
+Reproduce with `PYTHONPATH=py .neo-cast/runtime/.venv/bin/python py/recipe_sanity.py --help`. Default seeds are 42, 43, 44; result JSON includes each seed's metrics, parameter graph, and timing. `process_peak_rss_kib` is the process-wide cumulative high-water mark, not each model's independent peak memory.

@@ -14,11 +14,11 @@ function input(bridgeOnly = false) {
 }
 
 const hypothesis: HypothesisObject = {
-  id: "H_zero", statement: "依据数据的季节结构自主设计模型。", motivation: ["观察到周期为 24。"],
-  expectedOutcome: "降低 cv_avg_mse", suggestedBackbones: ["mlp"], suggestedPreprocessing: [],
+  id: "H_zero", statement: "Design a model autonomously from the dataset's seasonal structure.", motivation: ["An observed period is 24."],
+  expectedOutcome: "Reduce cv_avg_mse", suggestedBackbones: ["mlp"], suggestedPreprocessing: [],
   experimentContract: { mode: "exploratory", changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
-  requiredMechanisms: [], risk: "可能过拟合", testable: true, datasetEvidencePaths: [], literatureEvidence: [],
-  applicabilityAssumptions: [], falsificationCriteria: ["完整验证中主指标无效则无法支持该方案。"], evidenceLevel: "data_only",
+  requiredMechanisms: [], risk: "May overfit", testable: true, datasetEvidencePaths: [], literatureEvidence: [],
+  applicabilityAssumptions: [], falsificationCriteria: ["An invalid primary metric in full validation cannot support this approach."], evidenceLevel: "data_only",
 }
 
 for (const bridgeOnly of [true, false]) {
@@ -49,9 +49,9 @@ test("zero validates its configuration and goal builder preserves the explicit v
 
 test("zero requires autonomous hypotheses and explicit selection, and permits an explicit stop", () => {
   const task = { ...input(), id: "rtsk_zero" } as ResearchTask
-  const base = { task, dataAnalysisSummary: "周期为 24", runs: [], memory: [] }
+  const base = { task, dataAnalysisSummary: "The period is 24", runs: [], memory: [] }
   expect(() => buildHypoPlannerResult(base)).toThrow("deterministic hypothesis fallback is disabled")
-  const nextExperiment = { action: "experiment" as const, hypothesisID: hypothesis.id, rationale: "直接测试所选假设" }
+  const nextExperiment = { action: "experiment" as const, hypothesisID: hypothesis.id, rationale: "Test the selected hypothesis directly" }
   const result = buildHypoPlannerResult({ ...base, llmHypotheses: [hypothesis], nextExperiment })
   expect(result.plan.baselineStrategy).toBe("autonomous_from_scratch")
   expect(result.plan.referenceBaseline).toBeUndefined()
@@ -60,7 +60,7 @@ test("zero requires autonomous hypotheses and explicit selection, and permits an
   expect(() => buildHypoPlannerResult({ ...base, llmHypotheses: [{ ...hypothesis, experimentContract: { ...hypothesis.experimentContract!, mode: "baseline" } }], nextExperiment })).toThrow("exploratory or controlled")
   expect(() => buildHypoPlannerResult({ ...base, llmHypotheses: [hypothesis], nextExperiment: { ...nextExperiment, hypothesisID: "missing" } })).toThrow("open hypothesis")
   expect(() => buildHypoPlannerResult({ ...base, llmHypotheses: [{ ...hypothesis, evidenceLevel: "paper_supported", literatureEvidence: [{ cardID: "invented", cardRevision: 1, role: "supports_mechanism" }] }], nextExperiment })).toThrow()
-  const stop = buildHypoPlannerResult({ ...base, llmHypotheses: [], nextExperiment: { action: "stop", rationale: "没有可行实验" } })
+  const stop = buildHypoPlannerResult({ ...base, llmHypotheses: [], nextExperiment: { action: "stop", rationale: "No feasible experiment" } })
   expect(stop.plan.hypotheses).toEqual([])
   expect(stop.plan.nextExperiment?.action).toBe("stop")
 })

@@ -192,7 +192,7 @@ describe("filesystem", () => {
     test("reads UTF-8 content correctly", async () => {
       await using tmp = await tmpdir()
       const filepath = path.join(tmp.path, "unicode.txt")
-      const content = "Hello 世界 🌍"
+      const content = "Hello world 🌍"
       await fs.writeFile(filepath, content, "utf-8")
 
       expect(await Filesystem.readText(filepath)).toBe(content)

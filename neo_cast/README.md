@@ -109,7 +109,7 @@ After global npm installation, replace `node ./bin/neo-cast.js` with `neo-cast`.
 From the repository root:
 
 ```bash
-cd /Users/chengmingyue/human_agent_collaboration/research_working/idea/neo_research_for_tsf/neo_cast
+cd /path/to/NeoResearch/neo_cast
 npm install
 node ./bin/neo-cast.js init-runtime
 ```

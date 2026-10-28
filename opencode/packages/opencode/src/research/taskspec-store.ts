@@ -114,7 +114,7 @@ function normalizeSplitRowRanges(value: unknown) {
 }
 
 function explicitParameterLimit(value: unknown): number | undefined {
-  const match = typeof value === "string" ? value.trim().match(/^([+-]?\d+(?:\.\d+)?)\s*([kmb])?(?:\s*(?:parameters?|params|参数))?$/i) : undefined
+  const match = typeof value === "string" ? value.trim().match(/^([+-]?\d+(?:\.\d+)?)\s*([kmb])?(?:\s*(?:parameters?|params))?$/i) : undefined
   const count = typeof value === "number" ? value : match
     ? Number(match[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[match[2]?.toLowerCase() ?? ""] ?? 1)
     : undefined
@@ -140,8 +140,8 @@ function parseCsvLine(line: string): string[] {
 }
 
 function resolveCovariates(task: ResearchTask, slots: Record<string, unknown>) {
-  const raw = stringArray(slots.exogenous_variables).filter((value) => !/^(none|无|没有)$/i.test(value))
-  const requestsAll = raw.some((value) => /^(all|全部)$/i.test(value) || value.includes("全部外生"))
+  const raw = stringArray(slots.exogenous_variables).filter((value) => !/^none$/i.test(value))
+  const requestsAll = raw.some((value) => /^all$/i.test(value))
   const dataset = recordValue(task.taskSpec.dataset)
   const source = typeof dataset.path === "string" ? dataset.path : typeof slots.data_source === "string" ? slots.data_source : ""
   if (!requestsAll) return { columns: raw, policy: "explicit_columns", source, fingerprint: undefined }
@@ -284,7 +284,7 @@ export async function applySlotUpdates(
   }
   if ("secondary_metrics" in normalizedUpdates) normalizedUpdates.secondary_metrics = stringArray(normalizedUpdates.secondary_metrics)
   if (typeof normalizedUpdates.exogenous_variables === "string") {
-    normalizedUpdates.exogenous_variables = /^(none|无|没有)$/i.test(normalizedUpdates.exogenous_variables.trim())
+    normalizedUpdates.exogenous_variables = /^none$/i.test(normalizedUpdates.exogenous_variables.trim())
       ? []
       : stringArray(normalizedUpdates.exogenous_variables)
   }
@@ -358,8 +358,8 @@ export async function applySlotUpdates(
   const availability = typeof nextSlots.future_covariate_availability === "string"
     ? nextSlots.future_covariate_availability.trim()
     : undefined
-  const oracle = availability !== undefined && /oracle|上界|离线真值/i.test(availability)
-  const unavailable = availability !== undefined && /not available|unavailable|不可用|不能|无法|否/i.test(availability)
+  const oracle = availability !== undefined && /oracle|upper.?bound|offline ground truth/i.test(availability)
+  const unavailable = availability !== undefined && /\b(?:not available|unavailable|cannot|no)\b/i.test(availability)
   const availableAtPredictionTime = availability === undefined ? undefined : !oracle && !unavailable
   if (task.domainID === "tsf" && ((availability !== undefined && !unavailable) || (Array.isArray(existingDataset.knownFutureCovariates) && existingDataset.knownFutureCovariates.length > 0))) {
     throw new TaskSpecUpdateError("UNSUPPORTED_COVARIATE: known-future conditioning is unavailable; use observed-past covariates only")
@@ -485,7 +485,7 @@ export async function checkTaskspecReadiness(taskID: ResearchTaskID): Promise<Ta
   }
 }
 
-export const ASK_USER_CLARIFICATION_MARKER = "需要澄清研究意图："
+export const ASK_USER_CLARIFICATION_MARKER = "Research intent clarification required:"
 
 // ask_user creates a fresh pending approval per question and nothing else ever resolves the
 // previous one — left alone, they pile up and the stalest one keeps winning in the cockpit's
@@ -609,9 +609,9 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     return canonical !== undefined && canonical !== null ? canonical : intentSlots[slotKey]
   }
   return [
-    "## 需求交流确认完成后，才能结束 Intent Agent",
+    "## Complete and confirm requirements before finishing Intent Agent",
     "",
-    "请确认 Intent Agent 已完成需求交流，下面这些研究意图可以作为后续 Data Analysis、HypoPlanner 和实验循环的输入。",
+    "Confirm that Intent Agent has finished gathering requirements and that the following research intent is ready for Data Analysis, HypoPlanner, and the experiment loop.",
     `Intent signature: ${intentCheckpointSignature(task)}`,
     `Interaction mode: ${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `Task: ${task.title}`,
@@ -638,7 +638,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Deployment target: ${compactIntentValue(intentSlots.deployment_target ?? spec.deploymentTarget)}`,
     `Business context: ${compactIntentValue(intentSlots.business_context ?? metadata.businessContext ?? metadata.business_context)}`,
     "",
-    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并逐一修改 slots 后重新确认。",
+    "**Recommended action:** approve these requirements to finish Intent Agent and enter Data Analysis; to add requirements, reject, update the slots individually, and confirm again.",
   ].join("\n")
 }
 
@@ -669,7 +669,7 @@ export function supersedeIntentCheckpoints(taskID: ResearchTaskID, signature: st
 export async function enterIntentCheckpoint(taskID: ResearchTaskID): Promise<IntentCheckpointResult> {
   let task = await loadTask(taskID)
   const intentSlots = recordValue(recordValue(task.taskSpec.metadata).intentSlots)
-  if (stringArray(intentSlots.exogenous_variables).some((value) => /^(all|全部)$/i.test(value) || value.includes("全部外生"))) {
+  if (stringArray(intentSlots.exogenous_variables).some((value) => /^all$/i.test(value))) {
     await applySlotUpdates(taskID, {})
     task = await loadTask(taskID)
   }

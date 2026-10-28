@@ -1,177 +1,177 @@
-# neo-research for TSF：架构设计文档 v3.1
+# Neo-research for TSF: Structure Design Document v3.1
 
-> 2026-09-27 更新：用户已要求删除 `direct_multi_horizon`。该 action 已从当前 schema、注册表、工厂和搜索入口移除，旧方案中对其恢复/重新定义的描述不再适用。
+> 2026-09-27 Update: User has requested to delete `direct_multi_horizon`. This action has been removed from the current scheme, registration form, plant and search entry, and its restoration/redefinition description in the old program is no longer applicable.
 
-> 面向时间序列预测领域的自主研究智能体系统 — **Forecast Research Operating System**
-> 设计参照：Karpathy autoresearch（2026）、The AI Scientist（2024）、AutoML-Zero、TimeRecipe（ICLR 2026）
-> 数据加载与评估协议参照：[Time-Series-Library](https://github.com/thuml/Time-Series-Library)（thuml，2024）
-
----
-
-## 1. 系统定位与核心主张
-
-### 1.1 问题陈述
-
-时间序列预测（TSF）领域已经形成了高度碎片化的模型生态：Autoformer 用分解与 Auto-Correlation 切入长序列，PatchTST 用 patching + channel-independence 改造输入表示，iTransformer 把建模重心转到 variate token；但每一个"小模型"的诞生，都需要算法工程师大量人工投入——反复设计网络结构、调节优化策略、跑对比实验。这个过程**高度重复、耗时耗力，且严重依赖专家经验积累**。
-
-### 1.2 核心主张
-
-neo-research 系统通过把"设计 TSF 小模型"这件事转化为一个**可自动执行的闭环**，让 AI agent 在被严格约束的实验环境里，持续完成以下循环：
-
-1. 发现问题与提出假设
-2. 生成或修改模型结构
-3. 生成或修改训练目标与训练策略
-4. 自动运行实验并记录结果
-5. 判断变化是否有效
-6. 保留有效变化并继续迭代
-7. 输出可复现的模型、代码、报告与知识沉淀
-
-**系统目标不是"会聊天的时序助手"，而是一个 Forecast Research Operating System。**
-
-### 1.3 系统定义
-
-**Neo-Research** 不是简单的 AutoML（没有结构化搜索空间），也不是纯 LLM code agent（没有可审计的约束执行环境），而是把"研究假设—代码变更—实验执行—结果归因—知识积累"串成闭环的**受控研究系统**。
-
-**研究对象**：重点针对**小模型**，即满足参数量、延迟、显存、训练成本等约束的定制化时序预测模型，不追求无限放大参数规模。
-
-**研究产物**：
-
-- 新模型结构
-- 新 loss 组合
-- 新的数据预处理/特征策略
-- 新的训练配方（优化器、schedule、正则化组合）
-- 新的推理/蒸馏/集成策略
-- 可复现实验报告
-- 可继承的研究记忆（跨任务经验）
+> Auto-research smart system for time series prediction - **Forecost Research Organizing System**
+> Design reference: Karpathy autoresearch (2026), The AI Sciencelist (2024), AutoML-Zero, TimeRecipe (ICLR 2026)
+> Data loading and evaluation protocols reference: [Time-Series-Library](https://github.com/thuml/Time-Series-Library) (thuml, 2024)]
 
 ---
 
-## 2. 设计目标与系统边界
+## 1. System positioning and core propositions
 
-### 2.1 设计目标
+### 1.1 Question Statement
 
-| # | 目标 | 内涵 |
+The area of time series prediction (TSF) has developed a highly fragmented model ecology: Autoformer cuts into long sequences by decomposition and Auto-Correlation, PatchTST changes input by checking + channnel-indendence, iTransformer shifts modelling focus to paragate token; But the birth of every "small model" requires a lot of manual input from algorithm engineers — repeated design of network structures, fine-tuning strategies and running comparison experiments. This process**is highly repetitive, time-consuming and heavily dependent on expert experience.**
+
+### 1.2 Core Claim
+
+The neo-research system, by transforming the "design of a small TSF model" into an **self-implementable loop**, allows AI angent to continue to complete the following cycles in a strictly confined experimental environment:
+
+1. Identification of problems and presentation of assumptions
+2. Generate or modify model structures
+3. Generate or modify training objectives and training strategies
+4. Automatically run experiments and record results
+5. Assessing whether change is effective
+6. Keep valid changes and continue to overlap
+7. Output replicable models, codes, reports and knowledge deposition
+
+**The system's target is not a "chatting timer" assistant, but a Forest Research Operating System.**
+
+### 1.3 system definition
+
+**Neo-Research**is not a simple AutoML (no structured search space) or a purely LLM code agent (no auditable enforcement environment), but a closed** controlled research system that links "research assumptions - code change - experimental execution - results attributed - knowledge accumulation"**.
+
+**Subjects of study**: Focus on small models**, i.e. customized time-series prediction models that meet constraints such as parameters volume, delay, visibility, training costs, etc., without seeking an unlimited magnification of the size of the parameters.
+
+**Research products**:
+
+- New model structure
+- New loss group
+- New Data Preprocessing/Performance Policy
+- New training formulation (optimizer, Schedule, regular combination)
+- New inference/distillation/integrated strategy
+- Revertable Experiment Report
+- Legacy of research memory (cross-mission experience)
+
+---
+
+## 2. Design target and system boundary
+
+### 2.1 Design Target
+
+| # | Objective | Content |
 |---|------|------|
-| 1 | **自动化** | 尽量减少算法工程师手动改模型、调 loss、跑 ablation 的工作量 |
-| 2 | **约束性** | 所有实验在固定协议下执行，禁止任意绕过评测 |
-| 3 | **可复现** | 任何"有效变化"都必须可回放、可审计、可比较 |
-| 4 | **小模型优先** | 优化目标包括精度、参数量、延迟、稳定性，不单一追求 leaderboard |
-| 5 | **可积累** | 系统逐渐形成"在什么样的时序任务上，什么样的结构/目标更有效"的经验库 |
-| 6 | **人机协同** | 人负责定义任务边界、预算和研究方向；Agent 负责高频试验与局部创新 |
+| 1 | **Automation** | Minimize the workload of algorithm engineers to manually modify models, switch loss and run ablation |
+| 2 | **Binding** | All experiments are carried out under a fixed agreement and arbitrary circumvention of the evaluation is prohibited. |
+| 3 | **Revertible** | Any "effective change" must be reversible, auditable and comparable. |
+| 4 | **Small model priority** | Optimization targets include precision, parameter size, delay, stability and not a single pursuit of leaderboard |
+| 5 | **Accumulated** | The system evolves into a repository of experience on what sort of time-series tasks, what structure/target is more effective |
+| 6 | **Human synergies** | The person is responsible for defining the mission boundary, budget and research direction; Agent for HF testing and local innovation |
 
-### 2.2 非目标（第一阶段）
+### 2.2 Non-target (phase I)
 
-1. 不做开放式文献综述 Agent
-2. 不做自由无限制代码生成
-3. 不以自动写论文为主目标
-4. 不直接接管生产部署
-5. 不追求覆盖所有时序任务，先聚焦 forecasting
+1. No open literature review, Agent
+2. No Free Unlimited Code Generation
+3. Do not focus on auto-writing papers
+4. Not directly taking over production deployment
+5. Focus not on covering all time-series tasks, focus first
 
-### 2.3 核心原则
+### 2.3 Core Principles
 
-**原则一：先协议，后智能**
-先把数据协议、评估协议、预算协议、代码协议定死，再让 Agent 在约束内创新。
+**Principle I: Agreement first, intelligence later**
+First the data protocol, the evaluation protocol, the budget agreement, the code agreement, then Agent's innovation within the bounds.
 
-**原则二：先 DSL/IR，后自由改代码**
-最关键的工程决策是：**不要让 Agent 一开始就在整个代码仓里自由发挥**。更可行的做法是引入模型中间表示（IR）/配置 DSL，让 Agent 主要在声明式空间里搜索，再把少量高价值候选升级为代码级变更。
+**Principle II: DSL/IR first, then change code freely**
+The most critical engineering decision is: **Don't let Agent be free from the whole code warehouse at the start.**It would be more feasible to introduce intermediate expression (IR)/configuring DSL in the model, allowing Agent to search mainly in declarative space and upgrade a small number of high-value candidates to code level changes.
 
-> **Phase 0 例外说明：** 为了最快验证闭环，MVP 允许 Agent 仅在 `train.py` **单文件内**自由改动；这不是对"全仓自由改代码"的放开。从 Phase 1 开始，新增结构原则上应先通过 registry / DSL 暴露，再允许受限 patch。
+> **Phase 0 exception:** For the quickest verification of closed loops, MVP allows Agent to change freely only in `train.py`**single file**; It's not about letting go of the "freehouse change code."Starting with PHase 1, the new structure should in principle be exposed through registry/ DSL before being allowed to have a limited watch.
 
-> **阶段口径说明：** Phase 0 分成两个子阶段。`Phase 0a` 只验证 autoresearch 式闭环，允许 `train.py` 单文件自由实验；`Phase 0b` 开始冻结 `CandidateRecipe v1` 和 baseline recipe，但仍可用 `train.py` 作为执行载体；`Phase 1` 才要求候选优先通过 action registry 与 `build_model(candidate_recipe)` 生成。
+> **Phase calibration statement:** Phase 0 split into two sub-phases.`Phase 0a` validates only the autoresearch closed ring, allowing free experiment of `train.py` single files;`Phase 0b` starts freezing `CandidateRecipe v1` and baseline review, but can still use `train.py` as an executing carrier; It is only `Phase 1` that requires priority to be given to the selection of candidates through action registry and `build_model(candidate_recipe)`.
 
-**原则三：先多阶段筛选，后完整评测**
-所有候选不能直接上 full training，应采用：静态检查 → smoke run → 低保真实验 → 完整验证 → 多 seed 确认 → blind test 晋级。
+**Principle III: Multi-stage screening followed by a full assessment**
+Candidates should progress through static checks → smoke runs → low-fidelity experiments → full validation → multiple-seed confirmation → blind-test promotion, rather than all starting full training immediately.
 
-> **Phase 0 例外说明：** 上述是完整系统的理想流程。MVP 阶段允许退化为"修改 `train.py` → 直接 full run → keep/discard"，不要求先实现 smoke harness、低保真筛选器或多 baseline 调度器。
+> **Phase 0 exception:** The complete system targets the workflow above. The MVP may use "edit `train.py` → direct full run → keep/discard" without first implementing a smoke harness, low-fidelity filters, or multiple-baseline scheduling.
 
-**原则四：先保留有效增量，后追求颠覆式创新**
-系统天然偏向 **delta-based research**：每轮只提出少量可验证改动，并保留有效 patch。
+**Principle IV: Maintaining effective increments before pursuing subversive innovations**
+Natural bias of the system **delta-based research**: Only a few verifiable changes are proposed per round and valid watch is retained.
 
-**原则五：精度不是唯一目标**
-小模型研发必须做多目标优化：`accuracy + params + latency + robustness + reproducibility`。
+**Principle V: Precision is not the only goal**
+Small model development requires multi-purpose optimization: `accuracy + params + latency + robustness + reproducibility`.
 
 ---
 
-## 3. 总体架构
+## 3. Overall structure
 
-### 3.1 MVP 文件结构（autoresearch 同构）
+### 3.1 MVP file structure (autoresearch co-component)
 
 ```
 neo_research_tsf/
-├── prepare_tsf.py     ← 【冻结】数据加载 / 评估 / 固定常量
-├── train.py           ← 【Agent 唯一可编辑文件】模型架构 + 训练循环
-├── program.md         ← 【人类编辑】研究策略 + 行为协议
-├── results.tsv        ← 【不提交 git】实验日志
-└── run.log            ← 【不提交 git】最近一次实验输出
+├── prepare_tsf.py     ← Frozen: dataset loading, evaluation, and constants
+├── train.py           ← Agent-editable: model architecture and training loop
+├── program.md         ← Human-edited: research strategy and behavior policy
+├── results.tsv        ← Experiment log; do not commit
+└── run.log            ← Latest experiment output; do not commit
 ```
 
-三个文件的角色与 autoresearch 完全同构：
+The role of the three documents is identical to that of autoresearch:
 
 ```
 autoresearch          →  neo-research TSF
 ─────────────────────────────────────────
-prepare.py            →  prepare_tsf.py     （冻结层）
-train.py              →  train.py            （实验层）
-program.md            →  program.md          （策略层）
-val_bpb               →  val_avg_mse         （主指标，scaled space）
+prepare.py            → prepare_tsf.py       (frozen layer)
+train.py train.py (experiment level)
+program.md program.md (Strategic Layer)
+val_bpb               → val_avg_mse          (primary metric, scaled space)
 ```
 
-### 3.2 完整系统七层架构（长期目标）
+### 3.2 complete system seven-layer structure (long-term objective)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    Human Control Layer（人类控制层）                   │
-│         定义任务 · 批准搜索空间 · 审核晋级 · 冻结测试集 · 回滚终止       │
+│                    Human Control Layer (Human Control Layer)                   │
+│         Define tasks • Authorize search spaces • Approving promotions Freezing test sets • Roll-back termination       │
 ├─────────────────────────────────────────────────────────────────────┤
-│                  Agent Orchestration Layer（智能编排层）               │
+│                  Agent Organization Layer (intellectual hierarchy)               │
 │       Research Manager + Diagnostic / Design / Coder / Runner /     │
 │                        Analyst / Librarian                          │
 ├─────────────────────────────────────────────────────────────────────┤
-│                    Search Space Layer（搜索空间层）                    │
+│                    Search Space Layer (search space layer)                    │
 │       CandidateRecipe DSL · action registry · loss DSL · trainer DSL │
 ├─────────────────────────────────────────────────────────────────────┤
-│                   Protocol Layer（研究协议层）                         │
-│       TaskSpec · 切分边界 · 评测指标 · 参数/延迟/预算约束               │
+│                   Protocol Layer (Research Protocol Layer)                         │
+│       TaskSpec Quantification Boundary Assessment Indicator Parameters/Delaying/Budget Constraints               │
 ├─────────────────────────────────────────────────────────────────────┤
-│                    Execution Layer（执行层）                           │
-│        Sandbox · 训练器 · Static Validator · Artifact Store          │
+│                    Exchange Layer (Executive Level)                           │
+│        Sandbox trainer Static Validator Artifact Store          │
 ├─────────────────────────────────────────────────────────────────────┤
-│                   Evaluation Layer（评估层）                           │
-│        指标计算 · 多阶段筛选 · 晋级判定 · 误差诊断 · Metrics DB         │
+│                   Evaluation Layer (assessment level)                           │
+│        • Discrepancies in the diagnosis of errors.         │
 ├─────────────────────────────────────────────────────────────────────┤
-│                     Memory Layer（研究记忆层）                         │
-│         实验谱系 · 成功/失败模式 · 任务指纹 · patch diff · champion     │
+│                     Memory Layer (research memory)                         │
+│         Experimental spectrometry . Success/failure pattern Mission fingerprints . Patch diff champion     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 核心模块划分
+### 3.3 Core Module Division
 
-完整系统由 12 个核心服务模块组成：
+The complete system consists of 12 core service modules:
 
-| # | 模块 | 核心职责 |
+| # | Modules | Core responsibilities |
 |---|------|---------|
-| 1 | **Task Manager** | 创建任务、校验协议、生成 task_id、管理生命周期 |
-| 2 | **Dataset Service** | 数据加载、train/val/test 切分、特征物化、防泄漏 |
-| 3 | **Diagnostic Service** | 数据集画像、产出 TaskFingerprint |
-| 4 | **Baseline Builder** | 自动运行基线、生成 baseline metrics、产出初始 champion |
-| 5 | **Search Space Registry** | 注册 preprocessing / embedding / backbone / fusion / head / trainer action，约束 Agent 搜索边界 |
-| 6 | **Proposal Engine** | 基于指纹和历史记忆生成候选 hypothesis + CandidateRecipe |
-| 7 | **Patch Generator** | 将 recipe 转为可执行配置或受限模板变更（RecipeDelta / CodePatch） |
-| 8 | **Static Validator** | 检查 patch 合法性、接口兼容性、预算边界、越权检测 |
-| 9 | **Experiment Runner** | 创建容器、注入配置、执行训练评估、收集 artifact |
-| 10 | **Evaluator** | 统一指标计算、晋级判定、error analysis |
-| 11 | **Memory Service** | 保存实验记录、patch lineage、相似任务召回 |
-| 12 | **Governance Service** | blind test 保护、审批流、权限隔离、审计日志 |
+| 1 | **Task Manager** | Create tasks, validate protocols, generate task_id, manage life cycle |
+| 2 | **Dataset Service** | Data loading, train/val/test cut-off, characterization, leak protection |
+| 3 | **Diagnostic Service** | Dataset image, output TaskFingerprint |
+| 4 | **Baseline Builder** | Automatically run baseline, generate baseline metrics, start output |
+| 5 | **Search Space Registry** | Registering / registering / backbone / fund / head / trainer action, binding Agent to search the boundary |
+| 6 | **Proposal Engine** | Generate candidate hypothesis +CandidateRecipe based on fingerprints and historical memory |
+| 7 | **Patch Generator** | Convert recipe to an executable configuration or restricted template change (RecipeDelta/ CodePatch) |
+| 8 | **Static Validator** | Check the watch legitimacy, interface compatibility, budget boundaries, ultra vires testing |
+| 9 | **Experiment Runner** | Creation of containers, injection configurations, training assessment, collection |
+| 10 | **Evaluator** | Harmonized indicator calculation, promotion determination, error anallysis |
+| 11 | **Memory Service** | Preservation of experimental records, Patch lineage, recall for similar tasks |
+| 12 | **Governance Service** | blind test protection, approval flow, segregation of privileges, audit log |
 
-**Search Space Registry 是系统核心防线之一**——它决定 Agent 能探索什么，是整个系统可控性的关键。
+**Search Space Registry is one of the system's core lines** -- it determines what Agent can explore, which is key to the controlability of the entire system.
 
 ---
 
-## 4. 研究协议层（Protocol Layer）
+## 4. Study Protocol Layer (Protocol Layer)
 
-### 4.1 TaskSpec 定义
+### 4.1 TaskSpec Definition
 
-每个研究任务必须定义统一的 `TaskSpec`：
+Each research task must define a uniform `TaskSpec`:
 
 ```yaml
 task_id: etth1_multivar_96_720
@@ -183,64 +183,64 @@ prediction_lengths: [96, 192, 336, 720]
 
 dataset:
   loader_id: etth1_tslib_v1
-  target_cols: [HUFL, HULL, MUFL, MULL, LUFL, LULL, OT]  # Phase 0 默认采用 M setting：预测全部 7 个变量
+  target_cols: [HUFL, HULL, MUFL, MULL, LUFL, LULL, OT]  # Case 0 Default using Msetting: Forecasting all 7 variables
   known_future_covariates: []
-  observed_past_covariates: []  # 仅表示额外的 past-only 输入；Phase 0 中不与 target_cols 重复声明
+  observed_past_covariates: []  # Only indicates additional past-only input;0 does not repeat statements with target_cols
   static_covariates: []
 
 split:
   scheme: fixed_row_index
-  train: [0, 8640]            # 与 TSL Dataset_ETT_hour 完全一致
+  train: [0, 8640]            # Perfectly consistent with TSL Dataset_ETT_hour
   val: [8640, 11520]
-  test: [11520, 14400]        # 逻辑上的 public reference split；物理上仅 Runner 可见
+  test: [11520, 14400]        # Logical reference slip;Physically only Runner Visible
   test_exposure: promotion_only
-  blind_test: phase5_service  # 真正 blind test 在 Phase 5 以独立服务提供
+  blind_test: phase5_service  # The real blind test is available at PHase 5 for independent service
 
 evaluation:
   protocol: fixed_split
-  metric_primary: val_avg_mse  # 在 StandardScaler 归一化空间计算
+  metric_primary: val_avg_mse  # Calculate in StandardScaler Normalization Space
   metric_reference: ref_test_avg_mse
-  seeds: [42]                  # MVP 阶段单 seed；Phase 3+ 扩展至多 seed
+  seeds: [42]                  # MVP phase list seed;Phase 3+ extension up
 
 constraints:
-  max_params: 10_000_000       # 10M 参数软上限
+  max_params: 10_000_000       # Soft ceiling for 10M parameters
   max_training_seconds: 600
   max_gpu_hours_total: 100
   max_trials: 500
 ```
 
-> **字段语义说明：** `target_cols` 是需要预测的内生变量集合；它们默认也会出现在历史窗口 `x` 中。`observed_past_covariates` 只表示额外的 past-only 输入，不能把已在 `target_cols` 中的列再次拼接一遍。
+> **The syntax description of the field:** `target_cols` is a collection of endogenous variables to be predicted; They will also appear by default in the history window `x`.`observed_past_covariates` only indicates additional past-only input and cannot spell columns already in `target_cols` again.
 
-### 4.2 时序安全原则
+### 4.2 time-series security principles
 
-必须强制执行：
+It must be enforced:
 
-- 所有归一化、缺失值填补、统计特征拟合**只允许在 train fold 上完成**
-- 未来不可见特征禁止泄漏到训练样本
-- `val` 是 Agent 唯一可高频查询的决策信号
-- 仓库内自带的 `test` 只作为 **reference test**，默认仅在晋级节点由 Runner / Human Gate 查询，Agent 不直接读取
-- reference test 结果必须写入 **privileged promotion log**，不得写入 Agent 可读的 `results.tsv`
-- 真正 blind test 的标签和接口不进入仓库，Phase 5 才通过独立服务暴露
+- All Normalization, Missing Values Filled, Statistical Qualification**Allow completion only on trackFold**
+- Future invisibility prevents leaking to training samples.
+- `val` is the only high frequency query decision signal for Agent
+- `test` in the repository only as **Reference test**, defaulted to be queryed by Runner/ Human Gate only at the promotion node and Agent was not read directly
+- Reference test has to be written **privileged protocol log**, not Agent readable `results.tsv`
+- The real blind test tags and interfaces don't go into the warehouse. Phase 5 is exposed through independent services.
 
-### 4.3 三层评估协议
+### 4.3 Three Level Assessment Protocol
 
-建议分三层，避免系统对单一验证集过拟合：
+It is suggested that the system should be divided into three layers, so as to avoid over-compatibility of a single certification set:
 
-| 层次 | 名称 | 使用场景 | 查询频率 |
+| Level | Name | Use scene | Query Frequency |
 |------|------|---------|--------|
-| L1 | Dev Validation | 日常 keep/discard 决策 | 每次实验 |
-| L2 | Reference Test / Shadow Holdout | 晋级筛选与对外参考对齐 | 每 N 次 keep，由 Runner/Human 查询并写入 privileged log |
-| L3 | Blind Test | 最终 champion 确认 | 仅晋级节点，Phase 5 起可用 |
+| L1 | Dev Validation | Daytime keep/discard decision-making | Every experiment. |
+| L2 | Reference Test / Shadow Holdout | Promotion screening and external reference alignment | Every N keepep, queryed by Runner/Human and written to the Privileged log |
+| L3 | Blind Test | Final campion confirmation | Phase 5 is available for promotion only |
 
 ---
 
-## 5. 搜索空间设计（Search Space Layer）
+## 5. Search space design (Sayer)
 
-这是系统成败的核心。v3.1 将 Neo-Cast 的候选空间从"选择模型族 + 配模型参数"升级为 TimeRecipe 风格的**模块级配方搜索**：Agent 不再先问"用 PatchTST 还是 iTransformer"，而是按固定 pipeline 选择一组可注册 action，再由 runtime 组装成模型。
+This is central to the system's success. Version 3.1 changes the candidate space from choosing a model family and its parameters to TimeRecipe-style **module-level recipe search**: agents select registered actions along a fixed pipeline, and runtime assembles them into a model, rather than first choosing PatchTST or iTransformer.
 
 ### 5.1 Canonical Recipe Pipeline
 
-Neo-Cast 的候选模型统一抽象为：
+Neo-Cast's candidate model is uniform abstract:
 
 ```text
 Input
@@ -254,11 +254,11 @@ Input
   -> Forecast
 ```
 
-其中 `post_processing` 通常与 `preprocessing` 配对，例如 instance normalization 的反归一化、decomposition 的 trend/seasonal recomposition。第一阶段可以把 `post_processing` 作为自动派生字段，不暴露给 Agent 直接搜索。
+Of which `post_processing` is usually paired with `preprocessing`, e.g. reverse integration of information, decomposition trend/seasonal repositioning. The first stage allows `post_processing` to be used as an automatic derivative field without being exposed to Agent's direct search.
 
 ### 5.2 CandidateRecipe Schema
 
-候选不再以 `model_family` 为主键，而以 recipe 为主键：
+Candidates no longer use `model_family` as their primary key, but use recipe as their main key:
 
 ```json
 {
@@ -308,75 +308,75 @@ Input
 }
 ```
 
-这个 schema 的核心约束是：Agent 只能选择 registry 中存在的 action 和合法参数；`build_model(candidate_recipe)` 由 Python 端负责装配 PyTorch 模型，禁止候选直接注入任意模型代码。
+The core constraint of this schema is: Agent can only select the action and valid parameters that exist in registry;`build_model(candidate_recipe)` has Python-end responsibility for the assembly of PyTorch models, and candidates are prohibited from directly injecting any model code.
 
 ### 5.3 Preprocessing Action Space
 
-Preprocessing 负责处理尺度漂移、趋势/季节性、缺失和输入重采样。初期注册：
+Preprocessing handles scale drift, trends/seasonality, missing and input re-sampling. Initial registration:
 
-| Action | 参数 | 适用偏置 |
+| Action | Parameters | Apply bias |
 |--------|------|---------|
-| `none` | - | 保留原始输入，作为必要对照 |
-| `instance_norm` | `affine`, `eps` | distribution shift 明显、变量尺度不稳定 |
-| `series_decomposition` | `method`, `kernel_size` | trend 强、长期预测、DLinear/Autoformer 类偏置 |
-| `seasonal_differencing` | `period`, `order` | 强季节性、低频趋势干扰 |
-| `missing_mask` | `mask_channel`, `fill_policy` | 缺失率高、需要显式缺失提示 |
-| `sample_reweighting` | `scheme` | horizon 难度不均、异常点较多 |
+| `none` | - | Keep original input as a necessary contrast |
+| `instance_norm` | `affine`, `eps` | Distribution Shift is clearly, variable scale unstable |
+| `series_decomposition` | `method`, `kernel_size` | Trend strong, long-term forecast, DLinear/Autoformer class bias |
+| `seasonal_differencing` | `period`, `order` | Strong seasonal, low frequency trends |
+| `missing_mask` | `mask_channel`, `fill_policy` | High rate of missing and need for visible missing hints |
+| `sample_reweighting` | `scheme` | Horizon, difficult and more unusual. |
 
 ### 5.4 Embedding Action Space
 
-Embedding 决定序列如何进入 backbone。初期注册：
+Embedding decides how the sequence enters backbone. Initial registration:
 
-| Action | 参数 | 对应典型模型 |
+| Action | Parameters | Corresponds to typical models |
 |--------|------|-------------|
 | `none` | - | NLinear / DLinear |
 | `token` | `d_model`, `time_feature_mode` | Informer / Autoformer |
 | `patch` | `patch_len`, `stride`, `d_model` | PatchTST |
 | `invert` | `d_model` | iTransformer |
 | `frequency` | `n_freq`, `complex_mode` | FITS / frequency MLP |
-| `calendar` | `fields`, `embed_dim` | 有显式时间戳或已知未来协变量的任务；Phase 2+ 依赖冻结数据接口扩展 |
+| `calendar` | `fields`, `embed_dim` | Tasks with visible timetamps or known future competitors; Phase 2+ relies on frozen data interface extensions |
 
 ### 5.5 Backbone Action Space
 
-Backbone 只表达主要建模算子，不再绑定完整论文模型名。初期注册：
+Backbone only expresses the main modelling algorithm and no longer binds the full paper model name. Initial registration:
 
-| Action | 参数 | 核心偏置 |
+| Action | Parameters | Core bias |
 |--------|------|---------|
-| `linear` | `shared`, `bias` | 全局线性映射，强 baseline |
-| `mlp` | `depth`, `hidden_dim`, `activation` | 轻量、低延迟、适合 recipe 穷举 |
-| `rnn` | `cell`, `hidden_dim`, `num_layers` | 显式递归状态，适合变量多/短 horizon |
-| `tcn` | `channels`, `kernel_size`, `dilation` | 局部时序模式与低延迟 |
-| `transformer` | `n_layers`, `n_heads`, `d_model` | 长依赖、强季节性、变量相关性高 |
-| `ssm` | `state_dim`, `depth` | 长上下文和线性复杂度探索 |
-| `mixer` | `temporal_mixing`, `channel_mixing` | 多尺度 mixing、TimeMixer 类偏置 |
+| `linear` | `shared`, `bias` | Global linear map, strong baseline |
+| `mlp` | `depth`, `hidden_dim`, `activation` | Lightweight, low delay, suitable for size |
+| `rnn` | `cell`, `hidden_dim`, `num_layers` | Visible Recursive State, suitable for multi/short variable horizon |
+| `tcn` | `channels`, `kernel_size`, `dilation` | Local time series mode and low delay |
+| `transformer` | `n_layers`, `n_heads`, `d_model` | Long dependence, strong seasonality, high variable relevance |
+| `ssm` | `state_dim`, `depth` | Long context and linear complexity exploration |
+| `mixer` | `temporal_mixing`, `channel_mixing` | Multiscale mixing, TimeMixer class bias |
 
 ### 5.6 Fusion Action Space
 
-Fusion 决定优先建模时间依赖还是变量间依赖。初期注册：
+Fusion decides whether to give priority to modelling time or between variables. Initial registration:
 
-| Action | 参数 | 说明 |
+| Action | Parameters | Annotations |
 |--------|------|------|
-| `temporal` | `channel_mode: independent/shared` | 先沿时间维建模，适合 CI 与 PatchTST 类结构 |
-| `feature` | `variate_token`, `cross_attention` | 先沿变量维建模，适合 iTransformer 类结构 |
-| `temporal_then_feature` | `gate`, `residual` | 先时间后变量，适合中等变量数任务 |
-| `feature_then_temporal` | `gate`, `residual` | 先变量后时间，适合强变量相关任务 |
-| `graph` | `adjacency_source`, `sparsity` | 交通/传感器类拓扑任务 |
-| `gated_hybrid` | `gate_type` | 在 temporal 与 feature 分支之间学习加权 |
+| `temporal` | `channel_mode: independent/shared` | Model over time, fit for CI and PatchTST type structures |
+| `feature` | `variate_token`, `cross_attention` | Model the variable dimensions first, suitable for a iTransformer type structure |
+| `temporal_then_feature` | `gate`, `residual` | Time before variable, suitable for medium variable number tasks |
+| `feature_then_temporal` | `gate`, `residual` | A variable before time, suitable for a strong variable-related task |
+| `graph` | `adjacency_source`, `sparsity` | Transport/Sensor Spectrum Tasks |
+| `gated_hybrid` | `gate_type` | Learning weight between the temporal and feature branches |
 
 ### 5.7 Prediction Head Space
 
-Prediction head 负责把 latent 表示映射到 horizon 输出：
+Prediction head is responsible for mapping the last expression to horizon output:
 
-| Head | 参数 | 适用场景 |
+| Head | Parameters | Apply scene |
 |------|------|---------|
-| `linear` | `share_across_horizons` | point forecast 默认 head |
-| `quantile` | `quantiles` | 概率预测、P50/P90 场景 |
-| `gaussian` | `variance_floor` | 分布式预测与不确定性估计 |
-| `residual_correction` | `base_head`, `correction_dim` | 在强 baseline 上学习残差 |
+| `linear` | `share_across_horizons` | point forecast default head |
+| `quantile` | `quantiles` | Probability prediction, P50/P90 scene |
+| `gaussian` | `variance_floor` | Distributional projections and uncertainty estimates |
+| `residual_correction` | `base_head`, `correction_dim` | Learning residual on the strong baseline |
 
 ### 5.8 Training Strategy Space
 
-训练策略也进入 recipe，而不是散落在自由代码里：
+The training strategy goes into recipe instead of being scattered in the free code:
 
 ```text
 TrainingStrategy =
@@ -389,7 +389,7 @@ TrainingStrategy =
   + OptionalDistillation
 ```
 
-受限语法：
+Limited Syntax:
 
 ```text
 Loss = alpha * BaseLoss + beta * HorizonLoss + gamma * Regularization + delta * Calibration
@@ -403,21 +403,21 @@ Scheduler       in {none, cosine, one_cycle, plateau}
 Distillation    in {none, teacher_residual, ensemble_to_single}
 ```
 
-> **Phase 0 例外说明：** MVP 为了验证闭环，允许 Agent 在 `train.py` 内写少量 ad-hoc loss 和训练循环；从 Phase 1 开始，候选必须优先表达为 `CandidateRecipe`，从 Phase 2 开始新的 action 必须先注册到 grammar / registry。
+> **Phase 0 exception:** MVP allows Agent to write a small number of ad-hoc loss and training cycles in `train.py` for the purpose of verifying closed rings; Starting with PHase 1, the candidate must be given priority as `CandidateRecipe` and starting with 2 a new action must first register to Grammar/ registry.
 
-### 5.9 Dataset Profiler 与 Recipe Prior
+### 5.9 Dataset Profiler and Recide Prior
 
-TimeRecipe 的核心启发是：模块有效性依赖数据属性。Neo-Cast 需要在生成候选前先计算 `TaskFingerprint`，至少包括：
+The core inspiration for TimeRecipe is that the validity of the module depends on data attributes. Neo-Cast needs to calculate `TaskFingerprint` before creating a candidate, including at least:
 
-- 变量数量与序列数量
-- lookback / horizon 比例
-- trend 强度、seasonality 强度、transition / shift 指标
+- Number of variables and series
+- Lookback / horizon ratio
+- Trend intensity, security strength, transtion / Shift indicator
 - stationarity / scale stability
 - cross-variable correlation
-- 缺失率、频率、样本长度
-- 训练预算、参数量和延迟约束
+- Missing rate, frequency, sample length
+- Training budget, parameters and delayed constraints
 
-初期使用 rule-based prior 给候选排序；中期用实验记录训练 rank predictor。当前实现已进入中期形态：`tsf_profile_learned_memory_ranker_v1` 会从 task/domain memory、run metric、champion 记录中抽取 action/interaction feature，学习 lightweight feature weights，并把 learned contribution 写入 candidate selection artifact；LightGBM 仍可作为后续可插拔替换。
+The initial use of rule-based prior to sort candidates; Medium-term training on experimental records for rank predictor.`tsf_profile_learned_memory_ranker_v1` is currently in a medium-term mode: task/domain memory, run metric, champion logs extract ZXXQ2Z feature, learn lightweight forecast weights and write longned construction into profile description; LightGBM is still available as a follow-up plug-in.
 
 ```text
 TaskFingerprint + CandidateRecipe
@@ -428,85 +428,85 @@ TaskFingerprint + CandidateRecipe
   -> memory update
 ```
 
-示例先验：
+Example afore:
 
-- 高 `horizon_context_ratio` + trend 强 → `series_decomposition`, `patch`, `temporal`, `linear/mlp` 优先
-- 变量数高 + cross-var correlation 高 → `invert`, `feature`, `transformer/mlp` 优先
-- seasonality 强 → `token/frequency`, `transformer`, `calendar` 候选优先
-- distribution shift 高 → `instance_norm` 优先，但必须保留 no-IN 对照
-- latency 约束强 → `none/patch` + `linear/mlp/tcn` + `linear head` 优先
+- High `horizon_context_ratio`+tend Strong `series_decomposition`, `patch`, `temporal`, `linear/mlp` Priority
+- High variables + cross-var coordination high `invert`, `feature`, `transformer/mlp` priority
+- Seasonality Strong `token/frequency`, `transformer`, `calendar`
+- Distribution Shift high `instance_norm` priority, but no-IN contrast must be maintained
+- `none/patch` + `linear/mlp/tcn` + `linear head`
 
-这些规则只用于排序和解释，不直接锁死搜索空间。
+These rules are used only for sorting and interpretation and do not directly lock the search space.
 
-### 5.10 Fingerprint Metric 计算口径
+### 5.10 Fingerprint Metric calculator
 
-所有 `TaskFingerprint` 指标默认只在 train split 上计算，禁止读取 val/test 标签统计。指标输出统一归一到 `[0, 1]`，并记录原始统计量用于审计。
+All `TaskFingerprint` indicators are by default calculated only on track split, and it is forbidden to read val/test label statistics. The output of the indicators is consolidated into `[0, 1]` and records the raw statistics used for audit purposes.
 
-| 指标 | 初始计算口径 | 说明 |
+| Indicators | Initial calculator | Annotations |
 |------|-------------|------|
-| `trend_score` | STL / moving-average trend 方差占比 | 越高表示趋势成分越强 |
-| `seasonality_score` | dominant autocorrelation peak / periodogram peak | 越高表示周期性越强 |
-| `cross_var_corr_score` | train split 上变量相关矩阵非对角绝对值均值 | 多变量依赖强度 |
-| `distribution_shift_score` | train 前后窗口均值/方差差异的归一化距离 | 只在 train 内部分段计算 |
-| `transition_score` | change-point proxy 或一阶差分异常峰占比 | 结构突变强度 |
-| `data_scale_stability` | rolling std 稳定性的反向指标 | 越高表示尺度越稳定 |
-| `horizon_context_ratio` | `max(prediction_lengths) / context_length` | 可保留原值，同时提供 clipped score |
+| `trend_score` | STL / moving-average ratio | The higher it is, the stronger it is. |
+| `seasonality_score` | dominant autocorrelation peak / periodogram peak | Higher means more cyclical. |
+| `cross_var_corr_score` | value of non-reverse absolute values for arrays related to variables | Multiple variables depend on intensity |
+| `distribution_shift_score` | Normalization distance of difference in window averages/variances | Calculate only in the track internal segment |
+| `transition_score` | Change-point margin or first class differential abnormally peaked | Structural mutation intensity |
+| `data_scale_stability` | Rolling std inverse indicators of stability | The higher the scale, the more stable it is. |
+| `horizon_context_ratio` | `max(prediction_lengths) / context_length` | Can retain original values while providing Cripped score |
 
-第一版实现可以用轻量启发式，后续再替换为更稳健的统计检验；关键是计算口径固定、可复现、无泄漏。
+The first edition could be achieved with light inspiration and subsequently replaced by a more robust statistical test; The key is to calculate a fixed caliber, recoverable and non-spill.
 
 ---
 
-## 6. Agent 组织架构（Agent Orchestration Layer）
+## 6. Agent Organization Layer
 
-MVP 阶段采用**单 Agent + 固定工具调用**；完整系统采用 **1 个主控 Agent + 5 个工具型子代理**。
+The MVP phase uses**a single Agent+ fixed tool to call**; The complete system uses **1 master Agent + 5 tool-type agents**.
 
-### 6.1 主控：Research Manager
+### 6.1 Control: Research Manager
 
-职责：读取任务规格 → 维护全局状态 → 决定每轮研究目标 → 分配子任务 → 依据结果更新下一轮搜索方向
+Duties: Read mission specifications maintain global state determine the target of each study, assign sub-tasks, update the next search direction based on results
 
 ### 6.2 Diagnostic Agent
 
-职责：对数据做结构化诊断，产出**任务指纹**，包括：
+Responsibilities: structured diagnosis of data, output**mission fingerprints**, including:
 
-- 序列数量、频率、缺失率、是否多变量
-- 季节性/趋势性/突变性强度
-- context/horizon 比
-- 数据规模与噪声水平
-- 已知未来协变量情况
+- Number of series, frequency, missing rate, multiple variables
+- Seasonal/trend/variability intensity
+- context/horizon
+- Data size and noise level
+- Known future accompaniments
 
 ### 6.3 Design Agent
 
-职责：基于任务指纹提出候选假设，选择 preprocessing / embedding / backbone / fusion / head / training strategy action，给出变更理由与预期收益。
+Duties: To present candidate scenarios based on mission fingerprints, to select the name of change and expected benefits.
 
-输出示例：
+Example of output:
 
 ```
-- "长 horizon + trend 强，优先尝试 series_decomposition + patch + temporal fusion + MLP"
-- "变量数高且相关性强，优先尝试 invert embedding + feature fusion + Transformer/MLP"
-- "小数据场景，优先轻量 backbone + 强正则化或蒸馏"
+- "Long horizon+tend strong, give priority to series_decomposition + Patch + technological custom + MLP"
+- "Variables are high and relevant, priority is given to try Transformer/MLP"
+- "Small data scene, priority lightweight backbone + strong regularization or distillation"
 ```
 
 ### 6.4 Coder Agent
 
-职责：将 Design Agent 的 CandidateRecipe 转换为 DSL 配置变更 / 模块参数变更 / 模板化代码 patch，并运行静态检查、接口测试。
+Function: Convert CandidateRecipe from Design Agent to DSL Configuration Change/ Modular Parameter Changes/ Templateization Code Patch and run static checks, interface tests.
 
 ### 6.5 Runner Agent
 
-职责：提交实验 → 跟踪状态 → 捕获异常 → 管理资源预算 → 统一写入实验记录
+Responsibilities: Submission of experiments, tracking status, capture anomalies, management of resource budgets, unified recording of experiments
 
 ### 6.6 Analyst Agent
 
-职责：归因实验成败，比较候选与 champion，分析是"真提升"还是"seed 运气"，把结果压缩成下一轮可消费的研究记忆。
+Responsibility: Composed by the success or failure of experiments, comparing candidates to Campion, analysing whether it's "real up" or "seed luck", and compressing results into a consumptionable research memory for the next round.
 
 ### 6.7 Librarian / Memory Agent
 
-职责：管理实验谱系，相似任务检索，失败模式去重，把"经验"转成结构化规则。
+Duties: Management of experimental spectrometry, similar mission retrievals, weighting of failure patterns and conversion of "experience" to structured rules.
 
 ---
 
-## 7. 研究循环设计
+## 7. Research cycle design
 
-### 7.1 任务生命周期状态机
+### 7.1 mission life cycle status machine
 
 ```text
 CREATED
@@ -519,17 +519,17 @@ CREATED
 → PAUSED / STOPPED / FAILED
 ```
 
-### 7.2 实验状态机
+### 7.2 experimental status machine
 
 ```text
 QUEUED
-→ VALIDATING      （Static Validator 检查）
+VALIDATING (Static Validator)
 → RUNNING
 → SUCCEEDED / FAILED / INVALID
 → ARCHIVED
 ```
 
-### 7.3 候选晋级状态机
+### 7.3 candidate for promotion status machine
 
 ```text
 PROPOSED
@@ -542,19 +542,19 @@ PROPOSED
 → ACCEPTED / REJECTED
 ```
 
-### 7.4 任务初始化流程
+### 7.4 Job Initialisation Process
 
 ```text
 Create Task
 → Validate TaskSpec
 → Bind Dataset Version
-→ Run Diagnostic         → 产出 TaskFingerprint
-→ Build Baselines        → 运行 baseline recipes
+→ Run diagnostics → Produce TaskFingerprint
+Build Baselines run baseline studies
 → Create Initial Champion Set
 → Ready for Research
 ```
 
-### 7.5 单轮 Research Iteration
+### 7.5 Single Wheel Research Service
 
 ```text
 Load task context
@@ -572,91 +572,91 @@ Load task context
 → Update memory and lineage
 ```
 
-### 7.6 完整研究循环状态机（主循环）
+### 7.6 Full Study Cycle Body (Main Cycle)
 
 ```
           ┌──────────────────────────────────────────┐
-          │           SETUP（人工触发一次）            │
-          │  建分支 → 读文件 → 确认数据 → 初始化 tsv  │
+          │           SETTUP (a manual trigger)            │
+          │  Build Branch Query Read File Quest Data Initialization tsv  │
           └──────────────────┬───────────────────────┘
                              │
-                     第一次 baseline run（Round 0）
+                     First baseline run (Round 0)
                              │
           ┌──────────────────▼───────────────────────┐
           │           EXPERIMENT LOOP                  │
           │                                            │
-          │  提出假设 → 改 train.py → git commit       │
+          │  Make assumptions. Change train.py.       │
           │       ↓                                    │
-          │  smoke run（快速检查 crash）                │
+          │  smoke run (quick checkcrash)                │
           │       ↓                                    │
-          │  低保真实验（少 epoch / 子集）               │
+          │  Low security experiment (less epoch / subset)               │
           │       ↓                                    │
-          │  通过? → 完整实验（full training）           │
+          │  Full training.           │
           │       ↓                                    │
           │  ┌────┴────────────────────┐              │
           │  │ crash?                  │              │
           │  │  → tail run.log         │              │
-          │  │  → 修复或标记 crash 跳过 │              │
+          │  │  → Repair or mark crash and skip │              │
           │  └────┬────────────────────┘              │
           │       ↓                                    │
-          │  val_avg_mse 改善?                          │
-          │  ├── YES → 记录 keep → Champion 比较        │
-          │  └── NO  → 记录 discard → branch reset to   │
+          │  val_avg_mse Improvements?                          │
+          │  ├── YES-Keep-Champion Comparison        │
+          │  └── NO Discard blancy reset to   │
           │                last_keep_commit             │
           │                ↓                           │
-          │         回到"提出假设"                      │
+          │         Go back to "Assumption."                      │
           └──────────────────────────────────────────┘
-                    （人工 Ctrl+C 前不停止）
+                    (Advanced Ctrl+C not stop)
 ```
 
-> **图示说明：** 上图是 Phase 1+ 的完整形态。Phase 0 MVP 可以省略 smoke run、低保真筛选和多 baseline 调度，直接执行"改 `train.py` → full run → keep/discard"。
+> **Diagram Description:** The figure above is the complete form of Phase 1+. Chase 0 MVP can omit smoke run, low-security filters and multiple baseline scheduling to directly execute "Replace `train.py` full run keep/discard " .
 
-### 7.7 Round 0：基线建立
+### 7.7 Round 0: baseline establishment
 
-系统先必须跑一组固定 baseline：
+The system must first run a fixed set of baselines:
 
-- 统计基线（均值填充预测）
-- 线性基线（NLinear CI）← `train.py` 初始版本
-- 轻量深度学习基线（MLP）
-- 强参照基线（iTransformer 或 PatchTST）
+- Statistical baseline (average filling projection)
+- Linear baseline (NLinear CI) ← Initial `train.py` implementation
+- Light Depth Learning Baseline (MLP)
+- Strong reference baseline (iTransformer or PatchTST)
 
-目的不是拿最好分数，而是建立**任务下限、可行训练预算、误差结构**。
+The aim is not to get the best score, but rather to establish a minimum **mission, feasible training budget, error structure**.
 
-> **Phase 0 最低要求：** MVP 只要求把 `train.py` 初始版本的 NLinear CI 跑通并形成 keep/discard 闭环；其余 baseline 可由人工预跑，或延后到 Phase 1 再纳入统一调度。
+> **Phase 0 Minimum Requirements: **MVP requires only that the initial NLinear CI version of `train.py` run through and form a keep/discard closed loop; The rest of the baseline can be pre-run by hand or delayed to Phase 1 and then incorporated into the Unified Movement Control.
 
-### 7.8 低保真筛选
+### 7.8 Low security filter
 
-对候选先做：
+Candidates first:
 
-- 少量 epoch（1/5 标准数量）
-- 子集序列（1/3 数据）
-- 缩短 horizon（仅 96, 720）
-- 降低 hidden dim（1/2）
-- 单 seed
+- Small epoch (1/5 standard number)
+- Subset series (1/3 data)
+- Shorten horizon (96, 720 only)
+- Lower Hidden dim (1/2)
+- Just seed
 
-表现差的候选直接淘汰（节省 GPU 小时）。
+Candidates for low performance are directly phased out (saving GPU hours).
 
-> **实现边界：** 低保真筛选是 Phase 1+ 的推荐能力，不是 Phase 0 MVP 的必选实现项。
+> **Achieving boundaries:** Low security screening is a recommended capability for Phase 1+ and not an optional accomplishment for Phase 0 MVP.
 
-### 7.9 候选接受规则
+### 7.9 candidates Rule
 
-一个候选只有满足以下全部条件才能"保留"：
+A candidate can only be "reserved" if all of the following conditions are met:
 
-1. `val_avg_mse` 优于当前 champion
-2. **Phase 0/1 默认阈值：**
-   - 若 `Δval = champion_val_avg_mse - candidate_val_avg_mse >= 0.003`，可直接进入 keep 候选
-   - 若 `0.001 <= Δval < 0.003`，仅当 `Δparams_M <= 0.5` 且 `delta_loc <= 40` 时保留
-   - 若 `Δval < 0.001`，默认 discard；除非代码减少 ≥ 20 LOC 且参数量不增加
-3. **Phase 3+ 多 seed 阈值：**
+1. `val_avg_mse` is better than current Campion
+2. **Phase 0/1 default threshold:**
+   - If `Δval = champion_val_avg_mse - candidate_val_avg_mse >= 0.003`, you can go directly to the keepp candidate
+   - If `0.001 <= Δval < 0.003`, only if `Δparams_M <= 0.5` and `delta_loc <= 40`
+   - If `Δval < 0.001`, discard by default unless code decreases by at least 20 LOC without increasing parameters.
+3. **Phase 3+ Multiple Seed threshold:**
    - `mean(Δval) >= 0.005`
    - `std(val_avg_mse across seeds) <= 0.003`
-4. 参数量/延迟不超预算；若超预算，则仅当 Utility > 0 时允许晋级
-5. 无数据泄漏、无接口破坏
-6. patch 能独立复现
+4. Parameters/delayed in excess of budget; If the budget is exceeded, promotion is allowed only when Utility > 0
+5. No data leak, no interface damage
+6. I'll be back on my own.
 
-> 以上阈值是默认初始值，后续可由 `program.md` 或任务级 heuristics 覆盖。
+> The above threshold is the default initial value, which can then be covered by `program.md` or task level heuristics.
 
-### 7.10 Champion / Challenger 机制
+### 7.10 Champion/ Challenger Mechanism
 
 ```text
 AccuracyGain      = max(0, champion_val_avg_mse - candidate_val_avg_mse) / 0.01
@@ -674,54 +674,54 @@ Utility = 1.00 * AccuracyGain
         - 0.05 * ComplexityPenalty
 ```
 
-- **Phase 0-2：** Utility 只作为排序与 tie-breaker，不作为硬门槛
-- **Phase 3+：** Utility > 0 才能晋级 champion 比较
+- **Phase 0-2:** Utility as sorting only with tie-breaker, not as a hard threshold
+- **Phase 3+:** Utility > 0 for promotion comparison
 
-系统天然朝"小而稳"方向演化。同时维护 Pareto Front：
+The system naturally evolves in the direction of small and steady. While maintaining Pareto Front:
 
-| 维度 | 含义 |
+| Dimensions | Meaning |
 |------|------|
-| 精度最优 | val_avg_mse 最低 |
-| 延迟最优 | 推理延迟最低 |
-| 参数量最优 | 参数数量最少 |
-| 综合最优 | Utility 评分最高 |
+| Precision Best | val_avg_mse Minimum |
+| Delay best | The lowest delay in inference. |
+| Arguments best | Minimum number of parameters |
+| Integrated best | Utility highest rating |
 
-> **当前实现进展：** OpenCode Research Service 已在 `research_report_markdown` export 中加入候选级 multi-seed 汇总、95% CI half-width 和 Pareto Frontier 计算。当前 Pareto 使用主指标均值 + `resourceUsage.wallClockSec` 等运行成本字段；结果写入 Markdown 的 `Experiment Analysis` 段，并写入 artifact metadata（`evaluatedRunCount`, `multiSeedCandidateCount`, `paretoFrontierCount`），Web Dashboard 与 TUI Cockpit 会展示这些摘要。候选执行层已增加 `seed-sweep`：按 `taskSpec.evaluation.seeds` 或显式 seeds 顺序执行同一候选，并将 seed 写入 runner payload 与 `resourceUsage.seed`，Web Dashboard、TUI Cockpit、CLI 与 HTTP API 共用同一接口。概率预测链路已支持 `forecastMode=probabilistic`、`val_avg_pinball` / `val_avg_crps_approx` 主指标、quantile head 的 pinball/CRPS 近似/区间 coverage-width 评估与报告展示。`blind_test` 已形成 OpenCode stage / approval / query-limit / CLI/Web/TUI 操作入口 / Neo-Cast runner sidecar HTTP contract；Neo-Cast 已提供可独立部署的 `py/blind_test_sidecar.py` 服务模板，支持 bearer token、query limit 和私有审计 JSONL。真实私有数据接入与长期部署仍属于 Milestone 5 剩余项。
+> **Implementation progress:** OpenCode Research Service adds candidate-level multi-seed summaries, 95% CI half-widths, and Pareto Frontier calculations to `research_report_markdown`. Pareto compares the primary metric mean with costs such as `resourceUsage.wallClockSec`. Results appear in Markdown's `Experiment Analysis` and artifact metadata (`evaluatedRunCount`, `multiSeedCandidateCount`, `paretoFrontierCount`), with summaries in Web Dashboard and TUI Cockpit. Candidate execution supports `seed-sweep` using `taskSpec.evaluation.seeds` or explicit seeds, recording each seed in the runner payload and `resourceUsage.seed` through the shared Web/TUI/CLI/HTTP interface. Probabilistic forecasting supports `forecastMode=probabilistic`, primary metrics `val_avg_pinball` / `val_avg_crps_approx`, and quantile-head pinball/approximate-CRPS/interval-coverage-and-width evaluation and reports. `blind_test` has OpenCode stage, approval, query-limit, CLI/Web/TUI, and Neo-Cast sidecar HTTP contracts. Independently deployable `py/blind_test_sidecar.py` supports bearer tokens, query limits, and private audit JSONL. Actual private-data integration and long-term deployment remain Milestone 5 work.
 
-> **Utility 实现口径：** 当前 export 会产出 `Utility Ranking`，以当前 champion（若无则取最优 metric summary）为 reference，计算 accuracy gain，并扣除参数量、延迟、多 seed 方差和代码复杂度惩罚；结果写入 Markdown 与 artifact metadata（`utilityCandidateCount`）。当前 Utility 先用于排序和审计，不直接覆盖 champion 晋级策略。
+> **Utility achieves calibration:** Current export will produce `Utility Ranking`, using the current campaign (if not best metrology) as reference to calculate anachronism gas and deduct parameters, delays, multi-seed squares and code complexity penalties; The result is written in Markdown and Artificial Metadata (`utilityCandidateCount`). Current Utility is first used for sorting and auditing, without directly overwhelming the Champion promotion policy.
 
-### 7.11 指标统计口径
+### 7.11 Statistical calibration of indicators
 
-为了让接受规则和 Utility 真正可执行，以下观测量必须固定口径：
+In order for acceptance rules and Utility to be truly enforceable, the following observations must have a fixed calibre:
 
 - `delta_loc`
-  定义为当前候选相对父提交在 `train.py` 上的 **changed LOC = added_lines + deleted_lines**；
-  统计方式以 `git diff --numstat <parent_commit> -- train.py` 为准，不看净增量。
+  Defined as **changed LOC = added_lines + deleted_lines** submitted by the current candidate relative father on `train.py`;
+  The statistics are based on `git diff --numstat <parent_commit> -- train.py` and do not look at the net increase.
 
 - `candidate_latency_ms`
-  定义为在**同一硬件**上、`device=batch GPU/CPU` 固定、`batch_size=1`、每个 horizon 各 warmup 10 次后再测 50 次 forward 的中位数；
-  若当前系统是多 horizon bundle，则取各 horizon latency 的算术平均。
+  Defined as the median number of 50 forward at **on the same hardware**, `device=batch GPU/CPU` fixed, `batch_size=1`, each horizon and warmup 10 times;
+  If the current system is multiple horizon bundle, take an arithmetic average of each horizon latency.
 
 - `failure_rate`
-  定义为**当前 task_id、当前 branch、最近 20 次实验**中的失败占比；
-  失败包括：非零退出、OOM、NaN 指标、接口不匹配、超时被杀。
+  Defined as the percentage of failures in task_id, Zranch and most recent 20 experiments**;
+  Failures include: non-zero exit, OOM, NaN indicators, mismatches of interfaces and timeout killings.
 
 - `std_seed_val`
-  定义为同一候选在约定 seed 集上的 `val_avg_mse` 标准差；当前 OpenCode export 已可对同一 candidate 的多次 succeeded run 做均值/标准差/最好/最差汇总，runner 侧可通过 `seed-sweep` 自动按约定 seeds 生成这些 run。
+  Defined as the standard difference of `val_avg_mse` on the agreed lid set for the same candidate; The current OpenCode export has been able to do averages/standard deviations/best/worst summary for the same candidate many times, and runner can generate these runs automatically through `seed-sweep` as agreed.
 
 - `params_M`
-  若当前实现采用多 horizon bundle（每个 horizon 一个模型），则 `params_M` 为 bundle 总参数量；
-  所有参数量比较必须在**同一建模口径**下进行，不与单 horizon 单模型直接比较。
+  `params_M` is the total number of bindle parameters if multiple horizon bundle (one model per horizon) is currently achieved;
+  All parameter volume comparisons must be performed under **the same model calibre**, not directly compared with single horizon models.
 
 ---
 
-## 8. 研究记忆系统（Memory Layer）
+## 8. Research memory system (Memory Layer)
 
-这是 neo-research 与普通 AutoML **最大的区别**之一。
+This is one of the biggest differences between neo-research and normal AutoML**.
 
-### 8.1 记忆单元
+### 8.1 Memory Unit
 
-每次实验写成结构化记录：
+Each experiment is structured:
 
 ```json
 {
@@ -739,29 +739,29 @@ Utility = 1.00 * AccuracyGain
 }
 ```
 
-> **隔离说明：** Agent 可读的 research memory 只保存 `val_*`、资源消耗、失败标签和假设摘要；`ref_test_*` 必须进入 Runner/Human Gate 持有的 privileged promotion memory，不进入 Agent 上下文。
+> **Segregation statement:** Agent readable research memory only saves `val_*`, resource consumption, failure labels and summary assumptions;`ref_test_*` must enter the Runner/Human Gate-held Privileged protection memory without entering the Agent context.
 
-### 8.2 三类记忆
+### 8.2 Three types of memory
 
-**短期记忆（Short-term）**
-当前任务最近若干轮实验上下文，供 Research Manager 决策下一个假设。防止重复试验，让 Agent 连续迭代。
+**Short-term memory (Short-term)**
+The context of the most recent rounds of experiments in the current mission is for Research Manager to decide on the next hypothesis. Prevents repetition of the test and allows Agent to repeat it.
 
-**任务记忆（Task-level）**
-同一任务下哪些 recipe action 有效、哪些无效。例如："ETTh1 上 `series_decomposition + patch_len=16 + temporal fusion` 有效，`graph fusion` 无效"。记录哪类 action、loss、结构无效，以及哪些失败模式频繁出现。
+**Task-level**
+Which are valid under the same mandate and which are not. For example: "`series_decomposition + patch_len=16 + temporal fusion` valid on ETTh1, invalid `graph fusion`". Record what type of action, Loss, structure is not valid and which failure patterns are frequent.
 
-**跨任务元记忆（Cross-task Meta）**
-基于任务指纹进行迁移，例如：
+**Cross-task Meta**
+Relocation based on mission fingerprints, for example:
 
-- 强季节性 + 长 horizon → `series_decomposition` / `frequency` / `patch` 优先
-- 多变量 + 变量相关性高 → `invert embedding` + `feature fusion` 优先
-- 小样本 + 噪声大 → 轻量 `mlp/tcn` backbone + 强正则化或蒸馏优先
-- 高频数据 + latency 约束强 → `temporal fusion` + `mlp/tcn/linear` 优先
-- 高缺失场景 → 稳健方案优先
-- 小数据场景 → 正则化 + 蒸馏优先
+- Strong Season + Long Horizon `series_decomposition`/ `frequency` / `patch` Priority
+- Multivariant + variable highly relevant `invert embedding` + `feature fusion` priority
+- Small sample + Noise High and Light `mlp/tcn` backbone + Strong regularization or distillation priority
+- HF data + latency binding `temporal fusion` + `mlp/tcn/linear` priority
+- High-deficit scene.
+- Small data scenes + distill priority
 
-### 8.3 实验谱系图（Lineage Tree）
+### 8.3 Experimental Spectrum (Lineage Tree)
 
-每个 recipe 不是孤立点，而是一棵谱系树：
+Every recipe is not an isolated point, but a spectra tree:
 
 ```
 none_none_linear_temporal_linear_mse_v1 (baseline)
@@ -774,64 +774,64 @@ none_none_linear_temporal_linear_mse_v1 (baseline)
 
 ---
 
-## 9. 严格约束执行环境（Execution Layer）
+## 9. Strictly restrained environment (Execution Layer)
 
 ### 9.1 Sandbox
 
-每次实验在隔离容器里执行，固定：
+Each experiment is carried out in a containment container, fixed:
 
-- Python 版本
-- 依赖版本（`pyproject.toml` / `uv.lock`）
-- CUDA 环境
-- 数据挂载目录（只读；Agent 侧仅挂载 train/val rows）
-- 只读基线代码（`prepare_tsf.py`）
-- 可写 patch 目录（`train.py`）
-- Agent 容器**不挂载** reference test rows / 标签与 privileged promotion log
+- Python Version
+- Dependency version (`pyproject.toml`/ `uv.lock`)
+- CUDA Environment
+- Data mounted directories (read-only); Agent side only mounts train/valrows)
+- Read-only baseline code (`prepare_tsf.py`)
+- Writeable Patch Directory (`train.py`)
+- Agent container**unmounted** reference testrows / tags and Privileged protocol log
 
-另设一个 **Runner-only sidecar / service**：
+**Runner-only sidecar/service**:
 
-- 只接受已晋级 artifact 的路径或 checkpoint 引用
-- 持有 reference test 所需的私有数据挂载或访问令牌
-- 输出写入 privileged log（如 `promotion.tsv`），不回写到 Agent workspace
-- Agent 进程中没有调用该接口所需的 token / socket / mount
+- Accept only promoted paths or checkpoint references
+- Hold private data mounted or access tokens for reference test
+- Output written to privileged log (e. g. `promotion.tsv`) without returning to Agent workspace
+- The Agent process does not have the token / socket /mount required for this interface to be called
 
-### 9.2 权限控制
+### 9.2 Permission Control
 
-Agent 默认不能：
+Agent default cannot:
 
-- 任意联网
-- 任意安装新包
-- 访问测试标签
-- 修改评估代码（`prepare_tsf.py`）
-- 修改数据加载协议
-- 调用 reference test / blind test sidecar
-- 跳过 Static Validator
+- Any Networking
+- Install Any New Packages
+- Access Test Tabs
+- Modify Assessment Code (`prepare_tsf.py`)
+- Modify Data Loading Protocol
+- Call for reference test / blind test sidecar
+- Skip Static Validator
 
-### 9.3 Static Validator 拒绝条件
+### 9.3 Static Validator Refuse Condition
 
-Static Validator 在每个 patch 执行前检查以下条件，任一触发则拒绝：
+Static Validator checks the following conditions before each watch is executed, and either triggers are refused:
 
-- 修改评估协议（`prepare_tsf.py` 相关逻辑）
-- 修改数据 split 逻辑
-- 越过参数量上限（hard cap: 2× `max_params`）
-- 越过算力预算（训练时间预估超上限）
-- 使用未注册 action 或非法 action 参数组合
-- 接口不兼容（输入/输出 shape 不匹配）
+- Modify the evaluation protocol (relevant `prepare_tsf.py` logic)
+- Modify data split logic
+- Pass the upper limit of parameter (hard cap: 2 x `max_params`)
+- Over-calculation budget (training time estimate exceeded ceiling)
+- Use unregistered action or illegal action parameter combination
+- Incompatibility of interfaces (input/output shape mismatches)
 
-### 9.4 三级代码变更模式
+### 9.4 Level 3 code change mode
 
-| 级别 | 名称 | 允许操作 | 风险 | 适用阶段 |
+| Level | Name | Allow Operation | Risk | Phase of application |
 |------|------|---------|------|--------|
-| L0 | Single-file Research | 只改 `train.py`，用于验证 keep/discard 闭环 | 中 | Phase 0a |
-| L1 | Recipe Config Search | 只改已注册 action 的参数（patch size, depth, dropout, lr, scheduler, loss weighting）| 最低 | Phase 0b/1 |
-| L2 | Registry Composition | 在注册表中组合已有 action（preprocessing, embedding, backbone, fusion, head, trainer）| 中 | Phase 1/2 |
-| L3 | Template Patch | 在受限模板中新增/修改 action（new fusion block, new head, new loss component），需额外审计 | 较高 | Phase 3 |
+| L0 | Single-file Research | Change only `train.py` to verify keep/discard closed loops | Medium | Phase 0a |
+| L1 | Recipe Config Search | Change only the parameters of registered action (Patch size, depth, dropout, lr, Scheduler, lost watching)| Minimum | Phase 0b/1 |
+| L2 | Registry Composition | Accomplishing, combining, backbone, favor, head, train)| Medium | Phase 1/2 |
+| L3 | Template Patch | Add/modify an action (new custom block, new head, new loss complex) in restricted templates and require additional audit | Higher | Phase 3 |
 
 ---
 
-## 10. 模块接口设计（Module Interfaces）
+## 10. Module Interfaces
 
-以下接口采用"逻辑接口"描述，后续可映射为 Python service class、gRPC 或 REST。
+The following interface is described as a "logical interface", followed by Python service class, gRPC or RRT.
 
 ### 10.1 Task Manager Interface
 
@@ -877,7 +877,7 @@ def generate_proposals(task_id: str,
                        k: int) -> list[Proposal]
 ```
 
-每个 `Proposal` 必须包含：`hypothesis`, `target_actions`, `candidate_recipe`, `expected_gain`, `risk_level`, `est_cost`。
+Each `Proposal` must contain: `hypothesis`, `target_actions`, `candidate_recipe`, `expected_gain`, `risk_level`, `est_cost`.
 
 ### 10.6 Patch Generator Interface
 
@@ -886,7 +886,7 @@ def build_patch(proposal: Proposal,
                 base_recipe: CandidateRecipe) -> PatchBundle
 ```
 
-`PatchBundle` 包括：`recipe_delta`, `compiled_model_delta`, `code_patch_text`, `validation_manifest`。
+`PatchBundle` includes: `recipe_delta`, `compiled_model_delta`, `code_patch_text`, `validation_manifest`.
 
 ### 10.7 Static Validator Interface
 
@@ -932,7 +932,7 @@ def retrieve_failure_patterns(task_id: str,
 
 ---
 
-## 11. 核心数据结构设计（Core Data Structures）
+## 11. Core Data Structure (Core Data Structures)
 
 ### 11.1 TaskSpec
 
@@ -1024,7 +1024,7 @@ class SearchSpaceSpec:
 
 ### 11.5.1 ActionSpec
 
-`ActionSpec` 是 Static Validator 能真正工作的基础。每个 action 必须声明参数 schema、shape contract、相邻 action 兼容性和预算估计器。
+`ActionSpec` is the basis on which Static Validator can really work. Each action must state parameters: schema, shape conformity, adjacent action compatibility and budget estimate.
 
 ```python
 @dataclass
@@ -1091,7 +1091,7 @@ class CandidateRecipe:
 
 ### 11.8 ModelSpec
 
-`ModelSpec` 是 runtime 从 `CandidateRecipe` 编译后的可执行模型规格，主要供 Runner、Evaluator 和 Artifact Store 使用。
+`ModelSpec` is the operational model specification compiled by Runtime from `CandidateRecipe` and used mainly by Runner, Evaluator and Artifact Store.
 
 ```python
 @dataclass
@@ -1215,11 +1215,11 @@ class MemoryItem:
     lesson: str
 ```
 
-> **隔离约束：** `EvalSpec` 只能声明哪些指标属于 privileged 域；运行态记录中的 `privileged_*_ref` 都只能存 opaque 标识符（例如 `promotion_id`、对象存储 URI、Metrics DB 主键），不能直接内嵌 `ref_test_*` 数值；Agent 上下文只消费 `agent_*` 字段。
+> **Segregation:** `EvalSpec` can only state which indicators belong to the Privileged domain;`privileged_*_ref` in running state records can only save opaque identifiers (e. g. `promotion_id`, object storage URI, Metrics DB) and cannot directly embed `ref_test_*` values; Agent context only consumes `agent_*` fields.
 
 ### 11.16 Supporting Records
 
-接口层使用的辅助类型后续可以细化为独立 schema；第一版至少需要以下最小定义，避免服务接口只停留在占位符。
+Follow-up of assistive types used at interface level can be refined to stand-alone schema; Version 1 requires at least the following minimum definition to avoid an interface remaining only in placeholders.
 
 ```python
 @dataclass
@@ -1299,17 +1299,17 @@ class AnalysisReport:
 
 ---
 
-## 12. 目录结构建议
+## 12. Recommendations on the structure of the directory
 
-完整系统的参考目录布局：
+Full system directory layout:
 
 ```text
 neo_research/
   configs/
-    tasks/              ← TaskSpec YAML 文件
+    tasks/              ← TaskSpec YAML files
     search_spaces/      ← SearchSpaceSpec YAML
     recipes/            ← CandidateRecipe YAML / JSON
-    baselines/          ← baseline recipe 配置
+    baselines/          ← Baseline recipe configurations
   core/
     task_manager.py
     orchestrator.py
@@ -1339,14 +1339,14 @@ neo_research/
     llm_planner.py
   patching/
     patch_generator.py
-    validators.py       ← Static Validator 实现
+    validators.py       ← Static Validator implementation
   execution/
     runner.py
     sandbox.py
     scheduler.py
   evaluation/
     metrics.py
-    promotion.py        ← PromotionDecision 逻辑
+    promotion.py        ← PromotionDecision logic
     analysis.py
   memory/
     memory_store.py
@@ -1363,156 +1363,156 @@ neo_research/
     dashboard/
 ```
 
-Phase 0a 只需要：`prepare_tsf.py`, `train.py`, `program.md`。Phase 0b 开始补充 `configs/recipes/` 与最小 `CandidateRecipe` schema；其他目录随系统演进逐步填充。
+Chase 0a only needs: `prepare_tsf.py`, `train.py`, `program.md`. Chase 0b starts supplementing `configs/recipes/` with the smallest `CandidateRecipe` schema; Other directories are filled gradually with the evolution of the system.
 
 ---
 
-## 13. MVP 实现层：文件结构与接口
+## 13. MVP Implementation Layer: File Structure and Interface
 
-### 13.1 冻结层：`prepare_tsf.py`
+### 13.1 Freezing Layer: `prepare_tsf.py`
 
-`prepare_tsf.py` 是实验的"不可动摇的地基"，其实现直接参照 Time-Series-Library 的数据加载与评估逻辑。agent **绝不可以**修改此文件。
+`prepare_tsf.py` is the experiment's unshakeable foundation, which achieves a direct reference to Time-Series-Library data loading and assessment logic.** This document can never be modified.
 
-**固定常量：**
+**Fixed constant:**
 
 ```python
 import os
-# ─── 数据集 ──────────────────────────────────────────────────────────────────
+# ─── Dataset ──────────────────────────────────────────────────────────────────
 DATASET        = "ETTh1"
 DATA_PATH      = "ETTh1.csv"
-# 数据根目录：由 Human/Runner 在 Agent 容器外预置本地 CSV；Phase 0 不依赖 Agent 联网下载
+# Data Root Directory: Preset local CSV by Human/Runner outside the Agent container;Chase 0 does not rely on Agent network downloads
 DATA_ROOT      = os.path.expanduser("~/.cache/neo_research_tsf/dataset/ETT-small/")
-NUM_CHANNELS   = 7             # ETTh1 共 7 个变量（HUFL/HULL/.../OT）
+NUM_CHANNELS   = 7             # ETTh1 for 7 variables (HUFL/HULL/.../OT)
 
-# ─── 时间窗口 ────────────────────────────────────────────────────────────────
-INPUT_LEN      = 512           # look-back window（agent 不可修改）
-HORIZONS       = [96, 192, 336, 720]   # 全部 horizon 同时评估
+# ─── Time Window ────────────────────────────────────────────────────────────────
+INPUT_LEN      = 512           # Look-back window (agent not modified)
+HORIZONS       = [96, 192, 336, 720]   # All horizon and evaluation at the same time
 
-# ─── ETTh1 数据集切分边界（硬编码，与 TSL Dataset_ETT_hour 完全一致）────────
-# train: 行 [0,       8640)      → 12个月 × 30天 × 24小时
-# val:   行 [8640,   11520)      → 再 4个月
-# test:  行 [11520,  14400)      → 再 4个月
+# ─── ETTh1 data set to cut the boundary (hard code, fully consistent with TSL Dataset_ETT_hour)────────
+# Train: Line [0, 8640] 12 months x 30 days x 24 hours
+# val:   rows [8640,  11520) → Next 4 months
+# test:  rows [11520, 14400) → Next 4 months
 BORDER_TRAIN   = (0,                    12 * 30 * 24)                        # (0, 8640)
 BORDER_VAL     = (12 * 30 * 24,         12 * 30 * 24 + 4 * 30 * 24)         # (8640, 11520)
 BORDER_TEST    = (12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24)  # (11520, 14400)
 
-# ─── 计算预算 ────────────────────────────────────────────────────────────────
-TIME_BUDGET    = 600           # 单次实验训练时长上限，秒（10 分钟）
+# ─── Budgeting ────────────────────────────────────────────────────────────────
+TIME_BUDGET    = 600           # Maximum duration of one-time experimental training, seconds (10 minutes)
 
-# ─── 参数规模软约束 ──────────────────────────────────────────────────────────
-PARAM_BUDGET   = 10_000_000    # 10M 参数软上限（超出在日志中 WARNING，不强制中止）
+# ─── Soft limits on the size of parameters ──────────────────────────────────────────────────────────
+PARAM_BUDGET   = 10_000_000    # 10M parameter soft cap (overwrite in log WARNING without mandatory suspension)
 
-# ─── 随机种子 ────────────────────────────────────────────────────────────────
+# ─── Random Feeds ────────────────────────────────────────────────────────────────
 SEED           = 42
 ```
 
-**标准化协议（TSL 一致）：**
+**Standardisation Agreement (TSL Consistency):**
 
-完全采用 TSL 的标准化方式：**sklearn `StandardScaler`，仅在训练段 fit，并复用同一组 train 统计量**。实现上分成两个可见域：
+Full TSL standardization: **sklearn `StandardScaler`, only fit in the training session and revert to the same track statistics**. Achieving two visible domains above:
 
-- Agent workspace 只物化 `train + val` 行
-- Runner sidecar 私有持有 `reference test` 行，并复用同一个 scaler
+- Agent workspace only physical `train + val` line
+- Runner sidecar privately owned `reference test` row and reuses the same scaler
 
-评估时不做 inverse transform（在 scaled space 中计算 MSE/MAE），与 TSL 默认行为（`args.inverse=False`）一致。
+The evaluation does not involve inversion transport (calculated MSE/MAE in scaled space) and is consistent with TSL default behaviour (`args.inverse=False`).
 
 ```python
 from sklearn.preprocessing import StandardScaler
 
 scaler = StandardScaler()
 train_raw = df_visible[BORDER_TRAIN[0]:BORDER_TRAIN[1]].values   # shape: [8640, 7]
-scaler.fit(train_raw)          # fit 仅在 train 段
+scaler.fit(train_raw)          # fit only track segment
 
-# Agent 可见：只对 train/val rows 做 transform
+# Agent Visible: only train/valrows transform
 visible_scaled = scaler.transform(df_visible.values)            # shape: [11520, 7]
 
-# Runner sidecar 私有：对 reference test rows 复用同一 scaler
+# Runner sidecar private: reuse same scaler for reference testrows
 # ref_test_scaled = scaler.transform(df_ref_test.values)        # shape: [2880, 7]
 ```
 
-> **为什么不用 RevIN？** RevIN 在 forward 时进行实例级动态归一化，会影响 agent 设计 loss 的方式（agent 需要感知是否已反归一化）。固定使用静态 StandardScaler 能让 agent 专注于模型架构本身，同时评估结果直接与 TSL 发布的 baseline 数字可比。
+> **Why not use RevIN?** RevIN for instance dynamical integration during Forward will affect the way in which angent designs loss (agent needs to know if it is anti-consolidation). The fixed use of static StandardScaler allows angent to focus on the model structure itself, while the results are directly comparable with the baseline figures published by TSL.
 
-**Agent 可见数据加载接口（`make_dataloader`）：**
+**Agent Visible Data Loading Interface (`make_dataloader`):**
 
 ```python
 def make_dataloader(split: str, horizon: int, batch_size: int,
                     shuffle: bool = None) -> DataLoader:
     """
     split: "train" | "val"
-    horizon: 预测步数，从 HORIZONS 列表中取值
+    horizon: predict the number of steps to be taken from the HORIZONS list
 
-    每条样本：
-      x: Tensor[INPUT_LEN, NUM_CHANNELS]     ← 历史观测（scaled）
-      y: Tensor[horizon,   NUM_CHANNELS]     ← 预测目标（scaled）
+    Each sample:
+      x: Tensor[INPUT_LEN, NUM_CHANNELS]     ← Scaled historical observations
+      y: Tensor [horizon, NUM_CHANNELS] predicted target (scaled)
 
-    注意：
-    - val 集 shuffle=False（固定顺序）
-    - train 集 shuffle=True by default
-    - Phase 0a 不返回 time features
-    - Phase 1 之前，Agent 不应在 `train.py` 中私自回读原始 CSV 构造隐藏时间字段
-    - `calendar` embedding 需要 Phase 2+ 通过冻结接口显式返回 x_mark / y_mark 或 known future covariates
+    Note:
+    - val collection shuffle=False (fixed order)
+    - Train collection graph=True by default
+    - Chase 0a does not return time
+    - Before PHase 1, Agent should not privately read the original CSV hidden time fields in `train.py`
+    - `calendar` embedding requires Phase 2+ to return x_mark/ y_mark by freezing a visible interface or know
     """
 ```
 
-> **隔离要求：** `prepare_tsf.py` 对 Agent 只导出 `train/val` loader。reference test / blind test loader 若实现为本地函数，也必须位于 Runner sidecar 或 Agent 不可挂载的私有目录中，不能被 `train.py` import。
+> **Segregation request:** `prepare_tsf.py` for Agent only export `train/val` loader. If this is achieved as a local function, reference / blind test loader must also be located in a private directory that Runner sidecar or Agent cannot mount and cannot be `train.py` import.
 
-> **与 TSL 的简化差异：** TSL 的 `__getitem__` 同时返回 `(seq_x, seq_y, seq_x_mark, seq_y_mark)` 以支持 Transformer decoder 中的 teacher forcing。neo-research TSF 简化为 `(x, y)`，去掉 `label_len` 和时间戳特征。这使 agent 写模型时更简洁；若后续确实需要时间戳特征，应由 Human/Runner 在冻结层显式扩展接口，而不是让 `train.py` 私自回读原始 CSV 或重建隐藏字段。
+> **Simplified difference with TSL: **TSL's `__getitem__` is also returned to `(seq_x, seq_y, seq_x_mark, seq_y_mark)` to support trackformer decoder's Teacher forcing. Neo-research TSF simplified to `(x, y)`, removes `label_len` and time stamp features. This makes it easier for angent to write a model; If subsequent time stamp features are indeed required, Human/Runner should expand the visible interface in the freeze layer instead of allowing `train.py` to read the original CSV or rebuild hidden fields privately.
 
-**Agent 可见评估函数（主指标定义）：**
+**Agent Visible Assessment Function (primary metric definition):**
 
 ```python
 @torch.no_grad()
 def evaluate_val_tsf(model_or_models, device) -> dict:
     """
-    仅在 val split 上评估所有 HORIZONS。
+    Evaluate all HORIZONS only on val split.
 
-    计算在 SCALED SPACE（StandardScaler 归一化后）的 MSE 和 MAE，
-    与 TSL exp_long_term_forecasting.py 的 metric() 函数行为一致。
+    Calculating MSE and MAE in SCALED SPACE (after StandardScaler integration),
+    Consistent with the metric() function of TSL exp_long_term_forecasting.py.
 
     model_or_models：
-      - 若为 dict {horizon: model}，则逐 horizon 分别评估
-      - 若为单个 nn.Module，则用同一模型评估所有 horizon
+      - If dict {horizon: Moder}, evaluate it separately by horizon
+      - If a single nn.Module, evaluate all horizon using the same model
 
-    返回 dict，key 包括：
-      "val_avg_mse"  — 多 horizon 平均 MSE（主指标）
-      "val_avg_mae"  — 多 horizon 平均 MAE
-      "val_h{H}_mse" — 各 horizon 的 MSE
-      "val_h{H}_mae" — 各 horizon 的 MAE
+    returns dict, keep including:
+      " val_avg_mse " - Multihorizon Average MSE (primary metric)
+      " val_avg_mae " - Multihorizon Average MAE
+      "val_h{H}_mse" — MSE for each horizon
+      "val_h{H}_mae" — MAE for each horizon
     """
 ```
 
-**Runner-only privileged 接口：**
+**Runner-only Privileged Interface:**
 
 ```python
 def query_ref_test(artifact_uri: str, task_id: str, promotion_token: str) -> dict:
     """
-    由 Runner/Human Gate 调用的 privileged 接口。
+    An interface called by Runner/Human Gate.
 
-    - 读取独立的 reference test 数据或服务
-    - 返回 ref_test_* 指标
-    - 结果写入 privileged promotion log，不暴露给 Agent 进程
+    - Read independent reference test data or services
+    - returns ref_test_* indicator
+    - Result written to Privileged project log, not exposed to Agent process
     """
 
 def query_blind_test(artifact_uri: str, task_id: str, promotion_token: str) -> dict:
     """
-    由 Runner/Human Gate 调用的外部 blind-test sidecar 接口。
+    External blind-test sidecar interface called by Runner/Human Gate.
 
-    - 通过 NEO_TSF_BLIND_TEST_URL / NEO_TSF_BLIND_TEST_TOKEN 调用私有服务
-    - 仓库内只传递 artifact_uri、task_id、promotion_token
-    - 返回 blind_test_* 指标；私有标签和评分实现不进入 Agent 可见仓库
+    - Call for private services through NEO_TSF_BLIND_TEST_URL/ NEO_TSF_BLIND_TEST_TOKEN
+    - Only artifact_uri, task_id, promotion_token are passed in the warehouse
+    - returns blind_test_* indicator;Private labels and ratings are closed to Agent Visible Repository
     """
 ```
 
-`train.py` 的标准调用方式：
+Standard `train.py` call:
 
 ```python
-# keep/discard 依据：val 集
+# keep/discard by: Val Set
 val_results = evaluate_val_tsf(models, device=device)
 
-# 仅在 promotion 阶段，由 Runner/Human Gate 在 Agent 进程外调用：
+# Only in the process phase, called by Runner/Human Gate outside the Agent process:
 # ref_test_results = query_ref_test(artifact_uri, task_id, promotion_token)
 ```
 
-**默认 Summary 样例（Agent 可见，供 grep 解析，格式固定）：**
+**Default Summary sample (Agent visible for grep resolution, fixed format):**
 
 ```
 ---
@@ -1527,7 +1527,7 @@ peak_vram_mb:     4210.3
 num_params_M:     2.14
 ```
 
-**Runner-side promotion log 样例（不由 `train.py` 打印，Agent 默认不可见）：**
+**Runner-side protocol log sample (not printed by `train.py`, Agent default invisible):**
 
 ```text
 ref_test_avg_mse: 0.454800
@@ -1535,41 +1535,41 @@ ref_test_h96_mse: 0.397100   ref_test_h96_mae: 0.413200
 ...
 ```
 
-> **为什么默认不输出 test？** `val_avg_mse` 是唯一 keep/discard 决策信号。公开 `test` 只在晋级节点由 Runner/Human Gate 查询，用于和 TSL 已发布结果做参考对齐；真正 blind test 进一步后移到独立服务。
+> **Why not output by default?** `val_avg_mse` is the only keep/discard decision signal. Open `test` only for promotion nodes by Runner/Human Gate to align with the released TSL results; The real blind test moves further back to independent service.
 
 ---
 
-### 13.2 实验层：`train.py`
+### 13.2 Experimental Layer: `train.py`
 
-**Phase 0/MVP 中 agent 的自由度范围：**
+**Agent range of freedom in Chase 0/MVP:**
 
-`train.py` 是 agent **唯一可以修改的文件**，可改动范围包括：
+`train.py` is an agent**the only document that can be modified**.
 
-**模型架构（单文件内自由）：**
-- 网络类型：Transformer、MLP、TCN、CNN、SSM、线性模型、混合架构等
-- 深度与宽度：层数、隐藏维度、注意力头数
-- Channel 策略：Channel-Independent（CI）或 Channel-Dependent（CD）
-- Patch 设计：patch size、stride、是否使用 overlap
-- 位置编码、归一化位置、激活函数、残差连接方式
+**Model structure (freedom in single document):**
+- Type of network: Transformer, MLP, TCN, CNN, SSM, linear models, hybrid structures, etc.
+- Depth and width: layers, hidden dimensions, heads of focus
+- Channel Policy: Channel-Independent (CI) or Channel-Dependent (CD)
+- Patch Design: Patch size, stride, use overlap
+- Location Encoding, Normalization Positions, Activation Functions, Disable Connection Method
 
-**训练策略（单文件内自由）：**
-- Loss 函数：MSE、MAE、Huber、分位数损失、自定义组合（仅限 Phase 0；Phase 2+ 应收敛到 grammar / registry）
-- 优化器：Adam、AdamW、SGD、任意变体
-- 学习率及 schedule：cosine、linear warmup/warmdown 等
-- Batch size、训练 epoch 数量（在 TIME_BUDGET 范围内）
-- Dropout、正则化方式
-- 数据增强（仅对训练集，不能改验证/测试集）
+**Training strategy (freedom in single documents):**
+- Loss function: MSE, MAE, Huber, Bit Number Loss, Custom Group (Phase 0 only); Chase 2+ Receivable to Grammar/registry)
+- Optimizers: Adam, AdamW, SSD, Any variant
+- Learning rate and schedule: cosine, linear warmup/warmdown etc.
+- Batch size, training epoch number (within TIME_BUDGET)
+- Dropout, Regular
+- Data enhancement (training set only, not modified for validation/test set)
 
-**模型接口约定：**
+**Model interface engagement:**
 
 ```
-x: FloatTensor [B, INPUT_LEN, NUM_CHANNELS]   ← 历史窗口，scaled
-y: FloatTensor [B, horizon,   NUM_CHANNELS]   ← 预测目标，scaled
+x: FloatTensor [B, INPUT_LEN, NUM_CHANNELS] History window, scaled
+y: FloatTensor [B, Horizon, NUM_CHANNELS] Projection target, scaled
 
 pred = model(x)   # → [B, horizon, NUM_CHANNELS]
 ```
 
-**`train.py` 初始 baseline（NLinear CI）：**
+** `train.py` Initial baseline (NLinear CI):**
 
 ```python
 """
@@ -1584,17 +1584,17 @@ import torch
 import torch.nn.functional as F
 import time
 
-# ─── 超参数（agent 可直接修改这些以及下方所有内容）───────────────────────────
+# ─── Superparameters (agent can directly modify these and all below)───────────────────────────
 BATCH_SIZE  = 32
 LR          = 1e-3
-MAX_EPOCHS  = 100      # 在 TIME_BUDGET 内跑尽量多的 epoch；建议配合 early stopping
+MAX_EPOCHS  = 100      # Run as many epochs inside TIME_BUDGET;Suggestion
 
-# ─── 模型定义 ──────────────────────────────────────────────────────────────────
+# ─── Model definition ──────────────────────────────────────────────────────────────────
 class TSFModel(torch.nn.Module):
     """
     Baseline: Channel-Independent per-channel linear（NLinear-style）。
-    每个 channel 独立做线性映射，是 TSF 领域最简的有效 baseline。
-    参考：DLinear / NLinear (AAAI 2023)。
+    Each channel independent linear map is the simplest effective baseline for TSF fields.
+    Reference: DLinear / NLinear (AAAI 2023).
     """
     def __init__(self, input_len: int, horizon: int):
         super().__init__()
@@ -1607,7 +1607,7 @@ class TSFModel(torch.nn.Module):
         out = self.linear(x)                           # [B*C, H]
         return out.reshape(B, C, -1).permute(0, 2, 1)  # [B, H, C]
 
-# ─── 训练循环 ──────────────────────────────────────────────────────────────────
+# ─── Training cycle ──────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
 t_start = time.time()
@@ -1622,7 +1622,7 @@ for horizon in HORIZONS:
 
     best_val_loss = float("inf")
     patience_counter = 0
-    PATIENCE = 7  # early stopping patience（参照 TSL 默认值）
+    PATIENCE = 7  # Early stomping data (reference TSL default)
 
     for epoch in range(MAX_EPOCHS):
         if time.time() - t_start >= TIME_BUDGET:
@@ -1653,11 +1653,11 @@ for horizon in HORIZONS:
     model.load_state_dict(torch.load(f"/tmp/neo_tsf_best_h{horizon}.pt"))
     model.eval()
 
-# ─── 评估 ──────────────────────────────────────────────────────────────────────
+# ─── Evaluation ──────────────────────────────────────────────────────────────────────
 t_train_end = time.time()
 val_results = evaluate_val_tsf(models, device=device)
 
-# ─── Summary 输出（格式固定，供 grep 解析）─────────────────────────────────────
+# ─── Summary output (fixed format for grep resolution)─────────────────────────────────────
 training_seconds = t_train_end - t_start
 total_seconds    = time.time() - t_start
 num_params = sum(p.numel() for m in models.values() for p in m.parameters())
@@ -1677,93 +1677,93 @@ if num_params > PARAM_BUDGET:
 
 ---
 
-### 13.3 策略层：`program.md`
+### 13.3 Policy Layer: `program.md`
 
-`program.md` 是 **agent 行为协议**，由人类研究员编写和迭代。
+`program.md` is **AGent Behavior Agreement,** prepared by the Human Researcher and iteratively.
 
-**Setup 阶段：**
+**Setup Phase:**
 
 ```markdown
 ## Setup
 
-1. **约定实验 tag**：例如 `apr21-etth1`。创建分支 `neo-research/<tag>`。
-2. **读入上下文文件**：
-   - `prepare_tsf.py` — 了解固定常量、数据切分、评估协议
-   - `train.py` — 了解 baseline 模型和当前实验起点
-   - `results.tsv` — 了解历史实验轨迹（仅 Agent 可见指标）
-3. **确认数据就绪**：检查数据集是否已下载到 `~/.cache/neo_research_tsf/`
-4. **初始化 results.tsv**：写入 header 行
-5. **初始化 promotion.tsv**：由 Runner/Human Gate 持有；Agent 不读取
-6. **记录 `last_keep_commit`**：初始化为当前 baseline commit；之后每次 keep 成功都更新
-7. **确认后开始实验循环**
+1. **According to experiments tag**: e. g. `apr21-etth1`.Create branch `neo-research/<tag>`.
+2. ** Read context documents**:
+   - `prepare_tsf.py` - Knowledge of fixed constants, data splits, evaluation protocols
+   - `train.py` - Know baseline model and current experimental starting point
+   - `results.tsv` - Knowledge of historical experimental trajectory (Agent Visible Indicator only)
+3. ** Confirm data readiness**: check whether the data set has been downloaded to `~/.cache/neo_research_tsf/`
+4. ** Initialized results.tsv **: written in header line
+5. ** Initialization of promotion.tsv**: held by Runner/Human Gate;Agent does not read
+6. **Records `last_keep_commit`**: initialized into current base line group;Every time a keeper is successfully updated
+7. ** Start the experimental cycle after confirmation**
 ```
 
-**实验循环（核心协议）：**
+**Experimental cycle (core protocol):**
 
 ```markdown
-## 实验循环
+## Experimental cycle
 
 LOOP FOREVER:
 
-1. 查看当前 git 状态（所在 commit）
-2. 提出一个研究假设（要修改什么、为什么可能有效）
-3. 修改 `train.py`
-4. git commit（带一句话描述）
-5. 运行实验：`uv run train.py > run.log 2>&1`
-6. 读取结果：
+1. View the current guit status (where it is)
+2. Present a research assumption (what to modify, why might it be effective)
+3. Modify `train.py`
+4. It's a good idea, right?
+5. Run experiments: `uv run train.py > run.log 2>&1`
+6. Read results:
    `grep "^val_avg_mse:\|^num_params_M:\|^WARNING" run.log`
-7. 若 grep 为空，则 crash：读 `tail -50 run.log`，尝试修复
-8. 记录结果到 results.tsv（不提交 git）
-9. 决策（以 val_avg_mse 为准）：
-   - val_avg_mse **降低** → keep，保留 commit，并更新 `last_keep_commit=$(git rev-parse HEAD)`
-   - val_avg_mse **持平或升高** → discard。语义上必须让实验分支的 `HEAD` 真正回到 `last_keep_commit`
-     （专用 research branch 且 worktree clean 时：`git reset --hard <last_keep_commit>`）
-     若存在其他未提交改动，则停止自动循环并交由 Human 处理；不要只恢复 `train.py` 内容而保留 rejected commit 为当前 `HEAD`
-10. 若累计 `PROMOTION_INTERVAL`（默认 5）次 keep，则由 Runner/Human Gate 触发一次 reference test 查询；
-    该结果只写入 `promotion.tsv`，不回灌进 Agent 上下文
-11. 回到步骤 1
+7. If grep is empty, crash: read `tail -50 run.log` and try repair
+8. Record results to results.tsv (do not submit git)
+9. Decision-making (based on val_avg_mse):
+   - val_avg_mse** Reduce** keep, retain and update `last_keep_commit=$(git rev-parse HEAD)`
+   - Unchanged or higher val_avg_mse → discard. The experiment branch `HEAD` must actually return to `last_keep_commit`.
+     (Special: `git reset --hard <last_keep_commit>` for research lanch and workstream clean)
+     If there are other changes that have not been submitted, the automatic cycle is stopped and handed over to Human;Do not only restore `train.py` content while retaining the reprojected committee as the current `HEAD`
+10. If `PROMOTION_INTERVAL` (default 5) is cumulative, a reference test is triggered by Runner/Human Gate;
+    This result is written only to `promotion.tsv` and does not refill the Agent context
+11. Back to step 1.
 ```
 
-**TSF 专属研究方向提示：**
+**TSF exclusive research orientation tips:**
 
 ```markdown
-## 研究方向参考（按优先级排序）
+## Research orientation reference (in order of priority)
 
-优先尝试：
-- Channel-Independent（CI）→ Channel-Dependent（CD）策略切换
-  （CI 对每 channel 独立预测；CD 显式建模 channel 间依赖，如 iTransformer）
-- Patch 化输入（patch size = 16/32，stride = 8/16，参考 PatchTST）
-- 去趋势分解：将序列分解为 trend（moving average）+ remainder，分别建模
-  （参考 TSL 中的 DLinear 分解思路）
-- 用 MLP-Mixer 替代 Attention（计算更高效，seq_len 长时收益明显）
-- 频域特征：FFT 系数作为辅助输入（与时域特征 concat）
+Precedence:
+- Channel-Independent (CI)Channel-Dependent (CD) policy transition
+  (CI) Independent projection per channel;CD Visible Modell Channel Dependence, e. g. iTransformer)
+- Patch Chemical Input (Patch size = 16/32, stride = 8/16, reference PatchTST)
+- Decomposition of trends: decompose sequences into trend(moving input) + remainder, modeling separately
+  (Refer to DLinear decomposition in TSL)
+- Replace Attention with MLP-Mixer (more efficient calculation, seq_len significant long-term returns)
+- Frequency domain characteristics: FFT coefficient as aided input (temporal domain feature concat)
 
-次要探索：
-- 跨 horizon 参数共享：单模型 + 不同 pred_len projection head
-- 多尺度时序特征融合（不同 patch size 并行 branch，最终 concat）
-- 非对称 Loss：对上行/下行误差差异化惩罚
-- Distillation：以 iTransformer 为 teacher，小 MLP 为 student
+Secondary exploration:
+- Cross-horizon Parameter Sharing: Single Model + Different pred_len program head
+- Multiscale time-series feature integration (different watch size parallel brancy, final concat)
+- Asymmetric Los: Differential penalties for errors in the top/down row
+- Distinction: iTransformer for teacher, little MLP for student
 
-## 简洁性标准（继承自 autoresearch）
+## Simplicity criterion (inheritance from autoresearch)
 
-- 提升 0.005 val_avg_mse 但新增 80 行复杂代码：不值得保留
-- 提升 0.005 val_avg_mse 且删减了代码：一定保留
-- 提升为 0 但代码更简洁：保留（简化胜利）
-- 参数量增加超过 5M 且提升 < 0.010 val_avg_mse：不保留
+- Raise 0.005 val_avg_mse but add a new 80 line complex code: it is not worth preserving
+- Raise 0.005 val_avg_mse and delete code: Always keep
+- Raised to 0, but the code is simpler: keep (simplified victory)
+- Increase in the number of participants by more than 5M and raise < 0.010 val_avg_mse: do not retain
 
-## 模型规模惩罚规则
+## Model scale penalty rules
 
-当 val_avg_mse 改善量 Δ 与参数增量 ΔP 满足：
+When the val_avg_mse improvement Δ and parameter increase ΔP satisfy:
   Δ / (ΔP / 1e6) < 0.005
-  （即每增加 1M 参数，改善不足 0.005 MSE）
-→ 该变化视为"不划算"，建议 discard。
+  (i.e., inadequate improvement of 0.005 MSE per 1M parameter)
+→ Treat the change as not worthwhile and recommend discard.
 ```
 
 ---
 
-## 14. 日志文件设计（Tab 分隔，不提交 git）
+## 14. Log file design (Tab separated, no git submitted)
 
-### 14.1 `results.tsv`（Agent 可见）
+### 14.1 `results.tsv` (Agent Visible)
 
 ```
 commit	recipe_id	parent_recipe_id	recipe_hash	stage	seed	val_avg_mse	val_h96_mse	val_h720_mse	params_M	status	failure_tags	description
@@ -1773,53 +1773,53 @@ c3d4e5f	none_token_transformer_feature_linear_mse_v1	none_patch_mlp_temporal_lin
 d4e5f6g	none_token_transformer_feature_linear_mse_v2	none_patch_mlp_temporal_linear_mse_v1	sha256:ddd	full	42	NA	NA	NA	NA	crash	["oom"]	OOM with full-attn bs=256
 ```
 
-列说明：
-- `recipe_id` / `parent_recipe_id` / `recipe_hash`：追踪 recipe 谱系与可复现配置
-- `stage`：`smoke` / `low_fidelity` / `full` / `multi_seed`
-- `seed`：当前实验随机种子
-- `val_avg_mse`：**主指标**，keep/discard 的唯一决策依据（val 集，scaled space）
-- `val_h96_mse` / `val_h720_mse`：短期和长期 horizon 代表值，便于观察是否偏科
-- `params_M`：所有 horizon 模型参数总量（百万）
-- `status`：`keep` / `discard` / `crash`
-- `failure_tags`：结构化失败标签，如 `oom`, `nan`, `timeout`, `shape_mismatch`
-- 当 `status=crash` 时，数值列应写 `NA`，并在任何排序、聚合、champion 比较前先过滤
+Column description:
+- `recipe_id` / `parent_recipe_id` / `recipe_hash`: track recide spectrum and recoverable configuration
+- `stage`:`smoke` / `low_fidelity` / `full` / `multi_seed`
+- `seed`: Current Experiment Random Feed
+- `val_avg_mse`:**primary metric**, sole basis for decision-making (val collection, scaled space)
+- `val_h96_mse` / `val_h720_mse`: short-term and long-term horizon representation to allow observation of bias
+- `params_M`: Total number of parameters for all horizon models (millions)
+- `status`:`keep` / `discard` / `crash`
+- `failure_tags`: Structure failed tags such as `oom`, `nan`, `timeout`, `shape_mismatch`
+- When `status=crash`, the value column should write `NA` and filter before any sorting, aggregation, comparison
 
-### 14.2 `promotion.tsv`（privileged log，仅 Runner/Human Gate 可见）
+### 14.2 `promotion.tsv` (privileged log, only Runner/Human Gate visible)
 
 ```
 commit	ref_test_avg_mse	ref_test_h96_mse	ref_test_h720_mse	latency_ms	promotion_note
 b2c3d4e	0.439500	0.383200	0.489700	2.8	first promotion check passed
 ```
 
-- `promotion.tsv` 不进入 Agent 上下文，不作为下一轮假设生成的输入
-- Agent 只能看到 `results.tsv`
-- `promotion.tsv` 只是逻辑示例名；物理上应存放在 Agent 不可挂载的私有目录、对象存储或 Metrics DB 中，而不是 Agent workspace
+- `promotion.tsv` does not enter the Agent context and does not act as input for the next scenario
+- Agent can only see `results.tsv`
+- `promotion.tsv` is just a logical example; Physically should be stored in an Agent unmounted private directory, object storage or Metrics DB, not an Agent workspace
 
-> **Sanity check：** baseline（NLinear CI，INPUT_LEN=512）的 `ref_test_h96_mse` 可参考 TSL 论文中 NLinear on ETTh1 H=96 的结果（约 0.386）。由于当前协议包含 `INPUT_LEN=512`、多 horizon 同轮评估、time-budget 和 early stopping 等差异，该检查只用于发现明显的数据切分或标准化错误，不作为严格 leaderboard 对齐阈值。若要严格对齐，应启用单独的 TSL-compatible baseline mode。
+> **Sanity check:** Compare baseline (NLinear CI, INPUT_LEN=512) `ref_test_h96_mse` with the TSL paper's NLinear result on ETTh1 H=96 (approximately 0.386). Differences in `INPUT_LEN=512`, evaluating multiple horizon together, time budgets, and early stopping mean this checks only obvious split/normalization errors, rather than strict leaderboard alignment. Enable a separate TSL-compatible baseline mode for exact alignment.
 
 ---
 
-## 15. 时序预测专属能力
+## 15. Time-series forecasting exclusive capability
 
-### 15.1 多任务类型支持
+### 15.1 multi-task type support
 
-| 任务类型 | 描述 |
+| Task Type | Description |
 |---------|------|
-| univariate forecasting | 单变量，标准 M4/M5 场景 |
-| multivariate forecasting | 多变量联合预测，ETT/Weather/Traffic |
-| exogenous forecasting | 含已知未来协变量（如日历特征） |
-| point forecasting | 点预测，MSE/MAE 评估 |
-| probabilistic forecasting | 分布预测，CRPS/Pinball 评估 |
+| univariate forecasting | Single variable, standard M4/M5 scene |
+| multivariate forecasting | Multivariate Combined Forecast, ETT/Weather/Traffic |
+| exogenous forecasting | Contains known future accompaniment variables (e.g. calendar features) |
+| point forecasting | Point Forecast, MSE/MAE Assessment |
+| probabilistic forecasting | Distribution projection, CRPS/Pinball assessment |
 
-> ProbTS 已明确表明，不同 horizon 与 point/distributional 设置会显著改变模型偏好，系统设计时不能只盯住单一 long-term point forecast。
+> ProbTS has made it clear that different horizon and point/distributional settings significantly change the model preference, and systems cannot be designed to focus solely on a single long-term point forecast.
 
-### 15.2 任务指纹提取
+### 15.2 Job fingerprinting
 
-建议对每个任务自动提取：
+It is recommended that each task be automatically drawn:
 
 - seasonality period
 - autocorrelation signature
-- intermittency（间歇性）
+- Intermittentity
 - trend strength
 - change points
 - missing ratio
@@ -1827,248 +1827,248 @@ b2c3d4e	0.439500	0.383200	0.489700	2.8	first promotion check passed
 - target scale stability
 - horizon/context ratio
 
-### 15.3 多维度误差诊断
+### 15.3 multi-dimensional error diagnosis
 
-Analyst Agent 除了看 aggregate metric，还应输出：
+Analyst Agent, in addition to looking at aggregate metric:
 
-- 各 horizon 误差（是否长尾偏差）
-- 各序列 bucket 误差（是否集中在某类序列）
-- 峰值段误差（是否在高波动期表现差）
-- 节假日/异常日误差
-- 训练不稳定性（多 epoch 方差）
+- Each horizon error (whether or not)
+- Bucket error by series (whether or not to concentrate in a class)
+- Peak segment error (whether or not to perform during high-volatility periods)
+- Holidays/unusual day errors
+- Training for instability (multiepoch variance)
 
 ---
 
-## 16. 人机协同机制（Human Control Layer）
+## 16. Human Convergence Mechanism (Human Control Layer)
 
-系统不是取代研究员，而是把人从"重复调试"中解放出来。
+The system is not a substitute for researchers. It's a way to free people from the "replicate debugging".
 
-### 16.1 人负责
+### 16.1 is responsible.
 
-- 定义任务（TaskSpec）
-- 冻结数据协议与评估协议
-- 批准搜索空间扩展（从 L1 到 L2/L3）
-- 设定研究目标与迭代方向（编写/修改 `program.md`）
-- 审核最终 champion，决定是否晋级 blind test
-- 偶尔重写 `train.py` baseline，重置搜索起点
+- Define Tasks (TaskSpec)
+- Freezing data protocols and assessment agreements
+- Authorize search space extensions (from L1 to L2/L3)
+- Set the research target and iterative direction (formulate/modify `program.md`)
+- Audit final selection to decide whether or not to advance
+- Occasionally rewrite `train.py` baseline, reset search starting point
 
-### 16.2 Agent 负责
+### 16.2Agent.
 
-- 高频试验（每轮提出假设、改代码、跑实验、记录结果）
-- 自动归因实验成败
-- patch 迭代（delta-based，keep/discard 循环）
-- 失败总结与知识沉淀
-- 候选生成与推荐
+- HF tests (suppression per round, code changes, running experiments, recording of results)
+- Automatic attribution of success or failure
+- Patch (delta-based, keep/discard loop)
+- Failed Summary and Knowledge Deposition
+- candidates and Recommendations
 
-### 16.3 建议保留的人工闸门
+### 16.3 suggests keeping artificial gates
 
-| 闸门 | 触发时机 |
+| The gate. | Trigger Time |
 |-----|---------|
-| 新任务立项 | 新建 TaskSpec 时 |
-| 搜索空间扩展 | 从 L1 升 L2/L3 时 |
-| Shadow Holdout 查询 | 每 N 次 keep 后 |
-| Blind Test 晋级 | 最终 champion 候选 |
-| 代码合并到主干 | 完整实验周期结束 |
+| New Task Set | When New TaskSpec |
+| Searchspace Extension | When L1L L2/L3 |
+| Shadow Holding Query | Every N past keepep |
+| Blind Test promotion | Final Champion Candidates |
+| Merge Codes to Main | End of full experimental cycle |
 
-### 16.4 审计与回滚
+### 16.4 Audit and Rollback
 
-**审计日志**：每次候选都记录：谁提出、改了什么、在哪一版上改、跑了哪些实验、为什么晋级/拒绝、是否触发人工审批。
+**Audit log**: Each candidate is recorded: who proposed, changed what, which version was changed, which experiments ran away, why promotions/rejections, whether manual approvals were triggered.
 
-**回滚机制**：任何 champion 都必须支持：
-- 一键回滚到父版本
-- 一键重跑确认
-- 一键导出 patch diff
+**Rollback mechanism**: any campaign must support:
+- Scroll back to the parent version
+- One-key rerun confirmed.
+- One Key Export Patch Diff
 
 ---
 
-## 17. 关键设计对比
+## 17. Key design comparisons
 
-### 17.1 与 autoresearch 的差异
+### Difference between 17.1 and autoresearch
 
-| 维度 | autoresearch（LLM pretraining） | neo-research TSF |
+| Dimensions | autoresearch(LLM pretraining) | neo-research TSF |
 |------|--------------------------------|-----------------|
-| 任务类型 | 语言模型预训练 | 时间序列多步预测 |
-| 数据规模 | 数十亿 token | 数万条时序样本 |
-| 训练时间预算 | 300s（5 分钟） | 600s（10 分钟） |
-| 主指标 | val_bpb（越低越好） | val_avg_mse（越低越好，scaled space） |
-| 评估维度 | 单一语言建模指标 | 多 horizon（96/192/336/720）均值 |
-| 模型类型 | GPT-style decoder | 任意架构（Linear/Attn/TCN/SSM 等） |
-| 额外约束 | VRAM 软约束 | 参数量软约束 + VRAM 软约束 |
-| channel 设计 | 不适用 | CI vs CD 是核心自由度 |
-| loss 设计 | 固定 cross-entropy | Phase 0 可在单文件内自由组合；Phase 2+ 受 loss grammar 约束 |
-| early stopping | 无（固定 time budget） | time budget + val early stopping 双重控制 |
-| 参照 baseline | nanochat GPT | TSL NLinear（可与论文数字对齐验证） |
+| Task Type | Language model pre-training | Time series multistep projections |
+| Data size | Billions of dollars. | Tens of thousands of time series samples. |
+| Training time budget | 300s (5 minutes) | 600s (10 minutes) |
+| primary metric | val_bpb (lower, better) | val_avg_mse (lower, scaled space) |
+| Assessment dimensions | Single-language modelling indicators | Multiple horizon (96/192/336/720 average) |
+| Model Type | GPT-style decoder | Any structure (Linear/Attn/TCN/SSM etc.) |
+| Additional constraints | VRAM Soft Limit | Parameter weight soft bounds + VRAM soft bounds |
+| Channel Design | Not applicable | CI vs CD is core freedom |
+| loss Design | Fixed cross-entropy | Chase 0 can be freely assembled in a single document; Phase 2+ bound by lossgrammar |
+| early stopping | None (fixed time button) | Time buildt + val early starting |
+| Baseline | nanochat GPT | TSL NLinear (validable with paper numbers) |
 
-### 17.2 与 Time-Series-Library 的对接说明
+### 17.2 docking instructions with Times-Series-Library
 
-neo-research TSF 的 `prepare_tsf.py` 在数据层**直接采用 TSL 的实现逻辑**，确保：
+`prepare_tsf.py` of neo-research TSF uses the TSL realization logic directly in the data layer** to ensure that:
 
-- **切分边界完全一致：** ETTh1 的 train/val/test 边界与 `Dataset_ETT_hour` 中的 `border1s` / `border2s` 硬编码值完全相同，具备与 TSL 发布结果做**参考对齐**的前提。
-- **StandardScaler 行为一致：** fit on train only，并在 Agent 可见的 `train/val` 与 Runner 私有的 `reference test` 上复用同一组 train 统计量；评估在 scaled space（不 inverse transform），与 TSL 的 `exp_long_term_forecasting.py` 默认行为（`args.inverse=False`）一致。
-- **数据获取兼容：** 默认由 Human/Runner 预置本地 CSV（`~/.cache/neo_research_tsf/dataset/ETT-small/ETTh1.csv`）；如需自动下载，应在 Agent 容器外的 prestage/setup 步骤完成，而不是由 Phase 0 Agent 在实验环内联网获取。
+- **The cut-off borders are fully consistent:** the train/val/test boundary of ETTH1 is identical to the `border1s`/`border2s` hard-coding value in `Dataset_ETT_hour` and has the prerequisite for alignment with the TSL release **reference alignment**.
+- **StandardScaler behaviour is consistent:** fit on track only, and re-use the same group of `reference test` statistics on `train/val` visible in Agent with Runner ' s private `reference test`; The assessment is consistent with TSL 's `exp_long_term_forecasting.py` default behaviour (`args.inverse=False`) at scaled space (not inverse transport).
+- **Data Access Compatibility:** Default presets local CSV (`~/.cache/neo_research_tsf/dataset/ETT-small/ETTh1.csv`) by Human/Runner; Automatic downloads should be completed at the prestage/setup step outside the Agent container, instead of being obtained by Phase 0 Agent in the Experimental Ring Intranet.
 
-**与 TSL 的简化差异（有意为之）：**
-- 去掉 `label_len`（decoder teacher forcing 输入），让 agent 写更简洁的 encoder-only 模型
-- 去掉 `seq_x_mark` / `seq_y_mark`（时间戳特征）；若后续需要，应升级冻结接口，而不是要求 `train.py` 自行恢复
-- 去掉 `args` 全局配置对象，改为顶层常量，agent 不能通过改 args 绕过固定设置
+**Simplification difference with TSL (intentionally):**
+- Remove `label_len` (decoder tracker input) so that angent writes a simpler encoder-only model
+- Remove `seq_x_mark`/`seq_y_mark` (time stamp feature); If follow-up is required, the freeze interface should be upgraded instead of requesting `train.py` to restore itself
+- Remove `args` global configuration object to top level constant, angent cannot bypass fixed settings by changing args
 
-> **口径说明：** neo-research TSF 与 TSL 在数据切分和标准化上保持一致，但在 `INPUT_LEN=512`、多 horizon 同轮评估、time-budget 约束等实验协议上做了简化。因此这里的数字是**reference-comparable**，不是严格的 leaderboard apples-to-apples。若要做论文级严格对比，应在同一 window / horizon / budget 设置下重跑 TSL baseline。
+> **According to calibre: **neo-research TSF and TSL are consistent in data splitting and standardization, but have been simplified in experimental agreements such as `INPUT_LEN=512`, multihorizon round of assessments, time-budget binding. So the figure here is **Reference-comparable**, not strict leaderboard apples-to-apples. If you want to make a strict comparison at the dissertation level, you should rerun TSL baseline under the same window / horizon / Buildt setting.
 
 ---
 
-## 18. 实施路线图与里程碑
+## 18. Implementation of the road map and milestones
 
-### Milestone 0：基础底座（2～3 周）
+### Milestone 0: Base base (2 ~3 week)
 
-**目标：** 最快验证"Agent 是否真能形成有效闭环"
+**Target:** Best to verify whether "Agent is really able to form an effective closed ring"
 
-交付：
-- [x] 实现 `prepare_tsf.py`（ETTh1 / TSL 切分边界 / StandardScaler / make_dataloader / evaluate_val_tsf）
-- [x] 实现 `train.py` baseline（NLinear CI + early stopping）
-- [x] 实现 `program.md` 初版（setup + 实验循环协议）
-- [ ] **Sanity check：** 人工或 Runner 查询一次 `ref_test_h96_mse`，确认没有明显偏离 TSL NLinear ETTh1 H=96 参考量级；严格对齐需另启 TSL-compatible baseline mode
-- [x] 验证 agent 能读懂 program.md 并完成第一次自主实验（keep or discard 均可，验证闭环可运行）
-- [x] TaskSpec / EvalSpec / BudgetSpec 数据结构定义完成
-- [x] Phase 0b：CandidateRecipe v1 schema 定义完成，先覆盖 `none + linear + temporal + linear head` baseline
-- [x] 能记录 baseline 结果、能产出初始 champion
+Delivery:
+- [x] Achieve `prepare_tsf.py` (ETTh1/ TSL split border / StandardScaler / make_dataloader / evaluate_val_tsf)
+- [x] Achieved `train.py` baseline (NLinear CI+ early starting)
+- [x] Make `program.md` first edition (setup + experimental cycle protocol)
+- [ ] **Sanity check:** A human or runner queries `ref_test_h96_mse` once to check for obvious deviation from TSL NLinear ETTh1 H=96. Exact alignment requires a separate TSL-compatible baseline mode.
+- [x] Validation angent to read program.md and complete the first autonomous experiment (enable by keeping or discard, authenticating closed loop to run)
+- [x] TaskSpec/ EvalSpec/ BudgetSpec data structure definition completed
+- [x] Phase 0b: CandidateRecipe v1 schema definition completed, overwrite `none + linear + temporal + linear head` baseline first
+- [x] Capable of recording baseline results, initial output
 
-### Milestone 1：Recipe 化受限研究闭环（3～4 周）
+### Milestone 1: Recipe restricted study closed loop (3 ~4 week)
 
-**目标：** 把候选从"模型族 + 参数"升级为"模块 action 组合"，开始具备可控的小模型结构自主设计能力
+**Target:** Candidates are upgraded from "model family + parameter" to "modular action combination", starting with controllable small model structure autonomous design capability
 
-交付：
-- [x] 引入 action registry：preprocessing / embedding / backbone / fusion / head / trainer（OpenCode domain registry + Neo-Cast Python action specs）
-- [x] 实现 `build_model(candidate_recipe)`，由 recipe 组装 PyTorch 模型（`neo_cast/py/factory/build_model.py`）
-- [x] 支持 CandidateRecipe DSL 配置变更（L1/L2 代码变更模式）
+Delivery:
+- [x] Introduction of an action registry: creating / embedding / backbone / fusion / head / trainer (OpenCode domain registry + Neo-Cast Python action categories)
+- [x] Fulfill `build_model(candidate_recipe)` by recapitulating PyTorch models (`neo_cast/py/factory/build_model.py`)
+- [x] Supports CandidateRecipe DSL configuration changes (L1/L2 code change mode)
 - [x] Proposal Engine v1 + recipe config search
-- [x] Static Validator 实现
-- [x] Dataset profiler v1：变量数、horizon/context、trend、seasonality、shift、cross-var correlation
-- [x] Rule-based recipe prior v1，用 TaskFingerprint 对候选排序
-- [x] Low-fidelity + Full train 流水线
-- [x] 支持多数据集切换（Neo-Cast `prepare_tsf.py --dataset-preset` 已接入 `ettm1` 固定 TSL minute split，以及 `weather` / `traffic` 的 TSL Custom 70/10/20 split；仍保留显式 row range 的自定义任务入口）
-- [x] 完善实验记录（自动生成谱系树；report export 已写入 Candidate Lineage root/edge 与 metadata）
-- [x] 能自动生成候选、能自动筛选并晋级、能输出 challenger/champion 对比报告（当前为 heuristic/frontier + memory/ranker + report export）
+- [x] Static Validator
+- [x] Dataset programr v1: Variables, horizon/context, Trend, security, Shift, Cross-var coordination
+- [x] Rule-based reprieve v1, sorted with TaskFingerprint
+- [x] Low-field + Full water stream
+- [x] Support multi-data switching (Neo-Cast `prepare_tsf.py --dataset-preset` has access to `ettm1` fixed TSL minute split, and `weather`/`traffic` TSL Custom 70/10/20 split; Keep the visible row Range custom entry)
+- [x] Improvement of the experimental record (auto-generated spectroscopy tree); Report export written to Candidate Lineage root/edge and metadata)
+- [x] Automatically generate candidate, automatically filter and promote, and output challenger/champion comparison reports (currently heuristic/frontier+memory/ranker+report)
 
-### Milestone 2：TimeRecipe 风格模块组合搜索（4～6 周）
+### Milestone 2: TimeRecipe style modular search (4 ~6 week)
 
-**目标：** 扩大 Neo-Cast 自主探索空间，使系统能在模块级组合上搜索，而不是只在少数完整模型之间切换
+**Target:** Expand the Neo-Cast autonomous exploration of space to allow systems to search on modular-level combinations instead of switching between a few complete models
 
-交付：
-- [x] Registry Composition Search（L2）
-- [x] ModelSpec / PatchBundle / Lineage 完整化（Neo-Cast export artifact 已落盘 `model_spec.json` 与 `patch_bundle.json`；OpenCode report 已写入 Candidate Lineage root/edge 与 metadata）
-- [x] preprocessing 接入 `instance_norm`, `series_decomposition`, `seasonal_differencing`, `missing_mask`, `sample_reweighting`
-- [x] embedding 接入 `none`, `patch`, `multiscale_patch`, `invert`, `frequency`, `calendar`
-- [x] backbone 接入 `linear`, `mlp`, `rnn`, `dlinear`, `tcn`, `nbeats`, `timesnet`, `ssm`, `mixer`, `transformer`
-- [x] fusion 接入 `temporal`, `feature`, `temporal_then_feature`, `feature_then_temporal`, `graph`, `gated_hybrid`
-- [x] prediction head 接入 `linear`, `quantile`, `gaussian`, `residual_correction`
-- [x] Loss grammar DSL（BaseLoss + HorizonLoss + Regularization + Calibration）
-- [x] 支持 horizon weighting 策略
-- [x] 加入 distillation objective（当前实现为可执行 teacher-policy distillation：`last_value` / `moving_average` teacher 与 supervised loss 加权混合；foundation-model teacher 接入仍可作为后续 teacher provider 扩展）
-- [x] 能在 action registry 层面进行小模型结构创新、能形成 recipe 谱系树（当前谱系基于 parentCandidateID + report lineage，并在 artifact 中补充 PatchBundle / ModelSpec）
+Delivery:
+- [x] Registry Composition Search(L2)
+- [x] ModelSpec / PatchBundle / Lineage complete (Neo-Cast export description set `model_spec.json` and `patch_bundle.json`; OpenCode report written to Candidate Lineage root/edge and metadata)
+- [x] Accessing `instance_norm`, `series_decomposition`, `seasonal_differencing`, `missing_mask`, `sample_reweighting`
+- [x] Embedding access to `none`, `patch`, `multiscale_patch`, `invert`, `frequency`, `calendar`
+- [x] Backbone access to `linear`, `mlp`, `rnn`, `dlinear`, `tcn`, `nbeats`, `timesnet`, `ssm`, `mixer`, `transformer`
+- [x] Fusion access to `temporal`, `feature`, `temporal_then_feature`, `feature_then_temporal`, `graph`, `gated_hybrid`
+- [x] predation head access `linear`, `quantile`, `gaussian`, `residual_correction`
+- [x] Loss grammar DSL(BaseLoss + HorizonLoss + Regularization + Calibration)
+- [x] Support horizon policy
+- [x] Add a distillation objective: executable teacher-policy distillation mixes supervised loss with `last_value` / `moving_average` teachers. A foundation-model teacher may be added later through a teacher-provider extension.
+- [x] Enables small model structural innovation at the level of action registry, creates recipe spectrum trees (current spectra based on parentCandidateID + report lineage and adds PatchBundle/ ModelSpec to artifact)
 
-### Milestone 3：多 seed + Champion/Challenger + 研究记忆（4 周）
+### Milestone 3: multiseed + Champion/Challenger + research memory (4 week)
 
-**目标：** 从"单次试验系统"升级为"可统计显著性验证的研究系统"
+**Target:** Upgrade from a "single test system" to a "research system that can be statistically validated"
 
-交付：
-- [x] 支持多 seed 结果汇总与自动 seed sweep（同一 candidate 多 run 的 mean/std/ci95/best/worst；`seed-sweep` 按 task evaluation seeds 执行并记录 `resourceUsage.seed`）
-- [x] 实现 Pareto Front 维护（export artifact + Dashboard/Cockpit metadata 摘要）
-- [x] 实现 Shadow Holdout 审批 gate（`governance.requireShadowHoldout` / `requireBlindHoldout` 开启后，`ref_test` 前必须先批准 `shadow_holdout`）
-- [x] 实现基础 reference/shadow/blind 查询限流 gate（`governance.refTestQueryLimit` / `referenceTestQueryLimit` / `blindTestQueryLimit`，超过后生成 budget approval）
-- [x] 实现 Utility 评分（综合精度/参数量/延迟/多 seed 方差/代码复杂度；当前用于 report 排序与审计，不直接覆盖 champion 晋级）
-- [x] Memory Service v1 + 相似任务召回
-- [x] 能基于历史经验做 CandidateRecipe 排序
+Delivery:
+- [x] Aggregate multiple-seed runs and support automatic seed sweeps: mean/std/ci95/best/worst across runs of one candidate. `seed-sweep` uses task evaluation seeds and records `resourceUsage.seed`.
+- [x] Realization of Pareto Front maintenance (export analysis + Dashboard/Cockpit metadata summary)
+- [x] Achieve Shadow Holdout Approval Gate (`governance.requireShadowHoldout` / `requireBlindHoldout` must approve `shadow_holdout` before `ref_test` starts)
+- [x] Fulfill base reference/shadow/blind query restricted stream gate (`governance.refTestQueryLimit` / `referenceTestQueryLimit` / `blindTestQueryLimit`, post-budget application)
+- [x] Achievement of Utility ratings (comprehensive accuracy/parameters/delayedness/multi-seed variance/code complexity); Currently used for reporting sorting and auditing, not directly overcrowding promotion)
+- [x] Memory Service v1 + similar mission recall
+- [x] Can sort CandidateRecipe based on historical experience
 
-### Milestone 4：多任务元记忆（3～4 周）
+### Milestone 4: Multi-task membrane memory (3 ~4 week)
 
-**目标：** 从"自动试验机"升级为"会积累经验的研究系统"
+**Target:** Upgrade from "automated test machines" to "research systems with accumulated experience."
 
-交付：
-- [x] 实现 task fingerprint 自动提取
-- [x] 实现相似任务检索
-- [x] 实现跨任务经验迁移
-- [x] 实现跨任务 heuristics 库
-- [x] 积累 benchmark 记录，训练 lightweight rank predictor 作为 training-free recipe recommender（当前为无新依赖 feature-weight learner；LightGBM 可后续替换）
+Delivery:
+- [x] achieve task fingerprint automatic extraction
+- [x] Achieve a similar task search
+- [x] Achieving cross-mission experience migration
+- [x] Achieving cross-mission heuristics libraries
+- [x] accumulation of benchmark records, training lightweight rank predictors as training-free recommender (currently no new dependence-weight longer); LightGBM Replaceable)
 
-### Milestone 5：治理与盲测（3～4 周）
+### Milestone 5: Governance and Blindness (3 - 4 Week)
 
-**目标：** 研究过程正式受控，具备科研级可信度
+**Target:** The research process is officially controlled and credible at the scientific level
 
-交付：
-- [ ] 实现外部 blind test 服务（私有标签隔离、独立 sidecar、正式 query 限流与审计；当前已完成 OpenCode `blind_test` stage、审批 gate、query-limit gate、CLI/Web/TUI 操作入口、API stage 表达、Neo-Cast runner HTTP sidecar contract 与 `py/blind_test_sidecar.py` 可部署服务模板；尚未接入真实私有 blind 数据与长期运行部署）
-- [x] 实现基础研究审计日志 + 审批流（candidate / ref_test / shadow_holdout / budget / protocol / domain_action）
-- [x] 支持概率预测任务类型（OpenCode `TSFTaskSpec.forecastMode=probabilistic` 可选 `val_avg_pinball` / `val_avg_crps_approx`；Neo-Cast runner 对 quantile head 产出 pinball、CRPS 近似、central interval coverage/width，并在 export report 中展示）
-- [x] 完整研究报告自动生成（task/candidate/run/champion/memory + multi-seed/Pareto/Utility analysis）
+Delivery:
+- [ ] The realization of external blind test services (private labelling segregation, independent sidecar, formal query restrictions and auditing); OpenCode `blind_test` status, approval date, query-limit Gate, CLI/Web/TUI access, API status expression, Neo-Cast Runner HTTP deployment template and `py/blind_test_sidecar.py` deployable service templates are currently completed; Not yet connected to real private blind data and long run deployment)
+- [x] Achieve basic research audit log + approval stream (candidate/ref_test/shadow_holdout/budget/protocol/domain_action)
+- [x] Supports the probability prediction task type (OpenCode `TSFTaskSpec.forecastMode=probabilistic` optional `val_avg_pinball`/`val_avg_crps_approx`); Neo-Cast Runner for quantile head output pinball, CRS approximation, central interval coverage/width and displayed in the report report)
+- [x] Automatic generation of complete studies (task/candidate/run/champion/memory + multi-seed/Pareto/Utility analysis)
 
-### Milestone 6（P2 扩展）
+### Milestone 6 (P2 Extension)
 
-- [ ] Template patch（L3 代码变更模式）
-- [x] Distillation 模式完整支持（recipe schema / action registry / OpenCode runner payload / Neo-Cast train loss 已支持 `loss.base=distillation`、`supervised_weight`、`teacher_weight`、teacher policy）
-- [ ] 多任务迁移
+- [ ] Template Patch (L3 code change mode)
+- [x] Distillation mode complete support (recipe scheme / action registry / OpenCode runner payload / Neo-Cast track loss supported `loss.base=distillation`, `supervised_weight`, `teacher_weight`, teacher policy)
+- [ ] Multi-mission migration
 
-### 推荐研发分工
+### Recommended division of research and development
 
-| 方向 | 负责模块 |
+| Orientation | Responsible modules |
 |------|---------|
-| **算法方向** | action registry、baseline recipes、loss registry、promotion rules、error analysis |
-| **平台方向** | experiment runner、sandbox、scheduler、artifact store、metrics db |
-| **Agent 方向** | recipe proposal、patch generation、memory retrieval、analysis summarization |
-| **治理方向** | permissions、blind test、audit、approval workflow |
+| **Algorithmic orientation** | action registry,baseline recipes,loss registry,promotion rules,error analysis |
+| **Platform orientation** | experiment runner,sandbox,scheduler,artifact store,metrics db |
+| **Agent Direction** | recipe proposal,patch generation,memory retrieval,analysis summarization |
+| **Direction of governance** | permissions,blind test,audit,approval workflow |
 
-### 推荐 MVP 技术路线
+### Recommended MVP technology route
 
-第一步：先做一个**单任务、`train.py` 单文件、可 keep/discard** 的 Phase 0a 闭环。
-第二步：冻结 **CandidateRecipe v1 + baseline recipe**，把 Phase 0a 的有效实验回填成 recipe 记录。
-第三步：把模型结构搜索升级为 **action registry composition**，优先覆盖 TimeRecipe 的 preprocessing / embedding / backbone / fusion / head。
-第四步：再引入 loss 搜索、dataset profiler、recipe prior 和记忆迁移。
+Step 1: Make a ** single task, `train.py` single file, Phase 0a closed loop that can keep/discard**.
+Step 2: Freeze **CandidateRecipe v1 + baseline recipe**, return the valid experiment of Phase 0a to recipe records.
+Step 3: Upgrade the model structure search to **action registry control**, prioritizing TimeRecipe coverage / embedding / backbone / membership / head.
+Step four: Introduction of loss search, dataset profiler, recipe Prior and memory migration.
 
-这样可以最大程度避免项目一开始就陷入"Agent 很聪明，但系统完全不可控"的问题。
-
----
-
-## 19. 成功指标
-
-### 19.1 研究效果
-
-- 相对 baseline 的平均 val_avg_mse 提升幅度
-- 在多少数据集上形成 Pareto 改进
-- top-1 / top-3 CandidateRecipe 命中率（候选是否真的 keep）
-
-### 19.2 研究效率
-
-- 每次有效改进所需实验轮次数
-- 每次有效改进所需 GPU 小时
-- 候选到晋级的转化率（低保真筛选的召回率）
-
-### 19.3 工程可靠性
-
-- 实验复现通过率
-- 训练失败率（crash + OOM 占比）
-- patch 回滚率
-- blind test 泄漏事件数
-
-### 19.4 知识积累
-
-- 可复用 heuristic 数量（如"强季节性数据 patch 有效"）
-- 相似任务迁移成功率
-- 失败模式覆盖率（已知陷阱是否被记忆系统捕获）
+That would minimize the problem of getting into "Agent, smart but completely uncontrollable" at the start of the project.
 
 ---
 
-## 20. 设计哲学总结
+## 19. Indicators of success
 
-neo-research TSF 的技术本质不是"做一个会写时序代码的大模型"，而是：
+### 19.1 Research Effects
 
-**在严格协议下，构建一个可持续迭代的小模型自动研究执行系统。**
+- Average val_avg_mse increase relative to baseline
+- Pareto improvements on how many data sets
+- Top-1 / top-3 CandidateRecipe hit rate (are candidates really keeping)
 
-它的核心竞争力来自四件事：
+### 19.2 Research Efficiency
 
-1. **受控搜索空间** — `train.py` 里可以改架构、改 loss、改优化器，但仍属于"一个文件内的局部搜索"。阶段性地引入 DSL/注册表，再逐步开放 patch 级创新，是从稳到强的最可行路径。
+- Number of test wheels required for each effective improvement
+- GPU hours per effective improvement
+- Conversion rate of candidates for promotion (recall rate for low-prevalence screening)
 
-2. **可复现实验闭环** — `val_avg_mse`（val 集 scaled space 多 horizon 均值）是唯一的 keep/discard 依据。多 horizon 平均避免了 agent 专门优化短期、牺牲长期（或反之）。失败可逆：discard 时实验分支的 `HEAD` 要真实回到 `last_keep_commit`，crash 了就记录跳过。
+### 19.3 Project Reliability
 
-3. **多目标 champion 机制** — 系统天然朝"小而稳"方向演化。精度不是唯一目标：`accuracy + params + latency + robustness + reproducibility`。评价成本足够低：10 分钟一次实验，一晚上可以跑 ~50 个实验。这是整个系统的经济基础。
+- Experimental pass rate
+- Training failure rate (crash + OOM percentage)
+- Patch Rollback Rate
+- blind test number of leaks
 
-4. **跨任务研究记忆** — 每一次失败、每一次成功，都沉淀为下一轮的先验知识。经验积累足够后，系统会对"在什么样的时序任务上，什么样的结构/目标更有效"形成超过单一算法工程师的洞察。这是与普通 AutoML 最大的区别。
+### 19.4 Knowledge Accumulation
 
-**人类的角色不是被拿掉，而是从"写模型代码的人"变成"定义研究规则和约束的人"。** 人类最有价值的贡献是：设计 `prepare_tsf.py`（固定什么）、设计 `program.md`（agent 怎么研究）、偶尔重写 `train.py` 的 baseline（重置搜索起点）、审批 champion 晋级（把关研究边界）。
+- Number of reusable heuristics (e. g. "More Seasonal Data Patch Effective")
+- A similar mission migration success rate
+- Failure mode coverage (know if the trap is captured by memory system)
+
+---
+
+## 20. Summary of Design Philosophy
+
+The technical nature of neo-research TSF is not "to make a big model that can write time series codes", but:
+
+**Advanced an automated system for the implementation of a small, sustainable iterative model under strict agreement.**
+
+Its core competitiveness comes from four things:
+
+1. **Controlled search space** — `train.py` can change architecture, loss, and optimizer, but this remains local search within one file. Introduce a DSL/registry in stages, then progressively permit patch-level innovation to expand capabilities from a reliable base.
+
+2. **Repeatable experimental closed loop** - `val_avg_mse` (val collection scaled space multiple horizon average) is the only basis for keep/discard. Most horizon avoids, on average, anent specializing in the optimization of short-term and long-term sacrifice (or vice versa). Failure is reversible: Discard, the `HEAD` of the experimental branch should actually go back to `last_keep_commit` and record skipping.
+
+3. **Multi-Target Champion mechanism** - Systems naturally evolve in a "small but steady" direction. Precision is not the only target: `accuracy + params + latency + robustness + reproducibility`. Evaluation costs are low enough: one experiment per 10 minute, one night running ~50. This is the economic basis of the system.
+
+4. **Cross-mission research memory** — Every failure, every success, is deposited into the next wave of a priori knowledge. When experience is accumulated enough, the system provides more insight than a single algorithm engineer into what sort of time-series tasks and what structure/targets are more effective. It's the biggest difference with normal AutoML.
+
+**The role of human beings is not taken away, but from "the person who writes the model code" to "the person who defines the rules and constraints of research."** The most valuable human contribution is: design of `prepare_tsf.py` (fixed what), design of `program.md` (agent how); occasional rewriting of the baseline of `train.py` (replacement of search starting point); approval of promotions (crossing of borders).

@@ -1,176 +1,176 @@
-# LiteratureAgent 工具化与 TUI 接入实施方案
+# LiteratureAgent Tools and TUI Integration Plan
 
-状态：阶段 A/B/C 已实现；真实 provider/PDF 联调验收前保留 direct 默认路径（可选第三阶段未实施）
+Status: stages A/B/C implemented; direct remains the default until real-provider/PDF integration acceptance. Optional stage three is not implemented.
 
-范围：`opencode/packages/opencode` 的 Research 流水线、session 工具与 Research Cockpit TUI
+Scope: Research pipeline, session tools, and Research Cockpit TUI in opencode/packages/opencode.
 
-前置实现：[RetrieveAgent → HypoPlanner 证据桥接方案](./retrieve_hypoplanner_bridge_implementation_plan.md)
+Prerequisite: [RetrieveAgent to HypoPlanner evidence bridge](./retrieve_hypoplanner_bridge_implementation_plan.md).
 
-## 1. 目标与边界
+## 1. Goals and Boundaries
 
-将现有 `DataAnalysisAgent → LiteratureAgent → HypoPlanner` 流水线中的 Literature phase 接入 OpenCode child session，使用户能在 TUI 中看到检索、逐篇处理、证据组装及失败/降级状态。工具是可审计的执行入口，不改变 KnowledgeCard 和 TaskEvidenceBundle 的权威验证规则。
+Integrate the Literature phase of DataAnalysisAgent -> LiteratureAgent -> HypoPlanner with an OpenCode child session so the TUI displays retrieval, paper processing, evidence assembly, and failure/fallback states. Tools are auditable execution entrypoints; authoritative KnowledgeCard and TaskEvidenceBundle validation rules remain unchanged.
 
-本方案完成后应满足：
+Acceptance requirements:
 
-1. 主流水线仍只有一个对外 `literature` phase；`Retrieve(pre) → Literature(core) → Retrieve(post)` 是其内部步骤。
-2. Literature phase 有独立 child session，工具调用生成 OpenCode message/tool parts；Research Cockpit 可实时展示并在重启后回放关键结果。
-3. 与当前直接运行路径产生兼容的 `retrieve_result_v2`、`task_evidence_bundle_v1`、KnowledgeCard 和 provenance；HypoPlanner 仍只读取经校验的 Evidence Bundle。
-4. 没有 PDF、没有候选、单篇失败以及未配置 LLM 的情况按既有规则降级；schema、缓存或 KnowledgeStore 损坏继续硬失败。
-5. 不增加在线论文搜索、任意文件路径访问、自动下载 PDF、由模型直接写 KnowledgeStore，亦不让模型自行扩大预算或宣布证据为 `paper_backed`。
+1. Keep one external literature phase; Retrieve(pre) -> Literature(core) -> Retrieve(post) are internal steps.
+2. Give Literature its own child session. Tool calls create message/tool parts for live display and replay of key results after restart.
+3. Produce compatible retrieve_result_v2, task_evidence_bundle_v1, KnowledgeCard, and provenance. HypoPlanner consumes validated Evidence Bundles only.
+4. Preserve existing fallback for missing PDFs/candidates, individual paper failures, and unconfigured LLMs; schema, cache, or KnowledgeStore corruption remains a hard failure.
+5. Do not add online paper search, arbitrary paths, automatic PDF downloads, direct model writes to KnowledgeStore, model-controlled budget expansion, or model declarations of paper_backed evidence.
 
-这里的“主 session 接入”指研究任务 root session 下有可导航的 Literature child session，以及 Cockpit 中可见的工具轨迹；不把全文或完整工具输出复制成 root session 的 assistant 消息。
+Root-session integration means a navigable Literature child session and visible cockpit tool trace. Full papers and tool outputs are not copied into root assistant messages.
 
-## 2. 现状与改造切口
+## 2. Current Implementation and Integration Points
 
-- `research/service.ts` 的 `runFullPipeline()` 已按 `data_analysis → literature → hypo_planning` 执行，`runRetrieveAgent()` 直接构造 `RetrieveAgent`、注册两个 artifact、发布 `RetrieveAgentStarted/Completed/Failed`。
-- `retrieve/retrieve-agent.ts` 直接调用概念映射、BM25、候选筛选、`LiteratureAgent.run()` 和任务证据组装；`literature/extraction-model.ts` 对抽取/验证发起直接 LLM 请求。
-- `requestViaSession()` 可创建 child session 并转发 text/tool parts，但只把最终文本返回；纯工具调用可能被当成“无结果”。
-- `tool/registry.ts` 和 `agent/agent.ts` 已提供 `Tool.define`、工具白名单、隐藏研究 agent 的实现范式；`hypothesis-store.ts` 已有 child session 解析所属 task 的逻辑。
-- TUI 有 DataAnalysis/HypoPlanner 的实时 Part/Delta 处理和工作流节点，但没有 Literature 节点，也不消费 Retrieve 的专属展示事件。
-- `literature/README.md` 中“仅 standalone、未注册到服务”的描述已与当前流水线实现不一致，实施时须同步修订。
+- research/service.ts runFullPipeline executes data_analysis -> literature -> hypo_planning. runRetrieveAgent directly constructs RetrieveAgent, registers two artifacts, and publishes RetrieveAgentStarted/Completed/Failed.
+- retrieve/retrieve-agent.ts directly handles concept mapping, BM25, selection, LiteratureAgent.run(), and task evidence. literature/extraction-model.ts directly requests extraction/verification from the LLM.
+- requestViaSession creates child sessions and forwards text/tool parts but returns only final text; tool-only execution may be treated as no result.
+- tool/registry.ts and agent/agent.ts provide Tool.define, allowlists, and hidden research agents; hypothesis-store.ts resolves child-session ownership.
+- TUI handles DataAnalysis/HypoPlanner Part/Delta streams and workflow nodes, but lacks Literature nodes and dedicated Retrieve display events.
+- literature/README.md still describes standalone-only operation and must be updated to match current service integration.
 
-这些源码处于正在变动的工作区；实施前以当时的代码为准核对接口，不覆盖无关改动。
+These sources are changing; verify current interfaces and preserve unrelated work before implementation.
 
-## 3. 工具边界与推荐清单
+## 3. Tool Boundaries and Recommended Set
 
-采用“服务层控制 phase、工具执行受限操作、确定性代码作最终裁决”的混合编排。工具输入只暴露 task 内标识符，不暴露任意 `taskID`、`neoCastRoot`、PDF 路径或 KnowledgeStore 路径。
+Use hybrid orchestration: the service owns phases, tools perform bounded actions, and deterministic code decides validity. Inputs expose task-local identifiers rather than arbitrary taskID, neoCastRoot, PDF paths, or KnowledgeStore paths.
 
-| 工具 | 输入 | 结果摘要 | 副作用 | 阶段 |
+| Tool | Input | Summary | Side effect | Stage |
 | --- | --- | --- | --- | --- |
-| `literature_run` | 无；可选受控 `force=false` 仅由服务端指定 | `retrieveRunID`、缓存命中、论文/卡片计数、readiness、gap/失败计数、artifact 路径标识 | 执行完整现有 Literature phase | 第一阶段必做 |
-| `literature_list_intents` | 无 | `intentID`、问题、优先级、mustCover、query、预算 | 无 | 第二阶段 |
-| `literature_search` | `intentID`、服务端上限内的 `topK` | 候选论文、BM25 rank/score、匹配字段、PDF 可用性、决策理由 | 无 | 第二阶段 |
-| `literature_read_paper` | 已入选的 `paperID`，可选 section/chunk 游标、页大小 | 带 `chunkID`/页码的有限摘录及解析警告 | 可能触发可缓存 PDF 解析；不写卡片 | 第二阶段 |
-| `literature_get_results` | 已完成的 `retrieveRunID` 或默认当前 run；分页 | 论文状态、卡片 ID/claim 摘要、排除原因、gap/conflict、review 标识 | 无 | 第二阶段 |
-| `literature_process_papers` | 经服务端批准的 `paperID[]` | 逐篇 runID、状态、卡片数、错误摘要 | 解析、抽取、验证和写入 KnowledgeStore | 可选第三阶段 |
-| `literature_finalize` | 当前 run ID | 经 schema/provenance 校验的 Evidence Bundle 摘要 | 组装并持久化任务证据 | 可选第三阶段 |
+| literature_run | None; server-controlled force=false if needed | retrieveRunID, cache hit, paper/card counts, readiness, gaps/failures, artifact identifiers | Execute the existing Literature phase | Required stage one |
+| literature_list_intents | None | intentID, question, priority, mustCover, query, budget | None | Stage two |
+| literature_search | intentID and server-bounded topK | Candidates, BM25 rank/score, matched fields, PDF availability, rationale | None | Stage two |
+| literature_read_paper | Selected paperID; optional section/chunk cursor and page size | Bounded excerpts with chunkID/page and parse warnings | May populate parsing cache; no card writes | Stage two |
+| literature_get_results | Completed retrieveRunID or current run; pagination | Paper states, card IDs/claims, exclusions, gaps/conflicts, review IDs | None | Stage two |
+| literature_process_papers | Server-approved paperID[] | Per-paper runID, state, card count, errors | Parse, extract, verify, and write KnowledgeStore | Optional stage three |
+| literature_finalize | Current run ID | Schema/provenance-validated Evidence Bundle summary | Assemble and persist task evidence | Optional stage three |
 
-第一阶段**只让 `literature_run` 成为写入入口**，保持现有检索结果和缓存身份不变。第二阶段的探索工具提供真实、可见的检索与阅读步骤，但不允许模型以其搜索结果绕过既有候选选择器。只有在第一、二阶段验收后，才考虑把执行拆为逐篇处理和 finalize；届时要有服务端强制完成条件，不能因为 agent 提前结束就遗漏 must-cover intent。
+In stage one, **literature_run is the only write entrypoint**, preserving retrieval results and cache identity. Stage-two exploration tools provide visible search and reading without bypassing selection. Split processing/finalization only after both stages pass acceptance, with server-enforced completion so early agent termination cannot omit must-cover intents.
 
-不单独工具化 `searchBM25` 内部打分、claim schema 检查、exact-span 校验、去重、卡片写入事务或 Evidence Bundle 裁决。这些是受信任实现细节。抽取与验证 LLM 调用在第一阶段仍属于 `literature_run` 的内部执行；**一个外层工具调用不等于已把内部每次 LLM 请求变成 OpenCode tool part**。需要细粒度模型调用轨迹时，另行设计 session extraction adapter，并验证其与既有缓存、prompt 版本、调用记录完全兼容。
+Do not expose BM25 internals, claim-schema checks, exact-span validation, deduplication, card transactions, or bundle adjudication as separate tools. Extraction/verification LLM requests remain internal to literature_run: **one outer tool call does not turn every internal model request into a tool part**. Fine-grained model traces require a separate session extraction adapter compatible with caches, prompt versions, and call records.
 
-## 4. 执行架构
+## 4. Execution Architecture
 
 ```text
-Research Service（phase owner、状态/恢复、artifact 注册）
-  ├─ 创建 Literature child session，并绑定 task + 定量报告快照
+Research Service (phase ownership, state/recovery, artifact registration)
+  ├─ Create Literature child session bound to task and quantitative report snapshot
   ├─ SessionPrompt(research-literature)
-  │    └─ literature_run 工具
-  │         └─ 共享 LiteraturePhaseExecutor
+  │    └─ literature_run tool
+  │         └─ Shared LiteraturePhaseExecutor
   │              └─ RetrieveAgent → LiteratureAgent → Evidence Bundle
-  ├─ 读取并校验工具回执 + retrieve_result_v2 + bundle provenance
-  ├─ 注册/刷新现有两个 artifact，更新 workflow.literature
-  └─ 传递 taskEvidenceArtifactID 给 HypoPlanner
+  ├─ Read and validate receipt, retrieve_result_v2, and bundle provenance
+  ├─ Register/refresh the two artifacts and workflow.literature
+  └─ Pass taskEvidenceArtifactID to HypoPlanner
 ```
 
-### 4.1 共享执行入口，避免依赖环
+### 4.1 Shared Execution without Dependency Cycles
 
-不要让 `tool/research-literature.ts` 直接依赖 `Research.Service`：Research Service 依赖 `SessionPrompt`，后者依赖工具注册表，直接反向注入容易形成循环。把 `runRetrieveAgent()` 中可复用的“确定根目录 → 构造模型 → 运行 RetrieveAgent → 关闭资源”提取为不依赖 SessionPrompt/ToolRegistry 的 `research/literature-phase-executor.ts`。Service 和工具都可调用这一入口；artifact 注册、workflow 更新和 phase 事件仍归 Service 所有。
+Do not make tool/research-literature.ts depend on Research. Service: the service depends on SessionPrompt, which depends on ToolRegistry. Extract root resolution, model construction, RetrieveAgent execution, and cleanup from runRetrieveAgent into research/literature-phase-executor.ts without SessionPrompt/ToolRegistry dependencies. Service and tools share it; the service retains artifacts, workflow, and phase events.
 
-工具通过 `ctx.sessionID` 解析所属 task，要求当前 agent 为 `research-literature`，并读取本轮绑定的定量报告 artifact ID/digest 与预算快照。调用参数不能覆盖这些值。绑定可采用 service 管理的 session 上下文；进程重启后不恢复半截 LLM 对话，而由现有 workflow recovery 重新校验已持久化结果并安全重跑。若实现持久化绑定，需保证 sessionID、taskID 和 artifactID 一致且不可跨任务重用。
+Resolve task ownership through ctx.sessionID, require research-literature, and read the bound report artifact ID/digest and budget snapshot. Inputs cannot override them. Use service-managed context. After restart, validate persisted results through workflow recovery rather than restoring partial LLM conversations. Persistent bindings must keep sessionID/taskID/artifactID consistent and prevent cross-task reuse.
 
-### 4.2 工具回执而非最终文本
+### 4.2 Tool Receipts rather than Final Text
 
-为 Literature 新增专用 session 运行器，订阅 child session 的 `MessageV2.Event.PartUpdated/PartDelta`，并从**已完成的 `literature_run` tool part**解析结构化回执（建议含 `schemaVersion`, `taskID`, `quantitativeReportArtifactID`, `retrieveRunID`, `resultDigest`）。不得仅解析 agent 最终自然语言，也不得沿用 `requestViaSession()` 当前“无文本即返回 `undefined`”的判断。将订阅到的文本/工具 part 转发为 Research 专属 `LiteratureAgentStreamDelta/PartUpdated` 事件，供 Cockpit 按 `taskID` 消费；直接路径只发 phase/progress 事件。
+Add a dedicated runner subscribing to child MessageV2. Event. PartUpdated/PartDelta. Parse a structured receipt from **completed literature_run tool parts**, including schemaVersion, taskID, quantitativeReportArtifactID, retrieveRunID, and resultDigest. Do not rely on final natural language or requestViaSession's no-text/undefined rule. Forward parts/deltas through LiteratureAgentStreamDelta/PartUpdated scoped by taskID; direct execution emits phase/progress events only.
 
-Service 必须重新从持久化文件读取 `RetrieveResultSchema`/`TaskEvidenceBundleSchema`，验证回执、task、定量报告、task context digest、run ID 和 bundle 内容相互一致，再注册 artifact。工具输出仅作进度/定位信息，不能作为证据事实来源。session/provider 不可用，或能证实工具尚未开始执行时，可记录原因并走现有直接路径；如果工具已经开始而结果不确定，先按 runDigest 对账缓存/KnowledgeStore，不能盲目重跑。工具回执与持久化结果不一致、schema/provenance 损坏属于硬失败，不得伪装为 `ready_data_only` 或静默 fallback。需区分“工具成功但 agent 最终回复失败”（可从有效回执恢复）与“工具未执行”（才触发直接执行），防止重复成本。
+The service rereads persisted RetrieveResultSchema/TaskEvidenceBundleSchema and checks receipt, task, report, task-context digest, run ID, and contents before artifact registration. Tool output locates results and reports progress; it is not evidence authority. Use direct fallback only if the session/provider is unavailable or the tool demonstrably never started. For uncertain started execution, reconcile cache/KnowledgeStore by runDigest before retrying. Receipt mismatch or schema/provenance corruption is a hard failure, never ready_data_only or silent fallback. Distinguish successful tools with failed final replies from tools never executed to avoid duplicate cost.
 
-### 4.3 缓存、并发和强制重跑
+### 4.3 Cache, Concurrency, and Forced Reruns
 
-沿用当前 `retrieveRunID` 与 Literature 的 `inputDigest`，不得把 sessionID、toolCallID 或展示文案加入结果缓存身份。同一 task/report/index/budget 的重复工具调用返回同一已校验结果；并发调用按 runDigest 去重或锁定，避免对同一 KnowledgeStore 写入竞争。`force` 不开放给 LLM；仅服务端 recovery/人工显式操作可触发，且仍须复用或刷新同一 artifact 注册，不产生陈旧的 readiness 元数据。
+Keep retrieveRunID and Literature inputDigest unchanged; sessionID, toolCallID, and display text must not enter cache identity. Identical task/report/index/budget calls return the same validated result. Deduplicate or lock by runDigest to prevent KnowledgeStore races. LLMs cannot set force; server recovery or explicit human action may, while refreshing the same artifact registration and readiness metadata.
 
-### 4.4 权限与不可信输入
+### 4.4 Permissions and Untrusted Input
 
-- 在 `agent/agent.ts` 注册隐藏的 `research-literature`，只授权文献工具及必要的只读工具；默认拒绝 bash、写文件、任务修改和通用网络搜索。
-- 工具必须校验 session→task 归属、当前 phase、允许的 `intentID`/`paperID`、top-K/逐篇预算；不可接受任意本地路径。
-- PDF 文本作为不可信数据展示和传给模型，保留现有 prompt-injection 防护；工具输出过滤密钥、完整 prompt、长 PDF 正文及文件系统内部路径。长内容分页并截断，但持久化 artifact 保留完整审计数据。
-- `literature_process_papers` 若实施，只接受候选选择器准入且去重后的论文；exact-span、`includeAgentInference=false`、卡片验证与 KnowledgeStore 事务不可由工具参数关闭。
+- Register hidden research-literature with literature tools and necessary read-only tools only; deny shell, writes, task edits, and general web search by default.
+- Validate session/task ownership, phase, allowed intentID/paperID, top-K, and per-paper budgets. Reject arbitrary local paths.
+- Treat PDF text as untrusted data and retain injection defenses. Filter secrets, complete prompts, long PDF bodies, and internal paths. Paginate/truncate outputs while keeping complete audit artifacts.
+- If implemented, literature_process_papers accepts only admitted, deduplicated candidates. Tool parameters cannot disable exact spans, includeAgentInference=false, card verification, or transactions.
 
-## 5. 事件、主 session 与 TUI 合约
+## 5. Events, Root Session, and TUI Contract
 
-对外 phase 统一标记 `LiteratureAgent`；保留 `RetrieveAgent` 事件作为内部 substage，避免现有订阅方立即失效。新增 phase 事件和可选逐篇进度事件，字段使用小型结构化摘要，不发送全文：
+Label the external phase LiteratureAgent; retain RetrieveAgent events as internal substages for compatibility. Add phase and optional per-paper progress events with compact structured summaries, without full text:
 
 ```ts
 research.agent.literature.started   { taskID, phase: "literature", sessionID?, runID? }
 research.agent.literature.progress  { taskID, runID?, step, paperID?, status, counts?, cached? }
-research.agent.literature.stream.delta / part.updated { taskID, agent, delta 或 part 字段 }
+research.agent.literature.stream.delta / part.updated { taskID, agent, delta or part fields }
 research.agent.literature.completed { taskID, retrieveRunID, resultArtifactID, taskEvidenceArtifactID,
                                       readiness, summary, callPath: "session_tool" | "direct" }
 research.agent.literature.failed    { taskID, step?, paperID?, code, message, recoverable }
 ```
 
-`progress.step` 固定为 `prepare_intents | search | select | parse | extract | verify | assemble_evidence`；只有确实发生的步骤才发布，缓存命中单独标记。事件顺序应为 Literature started → 内部进度 → completed/failed → HypoPlanner started。单篇失败作为 `progress` 警告和 bundle gap，不发布整个 phase 的 failed；全局损坏才发布 failed。
+progress.step is prepare_intents | search | select | parse | extract | verify | assemble_evidence. Emit only real steps; mark cache hits separately. Order: started -> progress -> completed/failed -> HypoPlanner started. Individual paper failures are warnings and bundle gaps; only global corruption fails the whole phase.
 
-Research Cockpit 改造：
+Cockpit changes:
 
-1. 在 `research-cockpit-data.ts` 的 workflow 中插入 `LiteratureAgent`，位于 DataAnalysis 与 HypoPlanner 之间。done 依据有效的 `task_evidence_bundle_json`/workflow phase，active 依据 phase 事件或 task status `literature`，不能因为“有论文卡片”就误判完成；`ready_data_only` 也是成功完成但显示零证据及 gap。
-2. 同步 `researchAgentWorkflowOrder`、`researchAgentFullStageOrder` 和 live overlay，使开始/结束事件正确切换 sidebar 当前 agent；修正下一步推荐在 `data_analysis` 已完成但 `literature` 未完成时跳过 Literature 的问题。现有 `/pipeline hypo-planning` 可以继续驱动整体 pipeline，不一定新增独立命令。
-3. 在 `research-cockpit.tsx` 消费 Literature stage/progress 与 child session Part/Delta，展示 `[LiteratureAgent]` 区块：意图/候选计数、正在处理的论文、工具名/状态/耗时、卡片与 gap 摘要。与 DataAnalysis/HypoPlanner 一样支持实时文本/工具 part，但不把原始 JSON 或全文直接放进滚动区。
-4. 完成时将精简摘要写入已有 `stream.log` 和有界内存缓冲；重新打开 TUI 时从 artifact 元数据/结果报告恢复持久完成状态，避免仅靠易丢失的 SSE。重复事件按 `taskID + retrieveRunID + step/paperID` 去重，切换任务时过滤旧事件。
-5. 主研究 root session 可导航至 Literature child session；Cockpit 不把工具 call/结果重复写入 root session message。没有配置模型时采用 direct path，仍显示 phase 事件与结果摘要，并明确标注 `direct` 或 `llm_not_configured`。
+1. Insert LiteratureAgent between DataAnalysis and HypoPlanner. Completion requires a valid task_evidence_bundle_json/workflow phase; activity follows phase events or literature status. Existing cards alone do not establish completion. ready_data_only is successful with zero evidence and explicit gaps.
+2. Update researchAgentWorkflowOrder, researchAgentFullStageOrder, and live overlay so events select the right sidebar agent. Do not skip unfinished Literature after analysis. Existing /pipeline hypo-planning may drive the whole pipeline without a new command.
+3. Consume Literature stage/progress and child Part/Delta in research-cockpit.tsx. Show intents/candidates, current paper, tool name/state/timing, cards, and gaps. Support live text/tool parts without dumping JSON or full papers into the scrollback.
+4. Persist compact completion summaries in stream.log and bounded memory. On reopening, recover from artifact metadata/reports rather than SSE alone. Deduplicate by taskID + retrieveRunID + step/paperID and filter old-task events on switching.
+5. Allow navigation from the root session to Literature. Do not duplicate calls/results in root messages. Without a model, use direct execution while showing phase events/summaries and direct or llm_not_configured labels.
 
-建议渲染样例：
+Suggested rendering:
 
 ```text
-[LiteratureAgent] 检索中 · 6 intents / 24 candidates
+[LiteratureAgent] Searching · 6 intents / 24 candidates
   ✓ literature_search · 24 candidates · 82 ms
   ● paper-123 · parse/extract/verify
   ⚠ paper-456 · local PDF unavailable
-[LiteratureAgent] 完成 · 2 papers / 5 cards / 3 selected / 1 gap · partial_evidence
+[LiteratureAgent] Complete · 2 papers / 5 cards / 3 selected / 1 gap · partial_evidence
 ```
 
-## 6. 分阶段实施与文件清单
+## 6. Implementation Stages and Files
 
-### 阶段 A：最小工具化，结果不变
+### Stage A: Minimal Tools with Identical Results
 
-1. 新增 `src/research/literature-phase-executor.ts`，从 Service 提取可复用的执行逻辑；直接路径继续调用同一 executor。
-2. 新增 `src/tool/research-literature.ts` 的 `literature_run`；在 `src/tool/registry.ts` 注册，在 `src/agent/agent.ts` 注册 `research-literature` 与最小权限，新增 `src/agent/prompt/research-literature.txt`。
-3. 新增专用 session 运行器，读取已完成工具 part 的结构化回执；Service 校验和登记 artifact 后更新 workflow。保留 provider/session 不可用时的直接路径。
-4. 增加 phase started/completed/failed 和 `callPath`；不立即删除旧 RetrieveAgent 事件。
+1. Extract reusable execution into src/research/literature-phase-executor.ts; direct execution uses the same executor.
+2. Add literature_run in src/tool/research-literature.ts; register it in tool/registry.ts and the minimally privileged research-literature agent in agent/agent.ts; add agent/prompt/research-literature.txt.
+3. Add the dedicated session runner and completed-part receipt recovery. Service validation/registration precedes workflow updates. Retain direct execution when session/provider is unavailable.
+4. Add started/completed/failed events and callPath without immediately removing RetrieveAgent events.
 
-验收：同一离线 fixture 的工具路径与直接路径得到等价 Evidence Bundle；空目录得到 `ready_data_only`；纯工具调用即使最终文本为空也不会被当作失败；重复调用与恢复不重复生成卡片或 artifact。
+Acceptance: equivalent offline-fixture bundles across paths; empty catalogs yield ready_data_only; tool-only success with empty final text remains successful; repeated calls/recovery create no duplicate cards or artifacts.
 
-### 阶段 B：检索与阅读工具
+### Stage B: Search and Reading Tools
 
-1. 增加 `literature_list_intents`、`literature_search`、`literature_read_paper`、`literature_get_results`，复用现有 intent、index、BM25、解析缓存及 schemas。list/search 读取同一次定量报告与索引快照生成的意图和候选；即使工具先于 `literature_run` 调用，也必须与最终 run 的输入 digest 对齐，索引变化则重建快照而非混用两次结果。
-2. 增加逐步 progress 与逐篇状态；固定每次返回的长度、分页和预算。第一阶段的 `literature_run` 仍是唯一最终写入入口。
-3. 若需要 session 决定论文处理顺序，再试验 `literature_process_papers` + `literature_finalize`；必须由服务端检查所有被选候选均有最终 disposition，且最终结果与旧路径通过同一 schema/provenance 验证。此项可延后，不阻塞 TUI 接入。
+1. Add literature_list_intents/search/read_paper/get_results using current intents, indexes, BM25, parsing caches, and schemas. list/search share the quantitative-report/index snapshot with the final run, even when called first. Index changes rebuild the snapshot rather than mixing results.
+2. Add bounded step/paper progress, return sizes, pagination, and budgets. literature_run remains the only final write entrypoint.
+3. If session-controlled paper ordering is needed, trial process_papers/finalize. The server must require final dispositions for every selected candidate and the same schema/provenance validation. This optional work does not block TUI integration.
 
-验收：无效 `intentID`/`paperID`、越权 session、超预算、任意路径、重复/并发调用均被拒绝或安全去重；模型不能通过工具参数放松证据门槛。
+Acceptance: reject or safely deduplicate invalid identifiers, unauthorized sessions, excessive budgets, arbitrary paths, and repeated/concurrent calls. Model arguments cannot lower evidence thresholds.
 
-### 阶段 C：TUI 与文档
+### Stage C: TUI and Documentation
 
-1. 更新 `src/cli/cmd/tui/routes/research-cockpit-data.ts` 和 `research-cockpit.tsx` 的节点、live overlay、事件处理、摘要与回放。
-2. 更新 `src/research/event.ts`、相关 API 响应说明和 `src/research/literature/README.md`；在用户文档说明 session_tool/direct 两条调用路径。
-3. 为 `test/cli/tui/research-cockpit-render.test.tsx` 增加 started/progress/completed/failed、任务切换、缓存命中、重进 TUI 和 `ready_data_only` 用例。
+1. Update nodes, live overlays, event handling, summaries, and replay in research-cockpit-data.ts and research-cockpit.tsx.
+2. Update event.ts, API response documentation, and literature/README.md; describe session_tool/direct paths.
+3. Add cockpit rendering tests for started/progress/completed/failed, task switching, cache hits, reopening, and ready_data_only.
 
-验收：TUI 展示顺序为 DataAnalysis → LiteratureAgent → HypoPlanner；Literature 子 session 的工具状态可见；关闭重开后仍显示完成状态与结果摘要；连续 progress 不造成滚动区膨胀或重复行。
+Acceptance: DataAnalysis -> LiteratureAgent -> HypoPlanner order; visible child-session tool states; persisted completion/summaries after reopening; bounded progress without duplicated rows.
 
-## 7. 回归测试与完成判据
+## 7. Regression Tests and Completion Criteria
 
-| 测试层 | 必测场景 |
+| Layer | Required cases |
 | --- | --- |
-| 工具单测 | session/task 归属、参数 schema、权限、分页/预算、tool receipt、取消/超时、敏感输出截断 |
-| Literature/Retrieve 单测 | 搜索排序与筛选不变、单篇失败、无 PDF、无 LLM、缓存命中、并发去重、force/recovery |
-| Service 集成测试 | session_tool 与 direct 结果等价；纯工具无文本；异常分支只执行一次；artifact ID/readiness 更新；错误 bundle 拒绝交给 HypoPlanner |
-| TUI 测试 | 事件顺序、节点状态、逐篇进度、回放、任务切换、重复事件、长流输出上限 |
-| E2E | Companion checkpoint 后完成 DataAnalysis → Literature → HypoPlanner；有效文献与 data-only 两条路径均成功 |
+| Tool units | Ownership, schemas, permissions, pagination/budgets, receipts, cancellation/timeouts, sensitive-output truncation |
+| Literature/Retrieve units | Unchanged ranking/selection, paper failures, missing PDFs/LLMs, cache hits, concurrent deduplication, force/recovery |
+| Service integration | Equivalent paths, tool-only replies, once-only exceptional execution, artifact/readiness updates, invalid bundle rejection |
+| TUI | Event order, node states, paper progress, replay, task switching, duplicate events, long-stream bounds |
+| E2E | Companion checkpoint followed by DataAnalysis -> Literature -> HypoPlanner with literature and data-only paths |
 
-在 `opencode/packages/opencode` 运行新增的 package-scoped Bun 测试与 `bun typecheck`，不要在 `opencode/` 根目录运行 `npm test`。第一阶段上线前保留直接路径开关/降级能力；只有工具路径在真实任务中通过缓存、故障恢复和 TUI 回放验证后，才考虑让它成为默认。无需为本文档修改数据库或现有 artifact schema；若第三阶段引入新的运行状态持久化，再单独评估 migration 与版本升级。
+Run package-scoped Bun tests and bun typecheck in opencode/packages/opencode; do not run npm test at the opencode root. Retain direct fallback until real-task caching, recovery, and replay pass. No database/artifact schema change is required for this plan; evaluate migration/versioning separately if optional stage-three state is persisted.
 
-## 8. 实施与验证记录
+## 8. Implementation and Validation Record
 
-已落地共享 executor、五个受限工具、隐藏 `research-literature` agent、专用 session 回执恢复、
-Service 落盘校验与 artifact 刷新，以及 Cockpit 节点、进度、摘要回放和 `/literature-session` 导航。
-同一任务的 phase/artifact 登记串行；同一 KnowledgeStore 的写入在服务进程内串行，重复工具调用
-共享同一个执行 Promise。取消/超时在下一进度边界停止，正在进行的内部模型请求可能先返回。
+Implemented the shared executor, five restricted tools, hidden research-literature agent, dedicated receipt recovery,
+service persistence validation/artifact refresh, cockpit node/progress/replay, and /literature-session navigation.
+Phase/artifact registration is serialized per task; KnowledgeStore writes are serialized within the service process. Repeated calls
+share one Promise. Cancellation/timeouts stop at the next progress boundary; an in-flight internal model request may finish first.
 
-启用方式：在 taskSpec 的 runtime 中设置 `literatureSessionTools: true`。默认保留 direct，
-未配置可用模型或工具尚未开始时允许直接执行；已开始的操作对账原 Promise 与落盘结果。
-文献工具不开放 task/path/force 参数。可选第三阶段的 process/finalize 未实施。
-完整用户说明与事件 envelope 见 [Literature README](../../opencode/packages/opencode/src/research/literature/README.md)。
+Enable with runtime.literatureSessionTools=true in taskSpec. Direct remains the default;
+fallback is allowed without an available model or before tools start. Started work reconciles the original Promise and persisted results.
+Tools expose no task/path/force arguments. Optional process/finalize is not implemented.
+See [Literature README](../../opencode/packages/opencode/src/research/literature/README.md) for user instructions and event envelopes.
 
-验证命令（Bun 命令均在 `opencode/packages/opencode` 执行）：
+Validation commands (Bun commands run in opencode/packages/opencode):
 
 ```bash
 bun run typecheck
@@ -181,11 +181,11 @@ bun test test/research/literature-session.test.ts test/research/literature-tools
 bun test test/cli/tui/research-cockpit-render.test.tsx \
   --test-name-pattern 'Literature|renders the prompt agent label|tab cycles' --timeout 30000
 bun test test/agent/agent.test.ts test/tool/registry.test.ts test/research/domain-registry.test.ts --timeout 30000
-# 在 neo_cast 执行：
+# Run in neo_cast:
 npm test
 ```
 
-已通过核心回归、Literature 相关渲染、agent/tool 注册与权限、类型检查及 Neo-Cast Node/Python 测试。
-扩展检查发现 6 项已有 Cockpit 渲染失败（onboarding/旧文本/切换断言）和 8 项已有 TSF 域失败
-（baseline fixture 与当前 baseline 集合不符）；这些失败均已在独立的未修改 HEAD 副本复现。
-真实 provider 与实际 PDF 的 session_tool 联调尚未进行，因此本次不将工具路径改为默认。
+Core regression, Literature rendering, agent/tool registration and permissions, typechecks, and Neo-Cast Node/Python tests passed.
+Broader checks found six preexisting cockpit rendering failures (onboarding/old text/switch assertions) and eight preexisting TSF-domain failures
+(baseline fixtures differ from the current baseline set), reproduced against an independent unmodified HEAD copy.
+Real-provider/PDF session_tool integration has not been tested; the tool path therefore remains opt-in.

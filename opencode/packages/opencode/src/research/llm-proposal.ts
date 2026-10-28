@@ -464,7 +464,7 @@ export function buildUserPrompt(input: {
         instruction: "Repair syntax or missing fields only when the original experiment remains achievable. If the constraint conflicts with the hypothesis, return status=unavailable with the exact reason and proposed hypothesis revision. Do not substitute a proxy or clamp an experimental value merely to pass validation.",
       },
     } : {}),
-    instruction: "Implement the selected hypothesis faithfully. Treat its mechanism descriptions as claims to verify against component semantics, not as implementation facts. If unsupported or internally contradictory, return unavailable for HypoPlanner to regenerate the hypothesis. Do not change the scientific question to produce a legal recipe. Write concise Chinese explanations and preserve schema field names.",
+    instruction: "Implement the selected hypothesis faithfully. Treat its mechanism descriptions as claims to verify against component semantics, not as implementation facts. If unsupported or internally contradictory, return unavailable for HypoPlanner to regenerate the hypothesis. Do not change the scientific question to produce a legal recipe. Write concise English explanations and preserve schema field names.",
   }
   return JSON.stringify(prompt, null, 2)
 }

@@ -251,24 +251,24 @@ def main():
          "artifacts": {"references": len(artifact_index), "missing": len(missing), "missingByKind": dict(collections.Counter(row["kind"] for row in missing))},
          "excluded": ["provider credentials", "environment files", "dependency installations and virtualenv", "live runtime/chat database", "mopex task results"],
          "historicalPaths": "Immutable evidence preserves original paths; initialize_export.py creates a separate artifact locator and relocates operational source catalog paths."})
-    readme = '''# 前三个数据集可复用导出包
+    readme = '''# Reusable Export for the First Three Datasets
 
-此目录包含导出时的 NeoResearch-zero 源码，ETTh1、NP、PJM 的全部运行记录、候选、指标、训练曲线、报告、保留的权重/导出模型，以及共享经验和文献知识完整快照。共享库保留此前所有数据集和项目的积累，不仅限于本次三个任务；三任务经验另见 `exports/experience/first_three_structured.jsonl`。导出是快照，原实验继续运行。
+This directory snapshots NeoResearch-zero source code, all ETTh1/NP/PJM runs, candidates, metrics, training curves, reports, retained weights/exported models, and the complete shared experience and literature knowledge libraries at export time. Shared libraries preserve prior contributions from every dataset and project, beyond these three tasks. See `exports/experience/first_three_structured.jsonl` for the three tasks' experience. Exporting creates a snapshot while original experiments continue running.
 
-## 快速查看
+## Quick Reference
 
-- `exports/results/summary.csv`：三个数据集的 CV、测试集 MSE/MAE。
-- `exports/results/all_runs.csv`：包含成功、失败、重复、冒烟及测试阶段的全部运行指标。
-- `exports/results/research.sqlite` 和同目录 JSONL：三个已完成任务的研究记录；用于离线查询，不用作新副本的运行数据库。
-- `exports/experience/`：原始经验、组织关系、三层结构、整理决定和演化历史；实际可召回条数以读取器验证为准。
-- `.neo-research/experience.db`：新任务直接复用的完整共享经验库。
-- `neo_cast/.neo-cast/literature-knowledge/`：知识库、卡片、原文切块和修订/审查记录。
-- `neo_cast/.neo-cast/literature-source/`：原始 PDF 和文献目录。
-- `exports/artifact-index.jsonl`：全部产物索引；`exports/missing-artifacts.json`：原环境已清理的历史文件，不存在于导出包。
+- `exports/results/summary.csv`: CV and test MSE/MAE for the three datasets.
+- `exports/results/all_runs.csv`: metrics for every successful, failed, duplicate, smoke, and test run.
+- `exports/results/research.sqlite` and adjacent JSONL: completed research records for offline queries, separate from the new copy's runtime database.
+- `exports/experience/`: raw experience, organizational links, three-layer structure, curation decisions, and evolution history; validate actual recall counts with the reader.
+- `.neo-research/experience.db`: the complete shared experience library for direct reuse by new tasks.
+- `neo_cast/.neo-cast/literature-knowledge/`: knowledge base, cards, source chunks, and revision/review records.
+- `neo_cast/.neo-cast/literature-source/`: original PDFs and literature catalog.
+- `exports/artifact-index.jsonl`: complete artifact index. `exports/missing-artifacts.json` lists historical files already cleaned from the original environment and absent from the export.
 
-## 在新位置使用
+## Use at a New Location
 
-需要 Bun、Node.js、Python；依赖和密钥按新机器配置。源码与库已在同一目录，无须导入用户级全局经验库。
+Install Bun, Node.js, and Python, and configure dependencies and keys for the new machine. Source and libraries are colocated; importing a user-global experience library is unnecessary.
 
 ```bash
 python3 scripts/initialize_export.py
@@ -280,11 +280,11 @@ bun scripts/verify_export.ts
 bash scripts/reuse_export.sh
 ```
 
-`reuse_export.sh` 默认使用包内经验库、包内文献库、独立的新运行数据库和四折并行；不带参数时启动界面，新任务按现有 CLI 流程运行。需要调用模型时自行配置 provider API key；导出不包含原环境密钥。知识的来源校验和经验召回规则与源码保持一致，卡片、经验事实和封印未重写。
+`reuse_export.sh` defaults to the packaged experience and literature libraries, an independent new runtime database, and four-fold parallelism. With no arguments it starts the interface; new tasks follow the existing CLI workflow. Configure provider API keys when calling models; the export contains no original credentials. Source validation and recall rules follow the source implementation; cards, experience facts, and seals are preserved.
 
-原文引用中的历史绝对路径保留原样以保护可追溯性。初始化会生成 `exports/artifact-locations.jsonl` 作为当前目录下的产物导航；不会重写历史任务数据库，也不会自动恢复历史会话。直接复用知识和经验不依赖原任务数据库或原项目路径。
+Historical absolute paths in source citations remain intact for traceability. Initialization generates `exports/artifact-locations.jsonl` to navigate artifacts at the current location. It does not rewrite historical task databases or automatically restore sessions. Direct knowledge/experience reuse does not depend on the original task database or project path.
 
-Mamba CUDA 扩展需在新机器按 `neo_cast/README.md` 构建；`auto` 后端会根据运行环境选择。参考后端及 CPU 路径可用。运行 `python3 scripts/export_first_three.py --output /absolute/new-directory --archive` 可再次导出这三个固定任务（需要原研究运行数据库）。
+Build Mamba CUDA extensions on the new machine following `neo_cast/README.md`; the auto backend selects according to the environment. Reference and CPU paths are available. Run `python3 scripts/export_first_three.py --output /absolute/new-directory --archive` to export these three fixed tasks again (requires the original research runtime database).
 '''
     (out / "EXPORT_README.md").write_text(readme)
     for name in ["reuse_export.sh", "export_first_three.py"]:

@@ -138,8 +138,8 @@ test("a supported spectral family is retained when the mechanism explains a diff
   const model: PrincipleModel = { modelIdentifier: "family-transfer-boundary", async request(stage, payload) {
     const value = JSON.parse((await fixture.model.request(stage, payload)).text)
     if (stage === "architecture_extract") {
-      value.decisions[0].prefer = "采用频谱表示这一建模类别"
-      value.decisions[0].mechanism = "原文 FreMLP 使用复权重并逆变换回时域；该理论解释仅支持所述频谱表示原则，当前实现不复现该算子"
+      value.decisions[0].prefer = "Use spectral representations as a modeling category"
+      value.decisions[0].mechanism = "The original FreMLP uses complex weights and transforms back to the time domain; this theoretical explanation supports only the spectral representation principle, and the current implementation does not reproduce the operator"
     }
     if (stage === "architecture_review") {
       value.reviews[0].eligibility.recipe = { ...eligibilityRecipe, embedding: { type: "frequency", nFreq: 16, complexMode: "real_imag", dModel: 64 } }
@@ -167,7 +167,7 @@ for (const failure of ["unsupported", "mismatch", "efficiency", "missing_fact", 
       const response = await fixture.model.request(stage, payload)
       const value = JSON.parse(response.text)
       if (stage === "architecture_extract" && failure === "frequency_proxy") {
-        value.decisions[0].prefer = "在频域上施加复权重 MLP，再逆变换回时域"
+        value.decisions[0].prefer = "Apply a complex-weight MLP in the frequency domain, then transform back to the time domain"
         return { text: JSON.stringify(value) }
       }
       if (stage !== "architecture_review") return response

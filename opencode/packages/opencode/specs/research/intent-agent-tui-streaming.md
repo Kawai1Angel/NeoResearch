@@ -1,98 +1,98 @@
-# IntentAgent — TUI 流式渲染方案
+# IntentAgent - TUI Fluid Rendering Scheme
 
-> 状态：提案 / 未实现。本文档仅描述设计，代码尚未改动。
+> Status: Proposal / Not achieved. This document only describes the design, and the code has not been changed.
 >
-> 前置依赖：[intent-agent-tool-refactor.md](./intent-agent-tool-refactor.md)（已实现）——
-> IntentAgent 现在跑在一个真实、可恢复的 opencode session 里
-> （`service.ts` 的 `runIntentAgentTurn`/`runIntentAgent`/
-> `continueIntentAgentSession`），调用
+> Pre-dependent: [intent-agent-tool-refactor.md](./intent-agent-tool-refactor.md) -
+> IntentAgent is now running in a real, recoverable open session
+> (`service.ts` functions `runIntentAgentTurn` / `runIntentAgent` /
+> `continueIntentAgentSession`, call
 > `read_taskspec`/`update_taskspec`/`ask_user`/`check_taskspec`
-> 四个工具。本文档与
+> Four tools. This document and
 > [hypo-planner-tui-streaming.md](./hypo-planner-tui-streaming.md)
-> 是同一套基础设施（`ResearchAgentPartUpdated` 事件 + cockpit 的
-> `pushHypoPartLines()` 通用渲染器），后者**已经实现并在用**
-> （DataAnalysis / HypoPlanner / Reflection 三个 agent 都已接上），
-> 本提案是把 IntentAgent 接成第四个。
+> It's the same infrastructure (`ResearchAgentPartUpdated` event + cockpit)
+> `pushHypoPartLines()` General Renderer) , the latter**has been achieved and is in use**
+> (DataAnalysis / HypoPlanner / Reflection three delegates are on board)
+> This proposal is to make IntentAgent the fourth.
 
-## 1. 目标
+## 1. Objective
 
-1. IntentAgent 的 session 里每一次工具调用（`read_taskspec` /
-   `update_taskspec` / `ask_user` / `check_taskspec`）和模型的文本
-   回复，都像 HypoPlanner 一样实时滚动渲染到 streamLine 上。
-2. 不再在 `intent_gathering` / 等待用户回答阶段一开始就把 15 个
-   slot 的完整 checklist 摆出来——这部分信息现在改为通过观察工具
-   调用日志（尤其是 `read_taskspec` 的输出、`ask_user` 的输入）
-   自然呈现，不需要 TUI 自己再画一份。
+1. Every tool call in IntentAgent session (`read_taskspec`/
+   Text of `update_taskspec`/ `ask_user`/ `check_taskspec` and model
+   Reply, all scroll to streamLine in real time like HypoPlanner.
+2. No more 15s at the start of `intent_gathering`/ waiting for user response
+   The full checklist of the slot -- this information is now used as an observation tool
+   Call log (especially `read_taskspec` output, `ask_user` input)
+   It's natural. No need for Tui to draw another one of his own.
 
-## 2. 现状盘点
+## 2. Status Inventory
 
-### 2.1 已有的通用基础设施（HypoPlanner 已验证可用）
+### 2.1 Existing General Infrastructure (HypoPlanner validated available)
 
-- `research/event.ts` 已有 `ResearchAgentPartUpdated` schema 和
+- `research/event.ts` already has `ResearchAgentPartUpdated` schema and
   `HypoPlannerAgentPartUpdated` / `DataAnalysisAgentPartUpdated` /
-  `ReflectionAgentPartUpdated` 三个事件
-- `research-cockpit.tsx`：
-  - 每个 agent 各有一对信号 `xxxPartMap` / `xxxPartOrder`
-    （如 `hypoPartMap`/`hypoPartOrder`，约 1208-1209 行）
-  - 通用渲染函数 `pushHypoPartLines()`（4134-4176 行）——名字带
-    "Hypo" 但实现完全通用，接收
-    `(lines, order, map, streamID, done)`，DataAnalysis/Reflection
-    都直接复用它（4219、4320 行），IntentAgent 也可以直接复用，
-    不需要再写一个新的渲染函数
-  - 事件订阅 switch（约 1617-1758 行区间）：收到
-    `*.started` 时清空 `xxxPartMap`/`xxxPartOrder` 并把 stream 标记
-    `done:false`；收到 `*.part.updated` 时把 part 快照写入
-    map+order；收到 `*.completed`/`*.failed` 时把 `done:true`
+  `ReflectionAgentPartUpdated` Three Events
+- `research-cockpit.tsx`:
+  - Each agent has a pair of signals `xxxPartMap`/`xxxPartOrder`
+    (e. g. `hypoPartMap`/ `hypoPartOrder`, approximately 1208-1209 row)
+  - Universal Rendering Function `pushHypoPartLines()` (4134-4176 Line) - Namebelt
+    "Hypo," but it's completely universal, receiving.
+    `(lines, order, map, streamID, done)`,DataAnalysis/Reflection
+    4219, 4320 and IntentAgent can also be used directly.
+    No new rendering function needed to be written
+  - Event subscription switch (approximately 1617-1758 row): Received
+    On `*.started`, clear `xxxPartMap`/`xxxPartOrder` and mark the stream
+    `done:false`; Write part of the photo when `*.part.updated` is received
+    map+order; on `*.completed`/`*.failed`, set `done:true`
 
-### 2.2 IntentAgent 这一侧目前缺什么
+### 2.2 IntentAgent, what's missing on this side?
 
-- `service.ts` 的 `runIntentAgentTurn`（6548-6581 行）**直接手写了
-  session create + `sessionPrompt.prompt()`**，不是走
-  `requestViaSession()`（因为需要"找到已存在的 session 并续聊"这个
-  `requestViaSession` 不支持的能力）。所以它也**没有**
-  `requestViaSession` 那一套 `onDelta`/`onPartUpdated` 回调和
+- `service.ts`'s `runIntentAgentTurn` (lines 6548-6581) **directly constructs
+  `sessionPrompt.prompt()`**, not go
+  `requestViaSession()`.
+  `requestViaSession` does not support capacity. So it's not.
+  `requestViaSession`, the set of `onDelta`/`onPartUpdated`
   `Effect.scoped` + `bus.subscribe(MessageV2.Event.PartUpdated)`
-  订阅逻辑——这部分需要在 `runIntentAgentTurn` 内部重新接一份
-  （逻辑可以照抄 `requestViaSession` 里那段，见 hypo-planner 文档
-  第 2 节）
-- `event.ts` 还没有 `IntentAgentPartUpdated`（已有的只是
-  `IntentAgentStarted`/`Completed`/`Failed`/`AwaitingUser`）
-- `runIntentAgent()`（6622 行起）目前每次被 `runFullPipeline()`
-  调用时都会经过一次"已满足则跳过 session"的判断（见
-  intent-agent-tool-refactor.md 实现记录）——**只有在
-  `!alreadySatisfied` 时才会真正跑 `runIntentAgentTurn`**，已满足
-  的情况下不会有任何 part 事件，这是预期行为（不应该为了"省事"在
-  已经问完的情况下还要展示一次空的 stream）
-- `continueIntentAgentSession()`（6694 行起，承接用户每一次回答/
-  自由文本修改）**目前完全没有发布任何 Started/PartUpdated/
-  Completed 事件**——这是本提案要补的最关键的一块，因为用户回答后
-  的每一轮追问，才是 TUI 上最需要看到"模型在干什么"的时刻
-- cockpit.tsx 里 `clarification.active` 为真时的渲染分支
-  （4378-4396 行）目前是整段 slot checklist + "Next question"；
-  这是本提案要替换掉的部分
+  Logic of subscriptions - this part needs to be reproduced inside `runIntentAgentTurn`
+  (Logical copy of `requestViaSession` in hypo-planner document)
+  Section 2)
+- `event.ts` not yet `IntentAgentPartUpdated`
+  `IntentAgentStarted`/`Completed`/`Failed`/`AwaitingUser`)
+- `runIntentAgent()` (6622 row) is currently being `runFullPipeline()`
+  Calles are subject to a "satisfaction and skipping session" judgment.
+  intent-agent-tool-refactor.md achieves record) -** Only
+  `!alreadySatisfied` will run real only when `runIntentAgentTurn`** is satisfied
+  There won't be any part incident in this situation. It's an expected act.
+  I'm gonna show you an empty stream once and for all.
+- `continueIntentAgentSession()` (6694 row starting to receive each user response/
+  Free Text Change** No Started/PartUpdated/ currently published at all
+  Completed Event** — This is the most critical part of this proposal because after the user answers
+  Every round of questioning, it's the moment that TUI needs to see what the model is doing.
+- `clarification.active` in cockpit.tsx is the rendering branch of real time
+  (4378-4396 Line) This is the whole paragraph of slot checklist + "Next question";
+  That's the part of this proposal that needs to be replaced.
 
-## 3. 方案
+## 3. Programme
 
-### 3.1 `event.ts`：新增 `IntentAgentPartUpdated`
+### 3.1 `event.ts`: Add `IntentAgentPartUpdated`
 
-复用已有的 `ResearchAgentPartUpdated` schema，照抄
-`HypoPlannerAgentPartUpdated` 的定义方式：
+Re-enact existing `ResearchAgentPartUpdated` schema, copy
+`HypoPlannerAgentPartUpdated` definition:
 
 ```ts
 IntentAgentPartUpdated: BusEvent.define("research.agent.intent.part.updated", ResearchAgentPartUpdated),
 ```
 
-不新增单独的 `IntentAgentStreamDelta`——IntentAgent 的文本回复通常
-很短（提问前的一两句话），工具调用才是主要信息量，跟 part 事件一起
-走即可，没必要再加一路文本 delta（HypoPlanner 当年两路都加是因为
-它的文本回复本身就是主产出之一；IntentAgent 不是）。如果后续发现
-逐字流式效果也需要，再补 `IntentAgentStreamDelta`，不在本次范围内。
+Text reply normal without adding a separate `IntentAgentStreamDelta` - IntentAgent
+Short. Tool call is the main amount of information, with part events.
+Just go. There's no need to add another text. Delta.
+Its text response is itself one of the main outputs; IntentAgent is not. If there's any follow-up,
+The word-flow effect also needs to be supplemented with `IntentAgentStreamDelta`, which is not in this range.
 
-### 3.2 `service.ts`：`runIntentAgentTurn` 内联订阅 + 回调
+### 3.2 `service.ts`: `runIntentAgentTurn` Inline Subscription + Callback
 
-在 `runIntentAgentTurn`（6548 行）里加 `onPartUpdated` 回调参数，
-内部按 `requestViaSession`（3172-3234 行）同款写法接
-`Effect.scoped` + `bus.subscribe(MessageV2.Event.PartUpdated)`：
+In `runIntentAgentTurn` (row of 6548) Riga `onPartUpdated` echo parameters,
+`requestViaSession` (3172-3234 Line)
+`Effect.scoped` + `bus.subscribe(MessageV2.Event.PartUpdated)`:
 
 ```ts
 const runIntentAgentTurn = Effect.fn("Research.runIntentAgentTurn")(function* (input: {
@@ -118,54 +118,54 @@ const runIntentAgentTurn = Effect.fn("Research.runIntentAgentTurn")(function* (i
         }),
       )
     : yield* promptEffect.pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-  // ... 其余 checkOk 提取逻辑不变
+  // The rest of the checkOk extractions remain the same.
 })
 ```
 
-> 注意：现有代码对 `promptEffect` 的失败用
-> `.pipe(Effect.catchCause(() => Effect.succeed(undefined)))` 兜底；
-> 套了 `Effect.scoped` 之后这个 catch 需要包住整个 scoped 块,而不是
-> 只包 `promptEffect` 自己，否则订阅期间抛错会被 scoped 往外抛、
-> 不会被这层 catch 接住——写法上要参考 `requestViaSession` 实际是
-> 怎么处理这一层的（它在最外层统一 `.pipe(Effect.catchCause(...))`，
-> 而不是分别包），照搬即可。
+> Note: Failed to use existing code for `promptEffect`
+> `.pipe(Effect.catchCause(() => Effect.succeed(undefined)))` underground;
+> `Effect.scoped` and then this catch needs to wrap the entire scoped block instead of
+> Only pack `promptEffect` yourself, or error during subscription will be thrown out by scoped,
+> It's not going to be caught on this level -- it's written by `requestViaSession`, actually.
+> How to deal with this layer (it unites `.pipe(Effect.catchCause(...))` at the outermost level).
+> It's not a separate package. Just copy it.
 
-### 3.3 `service.ts`：发布事件的位置——按"整个 session"算边界
+### 3.3 `service.ts`: Location of release event - boundary by "wholly session"
 
-> 决策（已与用户确认）：`started`/`completed` 的粒度按**整个
-> session**算，不是按"每一次 turn"算。即同一个 task 的 intent
-> gathering 从第一次 `runIntentAgent()` 跑起，到最终
-> `check_taskspec` 成功为止，TUI 上是**同一段持续累积的日志**，
-> 中间用户每提交一次回答、触发一次新的 `runIntentAgentTurn`，都是
-> 往同一段日志后面继续追加，不清空、不重开。
+> Decision making (confirmed with user): `started` / `completed` particle size as a whole**
+> The session** count, not "every turn". It's the same intent of the task
+> Gathering from the first `runIntentAgent()` run to the end
+> Until `check_taskspec` is successful, TUI is**the same log that continues to accumulate**,
+> Every time an intermediate user submits a reply, triggers a new `runIntentAgentTurn`,
+> Continue to be added after the same paragraph of the log, which is unclear and does not reopen.
 
-具体到代码：
+Specific to code:
 
-- `IntentAgentStarted` 只在 `runIntentAgent()` 里发**一次**（已有
-  逻辑不变）——即整个 intent_gathering 阶段刚开始的那一刻
-- `continueIntentAgentSession()`（用户每次回答触发）**不发**
-  `IntentAgentStarted`，只传 `onPartUpdated` 回调,把新一轮的 part
-  事件继续追加进同一份 `intentPartMap`/`intentPartOrder`
-- `IntentAgentCompleted` 只在真正"intent gathering 整体完成"时发——
-  也就是 `runFullPipeline()` 那边判定 `missingFields.length === 0`
-  并往后推进、或者 `runIntentAgent`/`continueIntentAgentSession`
-  调用链最终让 `check_taskspec` 成功的那一刻，不是每次
-  `runIntentAgentTurn` 调用完就发。中间几轮如果模型只是调用了
-  `ask_user` 暂停等用户，**不发** `Completed`，也不发 `Failed`——
-  这两个事件现在只表示"整段结束"（正常结束/异常结束），不是
-  "这一轮结束"
-- cockpit.tsx 只在收到 `IntentAgentStarted` 时清空一次
-  `intentPartMap`/`intentPartOrder`（对应"这个任务开始一段新的
-  intent gathering 流程"，比如同一个任务可能因为后续被驳回又重新
-  触发一轮全新的 intent_gathering，那时才需要清空）；收到
-  `part.updated` 只追加,不清空；收到 `Completed`/`Failed` 才把
-  `done` 置为 `true`，让 streamLine 渲染器知道"不用再显示加载中的
-  省略号了"
+- `IntentAgentStarted` will be distributed only once in `runIntentAgent()`** (already available)
+  The logical change -- the moment the entire intent_gathering phase begins.
+- `continueIntentAgentSession()` (user triggers per answer)**not issued**
+  `IntentAgentStarted`, send only `onPartUpdated` to return the part of the new round
+  Events continue to add the same `intentPartMap`/`intentPartOrder`
+- `IntentAgentCompleted` only takes place when it's really "intent gathering the whole."
+  that is, where `runFullPipeline()` checks `missingFields.length === 0`
+  `runIntentAgent`/`continueIntentAgentSession`
+  The moment `check_taskspec` finally made it work, not every time.
+  `runIntentAgentTurn` calls and sends. In the middle, if the model is just transferred...
+  `ask_user` pauses the user,**does not send** `Completed` nor does `Failed` --
+  These two incidents now only mean "end of whole period" (normal end/abnormal end), not
+  "This is the end of the round."
+- cockpit.tsx only empty once on receipt of `IntentAgentStarted`
+  `intentPartMap`/`intentPartOrder`
+  Intent gathering process, for example, the same mission may be reset by subsequent rejection.
+  Triggers a completely new round of intent_gathering, before it needs to be emptied; Copy that.
+  `part.updated` only adds and is not clear; Copy that. `Completed`/`Failed`.
+  `done` to `true` so that the streamLine Renderer knows "no more loads will be shown
+  The ellipsis is omitted."
 
-### 3.4 cockpit.tsx：信号 + 订阅 + 渲染
+### 3.4 cockpit.tsx: signal + subscription + rendering
 
-完全照抄 HypoPlanner 那一套（hypo-planner-tui-streaming.md 第 4
-节），只是前缀换成 `intent`：
+Follow the HypoPlanner implementation exactly (section 4 of hypo-planner-tui-streaming.md
+Section), prefix replaced by `intent`:
 
 ```ts
 const [intentStream, setIntentStream] = createSignal<{ id: number; taskID?: string; done: boolean } | undefined>()
@@ -173,36 +173,36 @@ const [intentPartMap, setIntentPartMap] = createSignal<Map<string, HypoPartEntry
 const [intentPartOrder, setIntentPartOrder] = createSignal<string[]>([])
 ```
 
-事件 switch 里加三个 case（`research.agent.intent.started` /
+Event switch Riga 3 case(`research.agent.intent.started`/
 `research.agent.intent.part.updated` / `research.agent.intent.completed`
-和 `...failed`），渲染时复用 `pushHypoPartLines()`，不需要新写
-渲染组件。
+and `...failed`), reuse `pushHypoPartLines()` on rendering, no new writing required
+Rendering component.
 
-### 3.5 替换掉的渲染分支
+### Rendering branch of 3.5 replacement
 
-`streamLines` memo 里 4378-4396 行（`clarification.active &&
-!clarification.reviewMode` 分支）目前是：
+4378-4396 Line (`clarification.active & ) in `streamLines` memo
+clarification.reviewMode ' branch) is currently:
 
 ```
-Socratic clarification: slots: <missing slot id 列表>
-Next question: <下一题文案>
-<15 个 slot 的 checklist>
+Soctic identification: slots: <missing slot id list>
+Next question:
+15 checklist
 ```
 
-改为：
+was replaced by:
 
 ```ts
 } else if (clarification.active && !clarification.reviewMode) {
-  // 不再展示整张 slot checklist；展示 IntentAgent session 的实时
-  // 工具调用 / 文本流（跟 HypoPlanner 同款），用户从 ask_user 的
-  // 工具调用日志里看到具体问题。
+  // Do not show the whole slot checklist;Show IntentAgent session real time
+  // Tool Call / Text Stream (same as HypoPlanner), user from ask_user
+  // The tool calls to see specific issues in the log.
   const istream = intentStream()
   if (istream && (!task || !istream.taskID || istream.taskID === task.id)) {
     persistentLines.push({ id: `intent-stream-${istream.id}-header`, text: "[IntentAgent]", tone: "muted" })
     pushHypoPartLines(persistentLines, intentPartOrder(), intentPartMap(), istream.id, istream.done)
   }
-  // 仍保留一行"当前问题"作为醒目提示，数据来源不变（ask_user 落库
-  // 的 approval reason，经 buildSocraticClarificationState 解析）
+  // Keep a line "Current problem" as an explicit reminder, with the data source unchanged (ask_user library)
+  // Accursed by buildSocraticClarificationState
   if (clarification.nextQuestion) {
     persistentLines.push({
       id: "socratic-next-question",
@@ -213,68 +213,68 @@ Next question: <下一题文案>
 }
 ```
 
-**保留 "Next question" 这一行**：即使有了完整的工具调用日志，用户
-也需要一个不用往上翻日志就能看到的"现在该回答什么"提示——这一行
-的数据来源（`socraticClarification()` → `buildSocraticClarificationState`
-→ 读最新 pending 的 `ask_user` approval）完全不需要改动,本提案只是
-不再连带渲染下面那一长串 slot checklist。
+**Retain the line "Next question"**: even with a complete tool to call the log, users
+And you need a hint of what to answer now that you can see without going up the log.
+data source (`socraticClarification()` → `buildSocraticClarificationState`
+`ask_user` approximation)
+No more slot checkslist.
 
-**不动的部分**（按用户这次的描述,范围只针对"一开始展示整个
-slots"这一点,不包括以下两处,需要的话另外讨论）：
+**No movement** (as described by the user this time, the range is only for "to show the whole at first display")
+This point of slots is not covered by the following two, which are discussed separately if necessary:
 
-- `clarification.reviewMode` 分支（4365-4377 行，intent 被驳回后的
-  人工修改界面）——这是用户主动要求逐项核对/修改的场景,展示完整
-  checklist 是该场景的核心交互,不应该跟着去掉
-- `idle`、无 run 时的 onboarding 提示（4415-4431 行）——这是任务还
-  没真正进入 intent_gathering、用户也没开始回答时的引导信息,跟"已
-  经在追问中"是不同状态,本提案不涉及
+- `clarification.reviewMode` Branch (4365-4377 Line, incent after rejected
+  Manually modified interface) - This is a case-by-case view of the user's voluntary request to check/modify and present complete
+  Checklist is the centerpiece of this scene. It's not supposed to go away.
+- `idle`, no running onboarding hint (line 4415-4431) - this is the task still
+  No real access to intent_gathering, no user's guidance when it starts answering.
+  This proposal does not concern "a different state of affairs" when asked.
 
-### 3.6 是否要在 part 日志里特别高亮 `ask_user` 调用
+### Whether 3.6 should be particularly highlighted in part logs for `ask_user`
 
-`pushHypoPartLines()` 现在对所有工具一视同仁地渲染
-`[图标] toolName  → input  ← output`。`ask_user` 工具的 input 就是
-`{questions: [...]}`,作为日志的一部分会被 JSON 截断显示
-（`JSON.stringify(...).slice(0, 120)`），可读性一般。建议：
+`pushHypoPartLines()` Now render all tools equally.
+`[icon] toolName → input ← output`. The input of the `ask_user` tool is
+`{questions: [...]}` as part of the log will be cut off by JSON
+(`JSON.stringify(...).slice(0, 120)`), readability general. Recommendations:
 
-- 不在 `pushHypoPartLines()` 里加 `ask_user` 特判（保持这个函数
-  通用、跟其他三个 agent 共享的状态不变）
-- 继续依赖 3.5 节保留的 "Next question" 那一行做高亮——它是从
-  approval 原文解析出来的完整问题文本,不受 120 字符截断影响,
-  已经解决了"日志里看不清问题"的问题
+- Not in `pushHypoPartLines()` Riga `ask_user` Special (maintain this function)
+  Universal, shared with the other three parties)
+- Continue to rely on the line "Next question" reserved for 3.5 -- it's from
+  The full problem text from the original is not affected by the 120 character cut-off.
+  It's already solved the problem of "discovery in the log."
 
-## 4. 实施顺序
+## 4. Order of implementation
 
-| 步骤 | 文件 | 工作量 |
+| Steps | Documentation | Workload |
 |---|---|---|
-| 1. `event.ts` 新增 `IntentAgentPartUpdated` | `research/event.ts` | 小 |
-| 2. `runIntentAgentTurn` 加 `onPartUpdated` 参数 + scoped 订阅 | `research/service.ts` | 小 |
-| 3. `runIntentAgent()` 传入回调,转发到 bus | `research/service.ts` | 小 |
-| 4. `continueIntentAgentSession()` 传入 `onPartUpdated` 回调（不发 Started/Completed，沿用同一段日志） | `research/service.ts` | 小 |
-| 5. cockpit.tsx 加 `intentStream`/`intentPartMap`/`intentPartOrder` 信号 + 事件订阅 case | `research-cockpit.tsx` | 小 |
-| 6. cockpit.tsx 替换 4378-4396 行渲染分支 | `research-cockpit.tsx` | 小 |
-| 7. 测试：mock `IntentAgentPartUpdated` 事件序列,断言 streamLines 输出；回归 `research-cockpit-data.test.ts` 里跟 `buildSocraticClarificationState` 相关的用例（数据层没变,不应受影响） | `test/` | 小 |
+| 1. `event.ts` Add `IntentAgentPartUpdated` | `research/event.ts` | Small |
+| 2. `runIntentAgentTurn` plus `onPartUpdated` Parameters + coded subscription | `research/service.ts` | Small |
+| 3. `runIntentAgent()` transfer callback, forward to Bus | `research/service.ts` | Small |
+| 4. `continueIntentAgentSession()` Into `onPartUpdated` Echo (do not send Started/Completed, follow the same log) | `research/service.ts` | Small |
+| 5. cockpit.tsx plus `intentStream`/ `intentPartMap`/ `intentPartOrder` signal + event subscription case | `research-cockpit.tsx` | Small |
+| 6. cockpit.tsx Replaces the 4378-4396 line rendering branch | `research-cockpit.tsx` | Small |
+| 7. Test: mock `IntentAgentPartUpdated` event sequence, confirming streamLines output; Returns examples of `research-cockpit-data.test.ts` associated with `buildSocraticClarificationState` (data layer unchanged and should not be affected) | `test/` | Small |
 
-## 5. 开放问题
+## 5. Issues of openness
 
-- ~~`done` 按 turn 还是按 session~~ 已确认：按整个 session（见
-  3.3 节）。
+- ~ `done` Press turn or press session ~ Confirmed: press whole session (see
+  Section 3.3.
 
-- **新增（按 session 之后才暴露的问题）：TUI 信号是纯前端内存
-  状态，不会持久化。** 按 turn 设计时，单段日志生命周期短，用户
-  中途切走再切回来丢失得也不多；改成按 session 累积后，一次
-  intent gathering 可能跨好几轮、持续很久（用户去忙别的事再回来
-  回答），如果期间用户切到别的 task 再切回来，或者刷新/重开了
-  cockpit，`intentPartMap`/`intentPartOrder` 这两个信号会被重置为
-  空——之前几轮的工具调用记录就看不到了，只能看到下一次
-  `part.updated` 之后才有的新内容,体验上跟"按 session 持续累积"
-  的初衷是矛盾的。
-  - 需要决定：是否要在 cockpit **挂载/切换到某个 task 时**，主动
-    把这个 session 已有的历史消息读出来重建一遍 `intentPartMap`/
-    `intentPartOrder`（用 `session.messages({sessionID})` 拿到完整
-    历史，反查出其中的 tool parts 重放一遍），而不是只依赖"实时
-    事件流"。这部分目前 HypoPlanner 等三个 agent 都没有做（它们的
-    每次调用本身就很短,没有这个问题），IntentAgent 引入"按 session
-    累积"之后，是本提案独有的新需求,需要单独评估实现成本
-  - 如果暂时不做历史重建,至少要在文档/产品层面接受这个限制：
-    "刷新/切换 task 之后，只能看到接下来发生的新工具调用,看不到
-    之前几轮的"——这是否可以接受需要你确认
+- ** Add (session-only exposure problem): TUI signal is a pure frontend memory
+  Status, does not last.** Short life cycle for individual logs, user
+  It's not too much to lose if you cut in the middle of it. Replace by press the session cumulative, once
+  Intent gathering may take several rounds and last long.
+  If the user cuts to another task during this period, then cuts back or refreshs/reopens
+  Cockpit, `intentPartMap`/`intentPartOrder` will be reset to
+  Empty. I can't see a few rounds of phone calls before, just the next time.
+  `part.updated` has something new, and it's like, "Put the session on a cumulative basis."
+  The original intent was contradictory.
+  - Requires a decision: Active if the cockpit **mount/ switch to a task**
+    Rebuild `intentPartMap`/
+    `intentPartOrder` (with `session.messages({sessionID})` to complete)
+    History, find out where tool parts replay) instead of relying on "real time."
+    Incident flow."This part is currently not done by three parties.
+    Every call is very short, without the problem) IntentAgent Introduction to Press Session
+    After "accumulation" is a unique new demand for this proposal, which requires a separate assessment of the cost of realization.
+  - If there is no historical reconstruction for the time being, at least this limitation should be accepted at the document/product level:
+    After refreshing/toggle the question, you can only see what's coming next. You can't see.
+    That's what you need to know.

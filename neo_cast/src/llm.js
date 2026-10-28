@@ -56,18 +56,13 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
     text.includes("decompose") ||
     text.includes("trend") ||
     text.includes("seasonal") ||
-    text.includes("seasonality") ||
-    text.includes("分解") ||
-    text.includes("趋势") ||
-    text.includes("季节")
+    text.includes("seasonality")
   );
   const latencySensitive = (
     text.includes("latency") ||
     text.includes("deployment") ||
     text.includes("deploy") ||
-    text.includes("inference") ||
-    text.includes("部署") ||
-    text.includes("推理")
+    text.includes("inference")
   );
   const horizons = _taskHorizons(taskContext);
   const multiscaleBlocks = embedding.type === "multiscale_patch"
@@ -119,15 +114,13 @@ function _candidateRecipeToModelRecipe(recipe, taskContext = {}, options = {}) {
 function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   const text = String(requirement || "").toLowerCase();
   const fastMode = Boolean(process.env.NEO_CAST_FAST_E2E);
-  const channelMode = /channel[-_ ]independent|independent[-_ ]channels?|通道独立/.test(text) ? "independent" : (
+  const channelMode = /channel[-_ ]independent|independent[-_ ]channels?/.test(text) ? "independent" : (
     text.includes("channel") ||
     text.includes("cross") ||
     text.includes("correlation") ||
     text.includes("sensor") ||
     text.includes("multivariate") ||
-    text.includes("shared") ||
-    text.includes("通道") ||
-    text.includes("相关")
+    text.includes("shared")
   ) ? "shared" : "independent";
   const useMultiscale = (
     text.includes("multiscale") ||
@@ -135,14 +128,12 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
     text.includes("multi scale") ||
     text.includes("multiple scale") ||
     text.includes("multi resolution") ||
-    text.includes("multi-resolution") ||
-    text.includes("多尺度") ||
-    text.includes("多分辨率")
+    text.includes("multi-resolution")
   );
-  const wantsDLinear = text.includes("dlinear") || text.includes("d-linear") || text.includes("decomposition linear") || text.includes("分解线性");
-  const wantsTCN = text.includes("tcn") || text.includes("temporal conv") || text.includes("causal conv") || text.includes("convolution") || text.includes("卷积");
+  const wantsDLinear = text.includes("dlinear") || text.includes("d-linear") || text.includes("decomposition linear");
+  const wantsTCN = text.includes("tcn") || text.includes("temporal conv") || text.includes("causal conv") || text.includes("convolution");
   const wantsNBeats = text.includes("n-beats") || text.includes("nbeats") || text.includes("n beats");
-  const wantsTimesNet = text.includes("timesnet") || text.includes("times net") || text.includes("periodic") || text.includes("fft") || text.includes("周期");
+  const wantsTimesNet = text.includes("timesnet") || text.includes("times net") || text.includes("periodic") || text.includes("fft");
 
   let modelFamily = "nlinear";
   if (wantsTimesNet) {
@@ -202,7 +193,7 @@ function _buildHeuristicCandidate(requirement, attempt = 1, taskContext = {}) {
   };
 
   const newEncoder = text.includes("mamba") ? "mamba" : text.includes("timesblock") ? "timesblock_encoder" : (text.includes("diagonal") || text.includes("ssm")) ? "diagonal_ssm" : null;
-  const wantsPatch = /patch|切片/.test(text);
+  const wantsPatch = /patch/.test(text);
   if (newEncoder) {
     if (wantsPatch && (newEncoder === "timesblock_encoder" || useMultiscale)) {
       throw new Error("Patch sequence scanning supports single-scale Mamba/Diagonal SSM only");

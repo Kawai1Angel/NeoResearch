@@ -166,7 +166,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 ETTh1（context=96, horizon=96, OT + 6 observedPastCovariates）上，对已收敛的 mlp 基准做唯一干预 backbone.hiddenDim 64→128（depth=2, activation=gelu, dropout=0.1 不变），其余逐字段冻结；检验 mlp 族在 instance_norm+latentDim=64 设定下是否对编码器宽度敏感。"
+                "hypothesis": "On ETTh1 (context=96, horizon=96, OT + 6 observedPastCovariates), change only backbone.hiddenDim from 64 to 128 in the converged mlp baseline (depth=2, activation=gelu, dropout=0.1 unchanged), freezing every other field. Test encoder-width sensitivity of the mlp family under instance_norm+latentDim=64."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -456,7 +456,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 ETTh1（context=96, horizon=96, OT + 6 observedPastCovariates）上测试尚未触碰的 embedding=none mlp 族：此时 Linear(context=96,hiddenDim=64) 直接读取整段历史 + 非线性隐层 + latent 投影，构成全局时间感受野 MLP（非逐点 time MLP）。用 verified 稳定处方（instance_norm(affine=false,eps=1e-5) + adam lr=3e-4/wd=1e-4 + cosine warmupSteps=6<maxEpochs=40 + gradClip=1 + batchSize=32 + patience=12 + seed=42，4 折 expanding_window_ratio）给出可信收敛读数，判断该族是否落在已有非仿射平台量级（cv_avg_mse ≤0.095，理想 ≤0.0860）。"
+                "hypothesis": "Test the unexplored embedding=none mlp family on ETTh1 (context=96, horizon=96, OT + 6 observedPastCovariates): Linear(context=96,hiddenDim=64) reads the entire history, followed by nonlinear hidden layers and a latent projection, yielding a global temporal receptive field rather than a pointwise time MLP. Use the verified stable recipe (instance_norm(affine=false,eps=1e-5) + adam lr=3e-4/wd=1e-4 + cosine warmupSteps=6<maxEpochs=40 + gradClip=1 + batchSize=32 + patience=12 + seed=42, 4-fold expanding_window_ratio) to measure credible convergence and determine whether this family reaches the existing non-affine performance plateau (cv_avg_mse <=0.095, ideally <=0.0860)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -829,7 +829,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 NP 任务（OT 目标，L=168, H=24）上，以已验证对照 rrun_14405f61d001PDPFSc3vVsKeNU（instance_norm + shared linear，cv_avg_mse=0.50238325）为基准，将 preprocessing 动作整体替换为单一 last_value_centering（即去掉各通道最后观测值做水平基准、预测后加回），检验该序列级变换能否利用 OT 的极强持续性（ACF lag1=0.954054）带来至少 1% 的 cv_avg_mse 改善。"
+                "hypothesis": "On NP (OT target, L=168, H=24), use verified control rrun_14405f61d001PDPFSc3vVsKeNU (instance_norm + shared linear, cv_avg_mse=0.50238325). Replace all preprocessing actions with last_value_centering, subtracting each channel's last observation as a level baseline and adding it back after prediction. Test whether this sequence-level transformation exploits OT's strong persistence (ACF lag1=0.954054) to improve cv_avg_mse by at least 1%."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -1069,7 +1069,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在存在明显分布漂移（OT distributionShift=0.869997）的条件下，加入 instance_norm（affine=false，贴近源文的减均值/加回设置）的候选，其 cv_avg_mse 会优于未做实例级归一化的同架构候选。"
+                "hypothesis": "Under substantial distribution shift (OT distributionShift=0.869997), a candidate with instance_norm (affine=false, matching the source's mean subtraction/addition setting) should achieve lower cv_avg_mse than the same architecture without instance-level normalization."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -1326,7 +1326,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "参数量匹配对照检验分解先验：在同 shared-linear 设计上，把 preprocessing.actions.0 从 series_decomposition(moving_average, kernel_size=25) 回退为 instance_norm(affine=false, eps=1e-5)，并把 predictionHead.correctionDim 由 64 提高到 160 以近似匹配分解臂 40701 参数。若无分解但容量可比的对照仍落在 ±3% 带内且劣于 0.74687425，则确认固定移动平均趋势-残差分解提供了 rank-limited 仿射路径无法表达的加性结构先验；若对照追平或超过，则增益归因于容量而非分解机制。"
+                "hypothesis": "Test the decomposition prior with a parameter-matched control: in the same shared-linear design, revert preprocessing.actions.0 from series_decomposition(moving_average, kernel_size=25) to instance_norm(affine=false, eps=1e-5), and increase predictionHead.correctionDim from 64 to 160 to approximately match the decomposition arm's 40701 parameters. If the comparable-capacity control without decomposition remains within the +/-3% band and worse than 0.74687425, this supports an additive structural prior from fixed moving-average trend/residual decomposition beyond the rank-limited affine path; if it matches or exceeds the decomposition arm, attribute gains to capacity instead."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -1605,7 +1605,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在共享线性冠军（rrun_14527ff1a001Ok3w0f6bfN3S0N）之上，仅把预处理 instance_norm 换成 series_decomposition（固定 moving_average，kernel_size=25）：固定移动平均把历史拆成趋势+残差，残差走 linear 编码器/feature_mlp/residual_correction 头，另加一条可学习 Linear(context,H) 趋势预测分支，预测时把趋势加回。用以检验在 rank-limited 仿射路径之上显式加性趋势分支是否提供结构先验增益。"
+                "hypothesis": "From shared-linear champion rrun_14527ff1a001Ok3w0f6bfN3S0N, change only instance_norm preprocessing to series_decomposition (fixed moving_average, kernel_size=25). Split history into trend and residual; route residuals through the linear encoder/feature_mlp/residual_correction head and add a learnable Linear(context,H) trend prediction branch, adding the trend back at prediction time. Test whether this explicit additive trend branch provides a structural prior beyond the rank-limited affine path."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -1935,7 +1935,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 PJM 电价（OT, context168/H24）上，以 rrun_144b221d9001k7rYFAZDVIECrs（linear shared=true/bias=true + last_value_centering + feature_mlp + latentDim=24，cv_avg_mse=0.2076635）为对照，仅将预处理由 last_value_centering 替换为显式周期结构变换 seasonal_differencing(period=24)，其余全部冻结；若假设成立则 cv_avg_mse 应下降约 5–15%（~0.177–0.197），说明该配方族的主要缺口是未显式建模日周期结构，而非编码器表达能力。"
+                "hypothesis": "On PJM electricity prices (OT, context168/H24), use rrun_144b221d9001k7rYFAZDVIECrs (linear shared=true/bias=true + last_value_centering + feature_mlp + latentDim=24, cv_avg_mse=0.2076635). Replace only last_value_centering with seasonal_differencing(period=24), freezing everything else. If supported, cv_avg_mse should fall by about 5-15% (~0.177-0.197), indicating that the main limitation is missing explicit daily periodic structure rather than encoder expressiveness."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -2230,7 +2230,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 PJM 电价（OT, context168/H24）上，以已跑通的线性基线 rrun_144b221d9001k7rYFAZDVIECrs（linear shared=true/bias=true + last_value_centering + embedding=none + feature_mlp + channel_latent/latentDim=24，cv_avg_mse=0.2076635）为对照，仅把 embedding 由 none 切换为 frequency（rFFT 保留 nFreq=24 个频点、complexMode=magnitude 幅度谱、dModel=24），其余全部冻结，检验频域 tokenization 是否带来可分辨增益。"
+                "hypothesis": "On PJM electricity prices (OT, context168/H24), use verified linear baseline rrun_144b221d9001k7rYFAZDVIECrs (linear shared=true/bias=true + last_value_centering + embedding=none + feature_mlp + channel_latent/latentDim=24, cv_avg_mse=0.2076635). Change only embedding from none to frequency (rFFT retaining nFreq=24 bins, complexMode=magnitude spectrum, dModel=24), freezing everything else, to test for a measurable benefit from frequency-domain tokenization."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -2453,7 +2453,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 PJM 电价（OT）上下文 168、预测 24 的设定下，用一个带特征-mixing 的简单线性编码器（linear + last_value_centering + feature_mlp 融合）给出强基线：OT 近乎强持续性（ACF lag-1≈0.9447），显式混合通道信息（交叉相关 0.7521）应优于不混合通道的独立线性映射。"
+                "hypothesis": "For PJM electricity prices (OT), context=168 and horizon=24, establish a strong baseline with a simple linear encoder and feature mixing (linear + last_value_centering + feature_mlp fusion). OT is highly persistent (ACF lag-1 approximately 0.9447); explicit channel mixing (cross-correlation 0.7521) should outperform independent linear mappings without channel mixing."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -2719,7 +2719,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "以 rrun_14771dfe4001E3mKZobK9UlamM（mlp 基准，cv_avg_mse=0.08547725）为对照，唯一干预为编码器族替换：mlp→rnn（cell=gru、numLayers=2、hiddenDim=64、dropout=0.1），其余字段全部冻结，检验门控递推编码器在 channel_latent/readout=none/latentDim=64 + linear head 下是否能给出可信收敛读数（目标 cv_avg_mse ≤0.0875、cv_std_mse ≤0.022）。"
+                "hypothesis": "Use rrun_14771dfe4001E3mKZobK9UlamM (mlp baseline, cv_avg_mse=0.08547725) as control. Change only the encoder family from mlp to rnn (cell=gru, numLayers=2, hiddenDim=64, dropout=0.1), freezing all other fields. Test credible convergence of a gated recurrent encoder under channel_latent/readout=none/latentDim=64 + linear head (target cv_avg_mse <=0.0875, cv_std_mse <=0.022)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -2973,7 +2973,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 ETTh1（context=96, horizon=96, OT + 6 observedPastCovariates）上测试尚未触碰的 embedding=none mlp 族：此时 Linear(context=96,hiddenDim=64) 直接读取整段历史 + 非线性隐层 + latent 投影，构成全局时间感受野 MLP（非逐点 time MLP）。用 verified 稳定处方（instance_norm(affine=false,eps=1e-5) + adam lr=3e-4/wd=1e-4 + cosine warmupSteps=6<maxEpochs=40 + gradClip=1 + batchSize=32 + patience=12 + seed=42，4 折 expanding_window_ratio）给出可信收敛读数，判断该族是否落在已有非仿射平台量级（cv_avg_mse ≤0.095，理想 ≤0.0860）。"
+                "hypothesis": "Test the unexplored embedding=none mlp family on ETTh1 (context=96, horizon=96, OT + 6 observedPastCovariates): Linear(context=96,hiddenDim=64) reads the entire history, followed by nonlinear hidden layers and a latent projection, yielding a global temporal receptive field rather than a pointwise time MLP. Use the verified stable recipe (instance_norm(affine=false,eps=1e-5) + adam lr=3e-4/wd=1e-4 + cosine warmupSteps=6<maxEpochs=40 + gradClip=1 + batchSize=32 + patience=12 + seed=42, 4-fold expanding_window_ratio) to measure credible convergence and determine whether this family reaches the existing non-affine performance plateau (cv_avg_mse <=0.095, ideally <=0.0860)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -3360,7 +3360,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "以 rrun_14771dfe4001E3mKZobK9UlamM（mlp 基准，cv_avg_mse=0.08547725）为对照，唯一干预为编码器族替换：mlp→rnn（cell=gru、numLayers=2、hiddenDim=64、dropout=0.1），其余字段全部冻结，检验门控递推编码器在 channel_latent/readout=none/latentDim=64 + linear head 下是否能给出可信收敛读数（目标 cv_avg_mse ≤0.0875、cv_std_mse ≤0.022）。"
+                "hypothesis": "Use rrun_14771dfe4001E3mKZobK9UlamM (mlp baseline, cv_avg_mse=0.08547725) as control. Change only the encoder family from mlp to rnn (cell=gru, numLayers=2, hiddenDim=64, dropout=0.1), freezing all other fields. Test credible convergence of a gated recurrent encoder under channel_latent/readout=none/latentDim=64 + linear head (target cv_avg_mse <=0.0875, cv_std_mse <=0.022)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -3614,7 +3614,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 ETTh1（context=96, horizon=96, OT + 6 observedPastCovariates）上测试尚未触碰的 embedding=none mlp 族：此时 Linear(context=96,hiddenDim=64) 直接读取整段历史 + 非线性隐层 + latent 投影，构成全局时间感受野 MLP（非逐点 time MLP）。用 verified 稳定处方（instance_norm(affine=false,eps=1e-5) + adam lr=3e-4/wd=1e-4 + cosine warmupSteps=6<maxEpochs=40 + gradClip=1 + batchSize=32 + patience=12 + seed=42，4 折 expanding_window_ratio）给出可信收敛读数，判断该族是否落在已有非仿射平台量级（cv_avg_mse ≤0.095，理想 ≤0.0860）。"
+                "hypothesis": "Test the unexplored embedding=none mlp family on ETTh1 (context=96, horizon=96, OT + 6 observedPastCovariates): Linear(context=96,hiddenDim=64) reads the entire history, followed by nonlinear hidden layers and a latent projection, yielding a global temporal receptive field rather than a pointwise time MLP. Use the verified stable recipe (instance_norm(affine=false,eps=1e-5) + adam lr=3e-4/wd=1e-4 + cosine warmupSteps=6<maxEpochs=40 + gradClip=1 + batchSize=32 + patience=12 + seed=42, 4-fold expanding_window_ratio) to measure credible convergence and determine whether this family reaches the existing non-affine performance plateau (cv_avg_mse <=0.095, ideally <=0.0860)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -3900,7 +3900,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "以 rrun_14771dfe4001E3mKZobK9UlamM（mlp 基准，cv_avg_mse=0.08547725）为对照，唯一干预为编码器族替换：mlp→rnn（cell=gru、numLayers=2、hiddenDim=64、dropout=0.1），其余字段全部冻结，检验门控递推编码器在 channel_latent/readout=none/latentDim=64 + linear head 下是否能给出可信收敛读数（目标 cv_avg_mse ≤0.0875、cv_std_mse ≤0.022）。"
+                "hypothesis": "Use rrun_14771dfe4001E3mKZobK9UlamM (mlp baseline, cv_avg_mse=0.08547725) as control. Change only the encoder family from mlp to rnn (cell=gru, numLayers=2, hiddenDim=64, dropout=0.1), freezing all other fields. Test credible convergence of a gated recurrent encoder under channel_latent/readout=none/latentDim=64 + linear head (target cv_avg_mse <=0.0875, cv_std_mse <=0.022)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -4247,7 +4247,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 NP 任务上，以已验证的 32 宽共享线性近 champion 臂 rrun_144a6a0a7001ZuS5b3BkzWtSzu（seed=42，cv_avg_mse=0.5027275）为对照，在架构与全部结构字段完全冻结的前提下，仅把 trainingStrategy.budget.seed 由 42 改为 43 重跑同一配方，检验 cv_avg_mse 的排序是否在 seed 变化下稳定，即当前 champion 与近 champion 臂之间约 0.0018 的差距是否落在 fold 难度噪声（cv_std_mse≈0.6156）内。"
+                "hypothesis": "On NP, use verified width-32 shared-linear near-champion arm rrun_144a6a0a7001ZuS5b3BkzWtSzu (seed=42, cv_avg_mse=0.5027275) as control. Freeze the architecture and all structural fields, changing only trainingStrategy.budget.seed from 42 to 43. Test whether cv_avg_mse rankings are stable across seeds and whether the approximately 0.0018 champion/near-champion gap falls within fold-difficulty noise (cv_std_mse approximately 0.6156)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -4494,7 +4494,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 32 宽共享线性近 champion 臂（cv_avg_mse=0.50442825，6,200 参数）上，保持架构与全部结构字段不变，仅把 optimizer.lr 由 1e-3 降到 5e-4（warmupSteps 保持 0），检验「学习率减半」能否单独修复 fold-0 早期非收敛，从而排除此前 lr+warmup 捆绑的混淆。"
+                "hypothesis": "For the width-32 shared-linear near-champion arm (cv_avg_mse=0.50442825, 6,200 parameters), preserve the architecture and every structural field and reduce only optimizer.lr from 1e-3 to 5e-4 (warmupSteps remains 0). Test whether halving the learning rate alone fixes early non-convergence in fold 0, removing the previous confounding of learning rate and warmup."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -4798,7 +4798,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 PJM 电价（OT, context168/H24）上，以 rrun_144b221d9001k7rYFAZDVIECrs（linear shared=true/bias=true + last_value_centering + feature_mlp + latentDim=24，cv_avg_mse=0.2076635）为对照，仅将 representation.latentDim 由 24 提升到 64、其余全部冻结，检验 latent 宽度（单 composition 下时间仿射映射的秩上界）是否为当前主要瓶颈。"
+                "hypothesis": "On PJM electricity prices (OT, context168/H24), use rrun_144b221d9001k7rYFAZDVIECrs (linear shared=true/bias=true + last_value_centering + feature_mlp + latentDim=24, cv_avg_mse=0.2076635). Increase only representation.latentDim from 24 to 64, freezing everything else, to test whether latent width (the temporal affine rank bound under single composition) is the main bottleneck."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -4989,7 +4989,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 PJM 电价（OT）上下文 168、预测 24 的设定下，用一个带特征-mixing 的简单线性编码器（linear + last_value_centering + feature_mlp 融合）给出强基线：OT 近乎强持续性（ACF lag-1≈0.9447），显式混合通道信息（交叉相关 0.7521）应优于不混合通道的独立线性映射。"
+                "hypothesis": "For PJM electricity prices (OT), context=168 and horizon=24, establish a strong baseline with a simple linear encoder and feature mixing (linear + last_value_centering + feature_mlp fusion). OT is highly persistent (ACF lag-1 approximately 0.9447); explicit channel mixing (cross-correlation 0.7521) should outperform independent linear mappings without channel mixing."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -5254,7 +5254,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在共享线性冠军 rrun_14527ff1a001Ok3w0f6bfN3S0N 的基础上，唯一干预是把 embedding.none 换为 embedding.calendar（真实时间戳生成的 month/day 相位场，每月周期与日内位置），以检验 context=96 无法观测的 lag-365 季节相位能否降低主导均值的 fold3 高误差 regime，从而降低 cv_avg_mse。"
+                "hypothesis": "From shared-linear champion rrun_14527ff1a001Ok3w0f6bfN3S0N, change only embedding.none to embedding.calendar (month/day phase fields derived from real timestamps, representing monthly cycles and intraday positions). Test whether lag-365 seasonal phase, unobservable within context=96, reduces the high-error fold-3 regime dominating the mean and thereby lowers cv_avg_mse."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -5549,7 +5549,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "在 PJM 电价（OT, context168/H24）上，以 rrun_144eaa98e001HNegJLi2M2GP1w（single、last_value_centering、multiscale_patch[24/24,12/12]/dModel=24、linear shared=true/bias=true、feature_mlp、channel_latent/readout=none/latentDim=24、residual_correction{correctionDim=32}，cv_avg_mse=0.1915735）为对照，把 backbone 整对象替换为 tcn（embedding=none、hiddenDim=32、nLayers=2、kernelSize=3、dropout=0），会降低 cv_avg_mse：检验 stacked temporal convolutions 的局部感受野这一与线性仿射映射不同的时间编码器归纳偏置能否突破 fold1/fold2（0.264483/0.288826）的局部平台。"
+                "hypothesis": "On PJM electricity prices (OT, context168/H24), use rrun_144eaa98e001HNegJLi2M2GP1w (single, last_value_centering, multiscale_patch[24/24,12/12]/dModel=24, linear shared=true/bias=true, feature_mlp, channel_latent/readout=none/latentDim=24, residual_correction{correctionDim=32}, cv_avg_mse=0.1915735) as control. Replace the whole backbone with tcn (embedding=none, hiddenDim=32, nLayers=2, kernelSize=3, dropout=0). Test whether the local receptive-field bias of stacked temporal convolutions, unlike a linear affine mapping, lowers cv_avg_mse beyond the fold1/fold2 plateau (0.264483/0.288826)."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {
@@ -5882,7 +5882,7 @@
                   }
                 },
                 "recipeVersion": "recipe_schema_v3",
-                "hypothesis": "以 rrun_144c906c1001ixE026qT4cJdks（cv_avg_mse=0.19441575）为对照，冻结全部架构与训练配置，仅将 predictionHead 由 linear 改为 residual_correction(correction_dim=32)，检验非线性残差读出能否突破 rank-bounded 仿射 latent 映射在 fold1/fold2 regime-shift 高误差段上的误差平台。"
+                "hypothesis": "Use rrun_144c906c1001ixE026qT4cJdks (cv_avg_mse=0.19441575) as control, freezing all architecture and training settings. Change only predictionHead from linear to residual_correction(correction_dim=32), testing whether nonlinear residual readout breaks the error plateau of a rank-bounded affine latent mapping in high-error fold1/fold2 regime-shift segments."
               },
               "hypothesisSnapshot": {
                 "experimentContract": {

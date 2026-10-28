@@ -51,8 +51,8 @@ jobs:
           Search for all OPEN issues created today (${TODAY}) using:
           gh issue list --repo ${{ github.repository }} --state open --search \"created:${TODAY}\" --json number,title,body,labels,state,comments,createdAt,author --limit 500
 
-          IMPORTANT: EXCLUDE all issues authored by Anomaly team members. Filter out issues where the author login matches ANY of these:
-          adamdotdevin, Brendonovich, fwang, Hona, iamdavidhill, jayair, kitlangton, kommander, MrMushrooooom, R44VC0RP, rekram1-node, thdxr
+          IMPORTANT: Exclude issues authored by users listed in .github/TEAM_MEMBERS.
+          If the file is empty, no maintainer accounts are preconfigured.
           This recap is specifically for COMMUNITY (external) issues only.
 
           STEP 2: Analyze and categorize

@@ -2,7 +2,7 @@
 
 Reviews now preserve source prerequisite logic explicitly: `conditionLogic` is AND
 across groups and OR within a group's zero-based condition indexes. A matched smoothness
-alternative satisfies “smooth OR periodic” even if periodicity is unknown. Groups cite
+alternative satisfies "smooth OR periodic" even if periodicity is unknown. Groups cite
 the original rationale; every necessary condition is covered exactly once. Optional
 context, source hyperparameters and unmeasured local gains are not data prerequisites.
 Saved legacy reviews without this field remain readable as implicit conjunctions;
@@ -105,7 +105,7 @@ read from `<neoCastRoot>/.neo-cast/literature-reruns`; every historical source q
 must match normalized local chunks by document identity, content hash and text span.
 Only a provenance-version mismatch may be tolerated for historical discovery. Archives
 never overwrite current cards and are never republished. v1 fragments and files under
-`文档/` are not mainline discovery sources.
+`docs/` are not mainline discovery sources.
 
 Source extraction reads batches of at most 4 cards, bounded by 220,000 serialized
 characters. Sources are not silently truncated. The independent reviewer checks the
@@ -179,7 +179,7 @@ bun src/research/retrieve/architecture-knowledge-cli.ts \
 ```
 
 `--inventory-only` avoids LLM calls. `--selection-file` supplies a complete recall partition.
-Unlike the mainline, this legacy tool can also discover exports in `文档/` and produces
+Unlike the mainline, this legacy tool can also discover exports in `docs/` and produces
 preliminary extraction/review results without the final automatic curation stage. Its
 output is not a mainline handoff and must not be copied over task artifacts. Keep all
 runtime outputs, paper excerpts and request logs local and out of commits.

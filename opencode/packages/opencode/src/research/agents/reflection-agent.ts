@@ -206,12 +206,12 @@ function recoveryActionForFailure(category: ReflectionFailure["category"]) {
 }
 
 function recoverySummaryForFailure(category: ReflectionFailure["category"]) {
-  if (category === "oom") return "降低 batch size、模型宽度或训练并行度，然后重试同一候选或相邻保守候选。"
-  if (category === "nan") return "降低学习率、启用梯度裁剪或切换稳健损失，并检查异常值处理。"
-  if (category === "not_converge") return "调整 optimizer/scheduler、训练步数或 patience，确认 loss 曲线进入下降通道。"
-  if (category === "script_error") return "先修复 runner、依赖、recipe 序列化或数据路径问题，再恢复 NAS 搜索。"
-  if (category === "rejected") return "检查原始执行记录、实验配置和缺失证据，再决定如何恢复实验。"
-  return "保留上下文并人工复核 stderr、runner records 与候选定义。"
+  if (category === "oom") return "Reduce batch size, model width, or training parallelism, then retry the same candidate or a conservative neighboring candidate."
+  if (category === "nan") return "Lower the learning rate, enable gradient clipping or use a robust loss, and check outlier handling."
+  if (category === "not_converge") return "Adjust the optimizer/scheduler, training steps, or patience and verify that the loss decreases."
+  if (category === "script_error") return "Fix runner, dependency, recipe serialization, or dataset path issues before resuming NAS search."
+  if (category === "rejected") return "Check original execution records, experiment settings, and missing evidence before deciding how to resume."
+  return "Preserve context and manually review stderr, runner records, and the candidate definition."
 }
 
 function isBetter(direction: "minimize" | "maximize", next: number, current: number) {
@@ -244,22 +244,22 @@ function decide(input: {
   readonly succeededRuns: number
 }): { decision: ReflectionDecision; reason: string } {
   const { stoppedReason, failedStreak, succeededRuns } = input
-  if (stoppedReason === "target_reached") return { decision: "stop", reason: "已达到目标指标，反思建议停止迭代并发布。" }
+  if (stoppedReason === "target_reached") return { decision: "stop", reason: "The target metric has been reached; reflection recommends stopping iterations and publishing." }
   if (stoppedReason === "budget_exhausted")
-    return { decision: "stop", reason: "预算已耗尽，反思建议停止迭代并整理产物。" }
+    return { decision: "stop", reason: "The budget is exhausted; reflection recommends stopping iterations and collecting artifacts." }
   if (stoppedReason === "approval_required")
-    return { decision: "request_human", reason: "需要人工确认才能继续，进入 Companion checkpoint。" }
+    return { decision: "request_human", reason: "Human confirmation is required to continue; entering a Companion checkpoint." }
   if (stoppedReason === "crash_streak_exceeded" || failedStreak >= 3)
     return {
       decision: "request_human",
-      reason: "连续多次失败，建议人工介入排查代码、依赖或资源问题。",
+      reason: "Repeated failures require human review of code, dependencies, or resources.",
     }
   if (succeededRuns === 0)
     return {
       decision: "request_human",
-      reason: "尚无成功 run，先确认数据准备与训练脚本是否健康。",
+      reason: "No run has succeeded; first check data preparation and the training script.",
     }
-  return { decision: "continue", reason: "继续执行下一步实验。" }
+  return { decision: "continue", reason: "Continue with the next experiment." }
 }
 
 export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {

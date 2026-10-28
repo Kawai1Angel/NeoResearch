@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/historical_foundations.json",
+  "$id": "https://example.org/neo-cast/schemas/historical_foundations.json",
   "title": "NeoResearch Historical Foundations Manifest",
   "type": "object",
   "additionalProperties": false,

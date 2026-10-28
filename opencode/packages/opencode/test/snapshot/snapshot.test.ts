@@ -340,7 +340,7 @@ test("unicode filenames", async () => {
       expect(before).toBeTruthy()
 
       const unicodeFiles = [
-        { path: fwd(tmp.path, "文件.txt"), content: "chinese content" },
+        { path: fwd(tmp.path, "naïve.txt"), content: "unicode content" },
         { path: fwd(tmp.path, "🚀rocket.txt"), content: "emoji content" },
         { path: fwd(tmp.path, "café.txt"), content: "accented content" },
         { path: fwd(tmp.path, "файл.txt"), content: "cyrillic content" },
@@ -376,25 +376,25 @@ test.skip("unicode filenames modification and restore", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
-      const chineseFile = fwd(tmp.path, "文件.txt")
+      const unicodeFile = fwd(tmp.path, "café.txt")
       const cyrillicFile = fwd(tmp.path, "файл.txt")
 
-      await Filesystem.write(chineseFile, "original chinese")
+      await Filesystem.write(unicodeFile, "original unicode")
       await Filesystem.write(cyrillicFile, "original cyrillic")
 
       const before = await run(tmp.path, (snapshot) => snapshot.track())
       expect(before).toBeTruthy()
 
-      await Filesystem.write(chineseFile, "modified chinese")
+      await Filesystem.write(unicodeFile, "modified unicode")
       await Filesystem.write(cyrillicFile, "modified cyrillic")
 
       const patch = await run(tmp.path, (snapshot) => snapshot.patch(before!))
-      expect(patch.files).toContain(chineseFile)
+      expect(patch.files).toContain(unicodeFile)
       expect(patch.files).toContain(cyrillicFile)
 
       await run(tmp.path, (snapshot) => snapshot.revert([patch]))
 
-      expect(await fs.readFile(chineseFile, "utf-8")).toBe("original chinese")
+      expect(await fs.readFile(unicodeFile, "utf-8")).toBe("original unicode")
       expect(await fs.readFile(cyrillicFile, "utf-8")).toBe("original cyrillic")
     },
   })
@@ -408,8 +408,8 @@ test("unicode filenames in subdirectories", async () => {
       const before = await run(tmp.path, (snapshot) => snapshot.track())
       expect(before).toBeTruthy()
 
-      await $`mkdir -p "${tmp.path}/目录/подкаталог"`.quiet()
-      const deepFile = fwd(tmp.path, "目录", "подкаталог", "文件.txt")
+      await $`mkdir -p "${tmp.path}/décor/подкаталог"`.quiet()
+      const deepFile = fwd(tmp.path, "décor", "подкаталог", "café.txt")
       await Filesystem.write(deepFile, "deep unicode content")
 
       const patch = await run(tmp.path, (snapshot) => snapshot.patch(before!))
@@ -1127,7 +1127,7 @@ test("diffFull with a large interleaved mixed diff", async () => {
       await $`mkdir -p ${tmp.path}/mix`.quiet()
       await Promise.all([
         ...mod.map((file, i) => Filesystem.write(file, `before-${ids[i]}-é\n🙂\nline`)),
-        ...del.map((file, i) => Filesystem.write(file, `gone-${ids[i]}\n你好`)),
+        ...del.map((file, i) => Filesystem.write(file, `gone-${ids[i]}\nhello`)),
         ...bin.map((file, i) => Filesystem.write(file, new Uint8Array([0, i, 255, i % 251]))),
       ])
 

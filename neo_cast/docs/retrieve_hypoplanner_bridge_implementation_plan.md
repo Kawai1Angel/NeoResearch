@@ -1,103 +1,103 @@
-# LiteratureAgent Phase → HypoPlanner 任务证据桥接实施方案
+# LiteratureAgent Phase HypoPlanner Mission Evidence Bridge Implementation Program
 
-规则补充（2026-09-27，待实现与验收）：第 5.2、5.7 节增加知识卡类型完整性和机制角色门槛，对齐[知识卡规则](../../文档/LiteratureAgent与知识库独立实现方案.md#641-按类型强制执行的知识卡规则)。下列既有实现进度不代表本次补充已经落地。
+Rule additions (2026-09-27, pending implementation and acceptance): sections 5.2 and 5.7 add card-type completeness and mechanism-role gates, aligned with the [knowledge-card rules](../../opencode/packages/opencode/src/research/literature/README.md). The implementation progress below does not mean these additions are implemented.
 
-实现进度（2026-09-21）：桥接功能、持久化、恢复路径及离线验收已实现；全仓测试仍有下列既有失败。
-下文保留原设计与验收要求，不把完整训练/发布流水线标记为全绿。
+Progress achieved (2026-09-21): Bridge functionality, durability, recovery path and offline acceptance have been achieved; The following established failures continue to occur with respect to the full-base testing.
+The original design and acceptance requirements are retained below without the complete training/publishing line being marked as green.
 
-| 实施波次 | 已完成内容 | 验收位置（相对 `opencode/packages/opencode/`） |
+| Execute Waves | Completed content | Acceptance location (relative to `opencode/packages/opencode/`) |
 | --- | --- | --- |
-| Wave 1 | 严格证据契约、逐卡语义绑定、适用性、覆盖/多样性/预算、冲突及排除审计 | `test/research/retrieve/task-evidence-builder.test.ts` |
-| Wave 2 | deterministic/direct LLM 引用校验、非法整批回退、Markdown/YAML readiness | `test/research/hypo-planner-agent.test.ts` |
-| Wave 3 | 旧行迁移默认值、真实 add/update/list、service/store 一致性、会话固定证据 artifact | `test/research/hypothesis-evidence-{migration,tools}.test.ts` |
-| Wave 4 | DataAnalysis → Literature → HypoPlanner、重复恢复、缓存修复后下游重规划、损坏源契约阻塞 | `test/research/literature-{phase,pipeline}.test.ts` |
-| Wave 5 | v1 诊断兼容、v2-only 运行、真实 KnowledgeStore 集成、service 示例及回归记录 | `test/research/retrieve/retrieve-agent.test.ts`、`src/research/retrieve/README.md` |
+| Wave 1 | Rigorous evidence compacts, semantic binding, applicability, coverage/diversity/budget, conflict and exclusion of audits | `test/research/retrieve/task-evidence-builder.test.ts` |
+| Wave 2 | deterministic/direct LLM Reference Validation, Illegal Batch Back, Markdown/YAML response | `test/research/hypo-planner-agent.test.ts` |
+| Wave 3 | Old Line Migration Default, Real add/update/list, service/store Consistency, fixed proof of session | `test/research/hypothesis-evidence-{migration,tools}.test.ts` |
+| Wave 4 | DataAnalysis → Literature → HypoPlanner; repeated recovery, downstream replanning after cache repair, and blocking corrupt source contracts | `test/research/literature-{phase,pipeline}.test.ts` |
+| Wave 5 | v1 Diagnosis Compatibility, V2-only Run, Real KnowledgeStore Integration, Service Example and Return Record | `test/research/retrieve/retrieve-agent.test.ts`,`src/research/retrieve/README.md` |
 
-实现细节：预算上限仍有效；未入选的 warning claim 会进入 excluded detail 和同 intent 已选条目的
-limitations，contradiction 关系即使一侧被预算排除仍会呈现。HypoPlanner 不再用额外 top-3 截掉这些警告。
-单篇失败由 Literature 的 processed 状态降级；全局 bridge 异常和损坏契约必须失败。恢复可以从有效源报告
-重建缓存，但不能绕过损坏源报告；重新构建 Literature 会清除下游完成标记，避免复用旧假设。
+Details of achievement: the budget ceiling remains valid; Unselected Warning Claim will enter excluded detail and same intent selected entries
+Conflicts, regulation relationships may appear even if one side is excluded from the budget. HypoPlanner does not use extra top-3 to intercept these warnings.
+The failure of a single article was downgraded by the Literature Processed status; Global Bridge Anomalous and Damaged Contracts must fail. Recovery can be reported from active sources
+Rebuild caches, but not bypassing damage sources reports; Reconstructing the Literature will remove downstream markers and avoid repeating old assumptions.
 
-验证记录：本桥接定向测试 **75 通过、0 失败（16 个文件，351 个断言）**，类型检查、迁移一致性检查通过。
-完整 `service.test.ts --timeout 60000`
-本轮为 **26 通过、46 失败**，失败集中于既有 execution-contract/champion 约束及旧 checkpoint 预期。
-`neo_cast/npm test` 最近一次 Node 阶段为 **66 通过、4 失败**：测试 Python 缺少 `jsonschema`（2 项）、
-缺少 ETTh1 fixture（1 项）、既有 scheduler prompt 覆盖不完整（1 项），因此未进入 Python 阶段。
-这些失败按第 11.6 节记录，未通过修改无关模块或削弱约束来绕过。
+Validation record: This Bridge Connection Orientation Test**75 Passed, 0 Failed (16 file, 351 assertion)** Type check, migration consistency check passed.
+Complete `service.test.ts --timeout 60000`
+This round is ** 26 passed, 46 failed, focusing on existing execution-contract/champion constraints and old checkpoint expectations.
+`neo_cast/npm test` 's latest phase in Node is **66 passed, 4 failed**: Test Python missing `jsonschema` (2 item),
+Without ETTh1 fixture (1 item), with existing schemtuler coverage incomplete (1 item), the Python phase was not reached.
+These failures are recorded in section 11.6 and have not been bypassed by modifying unrelated modules or weakening constraints.
 
-## 1. 目标与已确定决策
+## 1. Objectives and defined decision-making
 
-本方案把检索、论文理解和任务证据组装整体视为一个对外的 `LiteratureAgent` phase，并补齐该 phase 到
-`HypoPlanner` 的桥接，使 HypoPlanner 能使用知识库中已经验证的 KnowledgeCard 生成可追溯、可证伪的研究假设。
+This program treats search, essay understanding and task evidence assembly as an external `LiteratureAgent` case and completes the verse to
+The `HypoPlanner` bridge allows HypoPlanner to use the proven KnowledgeCard in the knowledge base to generate retrospective and perjury research assumptions.
 
-已确定的架构决策：
+Structure decisions identified:
 
-1. 不新增 Agent；
-2. 对外只暴露一个 `LiteratureAgent` phase；RetrieveAgent 和现有 LiteratureAgent 是该 phase 内部按职责拆分的实现；
-3. 现有 LiteratureAgent 内核保持任务无关，只负责论文解析、claim 提取、证据验证和 canonical KnowledgeCard；
-4. 所有任务级后处理放在 RetrieveAgent 内部；
-5. Evidence Bundle 是 LiteratureAgent phase 的结构化产物，不是独立 Agent 或 workflow phase；
-6. 任务相关性、BM25 分数和假设引用不得写回 canonical KnowledgeCard；
-7. HypoPlanner 不直接扫描 KnowledgeStore，也不重新执行检索；
-8. 首版使用确定性匹配规则，不引入新的 LLM 分类调用；
-9. 没有合格文献证据时允许 HypoPlanner 以 `data_only` 模式继续；契约损坏或 provenance 不一致时必须失败。
+1. Do not add Agent;
+2. Only one external exposure `LiteratureAgent` case; RetrieveAgent and the existing LiteratureAgent are functionally split within the area;
+3. Existing LiteratureAgent kernel maintenance tasks are not related, except for dissertation, claim extraction, proof validation and canonical KnowledgeCard;
+4. All task-level reprocessing is within RetrieveAgent;
+5. Evidence Bundle is a structural product of LiteratureAgent case, not an independent Agent or workforce case;
+6. Mandate relevance, BM25 fractions and hypothetical references cannot be written back to canonical KnowledgeCard;
+7. HypoPlanner does not directly scan KnowledgeStore or re-execut the search;
+8. The first version uses the certainty matching rule and does not introduce new LLM group calls;
+9. Allows HypoPlanner to continue in `data_only` if there is no qualified documentary evidence; Contractual damage or inconsistency must fail.
 
-最终边界：
+Final boundary:
 
 ```text
 DataAnalysisAgent
         ↓ dataset_quantitative_analysis_v1
 LiteratureAgent phase
         └─ RetrieveAgent.run()
-             ├─ Retrieve 前处理
-             │    ├─ 数据证据 → 科学概念 → 检索意图
-             │    └─ BM25 召回与论文选择
-             ├─ LiteratureAgent.run()（论文理解内核）
+             ├─ Retrieve ex-processing
+             │    ├─ Data evidence, scientific concepts, intent to retrieve.
+             │    └─ BM25 Recall and Thesis Selection
+             ├─ LiteratureAgent.run() (paper understands kernel)
              │    └─ verified canonical KnowledgeCards
-             └─ Retrieve 后处理
-                  ├─ 加载 accepted cards
-                  ├─ card ↔ intent ↔ dataset evidence 绑定
-                  ├─ 可信度与适用性过滤
-                  ├─ 跨论文冲突、覆盖和预算处理
+             └─ Retrieve Post Processing
+                  ├─ Loaded Cards
+                  ├─ I'm sorry, but I don't know what to do with you.
+                  ├─ Trustworthiness and applicability filter
+                  ├─ Cross-paper conflict, coverage and budget processing
                   └─ task_evidence_bundle_v1
                             ↓
                        HypoPlanner
-                            ├─ 数据证据 + 文献证据 → 假设
-                            ├─ cardID/revision 引用
-                            └─ 适用假设与证伪条件
+                            ├─ Data evidence + documentary evidence
+                            ├─ cardID/revision Reference
+                            └─ Application of assumptions and perjury conditions
 ```
 
-因此，外部主流水线只展示：
+Thus, the external mainstream water lines show only:
 
 ```text
 DataAnalysisAgent → LiteratureAgent → HypoPlanner
 ```
 
-`Retrieve(pre) → Literature(core) → Retrieve(post)` 只属于 LiteratureAgent phase 的内部执行拓扑。
+`Retrieve(pre) → Literature(core) → Retrieve(post)` belongs only to the internal execution scale of LiteratureAgent case.
 
-## 2. 当前基础与缺口
+## 2. Current foundations and gaps
 
-### 2.1 已有能力
+### 2.1 is capable
 
-当前代码已经提供：
+The current code has been provided:
 
-- `dataset_quantitative_analysis_v1`，包含 domain、数据角色、预测跨度、规模、缺失、周期、趋势、漂移、频谱、变点和 cross-lag；
-- `DatasetEvidence → ScientificConcept → MethodConcept → RetrievalIntent`；
-- BM25 candidate、paper/intents 聚合和 LiteratureAgent bridge；
-- `KnowledgeCard` 的 applicability、evidence、limitations、implementation、confidence、status 和 provenance；
-- `RetrieveResult` 中 paper、intent、candidate 和 acceptedCardIDs 的论文级链路；
-- KnowledgeStore 的 card revision、card relation 和精确 evidence span；
-- HypoPlanner 的 deterministic/LLM/session 三条生成路径及 hypothesis pool 持久化。
+- `dataset_quantitative_analysis_v1`, which includes domain, data role, projection range, size, missing, periodicity, trends, drift, spectrum, variable points and cross-lag;
+- `DatasetEvidence → ScientificConcept → MethodConcept → RetrievalIntent`;
+- BM25 candidate, paper/intents polymer and LiteratureAgent Bridge;
+- `KnowledgeCard` applicability, exclusion, limitations, immunisation, confidence, status and protection;
+- Paper-level links for `RetrieveResult` paper, inent, Candidate and acceptedCardIDs;
+- KnowledgeStore's card review, card registration and precision span;
+- deterministic/LLM/session of HypoPlanner has three generation paths and hypothesis pool persistent.
 
-### 2.2 需要补齐的缺口
+### 2.2 needs to fill the gap
 
-当前链路停留在：
+The current link stays at:
 
 ```text
 paper.intentIDs[] + paper.acceptedCardIDs[]
 ```
 
-尚未建立：
+_Other Organiser
 
 ```text
 cardID
@@ -109,46 +109,46 @@ cardID
 → hypothesis evidence reference
 ```
 
-同时存在以下工程缺口：
+At the same time, there are the following gaps:
 
-- RetrieveAgent 没有从 KnowledgeStore 加载 LiteratureAgent 返回的 card；
-- 同一 paper 的所有 accepted cards 目前共享一组 intentIDs，尚未做 card 级归因；
-- HypoPlanner input、prompt、输出和 YAML 不包含文献证据；
-- session-mode 通过 `hypothesis_add/update` 落库，数据库当前没有证据引用字段；
-- autonomous pipeline 当前直接从 DataAnalysis 进入 HypoPlanner；
-- workflow recovery 没有对外的 `literature` phase；
-- 没有 task evidence artifact、readiness 或 evidence gap 测试。
+- RetrieveAgent did not load the LiteratureAgent back card;
+- All accepted cards from the same paper currently share a group of intentIDss, which have not been calibrated;
+- HypoPlanner input, prompt, output and YaML do not contain documentary evidence;
+- The session-mode drops through the `hypothesis_add/update` library, where there are currently no evidence reference fields;
+- Autonomous Pipeline currently enters HypoPlanner directly from DataAnalysis;
+- Workflow recovery has no external `literature` phase.
+- There are no tests for testing evidence, readinstance or evidence Gap.
 
-## 3. 范围
+## 3. Scope
 
-### 3.1 本期实现
+### 3.1 Achieved during the period
 
-- RetrieveAgent 内部的 task evidence 后处理；
-- task context、task evidence、exclusion、gap、conflict 严格 schema；
-- card 级 intent/concept/data-evidence 绑定；
-- 确定性 eligibility 和 applicability 检查；
-- 跨 paper 去重、冲突保留、覆盖和预算选择；
-- RetrieveResult v2 和 `task_evidence_bundle.json`；
-- HypoPlanner 输入、输出、prompt、tool 和持久化扩展；
-- 主 pipeline 时序、恢复和降级策略；
-- 单元、集成、迁移和端到端测试。
+- RetrieveAgent internal task integration;
+- I don't know what to do with it.
+- Card class intent/concept/data-evidence binding;
+- (a) Identification of eligibility and application;
+- Cross-paper heavyness, conflict retention, coverage and budget selection;
+- RetrieveResult v2 and `task_evidence_bundle.json`;
+- HypoPlanner input, output, prompt, tool and durability extension;
+- (a) The main time-series, recovery and downscaling strategy for Pipeline;
+- Units, integration, migration and end-to-end testing.
 
-### 3.2 本期不实现
+### 3.2 Not achieved during the period
 
-- 新 Agent；
-- LiteratureAgent task-aware prompt；
-- 修改 canonical KnowledgeCard 保存任务匹配结果；
-- 向量检索、reranker 或在线论文 API；
-- LLM card-intent classifier；
-- 自动 Search → Learn → Search 多轮循环；
-- 根据单个任务实验结果修改 KnowledgeCard status；
-- 自动生成新的跨论文科学结论。
+- New Age;
+- LiteratureAgent task-aware prompt;
+- Modifys the job matching for canonical KnowledgeCard;
+- Vector search, reranker or online paper API;
+- LLM card-intent classifier;
+- Automatic repeated Search → Learn → Search cycles.
+- Modify KnowledgeCard status based on the results of individual task experiments;
+- Automatically generate new cross-dissertation scientific findings.
 
-## 4. 契约设计
+## 4. Contract design
 
 ### 4.1 RetrieveTaskContext
 
-`DatasetQuantitativeAnalysis` 已经覆盖主要数据特征，但不包含完整研究目标和运行约束。Research Service 在调用 RetrieveAgent 时应传入一个规范化、最小化的任务上下文，而不是把完整数据库对象传给 retrieve 模块。
+`DatasetQuantitativeAnalysis` already covers the main data features, but does not contain complete research objectives and operational constraints. When calling RetrieveAgent, Research Service should enter a standardized and minimised task context instead of passing the complete database object to the retrieving module.
 
 ```ts
 export const RetrieveTaskContextSchema = z.object({
@@ -166,20 +166,20 @@ export const RetrieveTaskContextSchema = z.object({
 }).strict()
 ```
 
-`RetrieveAgentInput` 增加：
+`RetrieveAgentInput` Add:
 
 ```ts
 readonly taskContext?: RetrieveTaskContext
 ```
 
-为了保留独立 CLI 和测试能力，未传入时从 quantitative report 推导：
+In order to maintain independent CLI and test capabilities, extrapolate from the quantative report:
 
-- `taskType = forecasting`；
-- `domain = report.domain`；
-- `probabilistic = false`；
-- `computeProfile = unknown`。
+- `taskType = forecasting`;
+- `domain = report.domain`;
+- `probabilistic = false`;
+- `computeProfile = unknown`.
 
-manifest 必须记录 context 来源是 `research_task` 还是 `report_fallback`。
+The human best must record whether the source of the context is `research_task` or `report_fallback`.
 
 ### 4.2 TaskEvidenceEntry
 
@@ -251,11 +251,11 @@ export const TaskEvidenceEntrySchema = z.object({
 }).strict()
 ```
 
-`relevance.score` 只表示 card 与当前 intent 的相关程度，不表示论文可信度。四维 confidence 保持分离，不合并成单一 trust score。
+`relevance.score` only indicates the extent to which the card is relevant to the current intent and does not indicate the credibility of the paper.4D confidence remains separate and does not merge into a single trust score.
 
 ### 4.3 ExcludedTaskEvidence
 
-所有 acceptedCardID 都必须有去向：进入 entries，或带原因进入 excluded。禁止静默丢弃。
+All acceptedCardID must have a destination: enter anentries, or enter excruded with cause. It is forbidden to leave silently.
 
 ```ts
 export const ExcludedTaskEvidenceSchema = z.object({
@@ -323,31 +323,31 @@ export const TaskEvidenceBundleSchema = z.object({
 }).strict()
 ```
 
-### 4.5 RetrieveResult 版本
+### 4.5 RetrieveResult Version
 
-新增 `retrieve_result_v2`，包含必填 `taskEvidence`：
+Add `retrieve_result_v2` to include required `taskEvidence`:
 
 ```ts
 {
   schemaVersion: "retrieve_result_v2",
-  // 原 v1 字段
+  // Original v1 field
   taskEvidence: TaskEvidenceBundle
 }
 ```
 
-兼容策略：
+Compatibility strategy:
 
-- 保留 `RetrieveResultV1Schema`，使旧 artifact 仍可被诊断工具读取；
-- `RetrieveAgent.run()` 只返回 v2；
-- run digest 加入 `taskEvidenceMappingVersion` 和 `taskContextDigest`，因此不会错误复用旧 v1 run；
-- Research Service 只把 v2 交给 HypoPlanner；
-- 旧 v1 artifact 不执行原地升级，因为当时 card revision 和 KnowledgeStore 状态可能已经变化。
+- Retain `RetrieveResultV1Schema` so that the old artifact is still readable by diagnostic tools;
+- `RetrieveAgent.run()` returns only v2;
+- Run digest added `taskEvidenceMappingVersion` and `taskContextDigest`, thus not misusing old v1 run;
+- Research Service only gives v2 to HypoPlanner;
+- The old v1 upgrade did not perform in situ upgrades because the condition of the card review and KnowledgeStore may have changed at that time.
 
-## 5. RetrieveAgent 后处理算法
+## 5. RetrieveAgent Post Processing Algorithm
 
-### 5.1 KnowledgeStore 访问
+### 5.1 KnowledgeStore Access
 
-在 `RetrieveAgent` 中增加只用于后处理的 store 依赖：
+Add to `RetrieveAgent` a store dependent for reprocessing only:
 
 ```ts
 type TaskEvidenceKnowledgeSource = {
@@ -356,56 +356,56 @@ type TaskEvidenceKnowledgeSource = {
 }
 ```
 
-构造器支持注入 `knowledgeSource` 以便 fixture 测试。生产环境在 Literature bridge 完成后使用：
+Constructor supports injection of `knowledgeSource` for fixture testing. The production environment is used after the completion of the Literature Bridge:
 
 ```text
 <knowledgeRoot>/knowledge.db
 ```
 
-创建 `KnowledgeStore` 读取卡片，RetrieveAgent 关闭时同时关闭自有连接。不得访问 LiteratureAgent 的 private store，也不得修改卡片。
+Creates `KnowledgeStore` to read cards, and RetrieveAgent closes its own connection at the same time that it closes. LiteratureAgent is not allowed to access the Private store or modify the card.
 
-### 5.2 accepted card 完整性检查
+### 5.2 accepted card integrity check
 
-逐一处理 `literatureResults[].acceptedCardIDs`：
+Processing `literatureResults[].acceptedCardIDs`:
 
-1. `getCard(cardID)` 必须存在；
-2. `card.paperID` 必须等于 literature result paperID；
-3. 保存实际 `card.revision`，禁止假设 revision 为 1；
-4. 同一 cardID 被多个 paper result 引用属于契约错误；
-5. 缺失或 paper mismatch 进入 excluded，并使 readiness 至少为 `partial_evidence`；
-6. 不修改 canonical card。
+1. `getCard(cardID)` must exist;
+2. `card.paperID` shall be equal to Literature result paperID;
+3. Saves the actual `card.revision` and prohibits assuming that review is 1;
+4. The same cardID was cited as contractual error by multiple paper results;
+5. Missing or paper mismatch into excluded, making readies at least `partial_evidence`;
+6. Do not modify the canonical card.
 
-新增类型完整性检查：按知识卡规则执行条件校验，`model_mechanism` 必须具备非空 `problem` 和完整 `mechanism`，且有对应版本的类型、语义完整性与证据覆盖验证记录。仅有 `paper_backed` 状态或有效引用不够；不得从标签、模型名或检索词临时补出机制。缺少字段进入 excluded，原因为 `mechanism_incomplete`；缺少新版验证记录进入 excluded，原因为 `card_validation_required`；已确认类型错误记录 `card_type_mismatch`。保留 cardID、revision 和排除理由，并据剩余有效证据重算 coverage/readiness。
+Add a new type of completeness check: Validate `model_mechanism` according to the knowledge card rules, `model_mechanism` must have non-empty `problem` and complete `mechanism` with corresponding version types, semantic integrity and evidence overwhelming verification records. Only `paper_backed` states or valid references are insufficient; Mechanisms may not be temporarily replaced by labels, model names or search terms. Missing field into excruded for `mechanism_incomplete`; A new version of the authentication log is missing for access to excruded, due to `card_validation_required`; Confirmed type error record `card_type_mismatch`. Retain cardID, review and rationale for exclusion and recalculate coverage/readiness based on the remaining valid evidence.
 
-旧卡仍可读取和审计，但不得绕过上述门槛。重新验证或抽取由 LiteratureAgent 创建新 revision，桥接层不改写 canonical card；新规则启用后重建受影响的 evidence bundle，保留旧 bundle 的版本引用以便复现。
+The old card is still accessible and audited, but the above-mentioned threshold must not be bypassed. Revalidation or extraction of a new view created by LiteratureAgent without modification of the bridge layer; Rebuild affected effects of new rules after they are activated, and retain the old version quotes from the book so as to reproduce them.
 
 ### 5.3 eligibility gate
 
-正向支持证据必须满足：
+Proof of support must satisfy:
 
-- status 为 `paper_backed` 或 `corroborated`；
-- 至少一个 evidence 的 `directness=direct`；
-- 至少一个 evidence 的 `verification=exact_span`；
-- evidence type 不是 `agent_inference`。
+- Status is `paper_backed` or `corroborated`;
+- At least one `directness=direct` of ivence;
+- At least one `verification=exact_span` of ivence;
+- Evidence type is not `agent_inference`.
 
-其他状态处理：
+Other status processing:
 
-| Card status | 处理 |
+| Card status | Processing |
 | --- | --- |
-| `paper_backed` | 可作为正向证据 |
-| `corroborated` | 可作为正向证据，并优先于单篇结果 |
-| `contradicted` | 只进入 `contradicts`/warning，不作为正向支持 |
-| `extracted` | excluded：尚未达到论文证据门槛 |
-| `inconclusive` | excluded，但保留原因 |
+| `paper_backed` | It's a positive piece of evidence. |
+| `corroborated` | It can serve as positive evidence and take precedence over a single result |
+| `contradicted` | `contradicts`/warning only, not positive support |
+| `extracted` | Excruded: Not meeting the evidentiary threshold for dissertation |
+| `inconclusive` | Excluded, but retained |
 | `deprecated` | excluded |
 
-BM25 分数不得参与 eligibility 判断。
+BM25 scores shall not participate in eligibility judgement.
 
-### 5.4 card → intent 绑定
+### 5.4 Card → Intent Binding
 
-每张卡只在其所属 paper 已关联的 intentIDs 中匹配，不扫描其他任务 intent。
+Each card matches only the associated intentIDs of its own paper, without scanning any other task indent.
 
-构建 card term set：
+Build card term set:
 
 ```text
 normalizedClaim.subject/predicate/object
@@ -416,7 +416,7 @@ normalizedClaim.subject/predicate/object
 + tags
 ```
 
-构建 intent term set：
+Build inent term set:
 
 ```text
 scientificConcept.conceptID/label/paperTerms
@@ -424,34 +424,34 @@ scientificConcept.conceptID/label/paperTerms
 + paperLanguage task/phenomenon/method/domain terms
 ```
 
-首版确定性匹配维度：
+First edition certainty matching dimensions:
 
-| 维度 | 默认权重 | 说明 |
+| Dimensions | Default weight | Annotations |
 | --- | ---: | --- |
-| scientific/data feature exact or taxonomy alias | 0.35 | 当前数据现象 |
-| method/mechanism exact or taxonomy alias | 0.30 | 方法机制 |
-| task type | 0.15 | forecasting 等 |
-| domain | 0.10 | 仅作辅助，不可单独通过 |
-| card type 与 intent question 的角色兼容 | 0.10 | mechanism/limitation/evaluation 等 |
+| scientific/data feature exact or taxonomy alias | 0.35 | Current data phenomenon |
+| method/mechanism exact or taxonomy alias | 0.30 | Methodological mechanisms |
+| task type | 0.15 | Forecasting etc. |
+| domain | 0.10 | You can't go through it alone. |
+| Card type compatible with int question | 0.10 | mechanism/limitation/evaluation etc. |
 
-规则要求：
+The rules require:
 
-- domain-only 命中不能建立 card-intent binding；
-- 至少命中一个 scientific/data-feature 或 method/mechanism term；
-- 保存每个维度的匹配原因；
-- 一个 card 可以绑定多个 intent；
-- 无 intent 通过阈值的 card 进入 `no_intent_match`；
-- score 只用于当前 bundle 排序，不写回 KnowledgeCard。
+- Domain-only cannot create card-intent binding;
+- At least one scientific/data-feature or method/mechanism term;
+- Saves the matching cause for each dimension;
+- One card can bind multiple inents;
+- No intent enters `no_intent_match` through a threshold card;
+- score is used only for the current bookgle sorting, and does not return KnowledgeCard.
 
-阈值和 alias 放入版本化配置：
+Threshold and alias release into the version configuration:
 
 ```text
 retrieve/config/tsf-task-evidence.v1.json
 ```
 
-### 5.5 provenance 展开
+### 5.5 project expansion
 
-对每个 matched intent：
+For each monitored indent:
 
 ```text
 intent.transformationID
@@ -460,103 +460,103 @@ intent.transformationID
 → transformation.datasetEvidence[].path
 ```
 
-所有引用必须通过现有 ID 查表得到，禁止根据字符串重新推测 evidence path。
+All references must be obtained through an existing ID check, and re-pregnation based on a string is prohibited.
 
 ### 5.6 applicability gate
 
-使用 quantitative report、RetrieveTaskContext 和 card applicability 做分维度判断：
+Use Quantitative Report, RetrieveTaskContext and card application to judge the dimensions:
 
-- task type；
-- domain；
-- data features；
-- data scale；
-- horizon profile；
-- compute profile；
-- `notApplicableWhen`。
+- task type;
+- domain;
+- data features;
+- data scale;
+- horizon profile;
+- compute profile;
+- `notApplicableWhen`.
 
-规则：
+Rules:
 
-1. 明确命中负向条件时为 `conflicted`；
-2. card 声明了条件但任务侧无法判断时为 `unknown/partial`，不能猜测；
-3. 空 applicability 数组表示“论文未明确说明”，不是自动匹配；
-4. `notApplicableWhen` 只解析版本化配置中支持的受控谓词；无法解析的自然语言进入 `uncertainConditions`；
-5. 硬冲突卡片不作为正向机制或实现建议，但可以作为 limitation/conflict 保留；
-6. confidence.transferability 只参与排序和提示，不覆盖硬冲突。
+1. `conflicted` when it is specified that the negative hit condition is `conflicted`;
+2. Card declared conditions but could not be judged on the side of the mission as `unknown/partial`, which cannot be speculated;
+3. An empty application array means "discussed" and does not automatically match;
+4. `notApplicableWhen` only parses controlled terms supported in the version configuration; Unresolved natural language into `uncertainConditions`;
+5. Hard conflict cards do not act as positive mechanisms or implement recommendations, but may be retained as limitation/conflict;
+6. confidence.transferability only participates in sorting and prompting, and does not overwhelm hard conflicts.
 
-TSF 首版派生事实：
+TSF First Edition Fact:
 
-- `regular_sampling`：`irregularIntervalRatio < 0.05`；
-- `irregular_sampling`：`irregularIntervalRatio >= 0.05`；
-- `long_horizon`：沿用现有 `horizonContextRatio >= 1`；
-- data scale 和 compute profile 阈值全部进入配置，不散落在代码中。
+- `regular_sampling`:`irregularIntervalRatio < 0.05`;
+- `irregular_sampling`:`irregularIntervalRatio >= 0.05`;
+- `long_horizon`: Follow the existing `horizonContextRatio >= 1`;
+- Data scale and computer profile thresholds are fully configured, not scattered in code.
 
-### 5.7 role 映射
+### 5.7 roll map
 
-默认从 cardType 映射：
+Default map from cardType:
 
 | cardType | roles |
 | --- | --- |
 | `model_mechanism` | `supports_mechanism` |
 | `empirical_finding` | `supports_applicability` |
-| `applicability_rule` | `supports_applicability`；负向条件时 `warns_limitation` |
+| `applicability_rule` | `supports_applicability`;`warns_limitation` on Negative Condition |
 | `limitation` | `warns_limitation` |
 | `evaluation_protocol` | `defines_evaluation` |
 | `implementation_hint` | `suggests_implementation` |
-| status=`contradicted` 或 contradiction relation | `contradicts` |
+| status=`contradicted` or communication description | `contradicts` |
 
-首版 role 由确定性规则产生，不由 claim 中的乐观措辞决定。
+The first version of role is generated by the rule of certainty and is not determined by optimistic language in claim.
 
-上述映射仅对通过第 5.2 节及 eligibility 检查的卡片生效。`supports_mechanism` 还必须通过机制完整性与证据覆盖检查；仅描述 context length、prediction length、数据划分或评估指标的卡，即使误标为 `model_mechanism`，也不得进入该角色。
+The above-mentioned map is valid only for cards that are checked through 5.2 and eligibility.`supports_mechanism` must also be covered by mechanism integrity and evidence; Only the cards that describe contact length, predition lngth, data disaggregation or evaluation indicators are not allowed into this role even if `model_mechanism` is wrongly marked.
 
-`evaluation_protocol` 只能在与评估有关的任务需求中提供 `defines_evaluation`，不能计入机制问题的证据覆盖。其他类型同样按问题与角色的兼容性使用；匹配了相同 horizon 或数据集，不等于支持模型设计机制。HypoPlanner 的结构假设必须引用合格机制卡，或明确标注为待实验检验的 Agent 假设，不能把协议卡包装成论文支持。
+`evaluation_protocol` can only provide `defines_evaluation` in the assessment-related task needs and cannot be covered by evidence of mechanism issues. Other types are also used for the compatibility of issues and roles; Matches the same horizon or data set, which does not support model design mechanisms. HypoPlanner ' s structural assumptions must either refer to the eligibility mechanism card or be clearly labelled as Agent, which is subject to test tests, and cannot be packaged into paper support.
 
-验收须包含端到端反例：只有“输入长度 96，预测长度 96/192/336/720”的卡，即使原文真实、BM25 分数高且状态为 `paper_backed`，也不能输出 `supports_mechanism` 或填补机制 intent 的覆盖；正确分类并验证后可为评估需求提供协议参考。另需验证完整机制正例正常通过、旧版缺字段卡被排除、同一输入的规则升级不会复用旧版合格缓存。
+Acceptance must contain an end-to-end back example: only the card "Input length 96, predict length 96/192/336/720" cannot output `supports_mechanism` or fill intent coverage even if the original is authentic, BM25 scores are high and in state `paper_backed`; Proper classification and validation can provide an agreed reference for assessing needs. There is also a need to verify that the complete mechanism is properly passed, that old versions of missing field cards are excluded and that rule upgrades from the same input do not repeat the old version's eligible cache.
 
-### 5.8 跨论文冲突、去重与选择预算
+### 5.8 Cross-paper conflict, weight and budget selection
 
-读取 `KnowledgeStore.listRelations()`，只保留 bundle card 集合内部的 relation：
+Read `KnowledgeStore.listRelations()`, keep only the bookle card relation inside:
 
-- `duplicates`：保留证据更直接、status 更强、revision 更新的 entry，另一项进入 excluded；
-- `supports`：两项均可保留，但选择预算优先保证不同 paper；
-- `contradicts`：两项均保留并加入 conflicts，不做平均或静默选择；
-- `refines`：保留关系，排序时更具体的卡片优先。
+- `duplicates`: more direct preservation of evidence, stronger status, updated update entry, another entry into excluded;
+- `supports`: Both may be retained, but the choice of budgetary priority guarantees different paper;
+- `contradicts`: Both are retained and added conflicts, without any average or silent selection;
+- `refines`: Keep relationships, and more specific card preference when sorting.
 
-在 `RetrievalBudgets` 增加：
+Add in `RetrievalBudgets`:
 
 ```ts
 maxTaskEvidenceEntries: 12
 maxTaskEvidencePerIntent: 3
 ```
 
-选择顺序：
+Select order:
 
-1. 先保证每个 must-cover intent 至少一个合格 entry；
-2. 再补齐每个 intent 的 limitation/contradiction；
-3. 再按 relevance、card status、directness、transferability 排序；
-4. 同分优先不同 paper；
-5. 最后以 `paperID/cardID` 稳定排序，保证可复现。
+1. Ensure that at least one of each must-cover incent;
+2. limitation/contradiction for each incent;
+3. Sort by relevance, card status, directness, transferability;
+4. (a) Differentiated from the same priority;
+5. Finally sorted with `paperID/cardID` stability to ensure re-emergence.
 
-### 5.9 readiness 与 gap
+### 5.9 reports with Gap
 
 ```text
 ready_with_evidence
-  所有 must-cover intent 均有合格 entry，且无未呈现的高置信冲突
+  All must-cover inents have qualified entry and no undiscovered high confidence conflicts
 
 partial_evidence
-  至少有一个合格 entry，但存在 must-cover gap、card 缺失或 literature partial/failed
+  At least one eligible entry but must-cover Gap, card missing or forum partial/failed
 
 evidence_conflict
-  关键 intent 存在高置信 contradiction，必须向 HypoPlanner 显式展示
+  Key incent has high-trust command that must be displayed in HypoPlanner Visible
 
 ready_data_only
-  没有合格 card；HypoPlanner 允许继续，但只能输出 data_only 假设
+  No qualified card;HypoPlanner allows continuation, but only the output of data_only is assumed
 ```
 
-无 PDF、无候选和 LiteratureAgent 单篇失败属于 gap，不是整个 RetrieveAgent 的异常。schema/provenance/KnowledgeStore 损坏属于硬失败。
+No PDF, no candidate and LiteratureAgent failed as a gap, not an anomaly for the entire RetrieveAgent.schema/provenance/KnowledgeStore damage is a hard failure.
 
-## 6. RetrieveAgent 代码改动
+## 6. RetrieveAgent code changes
 
-新增：
+Add:
 
 ```text
 opencode/packages/opencode/src/research/retrieve/
@@ -566,7 +566,7 @@ opencode/packages/opencode/src/research/retrieve/
 └── config/tsf-task-evidence.v1.json
 ```
 
-修改：
+Amendments:
 
 ```text
 retrieve/contract.ts
@@ -575,10 +575,10 @@ retrieve/retrieve-store.ts
 retrieve/report-renderer.ts
 retrieve/index.ts
 research/service.ts
-research/event.ts（仅在需要补充 metadata 时修改，不新增 Agent event）
+research/event.ts (modify only if necessary to add metadata without adding Agent event)
 ```
 
-`RetrieveAgent.run()` 的新增步骤位于 Literature bridge 之后、构造 result 之前：
+The additional step for `RetrieveAgent.run()` is after Literature Bridge and before construction results:
 
 ```ts
 const taskEvidence = buildTaskEvidence({
@@ -598,40 +598,40 @@ const result = RetrieveResultV2Schema.parse({
 })
 ```
 
-RetrieveStore 新增落盘文件：
+RetrieveStore Add a landing disk file:
 
 ```text
 .neo-cast/literature-retrieval/runs/<retrieve-run-id>/
 ├── task_evidence_bundle.json
 ├── task_evidence_excluded.jsonl
-└── 其余现有文件
+└── The remaining existing documents
 ```
 
-`report.md` 增加：
+`report.md` Add:
 
-- readiness；
-- intent coverage；
-- selected cards 和 roles；
-- applicability conflicts；
-- excluded cards 和原因；
-- evidence gaps；
-- card → evidence path → paper page 的可读链路。
+- readiness;
+- intent coverage;
+- I don't know what you're talking about.
+- applicability conflicts;
+- Excluded cards and reasons;
+- evidence gaps;
+- Readable links to the environment path and paper page.
 
-## 7. HypoPlanner 桥接
+## 7. HypoPlanner Bridge
 
-### 7.1 输入
+### 7.1 input
 
-`HypoPlannerInput` 增加：
+`HypoPlannerInput` Add:
 
 ```ts
 readonly taskEvidence?: TaskEvidenceBundle
 ```
 
-可选是为了兼容手工调用和旧测试；缺失时等价于 `ready_data_only`，不得伪造文献支持。
+The choice is to accommodate manual calls and old tests; When missing, the value is equal to `ready_data_only` and cannot be forged for documentation support.
 
 ### 7.2 HypothesisObject
 
-增加必填字段，并为现有 deterministic fallback 提供空值：
+Add mandatory fields and provide empty values for existing deterministic fallback:
 
 ```ts
 readonly datasetEvidencePaths: readonly string[]
@@ -645,28 +645,28 @@ readonly falsificationCriteria: readonly string[]
 readonly evidenceLevel: "data_only" | "paper_supported" | "conflicted"
 ```
 
-约束：
+Binding:
 
-- `paper_supported` 至少引用一个 bundle entry；
-- `conflicted` 必须引用或说明相关 conflict；
-- `data_only` 的 literatureEvidence 必须为空；
-- cardID/revision/role 必须与 bundle 完全一致；
-- 每个 datasetEvidencePath 必须属于引用 entry 的 linkage；
-- 论文 evidence 只能支撑机制和条件，不能把 reported effect 改写为当前任务保证；
-- 每条非 baseline-control 假设至少一个 falsification criterion。
+- `paper_supported` at least quotes a booklet entry;
+- `conflicted` must refer to or explain the circumstances;
+- literatureEvidence for `data_only` must be empty;
+- cardID/revision/role must be fully consistent with the bookle;
+- Each datasetEvidencePath must belong to the linkage that quotes intry;
+- Thesis only supports mechanisms and conditions, not rewriting reported effect as a guarantee for the current mission;
+- Each nonbaseline-control assumes at least one penaltycient.
 
 ### 7.3 deterministic hypotheses
 
-现有 hardcoded hypothesis rules 保留为无文献或 LLM 失败时的 fallback。增强规则：
+Existing Hardcoded Hypothesis rules are reserved as a fallback when no literature or LLM failed. Enhancement rules:
 
-- 根据 rule bias 找到 bundle 中匹配 concept/method 的 entries；
-- 有 entry 时补充 literatureEvidence、limitations 和 assumptions；
-- 无 entry 时保持 `data_only`；
-- 不因存在 KnowledgeCard 自动更换 suggested backbone；实现建议只能来自 entry 的 registryMappings 或既有 method library。
+- Finds anentries matching concept/method according to rule bias;
+- Add literatureEvidence, claims and attachments to entry;
+- Keep `data_only` when no intry is available;
+- Not automatically replaced by the presence of KnowledgeCard; Only registryMappings or already method library can achieve the recommendation from anentry.
 
 ### 7.4 LLM prompt
 
-`buildHypoPlannerUserPrompt()` 增加压缩后的 `taskEvidence`，不传入整个 KnowledgeStore，也不传完整 evidenceSpan：
+`buildHypoPlannerUserPrompt()` adds a compressed `taskEvidence`, does not pass on the entire KnowledgeStore or complete evidenceSpan:
 
 ```json
 {
@@ -688,42 +688,42 @@ readonly evidenceLevel: "data_only" | "paper_supported" | "conflicted"
 }
 ```
 
-prompt 规则：
+Prompt rule:
 
-- 只能引用给定 cardID/revision；
-- 不得把 BM25 或 relevance score 当成真实性；
-- 有 contradicting evidence 时必须反映在 risk/assumptions；
-- 没有合格 entry 时必须输出 `data_only`；
-- expectedOutcome 是待验证预测，不是论文保证；
-- 每条假设给出证伪标准。
+- Only cardID/revision can be quoted;
+- BM25 or relevance score may not be considered authentic;
+- risk/assumptions must be reflected when there is a communication experience;
+- `data_only` must be exported if anentry is not eligible;
+- expectedOutcome is a projection to be validated, not a paper guarantee;
+- Each hypothesis gives a standard of perjury.
 
-### 7.5 输出校验
+### 7.5 output verification
 
-在 HypoPlanner 模块内增加纯函数：
+Add a pure function to the HypoPlanner module:
 
 ```ts
 validateHypothesisEvidence(hypotheses, taskEvidence)
 ```
 
-它不是 Agent，不创建事件或状态机。直接校验：
+It's not Agent, does not create events or status machines. Direct verification:
 
-- 未知 cardID；
-- revision mismatch；
-- role mismatch；
-- evidence path 越权；
-- conflicted card 被当作无条件正向证据；
-- evidenceLevel 与引用不一致；
-- 缺失 falsification criteria。
+- Unknown cardID;
+- revision mismatch;
+- role mismatch;
+- Exceeding authority;
+- Concluded card as unconditional positive evidence;
+- evidenceLevel does not match the reference;
+- Missing falsification critteria.
 
-direct LLM 路径若校验失败，整批 LLM hypotheses 视为失败并使用 deterministic fallback，禁止静默删除非法引用后继续。
+Direct LLM paths that fail to verify, the whole lot of LLM hypotheses is considered failed and uses deterministic fallback to prevent silent deletion of illegal references from continuing.
 
-## 8. session-mode 与持久化
+## 8. Session-mode and Endurance
 
-这是本方案的必做项。当前主路径优先通过 `hypothesis_add/update` 工具写入数据库；如果只修改 prompt 和内存类型，文献引用会在落库时丢失。
+This is an integral part of this programme. Current main path priority is given to writing in the database via `hypothesis_add/update` tool; If only prompt and memory type are modified, the reference is lost when you drop in the library.
 
-### 8.1 数据库迁移
+### 8.1 Database Migration
 
-`research_hypothesis` 增加：
+`research_hypothesis` Add:
 
 ```sql
 dataset_evidence_paths    TEXT JSON NOT NULL DEFAULT '[]'
@@ -733,34 +733,34 @@ falsification_criteria   TEXT JSON NOT NULL DEFAULT '[]'
 evidence_level           TEXT NOT NULL DEFAULT 'data_only'
 ```
 
-同时修改：
+Amend at the same time:
 
-- `research/research.sql.ts`；
-- 新 migration SQL；
-- `research/hypothesis-store.ts` 的 map/add/update；
-- `research/service.ts` 内重复的 row mapper 和直接 insert；
-- recovery path；
-- hypothesis changed event snapshot。
+- `research/research.sql.ts`;
+- New migration SQL;
+- map/add/update for `research/hypothesis-store.ts`;
+- `research/service.ts` duplicated row mapper and direct insert;
+- recovery path;
+- hypothesis changed event snapshot.
 
 ### 8.2 hypothesis tools
 
-扩展 `hypothesis_add` 和 `hypothesis_update` 参数：
+Expand `hypothesis_add` and `hypothesis_update` parameters:
 
-- `datasetEvidencePaths`；
-- `literatureEvidence`；
-- `applicabilityAssumptions`；
-- `falsificationCriteria`；
-- `evidenceLevel`。
+- `datasetEvidencePaths`;
+- `literatureEvidence`;
+- `applicabilityAssumptions`;
+- `falsificationCriteria`;
+- `evidenceLevel`.
 
-工具执行前从当前 task 最新的 `task_evidence_bundle_json` artifact 加载 bundle，并调用同一个 `validateHypothesisEvidence()`。不得在 tool 层复制一套规则。
+Loading a bookle from the current `task_evidence_bundle_json` description and calling the same `validateHypothesisEvidence()` before tool execution. Do not copy a set of rules on the Tool layer.
 
-`hypothesis_list` 返回完整证据字段，使后续 reflection turn 能看到先前引用。
+`hypothesis_list` returns the full evidence field to enable subsequent reference turn to see previous references.
 
-## 9. Research Service 与 pipeline
+## 9. Research Service and Pipeline
 
 ### 9.1 Artifact
 
-`runRetrieveAgent()` 除现有 retrieve result artifact 外，注册：
+`runRetrieveAgent()`, in addition to the existing retrieve result registration:
 
 ```text
 kind = task_evidence_bundle_json
@@ -771,20 +771,20 @@ selectedEntryCount
 uncoveredMustCoverIntentCount
 ```
 
-HypoPlanner 通过 artifact URI 加载 bundle，不自行计算 knowledgeRoot 路径。
+HypoPlanner loads bundle via artifact URI, and does not calculate the knowledgeRoot path by itself.
 
 ### 9.2 Workflow phase
 
-在 `PipelineWorkflowPhases` 增加：
+Add in `PipelineWorkflowPhases`:
 
 ```text
 literature
 ```
 
-该 key 的对外显示名称和 phase owner 均为 `LiteratureAgent`。现有 RetrieveAgent/LiteratureAgent started/completed/failed
-事件可继续作为内部 substage 事件，不把 Retrieve 前处理和后处理注册成额外 workflow phase。
+The name of the key's external display and the face owner are both `LiteratureAgent`. Existing RetrieveAgent/LiteratureAgent started/completed/failed
+Events can continue as internal substage events without registering Retrieve's pre- and post-processing as an additional workforce case.
 
-主 pipeline 调整为：
+The main pipeline is adjusted to:
 
 ```text
 data_analysis
@@ -793,13 +793,13 @@ data_analysis
 → searching
 ```
 
-增加 `recoverRetrieveResult()`：
+Add `recoverRetrieveResult()`:
 
-- 只接受 `retrieve_result_v2`；
-- 校验 taskID、quantitativeReportArtifactID 和 task evidence schema；
-- recovery 失败时重新运行 RetrieveAgent，不复用损坏 artifact。
+- Accept only `retrieve_result_v2`;
+- Validate taskID, quantitativeReportArtifactID and challenge evidence;
+- Rerun RetrieveAgent when recovery failed, not using damage.
 
-### 9.3 调用时序
+### 9.3 Call Time Order
 
 ```ts
 const literature = completed("literature")
@@ -814,39 +814,39 @@ const hypoPlanning = completed("hypo_planning")
     })
 ```
 
-`runHypoPlannerAgent()` 加载并传递同一 bundle 给：
+`runHypoPlannerAgent()` load and pass the same button to:
 
-- deterministic draft；
-- session prompt；
-- direct LLM prompt；
-- final result builder；
-- hypothesis tool validation。
+- deterministic draft;
+- session prompt;
+- direct LLM prompt;
+- final result builder;
+- hypothesis tool validation.
 
-### 9.4 失败和降级
+### 9.4 failed and downgraded
 
-| 情况 | 行为 |
+| Situation | Behaviour |
 | --- | --- |
-| 没有 BM25 candidate | 生成 `ready_data_only` bundle，继续 HypoPlanner |
-| 没有本地 PDF | 记录 gap，继续 |
-| 单篇 Literature 失败 | `partial_evidence`，继续 |
-| 所有卡片均不合格 | `ready_data_only`，继续 |
-| 存在 contradiction | `evidence_conflict`，继续但 HypoPlanner 必须展示风险 |
-| cardID 不存在或 paper mismatch | `partial_evidence`；记录 excluded；若全部 provenance 损坏则失败 |
-| bundle schema/provenance 损坏 | pipeline 失败，不允许无声降级 |
-| KnowledgeStore 无法打开 | pipeline 失败并保留 RetrieveAgentFailed event |
+| No, BM25 candidate | Generate `ready_data_only` roundle, continue HypoPlanner |
+| No local PDF | Record. Go on. |
+| Single Part Literature Failed | `partial_evidence`, go on. |
+| All cards don't qualify. | `ready_data_only`, go on. |
+| Exists command | `evidence_conflict`, go on but HypoPlanner must show risk |
+| cardID does not exist or paper mismatch | `partial_evidence`; Recorded; Failed if all damage |
+| Bundle schema/provenance damage | Pipeline failed, silent downgrade is not allowed |
+| KnowledgeStore could not be opened | Pipeline failed and RetrieveAgentFailed event maintained |
 
-## 10. 文件级实施清单
+## 10. Document-level implementation list
 
-### Wave 1：Retrieve task evidence 核心
+### Wave 1: Retrieve task core
 
-新增：
+Add:
 
 - `research/retrieve/task-evidence-builder.ts`
 - `research/retrieve/card-intent-binder.ts`
 - `research/retrieve/applicability-matcher.ts`
 - `research/retrieve/config/tsf-task-evidence.v1.json`
 
-修改：
+Amendments:
 
 - `research/retrieve/contract.ts`
 - `research/retrieve/retrieve-agent.ts`
@@ -854,123 +854,123 @@ const hypoPlanning = completed("hypo_planning")
 - `research/retrieve/report-renderer.ts`
 - `research/retrieve/index.ts`
 
-验收：RetrieveAgent 单次运行直接产出严格校验的 `task_evidence_bundle_v1`，每个 selected/excluded card 都可审计。
+Receiving and inspection: RetrieveAgent runs a single direct output strict verification of `task_evidence_bundle_v1`, which can be audited by each selected/excluded card.
 
-### Wave 2：HypoPlanner 契约与 deterministic/direct LLM
+### Wave 2: HypoPlanner Contract and deterministic/direct LLM
 
-修改：
+Amendments:
 
 - `research/agents/hypo-planner-agent.ts`
-- `research/service.ts` 中 prompt、parser 和 direct LLM 调用
+- Prompt, Parser and direct LLM calls in `research/service.ts`
 - `agent/prompt/research-hypo-planner.txt`
 - `research/index.ts`
 
-验收：无卡片时稳定产生 `data_only`；有卡片时假设引用合法 cardID/revision，并带 evidence paths、assumptions 和 falsification criteria。
+Receiving and inspection: Stable production of `data_only` in the absence of cards; If you have a card, use cardID/revision as a valid reference and bring evidence paths, attachments and fraud crime.
 
-### Wave 3：session tools 与数据库
+### Wave 3:session tools and databases
 
-新增：
+Add:
 
 - `migration/<timestamp>_research_hypothesis_evidence/migration.sql`
 
-修改：
+Amendments:
 
 - `research/research.sql.ts`
 - `research/hypothesis-store.ts`
 - `tool/research-hypothesis.ts`
-- `research/service.ts` 的 DB insert/map/recovery
+- DB insert/map/recovery for `research/service.ts`
 
-验收：`hypothesis_add → DB → hypothesis_list → recoverHypoPlanning` 往返后证据字段完全一致；非法 card 引用在 tool 执行阶段被拒绝。
+Acceptance and acceptance: `hypothesis_add → DB → hypothesis_list → recoverHypoPlanning` evidence field is fully consistent after return; The illegal card quote was rejected at the tool implementation stage.
 
-### Wave 4：pipeline 和 artifacts
+### Wave 4: popeline and artifices
 
-修改：
+Amendments:
 
 - `research/service.ts`
-- 必要时 `research/event.ts` 的 metadata schema
-- 对应 service tests
+- Metadata schema of `research/event.ts` if necessary
+- Corresponding service tests
 
-验收：外部 pipeline 顺序为 DataAnalysisAgent → LiteratureAgent → HypoPlanner，LiteratureAgent phase 内部执行
-Retrieve(pre) → Literature(core) → Retrieve(post)，并支持 phase recovery；无文献不是阻塞，损坏 bundle 是阻塞。
+Receiving and Inspection: External Pipeline is ordered as DataAnalysisAgent LiteratureAgent HypoPlanner, LiteratureAgent case
+Retrieve (pre) Literation (core) Retrieve (post) and support for case recovery; No documentation is not blocking, damage bundle is blocking.
 
-### Wave 5：回归与文档
+### Wave 5: Return and Document
 
-修改：
+Amendments:
 
 - `research/retrieve/README.md`
-- 当前实施方案状态；
-- CLI/service 示例；
-- schema/registry exports。
+- (a) The current status of the implementation programme;
+- Example CLI/service;
+- schema/registry exports.
 
-验收：相关 targeted tests、migration check 和项目测试通过；不存在未说明的兼容性变化。
+Receiving and inspection: relevant data tests, migration check and project testing passed; There was no unspecified change in compatibility.
 
-## 11. 测试计划
+## 11. Test plan
 
-### 11.1 Retrieve 单元测试
+### 11.1 Retrieve Unit Test
 
-新增 `test/research/retrieve/task-evidence-builder.test.ts`，至少覆盖：
+Add `test/research/retrieve/task-evidence-builder.test.ts`, at least over:
 
-1. 同一 paper 命中多个 intent，但 card 只绑定语义匹配的 intent；
-2. card provenance 展开到正确 transformation/concept/evidence path；
-3. `paper_backed + direct + exact_span` 可作为正向证据；
-4. extracted/inconclusive/deprecated 不能作为正向证据；
-5. contradicted card 只能作为反证；
-6. missing card 和 paper mismatch 不被静默忽略；
-7. `notApplicableWhen` 已知谓词命中时产生硬冲突；
-8. 未知自然语言条件进入 uncertain，而不是误判；
-9. domain-only 不建立 binding；
-10. must-cover intent 缺证据时产生 gap；
-11. duplicate/supports/contradicts/refines relation 正确处理；
-12. 预算优先保证 intent coverage 和 paper diversity；
-13. 输入顺序变化不影响稳定输出；
-14. BM25 高分不能绕过 evidence gate。
+1. The same paper hits multiple inents, but the card binds only incents matching semantics;
+2. Expand card provenance to the correct transformation/concept/evidence path.
+3. `paper_backed + direct + exact_span` can be used as positive evidence;
+4. extracted/inconclusive/deprecated cannot be used as positive evidence;
+5. (a) Contradicted card can only be used as counter-argument;
+6. Missing card and paper metatch will not be ignored silently;
+7. `notApplicableWhen` is known to create a hard conflict when the word hits;
+8. Unknown natural language conditions enter uncerttain, not miscalculation;
+9. Domain-only don't create binding;
+10. must-cover inent generated when evidence was missing
+11. duplicate/supports/contradicts/refines submission correctly processed;
+12. Budget priority guarantees for inert coverage and paper diversity;
+13. A change in the order of entry does not affect a stable output;
+14. A high BM25 score cannot bypass the evidence gate.
 
-### 11.2 Retrieve 集成测试
+### 11.2 Retrieve Integration Test
 
-扩展现有 `retrieve-agent.test.ts`：
+Expand existing `retrieve-agent.test.ts`:
 
-- fixture LiteratureAgent 写入真实 KnowledgeStore；
-- RetrieveAgent 返回 taskEvidence；
-- `task_evidence_bundle.json` 和 report 落盘；
-- 重复运行复用相同 v2 run；
-- task context 或 mapping version 改变会生成不同 runID。
+- Fixture LiteratureAgent writes real KnowledgeStore;
+- RetrieveAgent returns taskEvidence;
+- `task_evidence_bundle.json` and report drops;
+- Repeat to reuse the same v2 run;
+- Ask constext or mamapping version will generate a different runID.
 
-### 11.3 HypoPlanner 测试
+### 11.3 HypoPlanner Test
 
-扩展 `hypo-planner-agent.test.ts`：
+Extension `hypo-planner-agent.test.ts`:
 
-- data-only fallback；
-- paper-supported hypothesis；
-- conflict hypothesis；
-- revision mismatch；
-- bundle 外 cardID；
-- role mismatch；
-- evidence path 越权；
-- 缺失 falsification criteria；
-- Markdown/YAML 展示引用和 readiness；
-- invalid LLM output 回退 deterministic hypotheses。
+- data-only fallback;
+- paper-supported hypothesis;
+- conflict hypothesis;
+- revision mismatch;
+- cardID;
+- role mismatch;
+- Exceeding authority;
+- (a) Loss of financial resources;
+- Markdown/YAML displays references and updates;
+- Invalid LLM output retreats deterministic hypotes.
 
-### 11.4 Store/tool/migration 测试
+### 11.4 Store/tool/migration Test
 
-- 新 migration 可从现有 hypothesis schema 升级；
-- 旧行获得安全默认值；
-- add/update/list round-trip；
-- service 内两处 row mapper 行为一致；
-- session tool 拒绝非法 card 引用；
-- recovery 后证据字段不丢失。
+- New migration can be upgraded from the existing hypothesis scheme;
+- Old lines get a security default;
+- add/update/list round-trip;
+- Two parts of service are identical.
+- The session tool rejects the illegal card quote;
+- The evidence field after recover is not lost.
 
-### 11.5 Service/pipeline 测试
+### 11.5 Service/pipeline Test
 
-- 验证外部 DataAnalysisAgent → LiteratureAgent → HypoPlanner 顺序；
-- 验证 LiteratureAgent phase 内部 Retrieve(pre) → Literature(core) → Retrieve(post) 顺序；
-- Retrieve artifact 被 HypoPlanner 使用；
-- `ready_data_only` 不阻塞；
-- Literature partial 不阻塞；
-- bundle schema 损坏阻塞；
-- 已完成 literature phase 可以恢复；
-- force/retry 不重复创建同 retrieveRunID artifact。
+- Verify the external DataAnalysisAgent → LiteratureAgent → HypoPlanner order.
+- Verify Retrieve(pre) → Literature(core) → Retrieve(post) within the LiteratureAgent phase.
+- Retrieve artifact is used by HypoPlanner;
+- `ready_data_only` is not blocked;
+- Literature partial unblocked;
+- bundle schema damage blocked;
+- Completed literature case can be restored;
+- force/retry does not create duplicates of retrieveRunID artifact.
 
-### 11.6 建议命令
+### 11.6 recommended command
 
 ```bash
 cd opencode/packages/opencode
@@ -983,31 +983,31 @@ bun run script/check-migrations.ts
 bun typecheck
 ```
 
-最后运行仓库约定的完整测试；记录与本变更无关的既有失败，不修改无关模块。
+(b) Finally run the agreed complete testing of the warehouse; Records established failures not related to this change and does not modify unrelated modules.
 
-## 12. 完成标准
+## 12. Completion standards
 
-满足以下条件才算完成桥接：
+The bridge is completed only if the following conditions are met:
 
-1. 不新增 Agent；
-2. LiteratureAgent contract 不接收 task context，canonical card 不包含 task match；
-3. RetrieveAgent v2 输出 `task_evidence_bundle_v1`；
-4. 所有 accepted card 都进入 selected 或 excluded，且有明确原因；
-5. 每个 selected entry 可追溯到 card revision、paper evidence、intent、concept transformation 和 dataset evidence path；
-6. BM25 relevance 与 card confidence 明确分离；
-7. must-cover intent 的覆盖或 gap 可审计；
-8. contradiction 和 limitation 不被 top-K 排序隐藏；
-9. HypoPlanner 不能引用 bundle 外 card；
-10. paper-supported hypothesis 有适用假设和证伪条件；
-11. 无文献时 HypoPlanner 显式标记 `data_only`；
-12. session tool、数据库、artifact 和 recovery 往返不丢失证据；
-13. 默认 pipeline 已接入对外的 LiteratureAgent phase，内部包含完整 Retrieve/Literature/Retrieve 拓扑；
-14. 单篇论文失败不会中断任务，契约或 provenance 损坏不会无声降级；
-15. targeted tests、migration check 和类型检查通过。
+1. Do not add Agent;
+2. LiteratureAgent contract does not receive, canonical card does not contain task match;
+3. RetrieveAgent v2 output `task_evidence_bundle_v1`;
+4. All acceded card enters self-listed or excluded with clear reasons;
+5. Each self-described entries can be traced back to card review, paper vision, intent, concept transformation and daaset experience path;
+6. Keep BM25 relevance and card confidence explicitly separate.
+7. Must-cover indent coverage or gap auditable;
+8. Commradition and determination are not top-K sorted hidden;
+9. HypoPlanner cannot quote booklet outside card;
+10. Paper-suppleted hypothesis with applicable assumptions and perjury;
+11. HypoPlanner Visible Marker `data_only` when there is no literature;
+12. (b) The session tool, database, artifact and return not lost evidence;
+13. The default pipeline has access to external LiteratureAgent case, which contains the complete Retrieve/Literature/Retrieve scale;
+14. Failure of a single paper does not interrupt the mission, contract or damage does not go down silently;
+15. Tightened test, migration check and type check passed.
 
-## 13. 建议实施顺序
+## 13. Order of recommendations
 
-建议严格按以下顺序执行：
+The recommendations are implemented strictly in the following order:
 
 ```text
 1. TaskEvidence schema + deterministic builder
@@ -1018,4 +1018,4 @@ bun typecheck
 6. full regression
 ```
 
-不要先修改 prompt 或 pipeline。只有 task evidence builder 的确定性契约和测试稳定后，才允许 HypoPlanner 消费该产物；否则任务匹配逻辑会散落在 prompt、service 和 Agent 代码中，后续无法审计。
+Do not change prompt or pipeline first. HypoPlanner is allowed to consume the product only after certainty contracts and tests have stabilized; Otherwise the task matching logic will be scattered in prompt, service and Agent codes, which cannot be audited later.

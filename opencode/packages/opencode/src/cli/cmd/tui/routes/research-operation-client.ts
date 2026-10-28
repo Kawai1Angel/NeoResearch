@@ -22,7 +22,7 @@ export async function waitForResearchOperation<T>(input: {
   const headers = new Headers(input.headers)
   headers.delete("prefer")
   headers.delete("content-type")
-  if (input.operation.recoveryRequired) throw new Error("原执行状态需要核对，不能启动重复训练。")
+  if (input.operation.recoveryRequired) throw new Error("The original execution state needs reconciliation; duplicate training cannot start.")
   let operation = input.operation
   let canceled = false
   let failures = 0

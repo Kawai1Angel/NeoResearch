@@ -200,7 +200,7 @@ test("intent agent can use an LLM to refine the next Socratic question", async (
               message: {
                 content: JSON.stringify({
                   confidence: 0.74,
-                  clarifying_questions: ["这个业务场景中，OT 预测主要服务调度、告警还是容量规划？"],
+                  clarifying_questions: ["Does OT forecasting primarily support scheduling, alerts, or capacity planning in this business scenario?"],
                   slots: {
                     business_context: "LLM inferred operations planning context",
                   },
@@ -224,6 +224,6 @@ test("intent agent can use an LLM to refine the next Socratic question", async (
   })
 
   expect(result.llm.status).toBe("used")
-  expect(result.clarifyingQuestions).toEqual(["这个业务场景中，OT 预测主要服务调度、告警还是容量规划？"])
+  expect(result.clarifyingQuestions).toEqual(["Does OT forecasting primarily support scheduling, alerts, or capacity planning in this business scenario?"])
   expect(result.intentSpec.business_context).toBe("LLM inferred operations planning context")
 })

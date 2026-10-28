@@ -144,43 +144,43 @@ function verifierRecoveryAction(category: VerifierFailureCategory): {
   if (category === "metric_missing") {
     return {
       type: "fix_metric_reporting",
-      summary: "确认 runner 输出 primary metric，并补齐 eval record/metrics parser 后重跑该候选。",
+      summary: "Confirm that the runner emits the primary metric, complete the eval record/metrics parser, and rerun this candidate.",
     }
   }
   if (category === "regression") {
     return {
       type: "try_safer_candidate",
-      summary: "回退到当前 champion 或更保守的邻域 mutation，避免继续放大已退化的结构方向。",
+      summary: "Return to the current champion or a conservative neighboring mutation instead of amplifying a degraded structural direction.",
     }
   }
   if (category === "resource_budget") {
     return {
       type: "reduce_resource_usage",
-      summary: "降低参数量、batch size 或训练预算，再用相同阶段重试以确认是否为资源约束问题。",
+      summary: "Reduce parameters, batch size, or training budget, then retry the same stage to check for resource constraints.",
     }
   }
   if (category === "horizon_instability") {
     return {
       type: "stabilize_long_horizon",
-      summary: "增加长 horizon 约束、分解或 horizon weighting，优先重测长预测窗口。",
+      summary: "Add long-horizon constraints, decomposition, or horizon weighting; prioritize retesting longer forecasts.",
     }
   }
   if (category === "overfitting") {
     return {
       type: "audit_data_leakage",
-      summary: "检查切分、归一化和泄漏风险；必要时提升 ref/blind gate 后再接受该结果。",
+      summary: "Check splits, normalization, and leakage risk; strengthen ref/blind gates if needed before accepting this result.",
     }
   }
   if (category === "data_leakage") {
     return {
       type: "audit_split_boundaries",
       summary:
-        "立即停止该候选的晋升流程。检查 dataset_spec.json 中的 train/val/ref_test 边界、normalization fit_split 是否为 train、val context 窗口是否错误包含 ref_test 行。修复后从 smoke 阶段重新运行。",
+        "Immediately stop promoting this candidate. Check train/val/ref_test boundaries in dataset_spec.json, verify normalization fit_split is train, and ensure validation context windows exclude ref_test rows. Fix and rerun from smoke.",
     }
   }
   return {
     type: "manual_review",
-    summary: "保留 verifier 证据并进入人工复核，确认是否需要修复数据、runner 或候选定义。",
+    summary: "Preserve verifier evidence and request human review to determine whether the data, runner, or candidate definition needs correction.",
   }
 }
 

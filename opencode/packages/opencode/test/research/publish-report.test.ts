@@ -87,8 +87,8 @@ describe("PublishAgent final report", () => {
   })
 
   test("rejects incomplete reports and strips a single outer fence", () => {
-    const report = stripMarkdownFence("```markdown\n## 执行摘要\ntext\n```")
-    expect(report).toBe("## 执行摘要\ntext")
+    const report = stripMarkdownFence("```markdown\n## Executive summary\ntext\n```")
+    expect(report).toBe("## Executive summary\ntext")
     expect(validateFinalReport(report, snapshot()).length).toBeGreaterThan(0)
   })
 })

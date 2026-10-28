@@ -1,22 +1,22 @@
 import capabilities from "./model-capabilities.json"
 // Retrieval aliases broaden discovery only; they do not establish scientific equivalence.
 const aliases = [
-  ["width", "hidden dimension", "hidden dimensions", "hidden dim", "hidden_dim", "hiddendim", "宽度", "隐藏维度", "隐藏层维度"],
-  ["capacity", "容量"], ["depth", "深度", "层数"],
-  ["normalization", "normalisation", "归一化"],
-  ["learningrate", "learning rate", "learning rates", "lr", "学习率"],
-  ["warmup", "warm up", "预热"],
-  ["gradclip", "grad clip", "gradient clipping", "梯度裁剪"],
-  ["exogenous", "covariate", "covariates", "外生变量", "外生", "协变量"],
-  ["trend", "趋势"], ["seasonality", "seasonal", "季节性", "周期性"],
-  ["instability", "unstable", "oscillation", "不稳定", "振荡", "震荡"],
-  ["decomposition", "decompose", "分解"], ["fusion", "融合"],
-  ["variance", "方差"], ["replication", "replicate", "复现实验", "重复实验"],
-  ["seed", "随机种子"],
-  ["frequency", "fft", "rfft", "spectral", "频域", "频谱"],
-  ["rnn", "循环网络"], ["backbone", "主干"],
-  ["embedding", "嵌入"], ["residual", "残差"], ["branch", "分支"],
-  ["calendar", "日历"], ["kernel", "kernel size", "kernelsize", "核大小"],
+  ["width", "hidden dimension", "hidden dimensions", "hidden dim", "hidden_dim", "hiddendim", "hidden layer dimension"],
+  ["capacity"], ["depth", "layer count"],
+  ["normalization", "normalisation"],
+  ["learningrate", "learning rate", "learning rates", "lr"],
+  ["warmup", "warm up"],
+  ["gradclip", "grad clip", "gradient clipping"],
+  ["exogenous", "covariate", "covariates", "exogenous variables"],
+  ["trend"], ["seasonality", "seasonal", "periodicity"],
+  ["instability", "unstable", "oscillation"],
+  ["decomposition", "decompose"], ["fusion"],
+  ["variance"], ["replication", "replicate", "repeat experiment"],
+  ["seed", "random seed"],
+  ["frequency", "fft", "rfft", "spectral", "frequency domain", "spectrum"],
+  ["rnn", "recurrent network"], ["backbone"],
+  ["embedding"], ["residual"], ["branch"],
+  ["calendar"], ["kernel", "kernel size", "kernelsize"],
 ] as const
 const stopwords = new Set(("a an the and or of in on for to with without vs versus under between from by at " +
   "is are was were be been this that these those it its as into than then using use used does not no " +
@@ -39,9 +39,9 @@ export function experienceTokens(text: string, preserveStopwords = false) {
   const words = normalized.match(/[a-z][a-z0-9]*|\p{Script=Han}+/gu) ?? []
   return words.flatMap(word => {
     if (!preserveStopwords && stopwords.has(word)) return []
-    // Character bigrams let other Chinese phrases match without a tokenizer service.
+    // Character bigrams support unsegmented text without a tokenizer service.
     if (/\p{Script=Han}/u.test(word)) {
-      const chars = [...word.replace(/时间序列|预测|模型|经验|检索|进行|相关|是否|如何/g, " ")]
+      const chars = [...word]
       return chars.slice(1).flatMap((char, index) => /\p{Script=Han}/u.test(char) && /\p{Script=Han}/u.test(chars[index]!)
         ? [chars[index]! + char] : [])
     }
@@ -57,10 +57,10 @@ const names: ExperienceEntity[] = [...components.flatMap(component => Object.key
   .map(name => ({ component, name, terms: experienceTokens(name, true) })))
   , ...["gru", "lstm"].map(name => ({ component: "cell" as const, name, terms: [name] }))]
 export const experienceAxisTerms = new Set(["width", "depth", "capacity", "learningrate", "warmup", "gradclip", "kernel", "seed"])
-const comparisonCue = /\b(compare|comparison|versus|vs|against)\b|比较|对比|相比|相较/iu
-const compositionCue = /decompos|series[_ ]decomposition|trend.*residual|residual.*trend|two[_ ]branch|分解|双分支|两分支|趋势.*残差/iu
-const failureCue = /\b(cudnn|backward|exception|traceback|oom|failure|failed)\b|out of memory|(?:runtime|execution|training)[_ ]?error|报错|错误|失败/iu
-const effectCue = /\b(effects?|effective|effectiveness|improve[ds]?|improvements?|sensitivity|intervention|impact|benefit)\b|有效|效果|影响|干预|改善|收益|加宽|增加|降低|提高/iu
+const comparisonCue = /\b(compare|comparison|versus|vs|against)\b/iu
+const compositionCue = /decompos|series[_ ]decomposition|trend.*residual|residual.*trend|two[_ ]branch/iu
+const failureCue = /\b(cudnn|backward|exception|traceback|oom|failure|failed)\b|out of memory|(?:runtime|execution|training)[_ ]?error/iu
+const effectCue = /\b(effects?|effective|effectiveness|improve[ds]?|improvements?|sensitivity|intervention|impact|benefit)\b/iu
 
 export function parseExperienceQuery(query: string, override: ExperienceQueryIntent = "auto") {
   const terms = [...new Set(experienceTokens(query))].slice(0, 128)
@@ -92,7 +92,7 @@ export function parseExperienceQuery(query: string, override: ExperienceQueryInt
   const inferred = isError ? "execution_error" : comparisonCue.test(query) ? "comparison"
     : /[a-z][a-z0-9_.]*\s*=\s*\d/i.test(query) ? "configuration"
     : effectCue.test(query) || axes.length && !compound ? "intervention"
-    : architectureCount > 1 && !compound && !/\band\b|\+|同时|组合/iu.test(query) ? "discovery"
+    : architectureCount > 1 && !compound && !/\band\b|\+/iu.test(query) ? "discovery"
     : "configuration"
   const intent = override === "auto" ? inferred : override
   const mechanisms = [...new Set([
@@ -101,15 +101,15 @@ export function parseExperienceQuery(query: string, override: ExperienceQueryInt
     ...(querySet.has("decomposition") ? ["decomposition"] : []),
     ...(compound && querySet.has("trend") ? ["trend_branch"] : []),
     ...(compound && querySet.has("residual") ? ["residual_branch"] : []),
-    ...(/\b(two[_ ]branch|parallel[_ ]two[_ ]branch)\b|双分支|两分支/iu.test(query) ? ["two_branch"] : []),
+    ...(/\b(two[_ ]branch|parallel[_ ]two[_ ]branch)\b/iu.test(query) ? ["two_branch"] : []),
   ])]
   const branchRoles = (["trend", "residual"] as const).flatMap(role => {
-    const marker = role === "trend" ? "(?:trend|趋势)" : "(?:residual|残差)"
+    const marker = role
     return entities.filter(entity => entity.component === "backbone" || entity.component === "cell")
-      .filter(entity => new RegExp(`${marker}(?:[ _-]*(?:branch|分支))?[\\s:=：-]*(?:(?:uses?|using|使用|采用|为|是)[\\s:=：-]*)?${entity.name}\\b`, "iu").test(query))
+      .filter(entity => new RegExp(`${marker}(?:[ _-]*branch)?[\\s:=：-]*(?:(?:uses?|using|is)[\\s:=：-]*)?${entity.name}\\b`, "iu").test(query))
       .map(entity => ({ role, entity }))
   })
-  const dataConditions = /weak(?:ly)?[_ ]correlat|low[_ ]correlat|弱相关|低相关/iu.test(query)
+  const dataConditions = /weak(?:ly)?[_ ]correlat|low[_ ]correlat/iu.test(query)
     ? ["weak_correlation_requires_explicit_statistic_scope_and_threshold"] : []
   const groups = components.flatMap(component => {
     const values = entities.filter(entity => entity.component === component).map(entity => entity.name)

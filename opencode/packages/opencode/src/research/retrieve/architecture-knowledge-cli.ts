@@ -36,7 +36,7 @@ async function main() {
   await mkdir(output, { recursive: true })
   const task = await Bun.file(path.resolve(values.input)).json()
   const roots = [path.join(runtime, "literature-knowledge")]
-  if (values["include-history"]) roots.push(path.join(runtime, "literature-reruns"), path.join(root, "文档"))
+  if (values["include-history"]) roots.push(path.join(runtime, "literature-reruns"), path.join(root, "docs"))
   const corpus = new Map<string, { card: KnowledgeCardV2; file: string; seal: string[] }>()
   const excluded: { file: string; cardID: string; reason: string }[] = []
   for (const folder of roots) {
@@ -180,20 +180,20 @@ async function main() {
     integration: "standalone_reviewed_architecture_knowledge; not a sealed card or an automatic update to a running task",
   }
   await Bun.write(path.join(output, "architecture_knowledge.json"), JSON.stringify(result, null, 2))
-  const lines = ["# ETTh1 条件化架构知识", "", `召回池 ${cards.length} 张卡 / ${inventory.paperCount} 篇文献；原文复读 ${selected.length} 张；独立语义审核保留 ${accepted.length} 条。`,
-    "", "这是独立的下游知识包，未改写原始卡片或已运行任务。审核是原文忠实性与决策价值判断，不是重做论文实验。", ""]
+  const lines = ["# ETTh1 conditional architecture knowledge", "", `Recall pool: ${cards.length} cards / ${inventory.paperCount} papers; ${selected.length} cards reread against sources; ${accepted.length} decisions retained after independent semantic review.`,
+    "", "This independent downstream knowledge package preserves original cards and executed tasks. Review assesses source fidelity and decision value; it does not rerun paper experiments.", ""]
   for (const decision of accepted) {
-    lines.push(`## ${decision.decisionID}`, "", `**数据条件：** ${decision.dataCondition}`, "",
-      `**优先选择：** ${decision.prefer}`, "", `**降低优先级 / 排除：** ${decision.avoid}`, "",
-      `**为什么：** ${decision.mechanism}`, "", `**文献观察：** ${decision.observedEffect}`, "",
-      `**证据层级：** ${decision.evidenceLevel}`, "", `**ETTh1 适用性：** ${decision.taskFit} — ${decision.taskReason}`, "",
-      ...decision.limitations.map((s) => `- ${s}`), "", "来源：", "",
+    lines.push(`## ${decision.decisionID}`, "", `**Data conditions:** ${decision.dataCondition}`, "",
+      `**Prefer:** ${decision.prefer}`, "", `**Deprioritize / Avoid:** ${decision.avoid}`, "",
+      `**Why:** ${decision.mechanism}`, "", `**Literature observations:** ${decision.observedEffect}`, "",
+      `**Evidence level:** ${decision.evidenceLevel}`, "", `**ETTh1 applicability:** ${decision.taskFit} — ${decision.taskReason}`, "",
+      ...decision.limitations.map((s) => `- ${s}`), "", "Sources:", "",
       ...decisionCardIDs(decision).map((id) => {
         const item = corpus.get(id)!
-        return `- ${catalog.get(item.card.paperID) ?? item.card.paperID}：\`${id}\`，revision ${item.card.revision}，[原卡](${path.relative(output, item.file)})`
+        return `- ${catalog.get(item.card.paperID) ?? item.card.paperID}: \`${id}\`, revision ${item.card.revision}, [Original card](${path.relative(output, item.file)})`
       }), "")
   }
-  lines.push("## 未保留的提炼", "", ...reviews.filter((r) => r.verdict === "rejected").map((r) => `- ${r.decisionID}：${r.reason}`), "")
+  lines.push("## Rejected extractions", "", ...reviews.filter((r) => r.verdict === "rejected").map((r) => `- ${r.decisionID}: ${r.reason}`), "")
   await Bun.write(path.join(output, "report.md"), lines.join("\n"))
   console.log(JSON.stringify({ phase: "complete", accepted: accepted.length, rejected: decisions.length - accepted.length, output }))
 }

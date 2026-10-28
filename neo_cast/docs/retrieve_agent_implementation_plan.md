@@ -1,13 +1,13 @@
-# RetrieveAgent 实施方案（BM25 本地检索版）
+# RetrieveAgent Implementation Program (BM25 Local Retrieval)
 
-## 1. 目标
+## 1. Objective
 
-本方案在 NeoResearch 中增加一个首版 `RetrieveAgent`。它接收
-`DataAnalysisAgent` 生成的定量分析报告，将数据证据逐层转换为科学概念、方法概念和论文常用语言，
-然后使用本地 BM25 检索论文，并把高相关候选交给现有 `LiteratureAgent` 进行全文解析、claim 抽取和
-证据验证。
+This program adds a first edition of `RetrieveAgent` to NeoResearch. It's receiving.
+The quantitative analysis produced by `DataAnalysisAgent` translates data evidence from layer to layer into scientific concepts, methodological concepts and the language used in the papers.
+Then use local BM25 to retrieve the papers and hand over high-profile candidates to existing `LiteratureAgent` for full text analysis, claim extraction and
+Evidence validation.
 
-首版闭环为：
+The first edition closed with:
 
 ```text
 Current Dataset
@@ -34,96 +34,96 @@ LiteratureAgent
 Retrieve Result + KnowledgeCards
 ```
 
-这一版本的终点是完成 `RetrieveAgent → LiteratureAgent` 桥接，不接入 `HypoPlannerAgent`。
+This version ends with the completion of the `RetrieveAgent → LiteratureAgent` bridge without access to `HypoPlannerAgent`.
 
-## 2. 首版范围
+## 2. First edition scope
 
-### 2.1 本期实现
+### 2.1 Achieved during the period
 
-- DataAnalysis 输出机器可读的定量分析报告；
-- 从定量报告提取有来源的 Dataset Evidence；
-- 完成 `Dataset Evidence → Scientific Concepts → Method Concepts → Paper Language` 转换；
-- 每个 Retrieval Intent 只生成一个论文语言查询；
-- 使用本地 BM25 进行一次召回；
-- 对 BM25 结果进行去重、证据层级判断和简单筛选；
-- 将有本地 PDF 的高优先级论文交给 `LiteratureAgent`；
-- 收集 `LiteratureAgent` 返回的 KnowledgeCard 和失败状态；
-- 保存完整的输入、转换、查询、候选和桥接轨迹。
+- DataAnalysis output machine readable quantitative analysis reports;
+- Dataset Evidence from quantitative reports;
+- Completed `Dataset Evidence → Scientific Concepts → Method Concepts → Paper Language` conversion;
+- Each Retrieval Intent generates only one paper language query;
+- Using local BM25 for a recall;
+- Deduplicate BM25 results, assess evidence levels, and apply simple screening.
+- `LiteratureAgent` will deliver local PDF high priority papers;
+- Collect KnowledgeCard and failure statuses returned by `LiteratureAgent`.
+- Saves complete input, conversion, query, candidate and bridge tracks.
 
-### 2.2 本期不实现
+### 2.2 Not achieved during the period
 
-- 不配置学术乐问或其他论文检索 API；
-- 不实现同一 Intent 的多 Query Expansion；
-- 不实现 Reciprocal Rank Fusion（RRF）；
-- 不实现向量检索或 embedding rerank；
-- 不实现 Search → Learn → Search 的多轮循环；
-- 不实现 citation/reference expansion；
-- 不自动下载论文使用的数据集重新 profiling；
-- 不与 HypoPlanner 或 ModelDesigner 桥接；
-- 不让 RetrieveAgent 直接生成模型假设或修改模型代码。
+- No academic and other dissertation search API;
+- Multiple Query Exchange that does not achieve the same incent;
+- Unrealizing Recipal Rank Fusion (RRF);
+- Unrealized vector search or embedding rerank;
+- Do not implement repeated Search → Learn → Search cycles.
+- Unrealized citation/reference export;
+- The data set used for the non-automatic downloading of papers is reprogrammed;
+- Do not connect to HypoPlanner or ModelDesigner bridges;
+- RetrieveAgent is not allowed to directly generate model assumptions or modify model codes.
 
-如果一个数据集形成多个 Retrieval Intent，每个 Intent 可以各执行一次 BM25，但结果按 Intent 分开保存。
-这不属于“同一意图的多查询召回”，也不进行跨查询 RRF 融合。
+If a data set forms more than one Retrieval Enter, each Intent can execute BM25 at once, but the result is saved separately by Intent.
+This is not a "recall for multiple inquiries with the same intent" nor does it integrate cross-examination RRF.
 
-## 3. 组件职责
+## 3. Component duties
 
 ### 3.1 DataAnalysisAgent
 
-负责从原始数值数据产生客观分析结果，例如：
+Responsible for producing objective analyses from raw numerical data, such as:
 
-- 趋势强度；
-- 周期性强度；
-- ACF/PACF；
-- 频谱峰；
-- ADF/KPSS；
-- distribution shift；
-- change point；
-- missing/outlier/irregular interval；
-- cross-variate 和 cross-lag 关系；
-- observed-past、known-future 和 static covariate 角色。
+- (a) The intensity of trends;
+- Periodicity;
+- ACF/PACF;
+- Spectrum peaks;
+- ADF/KPSS;
+- distribution shift;
+- change point;
+- missing/outlier/irregular interval;
+- Cross-variate and cross-lag relations;
+- Observed-past, known-future and status covariate roles.
 
-DataAnalysisAgent 不负责生成论文检索词。
+DataAnalysisAgent is not responsible for generating paper search words.
 
 ### 3.2 RetrieveAgent
 
-负责：
+Responsible for:
 
-- 读取定量报告；
-- 判断哪些数据证据足以形成科学概念；
-- 为科学概念映射可能相关的方法概念；
-- 将内部概念翻译成论文标题、摘要和方法部分常见的英文表达；
-- 构造一个 BM25 查询；
-- 检索和筛选本地论文；
-- 决定哪些论文交给 LiteratureAgent。
+- Access to quantitative reports;
+- To determine which data evidence is sufficient to form scientific concepts;
+- (a) Mapping of methodological concepts that may be relevant for scientific concepts;
+- Translation of internal concepts into the English language expression common to the title, summary and methodology sections of the paper;
+- Construct a BM25 query;
+- Retrieving and screening local papers;
+- Decide which papers will be given to LiteratureAgent.
 
-RetrieveAgent 产生的是“检索相关性”，不是论文事实。
+RetrieveAgent produces "research relevance", not thesis fact.
 
 ### 3.3 LiteratureAgent
 
-现有 `LiteratureAgent` 继续负责：
+The current `LiteratureAgent` continues to be responsible for:
 
-- 解析本地 PDF；
-- 将论文分 section 和 chunk；
-- 抽取 candidate claim；
-- 验证 claim 是否被原文支持；
-- 生成 KnowledgeCard；
-- 保存 evidence span、页码、section 和 provenance；
-- 处理重复卡片和冲突关系。
+- Parsing local PDF;
+- Thesis is divided into sections and chunk;
+- Candidate claire;
+- Verify whether the original paper supports the claim.
+- Generate KnowledgeCard;
+- Save environment span, page number, section and policy;
+- Dealing with duplicate card and conflict relationships.
 
-只有 LiteratureAgent 验证通过的 claim 才能标记为 `paper_backed`。
+Only LiteratureAgent claim can be marked as `paper_backed`.
 
-## 4. DataAnalysis 定量报告契约
+## 4. DataAnalysis quantitative reporting compact
 
-### 4.1 双产物
+### 4.1 Double Product
 
-DataAnalysis 应从同一个内存对象生成：
+DataAnalysis should be generated from the same memory object:
 
-1. `dataset_quantitative_analysis_markdown`：供人阅读；
-2. `dataset_quantitative_analysis_json`：供 RetrieveAgent 读取。
+1. `dataset_quantitative_analysis_markdown`: Readable;
+2. `dataset_quantitative_analysis_json`: For RetrieveAgent reading.
 
-RetrieveAgent 不从 Markdown 表格中用正则提取数值。JSON 是机器交接的权威来源，Markdown 只是其可读视图。
+RetrieveAgent does not extract values from the Markdown table using regular values. JSON is the authoritative source of machine contact, Marktown just its readable view.
 
-### 4.2 JSON 示例
+### Example 4.2 JSON
 
 ```json
 {
@@ -196,22 +196,22 @@ RetrieveAgent 不从 Markdown 表格中用正则提取数值。JSON 是机器交
 }
 ```
 
-### 4.3 必要补充
+### 4.3 Required Supplement
 
-当前分析实现只有一个 dominant frequency。为了识别 multiple seasonalities，需要增加
-`spectralPeaks`，至少记录 period、power share、significance 和可选的 peak stability across windows。
+The current analysis achieves only one dominant freedom. In order to identify multiplications, add
+`spectralPeaks`, at least record period, power share, signature and optional languages.
 
-如果只有一个显著频谱峰，RetrieveAgent 只能转换为 `seasonality`，不能转换为
-`multiple_seasonalities`。
+If there is only one significant spectrum peak, RetrieveAgent can only be converted to `seasonality` and not to
+`multiple_seasonalities`.
 
-calendar/holiday effect 只有在 task 中确实存在相应字段，并且 DataAnalysis 做过分组分析后才能作为
-Dataset Evidence。否则保持 `unknown`。
+calendar/holiday effect Only if the corresponding field does exist in the desk and DataAnalysis has done group analysis
+Dataset Evidence. Otherwise keep `unknown`.
 
-## 5. 多层科学概念转换
+## 5. Multi-layer scientific conceptual transformation
 
-### 5.1 转换模型
+### 5.1 Conversion Model
 
-RetrieveAgent 不直接把数值拼进 Query，而是构造四层表示：
+RetrieveAgent does not spell values directly into Query, but constructs four layers to indicate:
 
 ```text
 Dataset Evidence
@@ -225,14 +225,14 @@ Paper Language
 BM25 Query
 ```
 
-各层含义：
+Various meanings:
 
-- `Dataset Evidence`：DataAnalysis 实际计算或 task spec 明确给出的事实；
-- `Scientific Concepts`：学术界对这种数据现象或问题的称呼；
-- `Method Concepts`：可能针对该问题的方法机制，属于检索假设，不代表已决定使用；
-- `Paper Language`：论文标题、摘要和方法章节中更可能出现的英文术语或短语。
+- `Dataset Evidence`: DataAnalysis actually calculates or is clearly given by the name of DataAnalysis
+- `Scientific Concepts`: Academies refer to such data phenomena or problems;
+- `Method Concepts`: a possible methodological mechanism for this issue, which is a search assumption and does not mean that it has been decided to use;
+- `Paper Language`: More likely English terminology or phrases in the title, summary and methodology sections of the paper.
 
-### 5.2 转换契约
+### 5.2 conversion contract
 
 ```ts
 type ConceptTransformation = {
@@ -268,12 +268,12 @@ type ConceptTransformation = {
 }
 ```
 
-Method Concept 必须标记为 `retrieval_hypothesis`。例如发现强周期性后可以检索
-frequency-domain modeling，但不能在检索前就声称 frequency-domain method 一定适合当前数据。
+Method Concept must be marked with `retrieval_hypothesis`. For example, if you find a strong cycle, you can search it.
+Freegency-domain modeling, but it cannot be claimed that fregacy-domain method must fit the current data before searching.
 
-### 5.3 转换示例
+### Example of 5.3 conversion
 
-#### 示例一：多周期
+#### Example I: Multiple cycles
 
 ```text
 Dataset Evidence
@@ -297,7 +297,7 @@ Paper Language
 - multi-scale seasonal modeling
 ```
 
-#### 示例二：趋势与非平稳性
+#### Example II: Trends and non-stableness
 
 ```text
 Dataset Evidence
@@ -323,10 +323,10 @@ Paper Language
 - trend decomposition forecasting
 ```
 
-只有 `trendStrength` 高、但平稳性检验和 shift 不支持时，Scientific Concept 应保持为
-`trend dynamics`，不能升级为 `non-stationarity`。
+Only if `trendStrength` is high, but steady and Shift does not support it should remain as
+`trend dynamics`, cannot be upgraded to `non-stationarity`.
 
-#### 示例三：变化点
+#### Example III: Change points
 
 ```text
 Dataset Evidence
@@ -350,10 +350,10 @@ Paper Language
 - regime-adaptive temporal modeling
 ```
 
-由于 change-point detector 也可能误报，concept 使用 `potential structural break`，而不是断言已存在确定的
-structural break。
+`potential structural break` is used by concept instead of asserting the existence of certainty because change-point detector can also be misreported
+structural break.
 
-#### 示例四：未来协变量
+#### Example IV: Future Accompaniments
 
 ```text
 Dataset Evidence
@@ -376,7 +376,7 @@ Paper Language
 - future covariate fusion
 ```
 
-#### 示例五：跨变量依赖
+#### Example five: Cross-variant dependency
 
 ```text
 Dataset Evidence
@@ -400,14 +400,14 @@ Paper Language
 - cross-variable attention for forecasting
 ```
 
-### 5.4 推荐的转换表
+### 5.4 recommended conversion table
 
 | Dataset evidence | Scientific concepts | Method concepts | Paper-language terms |
 | --- | --- | --- | --- |
-| strong seasonality + ACF/频域支持 | seasonality, recurrent temporal patterns | seasonal decomposition, periodic encoding | seasonal time series forecasting, periodic dependency modeling |
-| 两个以上显著频谱峰 | multiple seasonalities, multi-periodicity | frequency modeling, multi-scale modeling | multiple seasonalities forecasting, multi-periodic forecasting |
+| Strong seasonality supported by ACF/frequency evidence | seasonality, recurrent temporal patterns | seasonal decomposition, periodic encoding | seasonal time series forecasting, periodic dependency modeling |
+| Two or more significant spectrum peaks. | multiple seasonalities, multi-periodicity | frequency modeling, multi-scale modeling | multiple seasonalities forecasting, multi-periodic forecasting |
 | high trend strength | trend dynamics, long-term evolution | detrending, trend decomposition | trend-aware forecasting, trend decomposition forecasting |
-| ADF/KPSS/shift 联合支持 | non-stationarity, temporal distribution shift | adaptive normalization, shift-aware learning | non-stationary forecasting, distribution shift forecasting |
+| ADF/KPSS/shift Joint Support | non-stationarity, temporal distribution shift | adaptive normalization, shift-aware learning | non-stationary forecasting, distribution shift forecasting |
 | high change-point score | potential structural break, regime transition | change-point-aware modeling, regime adaptation | forecasting under structural breaks, regime shift forecasting |
 | known-future covariates | covariate-conditioned forecasting, exogenous dependence | covariate fusion, exogenous attention | forecasting with known future covariates, exogenous variable forecasting |
 | high cross-variate correlation | cross-series dependency | channel mixing, cross-variable attention | cross-variable dependency forecasting, channel mixing model |
@@ -416,37 +416,37 @@ Paper Language
 | high missing rate | incomplete observations | masked modeling, missingness-aware encoder | missing-aware forecasting, masked time series modeling |
 | irregular intervals | irregularly sampled time series | continuous-time modeling, time-gap encoding | irregular time series forecasting, irregular sampling model |
 | high horizon/context ratio | long-horizon dependency | multi-scale context, efficient long-range modeling | long-term time series forecasting, long-horizon forecasting |
-| holiday 分组效应有实证支持 | calendar effect, special-day effect | calendar embedding, event-aware gating | holiday load forecasting, calendar-aware forecasting |
+| There is empirical support for the grouping effect. | calendar effect, special-day effect | calendar embedding, event-aware gating | holiday load forecasting, calendar-aware forecasting |
 | variance changes over time | heteroscedasticity, time-varying uncertainty | probabilistic head, scale modeling | heteroscedastic forecasting, probabilistic time series forecasting |
 
-### 5.5 确定性规则与 LLM 分工
+### 5.5 Determination Rules and LLM Division of Labour
 
-确定性规则负责：
+The certainty rule is responsible for:
 
-- 根据报告字段和值决定允许出现哪些 Scientific Concepts；
-- 阻止 unsupported concept；
-- 从版本化词表加载 Method Concepts 和 paper terms；
-- 为每个 concept 保存 source path 和 confidence。
+- (a) To determine, on the basis of the report fields and values, which Scientific Concepts are allowed to appear;
+- Unsuppleted consept;
+- Load Method Concepts and paper terms from a version of the glossary;
+- Saves source path and condition for each concept.
 
-LLM 只负责：
+LLM is responsible only for:
 
-- 在允许的 concepts 内选择更自然的论文表达；
-- 把术语组织成一个简洁的英文检索字符串；
-- 去掉重复、口语化或数值化表达。
+- Select a more natural presentation within the permitted concepts;
+- Organize terminology into a simple English search string;
+- Delete repetition, oralization or numerical expression.
 
-LLM 不允许：
+LLM does not allow:
 
-- 修改 DataAnalysis 数值；
-- 添加报告中没有证据支持的 Scientific Concept；
-- 把 Method Concept 写成已经成立的方法结论；
-- 把 `seasonalityStrength=0.91` 这类内部字段名直接作为论文关键词；
-- 自动修改正式 taxonomy。
+- Modify the DataAnalysis value;
+- Add a scientific Concept that is not supported by evidence in the report;
+- Writing Method Concept as an established methodological conclusion;
+- Directly use `seasonalityStrength=0.91` such internal field names as key words for the paper;
+- Automatically modifys the official taxonony.
 
-LLM 输出必须通过严格 Zod schema，并检查每个 `datasetEvidence.path` 都能在报告中解析。
+LLM output must be Zod Schema strict and check that every `datasetEvidence.path` can be parsed in the report.
 
-## 6. Retrieval Intent 与论文语言查询
+## 6. Retrieval Intent & Paper Language Query
 
-### 6.1 Intent 结构
+### 6.1 Intent Structure
 
 ```json
 {
@@ -465,23 +465,23 @@ LLM 输出必须通过严格 Zod schema，并检查每个 `datasetEvidence.path`
 }
 ```
 
-### 6.2 单查询约束
+### 6.2 Single Query Constraint
 
-首版每个 Intent 只产生一个 `queryText`：
+Only one `queryText` is generated for each incent:
 
-- 不为 phenomenon、method、domain 分别生成查询；
-- 不为同义词生成多个查询；
-- 不执行 query paraphrase；
-- 不使用 RRF 合并结果；
-- 不进行第二轮 query refinement。
+- Do not generate queries for phenomenon, method and domain;
+- Do not generate multiple queries for synonyms;
+- Do not execute query paraphrase;
+- Do not use RRF merge results;
+- No second round query response.
 
-同义词可以作为同一个 BM25 查询中的 terms，但仍然只执行一次检索。
+Synonyms can be used as terms in the same BM25 query, but only for one search.
 
-### 6.3 论文语言转换规则
+### 6.3 Thesis Language Conversion Rule
 
-查询应优先使用论文可能出现的表达：
+Inquiries should give priority to possible expressions of the papers:
 
-| 内部表达 | 不推荐直接检索 | 推荐论文语言 |
+| Internal expression | Direct search not recommended | Language of recommended thesis |
 | --- | --- | --- |
 | `seasonalityStrength=0.91` | strong seasonality 0.91 | seasonal patterns, periodic dependencies |
 | `spectralPeaks=[24,168]` | period 24 period 168 | multiple seasonalities, multi-periodic patterns |
@@ -490,23 +490,23 @@ LLM 输出必须通过严格 Zod schema，并检查每个 `datasetEvidence.path`
 | `knownFutureCovariates` | future variables available | known future covariates, exogenous variables |
 | `crossVarCorrelation=0.72` | variables highly correlated | cross-variable dependencies, inter-series correlation |
 
-数字只保留在 provenance 和结果解释中，不进入首版 BM25 query；`24-hour`、`weekly` 等具有明确科学含义的
-周期描述可以例外，但必须由 sampling frequency 和 period 联合确定。
+Numbers are kept only in provenance and interpretation of results, not on the first edition of BM25 Query;`24-hour`, `weekly` etc. with clear scientific meanings
+The periodic description may be exceptional, but must be determined jointly by sampling freqency and period.
 
-## 7. 本地 BM25 检索
+## 7. Local BM25 Retrieval
 
-### 7.1 本地语料来源
+### 7.1 Local Language Source
 
-| Evidence level | 来源 | 可支持的用途 |
+| Evidence level | Source | Supportable uses |
 | --- | --- | --- |
-| `metadata_only` | catalog title、year、venue、publication status | 初步召回 |
-| `document_available` | abstract、introduction、method、results chunks | 相关性判断和全文检查 |
-| `paper_backed` | 已验证 KnowledgeCard 和 evidence span | 论文事实与机制证据 |
+| `metadata_only` | catalog title,year,venue,publication status | Initial recall |
+| `document_available` | abstract,introduction,method,results chunks | Relevance judgement and full-text examination |
+| `paper_backed` | Authenticated KnowledgeCard and evidence span | Thesis's facts and institutional evidence |
 
-当前 `paper_record` schema 没有 abstract 字段。因此只有 catalog、没有解析 PDF 的论文只能用标题参与 BM25，
-不能被标记为全文支持。
+The current `paper_record` schema does not have abstract fields. So only the catalog, which does not analyze PDF papers, can participate in BM25 with a title.
+This must not be labeled as supported by the full text.
 
-### 7.2 索引目录
+### 7.2 Index Directory
 
 ```text
 neo_cast/.neo-cast/literature-retrieval/
@@ -517,19 +517,19 @@ neo_cast/.neo-cast/literature-retrieval/
 └── runs/<retrieve-run-id>/
 ```
 
-`retrieval.db` 使用 SQLite/FTS5：
+`retrieval.db` for SQLite/FTS5:
 
-- `paper`：paperID、title、year、venue、publication status、PDF 状态；
-- `paper_text`：各 section 的聚合文本；
-- `paper_fts`：title、abstract、introduction、method、results、limitations；
-- `card_projection`：KnowledgeCard 的 claim、mechanism、applicability；
-- `index_source`：源文件 digest、parser version、taxonomy version。
+- `paper`: paperID, title, year, vene, public status, PDF state;
+- `paper_text`: polymerized text for each section;
+- `paper_fts`:title,abstract,introduction,method,results,limitations;
+- `card_projection`: claim, mechanism, applicability;
+- `index_source`: Source file digest, parser version, taxony version.
 
-首版不建立 citation graph，不建立向量索引。
+The first version does not create a status graph, nor does it create vector indexes.
 
-### 7.3 字段权重
+### 7.3 field weight
 
-BM25 建议字段权重：
+BM25 Suggested field weights:
 
 ```text
 title             = 4.0
@@ -541,12 +541,12 @@ results/ablation  = 1.5
 limitations       = 1.0
 ```
 
-如果 FTS5 的字段权重接口不能稳定满足需求，可在单元测试固定的 BM25 实现中显式计算 field score；
-仍然保持单查询、单阶段 BM25，不增加第二种召回器。
+If the FTS5 field weight interface does not stabilize to meet demand, medium-notation calculations of field score can be achieved by testing a fixed BM25 in cells;
+Single queries, single stages BM25 are still maintained without adding a second recaller.
 
-### 7.4 检索过程
+### 7.4 Retrieval process
 
-每个 Intent 的检索过程固定为：
+The search process for each incent is fixed to:
 
 ```text
 paper-language query
@@ -564,9 +564,9 @@ attach matched fields and evidence level
 select papers for LiteratureAgent
 ```
 
-首版保留 BM25 原始 rank 和可解释命中信息，不再叠加复杂综合公式。
+The first version retains the original BM25 rank and interprets hit information without supersing complex composite formulae.
 
-### 7.5 候选结构
+### 7.5 Candidate Structure
 
 ```json
 {
@@ -591,22 +591,22 @@ select papers for LiteratureAgent
 }
 ```
 
-### 7.6 简单筛选规则
+### 7.6 Simple Filter Rule
 
-- 每个 Intent 默认取 BM25 top 20；
-- 每个 Intent 最多向 LiteratureAgent 发送 top 5；
-- 同一论文被多个 Intent 命中时只解析一次，但保留全部 `intentID`；
-- 没有本地 PDF 的论文保留在结果中，状态为 `skipped_pdf_unavailable`；
-- `references` section 的命中不计入正文匹配；
-- 只有 domain term 命中、没有 scientific/method term 命中的候选降级为 `domain_only`；
-- watchlist/preprint 不删除，但显式保留 publication status；
-- BM25 分数不能转换为“论文结论可信度”。
+- BM25 top 20 for each Intent default;
+- Each incent sends a maximum of top 5 to LiteratureAgent;
+- The same paper was only analysed once in multiple Intent hits, but all `intentID` is retained;
+- No local PDF paper is kept in the result at `skipped_pdf_unavailable`;
+- `references` section does not include text matching in the hit;
+- Only domain term hit and no candidate for scientific/method term downgraded to `domain_only`;
+- watchlist/preprint does not delete but maintains the public status;
+- The BM25 score cannot be converted to "credibility of conclusions".
 
-## 8. RetrieveAgent 与 LiteratureAgent 桥接
+## 8. RetrieveAgent and LiteratureAgent Bridge
 
-### 8.1 桥接原则
+### 8.1 Bridge Principles
 
-RetrieveAgent 只向 LiteratureAgent 传递本地可解析的论文：
+RetrieveAgent only sends locally deciphered papers to LiteratureAgent:
 
 ```text
 BM25 Candidate
@@ -623,7 +623,7 @@ BM25 Candidate
      skipped_pdf_unavailable
 ```
 
-### 8.2 Bridge 输入
+### 8.2 Bridge input
 
 ```ts
 type RetrieveLiteratureBridgeInput = {
@@ -642,7 +642,7 @@ type RetrieveLiteratureBridgeInput = {
 }
 ```
 
-集成模式默认：
+Integration mode default:
 
 ```json
 {
@@ -652,7 +652,7 @@ type RetrieveLiteratureBridgeInput = {
 }
 ```
 
-### 8.3 Bridge 输出
+### 8.3 Bridge Output
 
 ```ts
 type RetrieveLiteratureBridgeResult = {
@@ -675,9 +675,9 @@ type RetrieveLiteratureBridgeResult = {
 }
 ```
 
-### 8.4 关联关系
+### 8.4 Association
 
-RetrieveAgent 需要额外保存：
+RetrieveAgent requires additional saving:
 
 ```text
 Dataset Evidence
@@ -688,21 +688,21 @@ Dataset Evidence
 → KnowledgeCard
 ```
 
-KnowledgeCard 本身保持跨任务、跨检索运行的 canonical knowledge，不写入 BM25 score。
-BM25 score、intent 和 DataAnalysis 来源保存在 RetrieveAgent 的运行记录中。
+KnowledgeCard itself maintains a cross-task and cross-research run canonical knowledge that does not write to BM25 score.
+BM25 score, incent and DataAnalysis sources are stored in the running records of RetrieveAgent.
 
-### 8.5 幂等与失败处理
+### 8.5 et al. and failed processing
 
-- 相同 PDF digest、parser version、prompt version 已有 completed LiteratureAgent run 时复用结果；
-- 单篇论文解析失败不能中止整个 RetrieveAgent run；
-- `ocr_required` 记录为 partial；
-- 没有 PDF 不是错误，记录为 skipped；
-- 所有失败保留 paperID、intentID 和原因；
-- RetrieveAgent 最终状态允许为 `completed_with_warnings`。
+- The results of the same PDF digest, parser version, prompt version are used when re-used LiteratureAgent run;
+- A single dissertation failed to stop the whole RetrieveAgent run;
+- `ocr_required` is recorded as partial;
+- No PDF is not an error, recorded as sskiped;
+- All failed to keep paperID, intentID and reasons;
+- RetrieveAgent final state allowed to be `completed_with_warnings`.
 
-## 9. 首版状态机
+## 9. First issue status machine
 
-首版是单轮流水线，不进行自主循环：
+The first edition is a single rotational water line, with no autonomous circulation:
 
 ```text
 READ_REPORT
@@ -726,9 +726,9 @@ COLLECT_KNOWLEDGE_CARDS
 FINISH
 ```
 
-状态机没有 `SEARCH_AGAIN`、`EXPAND_CITATIONS` 或 `UPDATE_QUERY` action。
+The status machine does not have `SEARCH_AGAIN`, `EXPAND_CITATIONS` or `UPDATE_QUERY` action.
 
-默认预算：
+Default budget:
 
 ```json
 {
@@ -739,9 +739,9 @@ FINISH
 }
 ```
 
-## 10. RetrieveAgent 最终产物
+## 10. RetrieveAgent final product
 
-### 10.1 运行目录
+### 10.1 Run Directory
 
 ```text
 .neo-cast/literature-retrieval/runs/<retrieve-run-id>/
@@ -788,11 +788,11 @@ FINISH
 }
 ```
 
-这个产物先供人工检查和后续模块开发使用，本期不由 HypoPlanner 消费。
+This product was first used for manual inspection and subsequent module development, not consumed by HypoPlanner during the period.
 
-## 11. 代码组织
+## 11. Code Organization
 
-建议新增：
+It is proposed to add:
 
 ```text
 opencode/packages/opencode/src/research/retrieve/
@@ -816,7 +816,7 @@ opencode/packages/opencode/src/research/retrieve/
     └── tsf-paper-language.v1.json
 ```
 
-建议新增 schema：
+Suggest new schema:
 
 ```text
 neo_cast/literature_knowledge/
@@ -828,96 +828,96 @@ neo_cast/literature_knowledge/
 └── retrieve_result.schema.json
 ```
 
-现有 `opencode/.../research/literature/` 保持为论文理解和 KnowledgeCard 模块。RetrieveAgent 通过
-`literature-bridge.ts` 调用它，不复制其解析、验证或存储逻辑。
+Existing `opencode/.../research/literature/` is maintained as thesis understanding and KnowledgeCard module. RetrieveAgent pass.
+`literature-bridge.ts` calls it and does not copy its resolution, validation or storage logic.
 
-## 12. 索引与运行可复现性
+## 12. Index and Run Recoverability
 
-`index_manifest.json` 至少记录：
+`index_manifest.json` at least recorded:
 
-- catalog SHA-256；
-- 每个 normalized document/chunk 文件的 SHA-256；
-- KnowledgeCard export digest；
-- tokenizer version；
-- BM25 参数；
-- taxonomy version；
-- 建立时间。
+- catalog SHA-256;
+- SHA-256 for each normalized document/chunk file;
+- KnowledgeCard export digest;
+- tokenizer version;
+- BM25 parameters;
+- taxonomy version;
+- Create time.
 
-`run_manifest.json` 至少记录：
+`run_manifest.json` at least recorded:
 
-- quantitative report digest；
-- index digest；
-- scientific concept mapping version；
-- method concept mapping version；
-- paper-language mapping version；
-- LLM model/prompt version（如果使用）；
-- 每个 Intent 的 queryText；
-- top K 和 LiteratureAgent 预算；
-- LiteratureAgent run IDs；
-- status、warnings 和 errors。
+- quantitative report digest;
+- index digest;
+- scientific concept mapping version;
+- method concept mapping version;
+- paper-language mapping version;
+- LLM model/prompt version (if used);
+- queryText for each incent;
+- Top K and LiteratureAgent budgets;
+- LiteratureAgent run IDs;
+- Status, Warnings and Errors.
 
-相同 report digest、index digest 和配置版本默认复用 RetrieveAgent 结果，除非显式指定 `force`。
+The same report data, index data and the default configuration version to reuse RetrieveAgent results unless visible `force` is specified.
 
-## 13. 测试方案
+## 13. Test programme
 
 ### 13.1 DataAnalysis contract
 
-- JSON 和 Markdown 来自同一个分析对象；
-- JSON schema 严格拒绝未知字段；
-- 所有 evidence path 可以解析；
-- spectral peaks 为空时不会产生 multiple seasonalities；
-- 没有 holiday 字段时不会产生 calendar effect。
+- JSON and Markdown are from the same subject;
+- JSON schema strictly rejects unknown fields;
+- All the evidence path can be analyzed;
+- Spectral Peaks do not produce spacetime
+- Cannot create calendar effect without the holidday field.
 
 ### 13.2 Concept conversion
 
-- 强周期性转换为 seasonality；
-- 两个显著频谱峰转换为 multiple seasonalities；
-- 单频谱峰不能转换为 multiple seasonalities；
-- 只有 trend strength 时不能直接断言 non-stationarity；
-- known-future covariates 转换为 covariate-conditioned forecasting；
-- method concepts 全部带 `retrieval_hypothesis`；
-- LLM 不能添加 allowlist 外的 scientific concept；
-- 内部指标名和数值不会原样进入 query。
+- Strong periodic conversion to security;
+- Two significant spectrum peaks are converted to multiplicates;
+- Single-spectral peaks cannot be converted to mmultiple seasonalities;
+- No direct assertion of non-state;
+- Know-future covariates converted to convariate-conditions;
+- Method consepts with all `retrieval_hypothesis`;
+- LLM cannot add a scientific concept outside of an allowlist;
+- Internal indicator names and values will not enter query as they are.
 
 ### 13.3 Paper-language translation
 
-- 每个 Intent 恰好产生一个 queryText；
-- query 使用英语学术术语；
-- query 包含 task term 和至少一个 scientific term；
-- query 不生成 paraphrase 列表；
-- query 不产生第二轮 refinement；
-- 相同输入和配置得到稳定结果。
+- Each incent happens to produce a queryText;
+- Qurey uses English academic terminology;
+- Query contains task terms and at least one scientific term;
+- query does not generate paraphrase lists;
+- Query does not produce a second round;
+- The same input and configuration have stable results.
 
 ### 13.4 BM25
 
-建立固定 fixture corpus：
+Create fixed fixtures:
 
-- 一篇 multiple-seasonality/frequency 论文；
-- 一篇 non-stationarity 论文；
-- 一篇仅 domain 相同但机制无关的论文；
-- 一篇只有 title、没有 PDF 的论文；
-- 一篇已有 KnowledgeCard 的论文。
+- A paper on multiple-seasonality/frequency;
+- A non-statearity paper;
+- (a) A paper that is only the same as domain but not related to mechanisms;
+- A paper with only Title and no PDF;
+- A paper that already has KnowledgeCard.
 
-验证：
+Authentication:
 
-- 对应 scientific/method terms 的论文排在前列；
-- 纯 domain 匹配不会被错误标为全文证据；
-- title-only 结果 evidence level 为 metadata_only；
-- references section 不参与正文匹配；
-- BM25 rank 和 matched fields 可以复现；
-- 不存在 RRF 或向量分数。
+- Thesis for scientific/method terms is at the top;
+- Pure domain matching will not be wrongly marked as full-text evidence;
+- Title-only results result level metadata_only;
+- Accesss section does not participate in text matching;
+- BM25 rank and monitored fields can be reproduced;
+- No RRF or vector fraction exists.
 
 ### 13.5 LiteratureAgent bridge
 
-- 有本地 PDF 的候选能调用 LiteratureAgent；
-- 同一论文被多个 Intent 命中时只解析一次；
-- completed run 可以复用；
-- no PDF 返回 skipped 而不是 failed；
-- 单篇失败不会中止其他论文；
-- acceptedCardIDs 可以追溯到 paperID、candidateID、intentID 和 DataAnalysis evidence；
-- integrated mode 禁止 agent-inference card 进入 accepted cards。
+- A local PDF candidate can call LiteratureAgent;
+- The same paper was analyzed only once in multiple Intent hits;
+- Completed run can be reused;
+- No PDF returns sskiped instead of failed;
+- A single failure does not suspend other papers;
+- acceptedCardIDs can be traced back to paperID, candidateID, intentID and DataAnalysis evidence;
+- Integraded mode forbids entry-inference card.
 
-### 13.6 端到端测试
+### 13.6 End-to-end test
 
 ```text
 quantitative report JSON
@@ -932,76 +932,76 @@ quantitative report JSON
 → retrieve_result.json
 ```
 
-## 14. 分阶段实施
+## 14. Phased implementation
 
-### Phase 1：定量报告与概念转换
+### Phase 1: quantitative reporting and conceptual transformation
 
-- 增加 `dataset_quantitative_analysis_json`；
-- 定义严格 schema；
-- 增加 `spectralPeaks`；
-- 实现 Dataset Evidence 提取；
-- 实现 Scientific Concept、Method Concept 和 Paper Language 三层 mapper；
-- 完成正例、反例和 unsupported concept 测试。
+- Add `dataset_quantitative_analysis_json`;
+- Strictly defined schema;
+- Add `spectralPeaks`;
+- Achieve Dataset Evidence extraction;
+- Achievement of the third floors of Scientific Concept, Method Concept and Paper Language
+- Completes the regular, inverse and unsupported test.
 
-验收：每个论文语言 term 都能反向追溯到 Dataset Evidence。
+Receiving and Inspection: Each thesis language term can be traced backwards to Dataset Employment.
 
-### Phase 2：本地 BM25
+### Phase 2: Local BM25
 
-- 构建 catalog/chunk/card FTS5 索引；
-- 实现每 Intent 单 query BM25；
-- 实现 matched field/term 解释；
-- 实现 candidate 去重、evidence level 和 PDF availability；
-- 生成 BM25 检索报告。
+- Build catalog/chunk/card FTS5 index;
+- Query BM25 per intent single;
+- (a) Accomplishing the monitored field/term interpretation;
+- Candidate heavy, video level and PDF aviality;
+- Generates BM25 search reports.
 
-验收：没有多查询扩展、RRF、向量检索或在线 API 调用。
+Receiving and inspection: No more query extensions, RRFs, vector search or online API calls.
 
-### Phase 3：LiteratureAgent 桥接
+### Phase 3: LiteratureAgent Bridge
 
-- 实现 candidate → LiteratureAgent input 转换；
-- 实现调用预算和同 paper 去重；
-- 接收 completed/partial/failed/skipped 状态；
-- 关联 acceptedCardIDs；
-- 生成 `retrieve_result.json` 和 `report.md`。
+- Candidate LiteratureAgent input conversion;
+- Realization of the mobilization budget and reprioritization;
+- Receive completed/partial/failed/skipped status;
+- Associated acceptedCardIDs;
+- Generate `retrieve_result.json` and `report.md`.
 
-验收：从定量报告到 paper-backed KnowledgeCard 的 provenance 链完整。
+Acceptance: Complete chain from quantitative report to paper-backed KnowledgeCard.
 
-### Phase 4：稳定性与可恢复性
+### Phase 4: stability and recoverability
 
-- 增加 index/run manifest；
-- 增加 digest 幂等复用；
-- 增加部分失败恢复；
-- 增加 fixture e2e；
-- 在 Research Service 中注册 RetrieveAgent 的 started/completed/failed events。
+- Add index/run climate;
+- (b) Add digest thallium etc. reuse;
+- (a) Increasing the number of failures to recover;
+- Add fixture e2e;
+- Registered in Research Service RetrieveAgent for started/completed/failed events.
 
-验收：一篇论文失败不影响其余结果，重复运行不会重复解析相同 PDF。
+Acceptance: The failure of a paper does not affect the remaining results, and repeated running does not repeat the same PDF.
 
-## 15. 后续版本再考虑
+## 15. We'll consider it later.
 
-以下能力明确留到首版完成之后：
+The following capabilities were explicitly retained after the completion of the first edition:
 
-- 同 Intent 多查询扩展；
-- BM25 + vector hybrid retrieval；
-- RRF 或 learned reranker；
-- Search → Learn → Search 术语迭代；
-- citation/reference expansion；
-- 学术乐问等在线 API provider；
-- 公开论文数据集的 computed profile；
-- Retrieve Result 与 HypoPlanner 的桥接；
-- 根据实验结果反向调整检索意图。
+- Extension of multiple queries with Intent;
+- BM25 + vector hybrid retrieval;
+- RRF or lost reranker;
+- "Search," "Learn", "Search" and "Search".
+- citation/reference expansion;
+- Online API programmer;
+- Publicly published data sets
+- Retrieve Research connects to HypoPlanner;
+- Retrieval intent adjusted in reverse on the basis of experimental results.
 
-## 16. MVP 完成标准
+## 16. MVP Completion Standard
 
-第一版达到以下条件即可认为完成：
+The first edition is considered complete if:
 
-1. 不配置外部论文 API 也能运行；
-2. RetrieveAgent 直接消费结构化定量分析报告；
-3. 完成 Dataset Evidence → Scientific Concepts → Method Concepts → Paper Language；
-4. 所有 Scientific Concepts 都有数值或 task contract 依据；
-5. Method Concepts 明确标记为 retrieval hypothesis；
-6. 每个 Intent 只执行一次 BM25；
-7. 不存在多查询融合、RRF、向量召回和多轮检索；
-8. 有本地 PDF 的候选能够正确桥接到 LiteratureAgent；
-9. 没有 PDF 的候选保持 metadata-only/skipped，不生成 paper-backed claim；
-10. KnowledgeCard 能追溯到 paper、intent、concept transformation 和 DataAnalysis evidence；
-11. RetrieveAgent 的结果先独立落盘，不依赖 HypoPlanner；
-12. 所有中间产物和版本信息可审计、可复现。
+1. API can also run without the configuration of external papers;
+2. RetrieveAgent Structured quantitative analysis of direct consumption;
+3. Complete Dataset Evidence → Scientific Concepts → Method Concepts → Paper Language.
+4. All Scientific Concepts have a value or a dataline;
+5. Method Concepts is clearly marked as retrievable hypothesis;
+6. Each Intent executes BM25 only once;
+7. There is no multi-search integration, RRF, vector recall and multiple search rounds;
+8. Local PDF candidates are able to get LiteratureAgent on the right bridge;
+9. No PDF candidate maintains metadata-only/skipped and does not generate paper-backed claim;
+10. KnowledgeCard can be traced back to paper, incent, concept transport and DataAnalysis experience;
+11. The result of RetrieveAgent is left on its own and does not depend on HypoPlanner;
+12. All intermediates and version information are auditable and re-available.

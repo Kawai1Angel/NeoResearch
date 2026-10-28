@@ -998,7 +998,7 @@ fi`))
         expect(unified).toContain("Dominant frequency period")
         expect(unified).toContain("Change point")
         expect(unified).toContain("Cross-lag")
-        expect(unified).toContain("领域解读")
+        expect(unified).toContain("Domain interpretation")
         expect(unified).toContain("![Time series overview](quantitative/plots/time-series-overview.png)")
         expect(unified).toContain("ADF stationarity")
         expect(unified).toContain("## Target Correlations")
@@ -1351,7 +1351,7 @@ fi`))
         const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
         expect(approvals.find((approval) => approval.kind === "protocol")).toMatchObject({
           status: "pending",
-          reason: expect.stringContaining("CSV 数据集路径"),
+          reason: expect.stringContaining("CSV dataset path"),
         })
         expect(await runResearch(Research.Service.use((svc) => svc.listRuns(task.id)))).toHaveLength(0)
       },
@@ -1879,7 +1879,7 @@ fi`))
   })
 
   test.each([
-    { source: "不可用", availableAtPredictionTime: false },
+    { source: "unavailable", availableAtPredictionTime: false },
     { source: "not available" },
     { availableAtPredictionTime: false },
   ] as Research.JsonRecord[])("prepare dataset ignores unused known-future availability metadata %j", async (availability) => {
@@ -6067,11 +6067,11 @@ async function createZeroTask(root?: string, datasetPath?: string) {
 }
 
 function zeroHypothesis(id: string) {
-  return { id, statement: `自主设计 MLP 模型 ${id}`, motivation: ["数据的上下文长度为 96。"],
-    expectedOutcome: "获得有效的 val_avg_mse", suggestedBackbones: ["mlp"], suggestedPreprocessing: [],
+  return { id, statement: `Autonomously design MLP model ${id}`, motivation: ["The dataset context length is 96."],
+    expectedOutcome: "Obtain a valid val_avg_mse", suggestedBackbones: ["mlp"], suggestedPreprocessing: [],
     requiredMechanisms: [], experimentContract: { mode: "exploratory" as const, changes: [], frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] },
-    risk: "可能过拟合", testable: true, datasetEvidencePaths: [], literatureEvidence: [],
-    applicabilityAssumptions: [], falsificationCriteria: ["完整评估未获得有效的主指标。"], evidenceLevel: "data_only" as const }
+    risk: "May overfit", testable: true, datasetEvidencePaths: [], literatureEvidence: [],
+    applicabilityAssumptions: [], falsificationCriteria: ["Full evaluation did not produce a valid primary metric."], evidenceLevel: "data_only" as const }
 }
 
 function installZeroFixture(invalidDesign = false, invalidPlanner = false) {
@@ -6089,13 +6089,13 @@ function installZeroFixture(invalidDesign = false, invalidPlanner = false) {
     if (system.startsWith("You are the NeoResearch HypoPlanner")) {
       plannerCalls++
       const hypotheses = [zeroHypothesis("H_zero_first"), zeroHypothesis("H_zero_second")]
-      result = { hypotheses, nextExperiment: { action: "experiment", hypothesisID: plannerCalls === 1 ? hypotheses[0]!.id : hypotheses[1]!.id, rationale: "直接执行自主设计的模型。" },
+      result = { hypotheses, nextExperiment: { action: "experiment", hypothesisID: plannerCalls === 1 ? hypotheses[0]!.id : hypotheses[1]!.id, rationale: "Run the autonomously designed model directly." },
         ...(invalidPlanner ? { referenceBaseline: "tsf_linear_raw_baseline", referenceBaselineRationale: "Unexpected preset" } : {}) }
     } else if (user.taskFingerprint?.selectedHypothesis) {
       designerCalls++
       result = invalidDesign ? { invalid: true } : {
         ...validTsfCandidateSpec(), recipeID: `zero_designed_${designerCalls}`,
-        hypothesis: "测试自主设计的 MLP 表示。", notes: "依据周期结构设计模型，不使用预置模板。",
+        hypothesis: "Test the autonomously designed MLP representation.", notes: "Design the model from periodic structure without preset templates.",
         embedding: { type: "patch", patchLen: 16, stride: 8, dModel: 64 },
         backbone: { type: "mlp", depth: 2, hiddenDim: designerCalls === 1 ? 64 : 128, activation: "gelu", dropout: 0 },
       }

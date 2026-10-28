@@ -1,89 +1,89 @@
-# 基于比例时间序列 K-Fold 的 MSE 优化指标修改方案
+# Ratio-based Time-series K-Fold MSE Objective Proposal
 
-## 1. 背景与目标
+## 1. Background and Goals
 
-当前 NeoCast 使用 `val_avg_mse` 作为候选模型的 keep/discard 主指标。该指标是在固定 validation split 上，对配置的多个预测 horizon 的 MSE 取平均：
+NeoCast currently ranks candidates and makes keep/discard decisions using val_avg_mse: mean MSE across configured horizon on the fixed validation split.
 
 ```text
 val_avg_mse = mean(val_h{H}_mse for H in horizons)
 ```
 
-本方案将候选优化指标改为基于时间顺序的 K-Fold 验证指标 `cv_avg_mse`，同时满足以下约束：
+This proposal changes the search objective to chronological K-Fold cv_avg_mse under these constraints:
 
-- 不复用或覆盖 `val_avg_mse`；两个指标语义保持独立。
-- 不使用随机 K-Fold，避免未来数据泄漏。
-- fold 按数据集可见区间长度的比例划分，以适配长度不同的数据集。
-- `cv_avg_mse` 只负责候选排序和 keep/discard。
-- 最终保存的 checkpoint 仍由原始 train split 训练，并用原始 val split 做 early stopping 和验证。
-- `ref_test` 不参与 fold 构造、归一化、训练、early stopping 或候选选择。
-- 尽量复用现有 `train.py`、`WindowDataset`、评估函数和 artifact 协议，控制修改范围。
+- Preserve val_avg_mse separately; the metrics have distinct meanings.
+- Do not use random K-Fold or leak future observations.
+- Define folds as proportions of the visible interval to support different dataset lengths.
+- Use cv_avg_mse only for candidate ranking and keep/discard.
+- Train the final checkpoint on the original train split, using the original val split for early stopping and validation.
+- Exclude ref_test from fold generation, normalization, training, early stopping, and candidate selection.
+- Reuse train.py, WindowDataset, evaluation functions, and artifact contracts where possible.
 
-## 2. 非目标
+## 2. Non-goals
 
-第一版不处理以下能力：
+The first version excludes:
 
-- 随机 K-Fold 或打乱时间点的交叉验证。
-- Sliding-window CV、fold 并行和多 seed × 多 fold。
-- 将 fold 模型组成 ensemble。
-- 使用 `cv_std_mse` 改写主目标，例如 `mean + lambda * std`。
-- 自动把不满足要求的数据集静默降级为更少 folds。
-- 使用某个 fold 的 checkpoint 作为最终 checkpoint。
+- Random K-Fold and shuffled-time cross-validation.
+- Sliding-window CV, parallel folds, and multiple seeds across multiple folds.
+- Fold-model ensembles.
+- Replacing the objective with cv_std_mse-based penalties such as mean + lambda * std.
+- Silently reducing fold counts when data is insufficient.
+- Selecting a fold checkpoint as the final checkpoint.
 
-## 3. 最终执行协议
+## 3. Final Execution Protocol
 
-每个候选的正式执行顺序为：
+Each candidate follows this execution order:
 
 ```text
 smoke test
     │
-    ├── 失败：crash，停止
+    ├── Failure: crash and stop
     │
-    └── 成功
+    └── Success
           │
           ▼
-比例 expanding-window K-Fold
+Ratio-based expanding-window K-Fold
     │
-    ├── 任一 fold 失败：crash，停止
+    ├── Any fold fails: crash and stop
     │
-    └── 全部成功：生成 cv_metrics.json
+    └── All succeed: generate cv_metrics.json
           │
           ▼
-原始 train split 训练 + 原始 val split 验证
+Train on the original train split and validate on the original val split
     │
-    ├── 生成 val_metrics.json
-    ├── 保存正式 checkpoint
-    └── 生成标准 training_summary.json
+    ├── Generate val_metrics.json
+    ├── Save the final checkpoint
+    └── Generate standard training_summary.json
           │
           ▼
-Runner 使用 cv_avg_mse 执行 keep/discard
+Runner uses cv_avg_mse for keep/discard
 ```
 
-采用先 CV、后标准训练的顺序，是为了避免 CV 已失败的候选继续消耗一次标准训练预算。标准训练必须在不带 fold override 的独立子进程中运行，确保 checkpoint 和 scaler 均来自原始 train/val 协议。
+CV precedes standard training to avoid spending another training budget after CV failure. Run standard training in a separate subprocess without fold overrides so its checkpoint and scaler follow the original train/val protocol.
 
-## 4. 指标定义
+## 4. Metric Definitions
 
-### 4.1 标准验证指标
+### 4.1 Standard Validation Metric
 
-`val_avg_mse` 保持现有定义和产出路径：
+Keep the current val_avg_mse definition and output location:
 
 ```text
 val_avg_mse = mean_H(val_hH_mse)
 ```
 
-它描述最终 checkpoint 在原始 val split 上的表现，不参与新版 keep/discard。
+It describes the final checkpoint on the original val split and no longer controls keep/discard.
 
-### 4.2 Fold 内指标
+### 4.2 Per-fold Metrics
 
-每个 fold 继续复用现有验证逻辑，产生：
+Reuse existing validation to produce these metrics for each fold:
 
 ```text
 fold_i_hH_mse
 fold_i_avg_mse = mean_H(fold_i_hH_mse)
 ```
 
-子进程内部仍可输出 `val_avg_mse`，因为对该子进程而言，它确实是在当前 fold 的 validation split 上评估；父级聚合时必须将其映射成 fold 明细，不能将它写入父 artifact 的标准 `val_metrics.json`。
+A fold subprocess may emit val_avg_mse because it evaluates that fold's validation interval. The parent must store it as a fold detail, never overwrite the final artifact's standard val_metrics.json with it.
 
-### 4.3 CV 聚合指标
+### 4.3 CV Aggregation
 
 ```text
 cv_avg_mse = mean_i(fold_i_avg_mse)
@@ -91,21 +91,21 @@ cv_std_mse = population_std_i(fold_i_avg_mse)
 cv_hH_mse = mean_i(fold_i_hH_mse)
 ```
 
-第一版使用 fold 宏平均，使每个时间区间具有相同权重。所有 fold 的验证比例相同，仅可能因行边界取整相差一行。
+Use a macro-average across folds, giving each time interval equal weight. Validation proportions match; rounding may cause a one-row difference.
 
-候选决策规则为：
+Candidate decision rule:
 
 ```python
 improved = best_cv_avg_mse is None or cv_avg_mse < best_cv_avg_mse
 ```
 
-`cv_std_mse` 仅用于诊断和反思，不参与排序。
+cv_std_mse supports diagnostics and reflection only; it does not affect ranking.
 
-## 5. 按比例生成 Fold
+## 5. Proportional Fold Generation
 
-### 5.1 可见区间
+### 5.1 Visible Interval
 
-CV 只使用原始 train 和 val 的联合区间：
+CV uses only the union of the original train and val intervals:
 
 ```python
 cv_start = BORDER_TRAIN[0]
@@ -113,13 +113,13 @@ cv_end = BORDER_VAL[1]
 visible_rows = (cv_start, cv_end)
 ```
 
-必须满足：
+Required conditions:
 
 ```text
 cv_end <= BORDER_TEST[0]
 ```
 
-### 5.2 默认配置
+### 5.2 Defaults
 
 ```json
 {
@@ -131,13 +131,13 @@ cv_end <= BORDER_TEST[0]
 }
 ```
 
-每个 fold 的验证比例自动计算：
+Compute each fold's validation fraction automatically:
 
 ```text
 fold_val_ratio = (1 - initial_train_ratio) / num_folds
 ```
 
-默认配置对应：
+The defaults produce:
 
 ```text
 Fold 0: train 0%–60%, val 60%–70%
@@ -146,11 +146,11 @@ Fold 2: train 0%–80%, val 80%–90%
 Fold 3: train 0%–90%, val 90%–100%
 ```
 
-这里的百分比均相对于 `train + val` 可见区间，而不是完整数据集。
+All percentages refer to the visible train+val interval, rather than the full dataset.
 
-### 5.3 行边界算法
+### 5.3 Row Boundaries
 
-为了避免不同数据长度和逐段取整造成的累计误差，直接计算每个比例分界点，并将最后一个 fold 的 `val_end` 强制设为 `visible_end`：
+Compute proportional boundaries directly to avoid accumulated rounding error. Force the final fold's val_end to visible_end:
 
 ```python
 def build_ratio_folds(
@@ -187,45 +187,45 @@ def build_ratio_folds(
     return folds
 ```
 
-要求：
+Requirements:
 
-- `num_folds >= 2`。
-- `0 < initial_train_ratio < 1`。
-- train 区间随 fold 单调扩张。
-- val 区间按时间连续、互不重叠。
-- 最后一个 val 的结束位置严格等于 `visible_end`。
+- `num_folds >= 2`.
+- `0 < initial_train_ratio < 1`.
+- Training intervals expand monotonically.
+- Validation intervals are chronological, contiguous, and nonoverlapping.
+- The final validation end equals visible_end exactly.
 
-### 5.4 窗口有效性
+### 5.4 Valid Windows
 
-验证集可以使用训练尾部作为 lookback，但预测目标必须完全位于 fold val 区间。因此：
+Validation may use the training tail as lookback, but every prediction target must fall entirely within fold validation:
 
 ```text
 required_train_length = input_len + max_horizon + min_train_windows - 1
 required_val_length = max_horizon + min_eval_windows - 1
 ```
 
-所有 fold 在启动训练前统一校验。如果任何 fold 不满足要求，应给出包含数据长度、fold 边界和最低要求的明确错误，不允许静默减少 folds。
+Validate all folds before training. If any fold is invalid, report dataset length, fold boundaries, and minimum requirements. Do not silently reduce fold counts.
 
-## 6. 最小侵入实现
+## 6. Minimal Implementation Changes
 
-### 6.1 新增 `py/cv_train.py`
+### 6.1 Add py/cv_train.py
 
-该文件作为现有 `train.py` 的编排包装器，负责：
+Wrap the existing train.py with an orchestrator that:
 
-1. 从原始 task spec 读取可见区间。
-2. 按比例生成并校验 folds。
-3. 为每个 fold 启动独立的 `train.py` 子进程。
-4. 解析每个子进程的 `eval_done` 和 artifact 事件。
-5. 聚合并写入 `cv_metrics.json`。
-6. 在不设置 split override 的环境中运行一次标准 `train.py`。
-7. 将 `cv_metrics.json` 附加到标准训练产生的 artifact。
-8. 对 Runner 输出同时包含 `val_*` 与 `cv_*` 的统一事件。
+1. Reads the visible interval from the original task specification.
+2. Generates and validates proportional folds.
+3. Starts an independent train.py subprocess for each fold.
+4. Parses eval_done and artifact events from each subprocess.
+5. Aggregates and writes cv_metrics.json.
+6. Runs standard train.py once without split overrides.
+7. Attaches cv_metrics.json to the standard-training artifact.
+8. Emits unified runner events containing both val_* and cv_* metrics.
 
-使用独立子进程可以复用当前模块级 `BORDER_TRAIN`、`BORDER_VAL` 和 `_VISIBLE_BUNDLE`，同时保证不同 fold 的 scaler、模型、optimizer、scheduler 和 early-stopping 状态互相隔离。
+Separate subprocesses reuse module-level BORDER_TRAIN, BORDER_VAL, and _VISIBLE_BUNDLE while isolating scalers, models, optimizer, scheduler, and early-stopping state between folds.
 
-### 6.2 `prepare_tsf.py` 增加受控 split override
+### 6.2 Controlled Split Overrides in prepare_tsf.py
 
-仅 CV 子进程设置：
+Only CV subprocesses set:
 
 ```text
 NEO_CAST_TRAIN_ROWS=0:6000
@@ -233,72 +233,72 @@ NEO_CAST_VAL_ROWS=6000:7000
 NEO_CAST_CV_FOLD_INDEX=0
 ```
 
-`prepare_tsf.py` 增加严格解析与校验：
+Add strict parsing and validation in prepare_tsf.py:
 
-- train 和 val override 必须同时提供。
-- 只允许在原始 `train + val` 可见区间内覆盖。
-- 不允许触及 `ref_test`。
-- `train_end <= val_start`。
-- 范围必须为整数且非空。
+- Require train and val overrides together.
+- Restrict overrides to the original visible train+val interval.
+- Never include ref_test.
+- `train_end <= val_start`.
+- Require nonempty integer ranges.
 
-标准训练前必须显式从子进程环境中移除这些变量，确保正式 checkpoint 使用原始 split。
+Explicitly remove these variables from the standard-training subprocess environment so the final checkpoint uses the original splits.
 
-### 6.3 Runner 修改
+### 6.3 Runner Changes
 
-正式训练入口在启用 CV 时从 `train.py` 切换到 `cv_train.py`，smoke 仍使用原 `train.py`。
+When CV is enabled, switch full training from train.py to cv_train.py; smoke still uses train.py.
 
-`RunnerState` 增加：
+Add to RunnerState:
 
 ```python
 best_cv_avg_mse: float | None = None
 ```
 
-标准训练完成后分别读取：
+After standard training, read separately:
 
 ```python
 val_avg_mse = float(val_metrics["val_avg_mse"])
 cv_avg_mse = float(cv_metrics["cv_avg_mse"])
 ```
 
-keep/discard 只比较 `cv_avg_mse`。旧 session 没有 `best_cv_avg_mse` 时可以读取，但启用 CV 后应开始新 session，避免旧 `val_avg_mse` champion 与 CV champion 混用。
+Compare only cv_avg_mse for keep/discard. Legacy sessions without best_cv_avg_mse remain readable, but enabling CV starts a new session so validation champions and CV champions are not mixed.
 
-### 6.4 Results 与展示
+### 6.4 Results and Display
 
-`results.tsv` 增加：
+Add to results.tsv:
 
 ```text
 cv_avg_mse
 cv_std_mse
 ```
 
-保留 `val_avg_mse`。`is_best` 根据 `cv_avg_mse` 计算。
+Keep val_avg_mse; calculate is_best from cv_avg_mse.
 
-Node 会话、companion 输出、reflection 和 LLM 上下文应同时显示：
+Node sessions, Companion output, reflection, and LLM context should show:
 
-- `cv_avg_mse`：主指标。
-- `cv_std_mse`：跨时间段稳定性。
-- `val_avg_mse`：正式 checkpoint 的标准 split 指标。
-- fold 明细：用于分析时间漂移。
+- cv_avg_mse: primary metric.
+- cv_std_mse: stability across time intervals.
+- val_avg_mse: the final checkpoint's original-split validation metric.
+- Fold details for analyzing temporal drift.
 
-Mutation 中原本依赖 `val_avg_mse` 的阈值判断应迁移到 `cv_avg_mse`，但字段名和状态字段不能通过别名兼容。
+Move metric-dependent mutation thresholds from val_avg_mse to cv_avg_mse. Do not alias the field names or state fields.
 
-## 7. Artifact 协议
+## 7. Artifact Contract
 
-最终 artifact 以标准 train/val 训练结果为主体：
+The final artifact is based on standard train/val training:
 
 ```text
 artifacts/run_<run_id>/
-├── model.pt                 # 原始 train split 训练的正式 checkpoint
+├── model.pt                 # Final checkpoint trained on the original train split
 ├── candidate.json
-├── preprocess.json          # 原始 train split 拟合的 scaler/预处理信息
-├── training_summary.json    # 标准训练摘要
-├── val_metrics.json         # 原始 val split 指标
-└── cv_metrics.json          # K-Fold 聚合及明细
+├── preprocess.json          # Scaler/preprocessing fitted on the original train split
+├── training_summary.json    # Standard training summary
+├── val_metrics.json         # Original validation split metrics
+└── cv_metrics.json          # K-Fold aggregates and details
 ```
 
-临时 fold artifact 不进入最终 checkpoint 集合。成功后只复制指标和必要日志；fold checkpoint 可由临时 artifact 生命周期清理。失败时保留足够的 fold 索引、命令退出码和日志位置用于排查。
+Temporary fold artifacts do not join the final checkpoint set. On success, copy only metrics and necessary logs; temporary lifecycle cleanup may remove fold checkpoints. On failure, retain fold indices, exit codes, and log locations for diagnosis.
 
-`cv_metrics.json` 建议格式：
+Suggested cv_metrics.json format:
 
 ```json
 {
@@ -331,87 +331,87 @@ artifacts/run_<run_id>/
 }
 ```
 
-`protocol_id` 必须由所有影响可比性的配置确定，包括 strategy、fold 数、初始训练比例、horizons、input length 和窗口规则。Runner 不应直接比较 protocol 不同的候选。
+Derive protocol_id from every comparability factor: strategy, fold count, initial training ratio, horizons, input length, and window rules. Do not compare candidates with different protocols directly.
 
-## 8. 错误处理
+## 8. Error Handling
 
-以下任一情况使整个候选 CV 失败：
+Any of these conditions fails the entire candidate evaluation:
 
-- fold 边界非法或窗口不足。
-- 任一 fold 子进程退出码非零。
-- 任一 fold 缺少 `eval_done` 或 artifact 事件。
-- 任一必要指标缺失、为 NaN 或 Inf。
-- 实际完成 fold 数与配置不一致。
-- fold 使用范围触及 ref-test。
-- 标准 train/val 训练失败。
+- Invalid fold boundaries or insufficient windows.
+- A nonzero fold subprocess exit code.
+- Missing eval_done or artifact events from any fold.
+- Missing, NaN, or infinite required metrics.
+- Completed fold count differs from configuration.
+- Any fold accesses ref_test.
+- Standard train/val training fails.
 
-不能丢弃失败 fold 后对剩余 fold 求平均，否则困难时间区间失败的候选可能得到虚假的更优分数。
+Do not omit failed folds and average the rest: failure on difficult intervals could otherwise produce an artificially favorable score.
 
-## 9. 文件级修改清单
+## 9. File Changes
 
-### 必需修改
+### Required Changes
 
 - `py/cv_train.py`
-  - 新增比例 fold 生成、校验、子进程调度、聚合和标准训练编排。
+  - Add proportional fold generation, validation, subprocess scheduling, aggregation, and standard-training orchestration.
 - `py/prepare_tsf.py`
-  - 增加受控的 train/val 边界 override。
+  - Add controlled train/val boundary overrides.
 - `py/runner.py`
-  - 读取 `cv_avg_mse`，新增 state 字段并切换 keep/discard。
+  - Read cv_avg_mse, add state fields, and switch keep/discard.
 - `py/search/mutate.py`
-  - 将指标驱动的 mutation 从 `val_avg_mse` 切换到 `cv_avg_mse`。
+  - Switch metric-driven mutation to cv_avg_mse.
 - `src/session.js`
-  - 按 `cv_avg_mse` 推导 session champion。
-- `src/loop.js`、`src/output.js`、`src/reflect.js`、`src/llm.js`
-  - 展示和描述独立 CV 指标。
+  - Determine session champions from cv_avg_mse.
+- `src/loop.js`,`src/output.js`,`src/reflect.js`,`src/llm.js`
+  - Display and describe CV metrics separately.
 - `py/schemas/metadata_schema.json`
-  - 增加严格的 CV metrics 元数据结构。
+  - Add a strict CV-metrics metadata structure.
 
-### 测试与文档
+### Tests and Documentation
 
 - `py/tests/test_cv_train.py`
-- 与 `prepare_tsf` split/scaler 相关的现有测试模块。
-- `py/tests/test_runner_curves.py` 或新的 runner CV 测试。
-- Node session、loop、output 相关测试。
-- README、使用说明和架构文档中的主指标描述。
+- Existing prepare_tsf split/scaler test modules.
+- py/tests/test_runner_curves.py or dedicated runner CV tests.
+- Node session, loop, and output tests.
+- Primary-metric descriptions in README, usage, and architecture documents.
 
-## 10. 测试计划
+## 10. Test Plan
 
-### 10.1 Fold 生成
+### 10.1 Fold Generation
 
-- 10,000 行、12,347 行等不同长度的比例边界正确。
-- 最后一个 val 精确结束于可见区间末尾。
-- train 单调扩张，val 连续且不重叠。
-- 非法比例、fold 数和不足窗口得到明确错误。
-- 任何 fold 都不触及 ref-test。
+- Correct proportional boundaries for lengths such as 10,000 and 12,347 rows.
+- Final validation ends exactly at the visible-interval boundary.
+- Training expands monotonically; validation intervals are contiguous and nonoverlapping.
+- Explicit errors for invalid ratios, fold counts, and insufficient windows.
+- No fold accesses ref_test.
 
-### 10.2 数据泄漏
+### 10.2 Leakage
 
-构造 train 与 val 分布明显不同的数据，确认每个 fold 的 scaler 只拟合该 fold train。
+Use data with clearly different training/validation distributions to verify each scaler fits only that fold's training rows.
 
-确认验证样本可使用 train 尾部作为 lookback，但所有预测 target 均落在 fold val 内。
+Verify lookback may use the training tail while every forecast target remains inside fold validation.
 
-### 10.3 训练隔离
+### 10.3 Training Isolation
 
-- 每个 fold 使用全新模型、optimizer、scheduler 和 early-stopping 状态。
-- 相同 seed 规则可复现。
-- 标准训练进程没有 fold override。
-- 最终 `model.pt` 与 `preprocess.json` 来自标准 train/val 运行，而非最后一个 fold。
+- Fresh model, optimizer, scheduler, and early-stopping state per fold.
+- Reproducible behavior under the same seed rule.
+- No fold override in standard training.
+- Final model.pt and preprocess.json come from standard train/val, rather than the final fold.
 
-### 10.4 指标聚合
+### 10.4 Aggregation
 
-- `cv_avg_mse`、`cv_std_mse` 和各 horizon 平均计算正确。
-- 父级 `val_metrics.json` 未被 fold 指标覆盖。
-- NaN、Inf、缺失指标或 fold 失败导致整体失败。
+- Correct cv_avg_mse, cv_std_mse, and per-horizon averages.
+- Fold metrics never overwrite the parent's val_metrics.json.
+- NaN, Inf, missing metrics, or fold failure fail the whole evaluation.
 
-### 10.5 Runner 与兼容性
+### 10.5 Runner and Compatibility
 
-- `cv_avg_mse` 更低时 keep，更高或相同时 discard。
-- `val_avg_mse` 更低但 `cv_avg_mse` 更高时仍 discard。
-- 不同 `protocol_id` 不直接比较。
-- 旧 state 可被读取，但启用 CV 后不会把旧 val champion 当作 CV champion。
-- smoke 行为和原有标准训练 artifact 契约保持兼容。
+- Lower cv_avg_mse means keep; equal or higher means discard.
+- Discard even when val_avg_mse decreases if cv_avg_mse increases.
+- Do not compare distinct protocol_id values directly.
+- Read old state without treating a legacy validation champion as a CV champion.
+- Preserve smoke behavior and standard-training artifact compatibility.
 
-完整修改后运行：
+After implementation, run:
 
 ```bash
 cd neo_cast
@@ -419,51 +419,51 @@ npm test
 node ./bin/neo-cast.js validate recipe py/schemas/recipe_native.example.json
 ```
 
-## 11. 实施步骤
+## 11. Implementation Stages
 
-### 步骤一：CV 执行器与数据边界
+### Stage One: CV Executor and Data Boundaries
 
-实现纯函数 fold 生成与校验、split override 和 `cv_train.py` 子进程编排。此时先生成 `cv_metrics.json`，但不切换 Runner 主指标。
+Implement pure fold-generation/validation functions, split overrides, and cv_train.py subprocess orchestration. Generate cv_metrics.json first without switching the runner objective yet.
 
-验收重点：fold 比例正确、无泄漏、标准 checkpoint 来源正确。
+Acceptance: correct fold ratios, no leakage, and correct final-checkpoint provenance.
 
-### 步骤二：主指标切换
+### Stage Two: Switch the Primary Metric
 
-增加 Runner state/results 字段，将 keep/discard、session champion 和 mutation 切换到 `cv_avg_mse`。保留 `val_avg_mse` 作为标准 checkpoint 的诊断指标。
+Add runner state/results fields and switch keep/discard, session champion, and mutation to cv_avg_mse. Keep val_avg_mse as a diagnostic for the standard checkpoint.
 
-验收重点：构造 `val_avg_mse` 与 `cv_avg_mse` 排名相反的测试，确认系统严格按 CV 决策。
+Acceptance: reverse the rankings of val_avg_mse and cv_avg_mse in a test and verify decisions strictly follow CV.
 
-### 步骤三：Schema、输出与文档收口
+### Stage Three: Schema, Output, and Documentation
 
-补齐 metadata schema、export、LLM prompt、reflection、CLI 展示和使用文档，冻结 `cv_metrics.v1` 与 `protocol_id` 口径。
+Complete metadata schemas, exports, LLM prompts, reflection, CLI display, and usage documentation; freeze cv_metrics.v1 and protocol_id semantics.
 
-验收重点：Python、Node、artifact 和文档对两个指标的语义完全一致。
+Acceptance: Python, Node, artifacts, and documentation agree on the two distinct metric meanings.
 
-## 12. 性能与后续优化
+## 12. Performance and Later Optimization
 
-该方案每个候选需要约 `K + 1` 次正式训练；默认 K=4 时约为 5 次。第一版优先保证协议正确。
+Each candidate requires approximately K+1 full training runs: about five at the default K=4. Protocol correctness takes priority in version one.
 
-如果成本不可接受，后续可以增加两阶段评估：
+If this cost is excessive, later add staged evaluation:
 
 ```text
-screening：最近一个 fold，小预算，不具备 champion 资格
-full_cv：完整 K folds，具备 champion 资格
-standard：原始 train/val，生成正式 checkpoint
+screening: the most recent fold with a small budget; ineligible for champion selection
+full_cv: all K folds; eligible for champion selection
+standard: original train/val training to generate the final checkpoint
 ```
 
-所有进入 champion 比较的候选仍必须完成相同的 full-CV protocol，不能将 screening 指标与 `cv_avg_mse` 混合比较。
+Every champion contender must complete the same full-CV protocol. Never compare screening scores with cv_avg_mse.
 
-## 13. 建议默认决策
+## 13. Recommended Defaults
 
-- CV 类型：expanding-window。
-- folds：4。
-- 初始训练比例：60%。
-- 每 fold 验证比例：自动均分剩余 40%。
-- gap：0；未来如任务存在标签发布延迟，再增加 gap 配置。
-- fold seed：使用 candidate 的相同基础 seed，不使用 `seed + fold_index`。
-- 聚合：fold 宏平均。
-- 方差：总体标准差，仅报告。
-- 小数据集：启动前失败，不静默改变协议。
-- checkpoint：始终保存原始 train/val 标准训练结果。
-- champion：只按 `cv_avg_mse` 决定。
+- CV strategy: expanding window.
+- folds:4.
+- Initial training fraction: 60%.
+- Validation per fold: divide the remaining 40% evenly.
+- Gap: 0; add configurable gaps later for delayed label availability.
+- Fold seed: use the candidate's same base seed, rather than seed + fold_index.
+- Aggregation: macro-average across folds.
+- Dispersion: population standard deviation, reported only.
+- Small datasets: fail before training rather than silently change the protocol.
+- Checkpoint: always the standard original train/val training result.
+- Champion: determined only by cv_avg_mse.
 
