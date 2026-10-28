@@ -116,7 +116,7 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
     const activeOperation = ResearchOperations.active(projectID, taskID) ?? null
     const blockers: string[] = []
     if (cycle && cycle.input_digest !== cycleDigest(mapTask(task)))
-      blockers.push("输入数据或评估协议已变更，请显式创建新研究周期")
+      blockers.push("Input data or the evaluation protocol changed; explicitly create a new research cycle")
     const artifacts = db.select().from(ResearchArtifactTable).where(eq(ResearchArtifactTable.task_id, taskID)).all()
     for (const artifact of artifacts) {
       const local = localArtifactPath(artifact.uri)
@@ -139,13 +139,13 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
             return receipt.run_id === run.id && receipt.kind === kind && run.artifact_refs.includes(receipt.id) && file && existsSync(file)
           }),
         )
-      if (local && !transientCV && !retainedSmoke && !existsSync(local)) blockers.push(`产物缺失：${local}`)
+      if (local && !transientCV && !retainedSmoke && !existsSync(local)) blockers.push(`Missing artifact:${local}`)
     }
-    if (!task.session_id) blockers.push("原研究对话已删除，研究结果仍保留")
+    if (!task.session_id) blockers.push("The original research conversation was deleted; research results are retained")
     const unknown =
       activeOperation?.recoveryRequired ||
       (!activeOperation && runs.some((run) => ["queued", "running"].includes(run.status)))
-    if (unknown) blockers.push("旧执行的结束状态尚未确认，禁止重复启动。请检查原服务、runner 和已有产物。")
+    if (unknown) blockers.push("The previous execution's final state is unconfirmed; duplicate execution is blocked. Check the original service, runner, and existing artifacts.")
     const recoveryState = unknown
       ? "needs_reconciliation"
       : activeOperation
@@ -159,12 +159,12 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
               : "resumable"
     const summary =
       recoveryState === "running"
-        ? "研究仍在执行，可查看原操作"
+        ? "Research is still running; view the original operation"
         : recoveryState === "waiting_input"
-          ? (pendingApproval?.reason ?? "请回答原意图问题")
+          ? (pendingApproval?.reason ?? "Please answer the original intent question")
           : recoveryState === "completed"
-            ? "研究已完成，可查看结果"
-            : blockers.join("；") || "可从已保存的阶段继续研究"
+            ? "Research is complete; view results"
+            : blockers.join("; ") || "Research can resume from the saved stage"
     return {
       taskID,
       intentSessionID: intentSession?.id ?? null,

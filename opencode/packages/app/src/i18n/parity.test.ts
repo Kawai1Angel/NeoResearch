@@ -17,10 +17,15 @@ import { dict as zh } from "./zh"
 import { dict as zht } from "./zht"
 import { dict as tr } from "./tr"
 
-const locales = [ar, br, bs, da, de, es, fr, ja, ko, no, pl, ru, th, tr, zh, zht]
+const locales = [ar, br, bs, da, de, es, fr, ja, ko, no, pl, ru, th, tr]
 const keys = ["command.session.previous.unseen", "command.session.next.unseen"] as const
 
 describe("i18n parity", () => {
+  test("legacy Chinese locale modules use the English dictionary", () => {
+    expect(zh).toBe(en)
+    expect(zht).toBe(en)
+  })
+
   test("non-English locales translate targeted unseen session keys", () => {
     for (const locale of locales) {
       for (const key of keys) {

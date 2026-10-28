@@ -1,50 +1,50 @@
-# NeoResearch OS on OpenCode Fork：设计说明
+# NeoResearch OS on OpenCode Fork: Design description
 
-日期：2026-04-27
+Date: 2026-04-27
 
-## 1. 背景
+## 1. Background
 
-目标是直接 fork OpenCode，并把它从通用 coding agent 产品重构为通用 Research OS。第一版内置 TSF / Neo-Cast 作为第一个 domain plugin，但架构需要为后续接入其他科研领域保留清晰边界。
+The target is fork OpenCode directly and re-constructs it from a generic coding agent product to a common Research OS. The first version has TSF / Neo-Cast as the first domain pugin, but the structure needs to maintain clear boundaries for subsequent access to other scientific fields.
 
-当前 Neo-Cast 已经具备候选驱动 runtime、CandidateRecipe、TSF 数据协议、训练评估、runner、artifact 导出等能力。OpenCode 则具备成熟的 provider、server、event bus、session、TUI/Web、permission、tool registry、plugin/MCP 基础。NeoResearch 应复用 OpenCode 的 agent runtime 基建，但把默认产品对象从 coding session 切换为 research task。
+Neo-Cast now has candidate driver runtime, CandidateRecipe, TSF data protocol, training assessment, runner, export. OpenCode has a mature foundation for provider, server, eventbus, session, TUI/Web, mission, tool reporting, plugin/MCP. NeoResearch should revert to OpenCode's anent runtime capital, but switch the default product object from coding session to research desk.
 
-## 2. 设计目标
+## 2. Design objectives
 
-- 把 OpenCode fork 改造成 Research-first 产品，而不是在原产品里增加一个小功能。
-- 保留 TUI + Web + CLI + Server API，所有入口共用同一套 research task / run / event / artifact API。
-- Web 默认是 Research Dashboard，TUI 默认是 Research Cockpit。
-- 支持两种交互模式：
-  - Review Mode：Agent 提出候选和实验计划，Human 批准后执行。
-  - Autonomous Mode：Human 批准任务和预算后，Agent 在预算内自主 propose / run / evaluate / memory，关键节点请求批准。
-- 第一版内置 TSF domain plugin，跑通 CandidateRecipe -> smoke/full train -> metrics -> champion -> memory -> artifact 的自主研究闭环。
-- 保留 OpenCode 原有 coding tools 作为 debug/admin 能力，但不再作为默认主体验。
+- Change OpenCode fork to a Research-first product instead of adding a small function to the original product.
+- Keep TUI + Web + CLI + Server API, with all access points sharing the same set of research procedures/ run / event / description API.
+- Web default is Research Dashboard, TUI default is Research Cockpit.
+- Two modes of interaction are supported:
+  - Review Mode: Agent presented a candidate and pilot project, which was approved by Human and implemented.
+  - Autonomous Mode: Upon the approval of mandates and budgets by Human, Agent is autonomous within the budget, requesting approval for key nodes.
+- The first version of the built-in TSF domain plugin runs through CandidateRecipe - smoke/full track - mittics - champion - curmory - à autofact.
+- Keeps OpenCode original coding skills as debug/admin, but no longer as default master experience.
 
-## 3. 非目标
+## 3. Non-target
 
-- v0.1 不追求支持所有科研领域，只要求 domain plugin 抽象足够稳定。
-- v0.1 不追求完整替换 OpenCode 所有旧 session/UI 代码，可以先隐藏或降级旧 coding 入口。
-- v0.1 不做论文写作 Agent、开放式文献综述 Agent 或生产部署平台。
-- v0.1 不要求多租户企业治理，只保留未来可扩展的权限和审计边界。
+- v0.1 does not seek to support all fields of scientific research, but only requires that domain pugin be abstracted and stable enough.
+- v0.1 does not seek full replacement of OpenCode all old session/UI codes, which can be hidden or downgraded first.
+- v0.1 does not write essays Agent, open literature review Agent or production deployment platform.
+- v0.1 does not require the governance of multi-tenant enterprises, but only preserves future scalable competencies and audit boundaries.
 
-## 4. OpenCode 改造边界
+## 4. OpenCode Adaptation of Borders
 
-保留并复用：
+Retain and reuse:
 
-- `provider`：模型供应商、认证、模型配置。
-- `server`：统一 HTTP/API 和事件流。
-- `bus/event`：运行态事件广播。
-- `permission`：作为 research approval policy 的底层机制。
-- `storage/session`：迁移为 research task / run / memory 的持久层。
-- `TUI/Web`：保留渲染和订阅事件的技术基础，重做信息架构。
-- `plugin/MCP`：后续用于 domain plugin 和 artifact tool 扩展。
+- `provider`: Model provider, certification, model configuration.
+- `server`: Unify HTTP/API and event stream.
+- `bus/event`: Run-state event broadcast.
+- `permission`: as a bottom-up mechanism for research applications.
+- `storage/session`: Moves to a permanent layer of research task / run / memory.
+- `TUI/Web`: Retain the technical basis for rendering and subscription events, and redo the information architecture.
+- `plugin/MCP`: Follow-up for domain plugin and extension tool.
 
-弱化或迁移：
+Weakened or relocated:
 
-- `bash/read/edit/write/apply_patch` 等 coding tools 不再是主入口，只在 debug/admin agent 中启用。
-- 原来的 chat-to-edit-code 体验迁入 legacy/debug namespace。
-- 原 coding prompt 和 agent mode 不再作为默认启动路径。
+- `bash/read/edit/write/apply_patch` etc. is no longer the main entrance but only enabled in debug/admin anent.
+- The original chat-to-edit-code experience is moving into legacy/debug namespace.
+- The original coding program and agent mode are no longer used as the default start path.
 
-新增核心目录建议：
+New Core Catalogue Proposal:
 
 ```text
 packages/opencode/src/research/
@@ -60,11 +60,11 @@ packages/opencode/src/research/
   event/
 ```
 
-产品默认路径切换为 NeoResearch。旧 OpenCode coding session 可以保留在隐藏命令或 debug mode 中，避免第一阶段大面积删除带来不必要风险。
+The product default path switch to NeoResearch. The old OpenCode working session can be kept in hidden commands or debug mode to avoid unnecessary risks arising from the first phase of large-scale deletion.
 
-## 5. 核心数据模型
+## 5. Core data model
 
-NeoResearch 的业务核心不再是 `Session -> Message -> Part`，而是：
+The core of NeoResearch business is no longer `Session -> Message -> Part`, but:
 
 ```text
 ResearchTask
@@ -76,14 +76,14 @@ ResearchTask
   -> MemoryItem
 ```
 
-OpenCode session 仍可作为用户和 Agent 的交互容器：
+OpenCode session still serves as an interactive container for users and Agent:
 
 ```text
-ResearchSession = 围绕某个 ResearchTask 的交互、日志和事件流
-ResearchTask = 可独立运行、评估和复现的科研任务实体
+ResearchSession = interactive, log and event stream around a ResearchTask
+ResearchTask = scientific mission entity that can operate, assess and reproduce independently
 ```
 
-核心实体：
+Core entity:
 
 ```ts
 type ResearchTask = {
@@ -142,11 +142,11 @@ type MemoryItem = {
 }
 ```
 
-Research state 必须从这些实体推导，不能依赖聊天历史反推。
+Research state has to deduce from these entities, not rely on chat history.
 
-## 6. Domain Plugin 抽象
+## 6. Domain Plugin Abstract
 
-NeoResearch 是通用 Research OS，domain plugin 负责领域特定逻辑。第一版只内置 TSF，但接口按通用形式设计。
+NeoResearch is the generic Research OS, domain pugin field-specific logic. Release 1 is built into TSF only, but interfaces are designed in a generic format.
 
 ```ts
 interface ResearchDomain {
@@ -166,20 +166,20 @@ interface ResearchDomain {
 }
 ```
 
-TSF domain plugin 对应 Neo-Cast：
+TSF domain plugin corresponds to Neo-Cast:
 
-- `TaskSpec`：数据集、horizons、context length、目标列、预算、评估协议。
-- `CandidateSpec`：CandidateRecipe。
-- `Evaluator`：val/ref-test MSE/MAE、utility、Pareto。
-- `ArtifactExporter`：模型 checkpoint、metadata、preprocess、inference、MCP forecast tool。
+- `TaskSpec`: Data set, horizons, context length, target column, budget, evaluation protocol.
+- `CandidateSpec`:CandidateRecipe.
+- `Evaluator`:val/ref-test MSE/MAE,utility,Pareto.
+- `ArtifactExporter`: Model checkpoint, metadata, preprocess, reference, MCP forecast tool.
 
-Domain plugin 不直接控制 UI。UI 只消费统一的 research API 和 domain-provided schema metadata。
+Domain pugin does not directly control UI. UI only consumes uniform search API and domain-proved schema metadata.
 
-## 7. 两种运行模式
+## 7. Two modes of operation
 
 ### Review Mode
 
-流程：
+Process:
 
 ```text
 Task created
@@ -192,11 +192,11 @@ Task created
 -> Agent proposes next candidate
 ```
 
-Review Mode 适合早期任务、高风险实验、预算敏感场景。TUI/Web 需要清晰显示 candidate diff、预估成本、风险原因和批准按钮。
+Review Mode is suited to early missions, high-risk experiments, budget sensitive scenarios. TUI/Web needs to clearly show candidate diff, estimated cost, risk cause and approval buttons.
 
 ### Autonomous Mode
 
-流程：
+Process:
 
 ```text
 Human approves task + budget + policy
@@ -208,18 +208,18 @@ Human approves task + budget + policy
 -> Stop on budget, convergence, crash streak, or human stop
 ```
 
-Autonomous Mode 的审批策略：
+Autonomous Mode's approval strategy:
 
-- ref-test / blind-test 查询必须人工批准。
-- 超预算、使用新 domain action、修改评估协议必须人工批准。
-- 低风险候选可自动批准。
-- 连续 crash 达到阈值自动暂停。
+- Ref-test/blind-test query must be manually approved.
+- Overbudgeting, the use of new domain action and amendments to assessment protocols require manual approval.
+- Low-risk candidates can be automatically approved.
+- The continuous crash reaches the threshold automatically suspends.
 
 ## 8. Research Orchestrator
 
-OpenCode 原 SessionPrompt / SessionProcessor 处理的是 LLM stream 和 tool call。NeoResearch 需要新增 ResearchOrchestrator，处理 research loop。
+OpenCode old SessionPrompt/ SessionProcessor handles LLM stread and tool call. NeoResearch needs to add a new ResearchOrchestrator to handle research loop.
 
-核心循环：
+Core cycle:
 
 ```text
 load task state
@@ -236,7 +236,7 @@ emit events
 repeat until stop condition
 ```
 
-Orchestrator 输出结构化 ResearchEvent，而不是依赖任意文本：
+Orchestra output structured ResearchEvent instead of relying on any text:
 
 - `task.created`
 - `task.profiled`
@@ -251,72 +251,72 @@ Orchestrator 输出结构化 ResearchEvent，而不是依赖任意文本：
 - `task.paused`
 - `task.completed`
 
-OpenCode 的 event bus 可以继续承载这些事件。
+OpenCode may continue to carry these events.
 
-## 9. TUI 和 Web
+## 9. TUI and Web
 
-### TUI：Research Cockpit
+### TUI:Research Cockpit
 
-TUI 默认面向实时操作：
+TUI default for real-time operations:
 
-- 当前 task 状态。
-- Agent 当前步骤。
-- 候选队列。
-- 审批请求。
-- 最新 run 日志和指标。
-- 当前 champion。
-- Stop / pause / approve / reject 操作。
+- Current task status.
+- Agent's current step.
+- candidates.
+- Requests for approval.
+- The latest run logs and indicators.
+- Current Campion.
+- Stop /pause / approve / project operation.
 
-TUI 不是完整分析平台，重点是快速监督和干预。
+TUI is not a complete analytical platform, focusing on rapid monitoring and intervention.
 
-### Web：Research Dashboard
+### Web:Research Dashboard
 
-Web 默认面向总览和分析：
+Web default for overview and analysis:
 
-- Task list。
-- 单 task dashboard。
-- Runs table。
-- Metrics trend。
-- Champion / challenger 对比。
-- Candidate lineage。
-- Artifact browser。
-- Memory / lessons。
+- Task list.
+- Just ask dashboard.
+- Runs table.
+- Metrics trend.
+- Champion / Challenger comparison.
+- Candidate lineage.
+- Artifact browser.
+- Memory / lessons.
 
-Web 通过同一 server API 和 event stream 读取状态，不直接调用 domain runner。
+Web does not directly call domain runner by reading status via the same server API and event stage.
 
 ## 10. TSF v0.1 Vertical Slice
 
-第一版内置 `domainId = "tsf"`，目标是跑通完整自主研究闭环。
+The first version of `domainId = "tsf"`, which is built in, aims to run through the complete autonomous research closed loop.
 
-TSF v0.1 能力：
+TSF v0.1 capability:
 
-- 创建 TSF ResearchTask。
-- 绑定本地 CSV 或现有 Neo-Cast dataset contract。
-- 生成 TaskFingerprint。
-- 运行 NLinear baseline。
-- 让 Agent 生成 CandidateRecipe。
-- 支持 Review / Autonomous 两种 mode。
-- 运行 smoke/full train。
-- 记录 val metrics。
-- 更新 champion。
-- 写 memory。
-- 导出 artifact。
+- Create TSF ResearchTask.
+- Bind local CSV or existing Neo-Cast dataset contract.
+- Generate TaskFingerprint.
+- Run NLinear baseline.
+- Let Agent generate CandidateRecipe.
+- Support for Review / Autonomous Mode.
+- Run smoke/full track.
+- Record val metrics.
+- Update.
+- Write memory.
+- Export artifact.
 
-TSF v0.1 的 CandidateRecipe 初始 action space：
+CandidateRecipe for TSF v0.1
 
-- preprocessing：`none`, `instance_norm`, `series_decomposition`
-- embedding：`none`, `patch`, `multiscale_patch`
-- backbone：`linear`, `mlp`, `transformer`, `dlinear`, `tcn`
-- fusion：`temporal`
-- head：`linear`
-- loss：`mse`, `huber`
-- optimizer：`adam`, `adamw`
+- preprocessing:`none`, `instance_norm`, `series_decomposition`
+- embedding:`none`, `patch`, `multiscale_patch`
+- backbone:`linear`, `mlp`, `transformer`, `dlinear`, `tcn`
+- fusion:`temporal`
+- head:`linear`
+- loss:`mse`, `huber`
+- optimizer:`adam`, `adamw`
 
-可以先从 Neo-Cast 现有 Python runtime 迁入或作为子进程调用，再逐步收敛为 OpenCode fork 内部 domain runner。
+You can move from the existing Python runtime to the Neo-Cast or call as a subprocess before gradually constricting to OpenCode fork internal domain runner.
 
-## 11. Storage 和 API
+## 11. Storage and API
 
-v0.1 使用 OpenCode 现有 storage/sql 基建，新增 research tables：
+v0.1 uses OpenCode for existing storage/sql infrastructure, adding new research data:
 
 - `research_task`
 - `research_candidate`
@@ -326,7 +326,7 @@ v0.1 使用 OpenCode 现有 storage/sql 基建，新增 research tables：
 - `research_memory`
 - `research_approval`
 
-Server API 建议：
+Server API recommends:
 
 ```text
 POST   /research/tasks
@@ -342,11 +342,11 @@ GET    /research/tasks/:id/artifacts
 GET    /research/events?taskId=...
 ```
 
-旧 session API 可以保留，但 Web/TUI 默认使用 research API。
+The old session API can be retained, but Web/TUI defaults to use a research API.
 
-## 12. 与 OpenCode Tool / Permission 的关系
+## 12. Relationship to OpenCodeTool / Mission
 
-NeoResearch 不应让 LLM 默认拥有开放 coding tools。默认 Agent 能力应改为：
+NeoResearch should not let LLM default to own coding tools. The default Agent capability should read:
 
 - `propose_candidate`
 - `validate_candidate`
@@ -356,112 +356,112 @@ NeoResearch 不应让 LLM 默认拥有开放 coding tools。默认 Agent 能力�
 - `export_artifact`
 - `ask_approval`
 
-这些可以实现为 ResearchTool，也可以直接是 Orchestrator service method。通用 coding tools 只在 debug/admin mode 下启用。
+These can be achieved as ResearchTool or directly by Orchestra service method. Universal working tables are enabled only under debug/admin Mode.
 
-Permission 层改造成 ApprovalPolicy：
+ApprovalPolicy:
 
 ```text
 tool permission -> research action permission
 ask/allow/deny -> approve/auto_approve/reject
 ```
 
-这样能复用 OpenCode 的 permission event 和 UI 交互，但语义更贴合研究过程。
+This allows OpenCode to interact with UI, but the semantics are more relevant to the research process.
 
-## 13. 迁移步骤
+## 13. Steps for relocation
 
-建议分 5 个阶段推进。
+5 is recommended to be advanced in stages.
 
-### Stage 1：Research data model and API skeleton
+### Stage 1:Research data model and API skeleton
 
-- 新增 `src/research` 模块。
-- 新增 research storage schema。
-- 新增 task/run/candidate/artifact/memory service。
-- 新增 server routes。
-- Web/TUI 能展示 mock research task。
+- Adds a `src/research` module.
+- Add a new search story scheme.
+- Add task/run/candidate/artifact/memory service.
+- Add a new server routes.
+- Web/TUI can show the mock research task.
 
-### Stage 2：TSF domain plugin adapter
+### Stage 2:TSF domain plugin adapter
 
-- 接入 Neo-Cast runtime，先允许子进程调用。
-- 实现 TSF TaskSpec、CandidateRecipe schema、runner adapter。
-- 跑通 baseline 和一次候选 full run。
+- Accesses Neo-Cast runtime, allowing a subprocess to call first.
+- Fulfill TSF TaskSpec, CandidateRecipe schema, runner adapter.
+- Run through baseline and a full run.
 
-### Stage 3：Review Mode
+### Stage 3:Review Mode
 
-- Agent 生成候选。
-- UI 展示 candidate 和 run plan。
-- Human approve/reject。
-- 批准后执行 smoke/full/eval。
+- Agent creates a candidate.
+- UI shows candidate and run plan.
+- Human approve/reject.
+- Execute smoke/full/eval after approval.
 
-### Stage 4：Autonomous Mode
+### Stage 4:Autonomous Mode
 
-- 加入 budget policy。
-- 加入 autonomous loop。
-- 加入 crash streak、budget exhausted、no improvement stop condition。
-- 写 memory。
+- Add Bridget policy.
+- Add autonomous loop.
+- Add crash streak, bugged exhausted, no improvement stop condition.
+- Write memory.
 
-### Stage 5：Research-first UX
+### Stage 5:Research-first UX
 
-- TUI 默认 Cockpit。
-- Web 默认 Dashboard。
-- 旧 coding mode 隐藏到 debug/legacy command。
-- 完善 artifact browser 和 champion lineage。
+- TUI Default Cockpit.
+- Web default Dashboard.
+- The old coding mode hides to debug/legacy company.
+- Perfecting artific Browner and Campion lineage.
 
-## 14. 测试策略
+## 14. Test Policy
 
-单元测试：
+Unit testing:
 
-- ResearchTask status transition。
-- ApprovalPolicy。
-- DomainPlugin contract。
-- TSF CandidateRecipe validation。
-- Champion decision。
+- ResearchTask status transition.
+- ApprovalPolicy.
+- DomainPlugin contract.
+- TSF CandidateRecipe validation.
+- Champion decision.
 
-集成测试：
+Integrated testing:
 
-- 创建 TSF task。
-- baseline run。
-- Review Mode approve 后执行 run。
-- Autonomous Mode 在小预算内完成至少一轮 propose/run/evaluate/memory。
-- artifact export。
+- Creates TSF task.
+- baseline run.
+- Review Mode application followed by run.
+- Autonomous Mode completes at least one round of propose/run/evaluate/memory in a small budget.
+- artifact export.
 
-端到端测试：
+End-to-end test:
 
-- CLI 创建任务并启动。
-- TUI 接收 approval event。
-- Web dashboard 展示 run 和 champion。
+- CLI creates tasks and starts them.
+- TUI receives approval event.
+- Web Dashboard displays run and champion.
 
-回归测试：
+Return test:
 
-- Provider config 仍可工作。
-- Server event stream 仍可被 TUI/Web 消费。
-- Debug coding tools 不影响 research default mode。
+- Provider config still works.
+- Server event still can be consumed by TUI/Web.
+- Debug coding tools does not affect research default mode.
 
-## 15. 风险与控制
+## 15. Risk and control
 
-主要风险：
+Main risks:
 
-- OpenCode 原 session/chat 逻辑和 research task 逻辑混杂。
-- 第一版同时保留 TUI/Web/Agent loop，范围偏大。
-- TSF runtime 与 TypeScript server 的进程边界可能复杂。
-- Autonomous Mode 早期可能浪费预算或反复生成低质量候选。
+- The OpenCode original session/chat logic is mixed with the research task logic.
+- The first edition, which also maintains TUI/Web/Agent loop, is broad in scope.
+- The TSF runtime process boundary with TypeScript server may be complex.
+- At an early stage, Autonomous Mode may have wasted the budget or repeatedly generated low-quality candidates.
 
-控制方式：
+Control mode:
 
-- ResearchTask 成为唯一业务状态源，Session 只做交互容器。
-- 先用 TSF 子进程 adapter，避免一次性重写训练 runtime。
-- Review Mode 先落地，Autonomous Mode 复用同一 approval policy。
-- 所有 autonomous loop 必须有 budget、crash streak 和 stop condition。
-- 旧 coding tools 默认关闭，只在 debug/admin mode 开启。
+- ResearchTask became the only source of business status, and the Board only made interactive packagings.
+- Use TSF subprocesses first to avoid one-time rewrite training runtime.
+- Review Mode landed first, Autonomous Mode returns to the same approximation policy.
+- All autonomous loop must have buttons, crash streak and stop condition.
+- The old coding tools is closed by default, only opened in debug/admin mode.
 
-## 16. 成功标准
+## 16. Criteria for success
 
-v0.1 成功标准：
+v0.1 success criteria:
 
-- 能在 OpenCode fork 中创建 TSF ResearchTask。
-- Web dashboard 能展示 task、runs、metrics、champion、artifact。
-- TUI cockpit 能显示当前 agent loop、run event、approval prompt。
-- Review Mode 能完成一轮 Human-approved candidate run。
-- Autonomous Mode 能在预算内完成多轮 propose/run/evaluate/memory。
-- TSF artifact 可导出并包含 metadata、model、preprocess、eval report。
-- 旧 coding agent 不再是默认产品入口，但保留 debug/admin 可用性。
+- Can create TSF ResearchTask in OpenCode fork.
+- Web dashboard can show yask, runs, metrics, champion, artifact.
+- TUI cockpit can show the current anggent loop, run event, program prompt.
+- Human-approved candidate run.
+- Autonomous Mode can complete multiple rounds of propose/run/evaluate/memory within budget.
+- TSF analysis can be exported and include metada, model, preprocess, eval report.
+- The old coding agent is no longer the default product entry but retains debug/admin usability.
 

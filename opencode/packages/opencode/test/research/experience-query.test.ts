@@ -26,10 +26,10 @@ const metadata = (memory: ResearchMemory) => memory.candidateSummary.experienceR
 
 test("intent distinguishes observed configuration, intervention, matched comparison, discovery and runtime errors", () => {
   for (const [query, intent] of [
-    ["hidden_dim=128", "configuration"], ["MLP 隐藏宽度是否有效", "intervention"],
-    ["linear vs tcn", "comparison"], ["linear 和 TCN 的对比", "comparison"],
+    ["hidden_dim=128", "configuration"], ["Is an MLP hidden width intervention effective?", "intervention"],
+    ["linear vs tcn", "comparison"], ["comparison of linear and TCN", "comparison"],
     ["mlp tcn nbeats architectures", "discovery"], ["cudnn RNN backward", "execution_error"],
-    ["趋势 linear 残差 tcn 分解", "configuration"],
+    ["trend linear residual tcn decomposition", "configuration"],
   ] as const) expect(parseExperienceQuery(query!).intent).toBe(intent!)
   expect(parseExperienceQuery("MLP width", "configuration")).toMatchObject({ intent: "configuration", inferred: false })
   expect(DirectExperienceRequestSchema.parse({ status: "experience_request", request: { query: "MLP width", intent: "configuration" } }).request.intent).toBe("configuration")
@@ -45,8 +45,8 @@ test("component phrases do not erase a separately named backbone or confuse feat
 test("width lookup can use an observed configuration; width-effect queries require a real matched contrast", () => {
   const observed = entry("width_observation", { backbone: { type: "mlp", hiddenDim: 128 } }, { backbone: "mlp" })
   expect(ids(rankExperiences([observed], "MLP hidden_dim=128"))).toEqual([String(observed.memory.id)])
-  expect(rankExperiences([observed], "MLP 隐藏宽度是否有效")).toEqual([])
-  const background = rankExperiences([observed], "MLP 隐藏宽度是否有效", { includeBackground: true })
+  expect(rankExperiences([observed], "Is an MLP hidden width intervention effective?")).toEqual([])
+  const background = rankExperiences([observed], "Is an MLP hidden width intervention effective?", { includeBackground: true })
   expect(metadata(background[0]!)).toMatchObject({ relevance: "configuration_background", queryIntent: "intervention",
     missingRequiredConditions: expect.arrayContaining([expect.objectContaining({ requirement: "queried_intervention_with_matched_full_run_contrast" })]) })
   expect(rankExperiences([observed], "MLP width", { intent: "configuration" })).toHaveLength(1)
@@ -137,8 +137,8 @@ test("a named mechanism effect requires changing that mechanism, not a learning-
   }
   const targeted = makePair("normalization_change", true)
   const unrelated = makePair("lr_under_normalization", false)
-  expect(parseExperienceQuery("归一化是否有效").intent).toBe("intervention")
-  expect(ids(rankExperiences([targeted, unrelated], "归一化是否有效"))).toEqual([String(targeted.memory.id)])
+  expect(parseExperienceQuery("Is normalization effective?").intent).toBe("intervention")
+  expect(ids(rankExperiences([targeted, unrelated], "Is normalization effective?"))).toEqual([String(targeted.memory.id)])
   expect(ids(rankExperiences([targeted, unrelated], "instance_norm effect"))).toEqual([String(targeted.memory.id)])
   expect(rankExperiences([targeted, unrelated], "instance_norm", { intent: "configuration" })).toHaveLength(2)
   expect(parseExperienceQuery("instance_norm vs none").entities).toEqual(expect.arrayContaining([

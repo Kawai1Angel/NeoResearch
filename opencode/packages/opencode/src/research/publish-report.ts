@@ -15,19 +15,19 @@ export const PUBLISH_REPORT_SCHEMA_VERSION = "neo_research_publish_report_input.
 export const PUBLISH_REPORT_PROMPT_VERSION = "publish-report.v1"
 
 export const PUBLISH_REPORT_SECTIONS = [
-  "执行摘要",
-  "任务背景与目标",
-  "数据与切分协议",
-  "数据分析与建模启示",
-  "模型搜索方法与搜索轨迹",
-  "实验设置与评价协议",
-  "验证集结果与候选比较",
-  "最终 Ref Test 结果",
-  "失败案例、无效尝试与经验",
-  "最终模型选择理由",
-  "局限性与风险",
-  "复现步骤",
-  "产物与证据索引",
+  "Executive summary",
+  "Task background and objectives",
+  "Data and split protocol",
+  "Data analysis and modeling insights",
+  "Model search method and trajectory",
+  "Experimental setup and evaluation protocol",
+  "Validation results and candidate comparison",
+  "Final Ref Test results",
+  "Failures, unsuccessful attempts, and lessons",
+  "Rationale for final model selection",
+  "Limitations and risks",
+  "Reproduction steps",
+  "Artifact and evidence index",
 ] as const
 
 export interface PublishReportSnapshot {
@@ -150,12 +150,12 @@ export function buildPublishReportSnapshot(input: {
 
 export function buildPublishReportPrompt(snapshot: PublishReportSnapshot): string {
   return [
-    "你是 PublishAgent 的最终报告撰写阶段。只能依据下面的受控 JSON 快照写作。",
-    "不得虚构指标、命令、消融或失败原因；缺失信息明确写‘未提供/未执行’。",
-    "val 指标用于搜索和模型选择；ref_test 只用于最终泛化评估，绝不能描述为选择 champion 的依据。",
-    "关键数字注明 run ID 或 artifact ID。只输出 Markdown 正文。必须按顺序包含以下二级章节：",
+    "You are writing PublishAgent's final report. Use only the controlled JSON snapshot below. Write in English.",
+    "Do not invent metrics, commands, ablations, or failure causes; mark missing information as 'not provided/not executed'.",
+    "Validation metrics guide search and model selection; ref_test is only for final generalization evaluation and must never be described as a basis for champion selection.",
+    "Cite a run ID or artifact ID for key numbers. Output only Markdown content. Include the following level-two sections in order:",
     PUBLISH_REPORT_SECTIONS.map((section) => `## ${section}`).join("\n"),
-    "\n受控快照：",
+    "\nControlled snapshot:",
     JSON.stringify(compactPromptContext(snapshot), null, 2),
   ].join("\n")
 }
@@ -169,18 +169,18 @@ export function stripMarkdownFence(value: string): string {
 export function validateFinalReport(report: string, snapshot: PublishReportSnapshot): string[] {
   const errors: string[] = []
   for (const section of PUBLISH_REPORT_SECTIONS) {
-    if (!report.includes(`## ${section}`)) errors.push(`缺少章节：${section}`)
+    if (!report.includes(`## ${section}`)) errors.push(`Missing section: ${section}`)
   }
   for (const id of [snapshot.task.id, snapshot.champion.candidateID, snapshot.champion.runID, snapshot.refTestRun.id]) {
-    if (!report.includes(id)) errors.push(`缺少标识：${id}`)
+    if (!report.includes(id)) errors.push(`Missing identifier: ${id}`)
   }
   for (const [name, value] of Object.entries(snapshot.refTestMetrics)) {
-    if (!report.includes(name) || !report.includes(String(value))) errors.push(`ref_test 指标不一致或缺失：${name}`)
+    if (!report.includes(name) || !report.includes(String(value))) errors.push(`Inconsistent or missing ref_test metric: ${name}`)
   }
-  if (/ref[_ -]?test.{0,80}(选择|筛选|搜索).{0,40}champion/i.test(report)) {
-    errors.push("错误地将 ref_test 描述为 champion 搜索或选择依据")
+  if (/ref[_ -]?test.{0,80}(select(?:ion|ing|s|ed)?|filter(?:ing|s|ed)?|search(?:ing|es|ed)?).{0,40}champion/i.test(report)) {
+    errors.push("ref_test was incorrectly described as a basis for champion search or selection")
   }
-  if (secretPattern.test(report)) errors.push("报告疑似包含密钥或敏感凭据")
+  if (secretPattern.test(report)) errors.push("The report may contain a secret or sensitive credential")
   return errors
 }
 
@@ -190,37 +190,37 @@ export function renderDeterministicFinalReport(snapshot: PublishReportSnapshot):
   const failedRuns = snapshot.runs.filter((run) => run.status === "failed" || run.status === "rejected")
   const commands = snapshot.reproducibility.commands.length
     ? snapshot.reproducibility.commands.map((command) => `- \`${command}\``)
-    : ["- 未提供。"]
+    : ["- Not provided."]
   const evidence = snapshot.evidence.length
     ? snapshot.evidence.map((item) => `- \`${item.artifactID}\` — ${item.kind} (${item.uri})`)
-    : ["- 未提供。"]
+    : ["- Not provided."]
   return [
     `# Final Research Report: ${snapshot.task.title}`,
     `## ${PUBLISH_REPORT_SECTIONS[0]}`,
-    `任务 \`${snapshot.task.id}\` 的最终模型为候选 \`${snapshot.champion.candidateID}\`（选择 run：\`${snapshot.champion.runID}\`）。最终参考测试 run 为 \`${snapshot.refTestRun.id}\`。`,
+    `Task \`${snapshot.task.id}\` uses final candidate \`${snapshot.champion.candidateID}\` (selection run: \`${snapshot.champion.runID}\`). The final reference test run is \`${snapshot.refTestRun.id}\`.`,
     `## ${PUBLISH_REPORT_SECTIONS[1]}`,
-    `目标：${JSON.stringify(snapshot.task.objective)}。`,
+    `Objective: ${JSON.stringify(snapshot.task.objective)}.`,
     `## ${PUBLISH_REPORT_SECTIONS[2]}`,
-    Object.keys(snapshot.reproducibility.datasetSpec).length ? `数据协议：\`${JSON.stringify(snapshot.reproducibility.datasetSpec)}\`` : "数据与切分细节未提供。",
+    Object.keys(snapshot.reproducibility.datasetSpec).length ? `Dataset protocol: \`${JSON.stringify(snapshot.reproducibility.datasetSpec)}\`` : "Dataset and split details were not provided.",
     `## ${PUBLISH_REPORT_SECTIONS[3]}`,
-    "建模启示以已登记的分析证据为准；未登记的分析不作推断。",
+    "Modeling insights follow recorded analysis evidence; unrecorded analyses are not inferred.",
     `## ${PUBLISH_REPORT_SECTIONS[4]}`,
-    `共记录 ${snapshot.candidates.length} 个候选和 ${snapshot.runs.length} 次运行。`,
+    `Recorded ${snapshot.candidates.length} candidates and ${snapshot.runs.length} runs.`,
     `## ${PUBLISH_REPORT_SECTIONS[5]}`,
-    "验证集指标用于搜索与模型选择；ref_test 仅用于 champion 固化后的最终泛化评估。",
+    "Validation metrics guide search and model selection; ref_test is only for final generalization evaluation after the champion is fixed.",
     `## ${PUBLISH_REPORT_SECTIONS[6]}`,
-    validationRuns.length ? validationRuns.map((run) => `- \`${run.id}\` / \`${run.candidateID ?? "未提供"}\`: ${JSON.stringify(run.metrics)}`).join("\n") : "未提供成功的验证运行。",
+    validationRuns.length ? validationRuns.map((run) => `- \`${run.id}\` / \`${run.candidateID ?? "Not provided"}\`: ${JSON.stringify(run.metrics)}`).join("\n") : "No successful validation runs were provided.",
     `## ${PUBLISH_REPORT_SECTIONS[7]}`,
-    `Ref Test run：\`${snapshot.refTestRun.id}\`。\n\n| metric | value |\n| --- | ---: |\n${metricRows.join("\n")}`,
+    `Ref Test run: \`${snapshot.refTestRun.id}\`.\n\n| metric | value |\n| --- | ---: |\n${metricRows.join("\n")}`,
     `## ${PUBLISH_REPORT_SECTIONS[8]}`,
-    failedRuns.length ? failedRuns.map((run) => `- \`${run.id}\`: ${run.status}`).join("\n") : "未记录失败或拒绝的运行。",
+    failedRuns.length ? failedRuns.map((run) => `- \`${run.id}\`: ${run.status}`).join("\n") : "No failed or rejected runs were recorded.",
     `## ${PUBLISH_REPORT_SECTIONS[9]}`,
-    `Champion \`${snapshot.champion.candidateID}\` 依据验证阶段结果固化；ref_test 未参与选择。`,
+    `Champion \`${snapshot.champion.candidateID}\` was fixed using validation results; ref_test did not influence selection.`,
     `## ${PUBLISH_REPORT_SECTIONS[10]}`,
-    "报告仅覆盖快照中已登记的运行、汇总指标和证据；未提供逐样本 ref_test 数据。",
+    "This report covers only the snapshot's recorded runs, aggregate metrics, and evidence; per-sample ref_test data was not provided.",
     `## ${PUBLISH_REPORT_SECTIONS[11]}`,
     commands.join("\n"),
-    `随机种子：${snapshot.reproducibility.seeds.length ? snapshot.reproducibility.seeds.join(", ") : "未提供"}。环境：${Object.keys(snapshot.reproducibility.environment ?? {}).length ? JSON.stringify(snapshot.reproducibility.environment) : "未提供"}。`,
+    `Random seeds: ${snapshot.reproducibility.seeds.length ? snapshot.reproducibility.seeds.join(", ") : "Not provided"}. Environment: ${Object.keys(snapshot.reproducibility.environment ?? {}).length ? JSON.stringify(snapshot.reproducibility.environment) : "Not provided"}.`,
     `## ${PUBLISH_REPORT_SECTIONS[12]}`,
     evidence.join("\n"),
   ].join("\n\n") + "\n"

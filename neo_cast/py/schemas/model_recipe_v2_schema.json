@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://ustc-time-series.github.io/neo-cast/schemas/model_recipe_v2_schema.json",
+  "$id": "https://example.org/neo-cast/schemas/model_recipe_v2_schema.json",
   "title": "neo-cast ModelRecipe DSL Schema",
   "description": "Typed model recipe compiled to recipe_schema_v3; each horizon trains independently.",
   "type": "object",

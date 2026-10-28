@@ -1,84 +1,84 @@
-# HypoPlanner Agent — TUI 流式渲染方案
+# HypoPlanner Agent - TUI Fluid Rendering Scheme
 
-> 目标：像 CastClaw_own 那样，将 LLM 的生成回复、工具调用、调用结果等原始信息实时渲染到 TUI 上，而不是只在任务完成后显示结构化摘要。
+> Target: As in CastClaw_own, original information such as LLM generation responses, tool calls, call results is rendered to TUI on a real-time basis instead of showing structured summaries only after the task has been completed.
 
 ---
 
-## 现状分析
+## Situation analysis
 
-### 调用路径
+### Call Path
 
-HypoPlanner 走的是 **opencode session 引擎路径**，而不是直接调 LLM API：
+HypoPlanner goes **opencode session engine path** instead of direct LLM API:
 
 ```
 service.ts
-  → requestViaSession()          # 创建子 session，通过 sessionPrompt.prompt() 调用 LLM
-      → session 引擎处理工具调用   # provider 无关，引擎统一处理
-      → 发出 MessageV2.Event.PartDelta    (BusEvent，文本增量)
-      → 发出 MessageV2.Event.PartUpdated  (SyncEvent，Part 快照，含 ToolPart)
+  → requestViaSession()          # Create subsession, call LLM through sessionPrompt.prompt()
+      → Session engine handles tool calls   # Provider-independent, centralized engine handling
+      Send MessageV2.Event.PartDelta (BusEvent, text increment)
+      Send MessageV2.Event.PartUpdated (SyncEvent, Partshot, with ToolPart)
 ```
 
-这意味着：
-- **工具调用能力已经有了**，由 session 引擎负责，不需要针对各 provider 的 SSE 格式做适配
-- **provider 无关**：Anthropic、OpenAI-compat 或其他任何 provider 都走同一套逻辑
+This means:
+- **Tool call capability already in place**, covered by the session engine, does not need to match SSE formats for individual processes
+- **provider does not matter**: Anthropic, OpenAI-compat or any other provider follows the same logic
 
-### 问题所在
+### What's the problem?
 
-`requestViaSession`（`service.ts:3733-3744`）只订阅了文本增量：
+`requestViaSession` (`service.ts:3733-3744`) subscribes only to text increments:
 
 ```typescript
 bus.subscribe(MessageV2.Event.PartDelta).pipe(
   Stream.filter((event) =>
     event.properties.sessionID === child.id &&
-    event.properties.field === "text",  // ← 只转发文本 delta
+    event.properties.field === "text",  // ← Forward text deltas only
   ),
   Stream.runForEach((event) => onDelta(event.properties.delta)),
 )
 ```
 
-`MessageV2.Event.PartUpdated` 包含完整的 `ToolPart` 快照（tool name、input、state: pending/running/completed、output），但**完全没被订阅**，信息在 session 层就被丢弃了，不会冒泡到 research bus，TUI 自然看不到。
+`MessageV2.Event.PartUpdated` contains complete `ToolPart` snapshots (tool name, input, state: pending/running/completed, output), but** is not subscribed to at all. Information is discarded on the session level and does not ejaculate into a search Bus, which TUI naturally cannot see.
 
-### CastClaw_own 的做法
+### CastClaw_own approach
 
-CastClaw 直接消费 `message.part.updated` 事件渲染完整 Part 列表：
+CastClaw direct consumption of `message.part.updated` event render full Part list:
 
 ```
-text  → 流式文字内容
-tool  → 工具调用（含 name, input, output, state: pending/running/completed/error）
+Text text fluent text
+Tool call for tool tool (including name, input, output, state: pending/running/completed/error)
 ```
 
-TUI 按 part 类型选择渲染组件，Part 快照替换（而非增量 diff），`partID` 不变让 Solid.js 高效 reconcile。
+TUI selects the rendering component by part type, Part Snapshot Replace (rather than Incremental Diff), `partID` remains unchanged to make Solid.js efficient.
 
 ---
 
-## 设计目标
+## Design objectives
 
-以 HypoPlanner 为例，实现以下 TUI 可见信息：
+Take HypoPlanner, for example, to achieve the following TUI visible information:
 
 ```
-[HypoPlanner] 开始规划假设 ...
-  ▸ text  "我将先读取当前假设池，然后..."   (流式滚动)
+[HypoPlanner] Start planning assumptions...
+  ▸ text  "I will first read the current hypothesis pool, then..."   (streaming)
   ▸ tool  read_hypothesis_pool            (🔵 running)
           input:  { taskID: "abc123" }
   ▸ tool  read_hypothesis_pool            (✅ done, 12ms)
           output: { count: 3, hypotheses: [...] }
-  ▸ text  "当前有 3 个假设，优先级分布..."  (流式滚动)
+  ▸ text  "There are currently three hypotheses; the priority distribution..."  (streaming)
   ▸ tool  write_hypothesis                (✅ done, 8ms)
-[HypoPlanner] 完成 — 生成 4 个假设
+[HypoPlanner] Completed - Generate 4 assumptions
 ```
 
 ---
 
-## 方案
+## Programme
 
-### 1. 新增事件类型（`research/event.ts`）
+### 1. Add Event Type (`research/event.ts`)
 
 ```typescript
-// 单个 Part（文本块 or 工具调用）的快照
+// Snapshot of a single Part (Text Block or Tool Call)
 export class ResearchAgentPart extends Schema.Class<ResearchAgentPart>("ResearchAgentPart")({
   taskID: ResearchTaskID,
   agent: Schema.String,
-  partID: Schema.String,         // 稳定 ID（来自 MessageV2.PartID），用于 Solid.js key reconciliation
+  partID: Schema.String,         // Stable ID (from MessageV2.PartID) for Solid.js key provision
   kind: Schema.Literals(["text", "tool"]),
 
   // kind === "text"
@@ -93,9 +93,9 @@ export class ResearchAgentPart extends Schema.Class<ResearchAgentPart>("Research
   toolError: Schema.optional(Schema.String),
 }) {}
 
-// 在 Event 对象中注册
+// Register in Event object
 export const Event = {
-  // ... 已有事件 ...
+  // There's been an incident.
   HypoPlannerAgentPartUpdated: BusEvent.define(
     "research.agent.hypoPlanner.part.updated",
     ResearchAgentPart,
@@ -103,14 +103,14 @@ export const Event = {
 }
 ```
 
-> **为什么用「快照」而不是增量？**
-> `ToolPart` 的 state 会经历 pending → running → completed 多次更新，快照替换比 diff patch 更简单；`partID` 不变可让 Solid.js 高效 reconcile。文本 part 同理，累积后整体替换。
+> **Why "show" instead of incremental?**
+> The state of `ToolPart` will be updated several times with a snapshot replacement easier than diff check;`partID` remains unchanged to make Solid.js efficient. Text part is the same, cumulatively replaced as a whole.
 
 ---
 
-### 2. `requestViaSession` — 增加 `onPartUpdated` 回调
+### 2. `requestViaSession` - Add `onPartUpdated`
 
-在 `service.ts:3711` 的 `requestViaSession` 函数签名中增加一个可选回调，并在 `Effect.scoped` 块内额外订阅 `MessageV2.Event.PartUpdated`：
+Add an optional callback to the `requestViaSession` signature for the `service.ts:3711` function and subscribe additional `MessageV2.Event.PartUpdated` in the `Effect.scoped` block:
 
 ```typescript
 const requestViaSession = (input: {
@@ -121,7 +121,7 @@ const requestViaSession = (input: {
   readonly user: string
   readonly modelRef: OpencodeModelRef | undefined
   readonly onDelta?: (delta: string) => Effect.Effect<void>
-  readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>  // ← 新增
+  readonly onPartUpdated?: (part: MessageV2.Part) => Effect.Effect<void>  // New
 }) =>
   Effect.gen(function* () {
     if (!input.rootSessionID || !input.modelRef) return undefined
@@ -130,7 +130,7 @@ const requestViaSession = (input: {
     const result = (input.onDelta || input.onPartUpdated)
       ? yield* Effect.scoped(
           Effect.gen(function* () {
-            // 已有：文本 delta 订阅
+            // Already: text delta subscription
             if (input.onDelta) {
               yield* Effect.forkScoped(
                 bus.subscribe(MessageV2.Event.PartDelta).pipe(
@@ -139,7 +139,7 @@ const requestViaSession = (input: {
                 ),
               )
             }
-            // 新增：Part 快照订阅（含 ToolPart）
+            // New: Part Snapshot Subscriptions (with ToolPart)
             if (input.onPartUpdated) {
               yield* Effect.forkScoped(
                 bus.subscribe(MessageV2.Event.PartUpdated).pipe(
@@ -153,17 +153,17 @@ const requestViaSession = (input: {
         )
       : yield* sessionPrompt.prompt({ ... })
 
-    // ... 后续 text 拼接、usage 提取不变
+    // ... follow-up text adhesion, usage extraction is the same
   })
 ```
 
-> **`PartUpdated` 走 bus 是确定的**：`SyncEvent.run()` 默认 `publish: true`（`sync/index.ts:245`），内部调 `ProjectBus.publish()`（`sync/index.ts:163`）。`session.ts:522` 触发 `PartUpdated` 时没有传 `{ publish: false }`，所以每次 Part 状态变化都会实时到达 bus，`bus.subscribe(MessageV2.Event.PartUpdated)` 可以直接用。
+> ** `PartUpdated` Go Bus is OK**: `SyncEvent.run()` Default `publish: true` (`sync/index.ts:245`), Internal `ProjectBus.publish()` (`sync/index.ts:163`).`session.ts:522` did not pass `{ publish: false }` when it triggers `PartUpdated`, so every change in Part status arrives at Bus, and `bus.subscribe(MessageV2.Event.PartUpdated)` can be used directly.
 
 ---
 
-### 3. `service.ts` HypoPlanner 调用处 — 传入回调并转发到 research bus
+### 3. `service.ts` HypoPlanner Caller Use - Send Back Call and Forward to Research Bus
 
-在 `service.ts:7344` 的 `requestViaSession` 调用中增加 `onPartUpdated`：
+Add `onPartUpdated` to the `requestViaSession` call at `service.ts:7344`:
 
 ```typescript
 const hypoSessionAttempt = yield* requestViaSession({
@@ -175,7 +175,7 @@ const hypoSessionAttempt = yield* requestViaSession({
   modelRef: mapToModelRef(hypoConfig),
   onDelta: (delta) =>
     bus.publish(Event.HypoPlannerAgentStreamDelta, { taskID: task.id, agent: "HypoPlannerAgent", delta }),
-  onPartUpdated: (part) => {  // ← 新增
+  onPartUpdated: (part) => {  // New
     if (part.type === "text") {
       return bus.publish(Event.HypoPlannerAgentPartUpdated, {
         taskID: task.id,
@@ -208,22 +208,22 @@ const hypoSessionAttempt = yield* requestViaSession({
 })
 ```
 
-> 现有的 `HypoPlannerAgentStreamDelta` 保持不变，可用于向后兼容或简单日志场景。`HypoPlannerAgentPartUpdated` 是更完整的替代，TUI 可只消费这一个事件。
+> The existing `HypoPlannerAgentStreamDelta` remains unchanged and can be used for backward compatibility or simple log scenes.`HypoPlannerAgentPartUpdated` is a more complete alternative, and TUI can only consume this event.
 
 ---
 
-### 4. `cockpit.tsx` — 订阅 Part 事件并渲染
+### 4. `cockpit.tsx` - Subscribe and render Part Events
 
-#### 4a. 状态数据结构
+#### 4a. Status data structure
 
 ```typescript
-// Part 快照 map，partID 为 key
+// Part Map, partID is key
 const [agentParts, setAgentParts] = createSignal<Map<string, ResearchAgentPartShape>>(new Map())
-// 有序 partID 列表（决定渲染顺序）
+// Ordered partID list (deciding order)
 const [agentPartOrder, setAgentPartOrder] = createSignal<string[]>([])
 ```
 
-#### 4b. 事件订阅（在现有 event handler switch 中添加）
+#### 4b. Event subscription (add to existing event handler switch)
 
 ```typescript
 if (researchPayload.type === "research.agent.hypoPlanner.part.updated") {
@@ -242,7 +242,7 @@ if (researchPayload.type === "research.agent.hypoPlanner.part.updated") {
 }
 ```
 
-#### 4c. 渲染组件
+#### 4c. Render components
 
 ```tsx
 function AgentPartList(props: { parts: Map<string, ResearchAgentPartShape>; order: string[] }) {
@@ -302,22 +302,22 @@ function AgentToolPart(props: { part: ResearchAgentPartShape }) {
 }
 ```
 
-#### 4d. 清理
+#### 4d. Cleaning
 
 ```typescript
-// 在 HypoPlannerAgentStarted 处理中重置（而不是 Completed），避免上一轮残留
+// Reset in HypoPlannerAgentStarted treatment (rather than Completed) to avoid last-round residue
 if (researchPayload.type === "research.agent.hypoPlanner.started") {
   setAgentParts(new Map())
   setAgentPartOrder([])
-  // ... 其余已有逻辑
+  // The rest is logical.
 }
 ```
 
 ---
 
-### 5. 可选：持久化到 session stream.log
+### 5. Optional: Enduring to session stream.log
 
-在 `onPartUpdated` 回调中可复用现有的 `persistResearchSessionStreamLines()`：
+Reuse existing `persistResearchSessionStreamLines()` in `onPartUpdated` return:
 
 ```typescript
 if (part.type === "tool" && part.state.type === "completed") {
@@ -331,18 +331,18 @@ if (part.type === "tool" && part.state.type === "completed") {
 
 ---
 
-## 实施顺序
+## Order of implementation
 
-| 步骤 | 文件 | 工作量 |
+| Steps | Documentation | Workload |
 |---|---|---|
-| 1. 新增 `ResearchAgentPart` schema + `HypoPlannerAgentPartUpdated` event | `research/event.ts` | 小 |
-| 2. `requestViaSession` 增加 `onPartUpdated` 回调 + 订阅 `MessageV2.Event.PartUpdated` | `research/service.ts` | 小 |
-| 4. HypoPlanner 调用处传入 `onPartUpdated`，转发到 research bus | `research/service.ts` | 小 |
-| 5. cockpit.tsx 添加 part 状态 + 事件订阅 + 渲染组件 | `research-cockpit.tsx` | 中 |
-| 6. 补充测试：mock PartUpdated 事件序列 → 断言 TUI state 变化 | `test/research/` | 小 |
+| 1. Add `ResearchAgentPart` schemea+`HypoPlannerAgentPartUpdated` event | `research/event.ts` | Small |
+| 2. `requestViaSession` Add `onPartUpdated` Callback +subscribe to `MessageV2.Event.PartUpdated` | `research/service.ts` | Small |
+| 4. HypoPlanner for transfer to `onPartUpdated` and forward to research bus | `research/service.ts` | Small |
+| 5. cockpit.tsx Add Part Status + Event Subscription + Rendering Component | `research-cockpit.tsx` | Medium |
+| 6. Add tests: mock PartUpdated events → assert TUI state transitions | `test/research/` | Small |
 
 ---
 
-## 与其他 Agent 的复用
+## Reuse with other Agent
 
-`requestViaSession` 的 `onPartUpdated` 回调是通用的，DataAnalysis 和 Reflection Agent 只需在各自的调用处传入回调，并在 `Event` 对象中注册对应的 `part.updated` 事件类型，渲染组件（`AgentPartList` / `AgentToolPart`）可直接复用。
+`onPartUpdated` echoes for `requestViaSession` are generic, and DataAnalysis and ReflectionAgent simply need to transfer back calls for their respective uses and register the corresponding `part.updated` event type in `Event` objects. Rendering components (`AgentPartList`/ `AgentToolPart`) can be reused directly.

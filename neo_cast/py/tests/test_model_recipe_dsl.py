@@ -54,7 +54,7 @@ def make_model_recipe() -> dict:
 
 class ModelRecipeDslTest(unittest.TestCase):
     def test_candidate_schemas_accept_extended_design_notes(self) -> None:
-        long_notes = "设计依据" * 600
+        long_notes = "design rationale" * 600
         recipe = json.loads((PY_ROOT / "schemas" / "recipe_dlinear.example.json").read_text(encoding="utf-8"))
         recipe["notes"] = long_notes
         model_recipe = make_model_recipe()

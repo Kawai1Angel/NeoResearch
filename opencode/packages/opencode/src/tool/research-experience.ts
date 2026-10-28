@@ -87,7 +87,7 @@ const ReadParameters = Schema.Struct({
   level: Schema.optional(Schema.Literals(["experiment_fact", "conditional_experience", "validated_principle"])),
   polarity: Schema.optional(Schema.Literals(["positive", "negative", "mixed", "inconclusive"])),
   query: Schema.optional(Schema.String).annotate({
-    description: "Optional concrete mechanism, changed recipe field or error question. Ranks verified changes, observed errors and executed configurations. Untested interpretation/plan text cannot establish a default match. Supports Chinese/English aliases and recipe field names. Does not pad results with unrelated entries.",
+    description: "Optional concrete mechanism, changed recipe field or error question. Ranks verified changes, observed errors and executed configurations. Untested interpretation/plan text cannot establish a default match. Supports English aliases and recipe field names. Does not pad results with unrelated entries.",
   }),
   includeBackground: Schema.optional(Schema.Boolean).annotate({
     description: "Opt in to explicitly labeled configuration or unverified-text background (default false). These matches are suggestions for investigation, not direct evidence for the queried intervention.",

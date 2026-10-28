@@ -35,8 +35,6 @@ function cookie(locale: Locale) {
 
 const LOCALES: readonly Locale[] = [
   "en",
-  "zh",
-  "zht",
   "ko",
   "de",
   "es",
@@ -55,8 +53,8 @@ const LOCALES: readonly Locale[] = [
 
 const INTL: Record<Locale, string> = {
   en: "en",
-  zh: "zh-Hans",
-  zht: "zh-Hant",
+  zh: "en",
+  zht: "en",
   ko: "ko",
   de: "de",
   es: "es",
@@ -135,8 +133,7 @@ export function loadLocaleDict(locale: Locale) {
 
 const localeMatchers: Array<{ locale: Locale; match: (language: string) => boolean }> = [
   { locale: "en", match: (language) => language.startsWith("en") },
-  { locale: "zht", match: (language) => language.startsWith("zh") && language.includes("hant") },
-  { locale: "zh", match: (language) => language.startsWith("zh") },
+  { locale: "en", match: (language) => language.startsWith("zh") },
   { locale: "ko", match: (language) => language.startsWith("ko") },
   { locale: "de", match: (language) => language.startsWith("de") },
   { locale: "es", match: (language) => language.startsWith("es") },

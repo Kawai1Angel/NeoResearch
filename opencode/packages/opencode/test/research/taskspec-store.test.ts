@@ -66,12 +66,12 @@ describe("taskspec-store", () => {
         const task = await createTask()
         const snapshot = await applySlotUpdates(task.id, {
           data_source: "/data/etth1.csv",
-          forecast_object: "OT 列时间序列",
+          forecast_object: "OT column time series",
           primary_metric: "val_avg_mse",
         })
         expect(snapshot.slots.data_source?.value).toBe("/data/etth1.csv")
         expect(snapshot.slots.data_source?.missing).toBe(false)
-        expect(snapshot.slots.forecast_object?.value).toBe("OT 列时间序列")
+        expect(snapshot.slots.forecast_object?.value).toBe("OT column time series")
 
         const updated = await runResearch(Research.Service.use((svc) => svc.getTask(task.id)))
         expect(updated.taskSpec).toMatchObject({
@@ -303,12 +303,12 @@ describe("taskspec-store", () => {
       directory: tmp.path,
       fn: async () => {
         const task = await createTask()
-        await recordAskUserQuestions(task.id, ["数据集路径是什么？"])
-        await recordAskUserQuestions(task.id, ["目标列是什么？"])
+        await recordAskUserQuestions(task.id, ["What is the dataset path?"])
+        await recordAskUserQuestions(task.id, ["What are the target columns?"])
         const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
         const pending = approvals.filter((a) => a.status === "pending")
         expect(pending).toHaveLength(1)
-        expect(pending[0]?.reason).toContain("目标列是什么？")
+        expect(pending[0]?.reason).toContain("What are the target columns?")
       },
     })
   })
@@ -343,7 +343,7 @@ describe("taskspec-store", () => {
         const task = await createTask()
         const before = await checkTaskspecReadiness(task.id)
         await applySlotUpdates(task.id, Object.fromEntries(before.missingRequiredSlots.map((id) => [id, fillerValueFor(id)])))
-        await recordAskUserQuestions(task.id, ["还需要确认一下业务背景"])
+        await recordAskUserQuestions(task.id, ["The business context still needs confirmation"])
         await enterIntentCheckpoint(task.id)
         const approvals = await runResearch(Research.Service.use((svc) => svc.listApprovals({ taskID: task.id })))
         const pending = approvals.filter((a) => a.status === "pending")

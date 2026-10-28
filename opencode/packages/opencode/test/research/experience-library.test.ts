@@ -91,7 +91,7 @@ test("search handles bilingual terms, code identifiers and executed model facts 
     library.save(feature, source)
     library.save(searchMemory("dlinear", "DLinear decomposition was observed.", 2, { backbone: "dlinear" }), source)
     library.save(searchMemory("linear", "Linear projection was observed.", 3, { backbone: "linear" }), source)
-    for (const query of ["FEATURE-MLP hidden dimension", "模型宽度容量学习率", "featureMlp hidden_dim"]) {
+    for (const query of ["FEATURE-MLP hidden dimension", "model width capacity learning rate", "featureMlp hidden_dim"]) {
       expect(library.list({ query, includeBackground: true, limit: 1 })[0]?.id).toBe(feature.id)
     }
     expect(library.list({ query: "linear" }).map(entry => entry.id)).toEqual([ResearchMemoryID.make("rmem_shared_linear")])
@@ -110,7 +110,7 @@ test("relevance ranking preserves explicit scope and evidence filters and applie
     library.save(local, { projectID: "local", projectRoot: "/local" })
     library.save(foreign, { projectID: "foreign", projectRoot: "/foreign" })
     library.save(otherDomain, { projectID: "other", projectRoot: "/other" })
-    const query = "梯度裁剪 warm up stability"
+    const query = "gradient clipping warm up stability"
     expect(library.list({ query, domainID: "tsf", limit: 1 })[0]?.id).toBe(foreign.id)
     expect(library.list({ query, projectID: "local" }).map(entry => entry.id)).toEqual([local.id])
     expect(library.list({ query, taskID: local.taskID }).map(entry => entry.id)).toEqual([local.id])

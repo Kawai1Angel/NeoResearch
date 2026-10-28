@@ -984,9 +984,9 @@ export function formatResearchCockpitIntentCheckpointReason(task: ResearchCockpi
   const metadata = asRecord(spec.metadata)
   return [
     "[checkpoint:intent_confirmed]",
-    "## 需求交流确认完成后，才能结束 Intent Agent",
+    "## Complete and confirm requirements before finishing Intent Agent",
     "",
-    "请确认 Intent Agent 已完成需求交流，下面这些研究意图可以作为后续 Data Analysis、HypoPlanner 和实验循环的输入。",
+    "Confirm that Intent Agent has finished gathering requirements and that the following research intent is ready for Data Analysis, HypoPlanner, and the experiment loop.",
     `Intent signature: ${researchCockpitIntentCheckpointSignature(task)}`,
     `Interaction mode: ${compactIntentValue(interactionModeForTask(task) ?? task.mode)}`,
     `Task: ${task.title}`,
@@ -999,7 +999,7 @@ export function formatResearchCockpitIntentCheckpointReason(task: ResearchCockpi
     `Stop after no improvement: ${compactIntentValue(loop.maxNoImprove ?? loop.maxNoImproveRounds ?? NAS_DEFAULT_MAX_NO_IMPROVE)}`,
     `Business context: ${compactIntentValue(metadata.businessContext ?? metadata.business_context)}`,
     "",
-    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并更新 taskSpec/intent slots 后重新运行。",
+    "**Recommended action:** approve these requirements to finish Intent Agent and enter Data Analysis; to add requirements, reject, update taskSpec/intent slots, and rerun.",
   ].join("\n")
 }
 
@@ -1921,7 +1921,7 @@ export function formatResearchCockpitLLMDesignLines(
     const recipePart = llmRecipeID ? ` / ${llmRecipeID}` : ""
     lines.push({
       id: `llm-design-${artifact.id}-status`,
-      text: `LLM ${modelLabel} → 生成成功${recipePart}`,
+      text: `LLM ${modelLabel} → Generation succeeded${recipePart}`,
       tone: "success",
     })
     if (llmHypothesis) {
@@ -2211,91 +2211,91 @@ export type SocraticIntentSlot = {
 const socraticIntentSlotDefinitions: Array<Omit<SocraticIntentSlot, "status" | "value">> = [
   {
     id: "interaction_mode",
-    label: "交互模式",
-    question: "这次任务是否按 Socratic 模式执行：前期充分澄清，后续自主运行？",
+    label: "Interaction mode",
+    question: "Should this task use Socratic mode: clarify requirements thoroughly first, then run autonomously?",
   },
   {
     id: "forecast_object",
-    label: "预测对象",
-    question: "这次预测对象具体是什么？请说明业务对象和被预测现象。",
+    label: "Forecast object",
+    question: "What exactly are you forecasting? Describe the business entity and the phenomenon to predict.",
   },
   {
     id: "data_source",
-    label: "CSV 数据集路径",
-    question: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
+    label: "CSV dataset path",
+    question: "Which CSV dataset path should NeoResearch use for profiling and execution?",
   },
   {
     id: "target_columns",
-    label: "目标列",
-    question: "需要预测哪些目标列？",
+    label: "Target columns",
+    question: "Which target columns should be forecast?",
   },
   {
     id: "lookback_window",
     label: "lookback window",
-    question: "模型应使用多长的 lookback window 作为输入上下文？",
+    question: "How long should the model's lookback window be?",
   },
   {
     id: "prediction_horizon",
-    label: "预测 horizon",
-    question: "需要评估哪些预测 horizon？",
+    label: "Forecast horizons",
+    question: "Which forecast horizons should be evaluated?",
   },
   {
     id: "exogenous_variables",
-    label: "外生变量",
-    question: "是否有天气、节假日、价格、事件等外生变量？如果没有，请明确为 none。",
+    label: "Exogenous variables",
+    question: "Are there exogenous variables such as weather, holidays, prices, or events? If there are none, explicitly answer none.",
   },
   {
     id: "business_context",
-    label: "业务背景",
-    question: "这个预测结果最终服务哪个业务决策或研究判断？",
+    label: "Business context",
+    question: "Which business decision or research judgment will this forecast support?",
   },
   {
     id: "primary_metric",
-    label: "主指标",
-    question: "模型搜索应该优化哪个验证指标？",
+    label: "Primary metric",
+    question: "Which validation metric should model search optimize?",
   },
   {
     id: "secondary_metrics",
-    label: "辅助指标",
+    label: "Secondary metrics",
     required: false,
-    question: "除了主指标，还要同时关注哪些辅助指标或 horizon-wise trade-off？",
+    question: "Which secondary metrics or trade-offs across horizons matter alongside the primary metric?",
   },
   {
     id: "error_preferences",
-    label: "误差偏好",
-    question: "误差偏好是什么：更重视短期、长期、峰值、平均误差，还是稳定性？",
+    label: "Error preferences",
+    question: "Which errors matter most: short-term, long-term, peak, average error, or stability?",
   },
   {
     id: "latency_budget",
-    label: "延迟预算",
-    question: "部署或推理是否有延迟预算？例如单次推理、批处理窗口或无硬约束。",
+    label: "Latency budget",
+    question: "Is there a deployment or inference latency budget, such as per-request latency, a batch window, or no hard constraint?",
   },
   {
     id: "parameter_budget",
-    label: "参数预算",
-    question: "模型参数量或资源预算有什么限制？",
+    label: "Parameter budget",
+    question: "What limits apply to model parameters or resource usage?",
   },
   {
     id: "max_iterations",
-    label: "NAS 计划迭代数",
+    label: "Planned NAS iterations",
     required: false,
-    question: "本次 NAS 搜索计划运行多少轮？默认是 25 轮；请确认默认值或给出新的计划迭代上限。系统安全运行上限会独立执行。",
+    question: "How many NAS iterations are planned? Confirm the default of 25 or provide a new limit. The system safety cap applies independently.",
   },
   {
     id: "max_no_improve",
-    label: "连续无提升停止轮数",
+    label: "Iterations without improvement",
     required: false,
-    question: "NAS 连续多少轮没有改善时应提前停止？默认是 7 轮，请确认或修改。",
+    question: "After how many consecutive NAS iterations without improvement should search stop early? Confirm or change the default of 7.",
   },
   {
     id: "interpretability",
-    label: "可解释性",
-    question: "是否需要可解释性、消融解释或简单模型优先？",
+    label: "Interpretability",
+    question: "Do you need interpretability, ablation explanations, or a preference for simple models?",
   },
   {
     id: "deployment_target",
-    label: "部署目标",
-    question: "最终模型部署目标是什么：本地 CPU、GPU 服务、边缘设备、离线批处理，还是仅研究报告？",
+    label: "Deployment target",
+    question: "Where will the final model be deployed: local CPU, a GPU service, an edge device, offline batch processing, or a research report only?",
   },
 ]
 
@@ -2342,7 +2342,7 @@ export function buildSocraticClarificationState(
     .toSorted((a, b) => b.time.updated - a.time.updated)[0]
   const approval =
     latestPendingProtocol &&
-    (/Intent clarification required/i.test(latestPendingProtocol.reason) || /澄清研究意图/.test(latestPendingProtocol.reason))
+    /research intent clarification required|intent clarification required|clarify research intent/i.test(latestPendingProtocol.reason)
       ? latestPendingProtocol
       : undefined
   const questions = approval
@@ -2381,23 +2381,23 @@ export function buildSocraticClarificationState(
 }
 
 export function slotFromSocraticQuestion(question: string): string {
-  if (/数据集路径|csv.*路径|dataset path/i.test(question)) return "data_source"
-  if (/目标列|target.*col/i.test(question)) return "target_columns"
+  if (/csv.*(?:dataset|path)|dataset path/i.test(question)) return "data_source"
+  if (/target.*col/i.test(question)) return "target_columns"
   if (/lookback.*window|lookback/i.test(question)) return "lookback_window"
-  if (/horizon|预测.*horizon|predictionLength/i.test(question)) return "prediction_horizon"
-  if (/外生变量|exogenous/i.test(question)) return "exogenous_variables"
-  if (/业务背景|业务决策|business.*context/i.test(question)) return "business_context"
-  if (/主指标|优化.*指标|primary.*metric/i.test(question)) return "primary_metric"
-  if (/辅助指标|secondary.*metric/i.test(question)) return "secondary_metrics"
-  if (/误差偏好|error.*prefer/i.test(question)) return "error_preferences"
-  if (/延迟预算|latency.*budget/i.test(question)) return "latency_budget"
-  if (/参数预算|parameter.*budget/i.test(question)) return "parameter_budget"
-  if (/NAS.*运行多少轮|计划迭代|planned.*iterations|max.?iterations/i.test(question)) return "max_iterations"
-  if (/连续多少轮.*没有改善|无提升停止|no.?improve/i.test(question)) return "max_no_improve"
-  if (/可解释性|interpretab/i.test(question)) return "interpretability"
-  if (/部署目标|deployment.*target/i.test(question)) return "deployment_target"
-  if (/交互模式|interaction.*mode/i.test(question)) return "interaction_mode"
-  if (/预测对象|forecast.*object/i.test(question)) return "forecast_object"
+  if (/horizon|predictionLength/i.test(question)) return "prediction_horizon"
+  if (/exogenous/i.test(question)) return "exogenous_variables"
+  if (/business.*(?:context|decision)/i.test(question)) return "business_context"
+  if (/primary.*metric|optimi[sz].*metric|metric.*optimi[sz]/i.test(question)) return "primary_metric"
+  if (/secondary.*metric/i.test(question)) return "secondary_metrics"
+  if (/error.*prefer|errors matter/i.test(question)) return "error_preferences"
+  if (/latency.*budget/i.test(question)) return "latency_budget"
+  if (/parameter.*budget|limits.*parameters/i.test(question)) return "parameter_budget"
+  if (/without improvement|no.?improve/i.test(question)) return "max_no_improve"
+  if (/NAS.*iterations|planned.*iterations|max.?iterations/i.test(question)) return "max_iterations"
+  if (/interpretab/i.test(question)) return "interpretability"
+  if (/deployment.*target|model.*deployed/i.test(question)) return "deployment_target"
+  if (/interaction.*mode|Socratic mode|Companion mode/i.test(question)) return "interaction_mode"
+  if (/forecast.*object|what.*forecasting/i.test(question)) return "forecast_object"
   return "unknown"
 }
 
@@ -2443,7 +2443,7 @@ function socraticSlotsForTaskReview(task: ResearchCockpitTask): SocraticIntentSl
       socraticSlotValue(slot.id, dataset, taskSpec, objective, budget, metadata) ??
       (slot.id === "interaction_mode" ? interactionModeForTask(task) : undefined)
     const reviewQuestion = value !== undefined
-      ? `${slot.question} (当前: ${value})`
+      ? `${slot.question} (current: ${value})`
       : slot.question
     return {
       ...slot,
@@ -2538,9 +2538,9 @@ function socraticSlotValue(
 }
 
 export function researchInteractionModeLabel(mode: ResearchInteractionMode | undefined) {
-  if (mode === "companion") return "认知伴随"
-  if (mode === "socratic") return "苏格拉底"
-  return "未选择"
+  if (mode === "companion") return "Companion"
+  if (mode === "socratic") return "Socratic"
+  return "Not selected"
 }
 
 export function taskModeForInteractionMode(mode: ResearchInteractionMode): ResearchCockpitTask["mode"] {

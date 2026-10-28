@@ -32,7 +32,7 @@ export function hasNeoResearchApiKey(env: ApiKeyEnv = process.env) {
   return NEO_RESEARCH_API_KEY_ENVS.some((key) => Boolean(env[key]?.trim()))
 }
 
-type HomeAction = "Configure API Key" | "New CSV Task" | "Open Cockpit" | "历史研究" | "Run Doctor"
+type HomeAction = "Configure API Key" | "New CSV Task" | "Open Cockpit" | "Research history" | "Run Doctor"
 
 const neoResearchLogo = [
   " _  _          ___                         _   ",
@@ -78,7 +78,7 @@ export function Home() {
   const verticalGap = createMemo(() => (compactHeight() ? 1 : 2))
   const providerConnected = createMemo(() => Boolean(sync?.data.provider_next.connected.length))
   const needsApiKey = createMemo(() => !hasNeoResearchApiKey() && !providerConnected())
-  const actions: HomeAction[] = ["Configure API Key", "New CSV Task", "Open Cockpit", "历史研究", "Run Doctor"]
+  const actions: HomeAction[] = ["Configure API Key", "New CSV Task", "Open Cockpit", "Research history", "Run Doctor"]
   const promptMetadataText = createMemo(() => {
     const selectedModel = local?.model.current()
     if (selectedModel) return local?.model.parsed().model ?? selectedModel.modelID
@@ -213,7 +213,7 @@ export function Home() {
   })
 
   command.register(() => [
-    { title: "历史研究", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
+    { title: "Research history", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
     {
       title: "Open research cockpit",
       value: "research.cockpit.open",
@@ -269,7 +269,7 @@ export function Home() {
   ])
 
   function runAction(action: HomeAction) {
-    if (action === "历史研究") { dialog.replace(() => <DialogResearchHistory />); return }
+    if (action === "Research history") { dialog.replace(() => <DialogResearchHistory />); return }
     if (action === "Configure API Key") {
       openProviderDialog()
       return
@@ -346,7 +346,7 @@ export function Home() {
               selection={slashSelection}
             />
             <box flexShrink={0} flexDirection="row" gap={1} paddingTop={1}>
-              <text fg={theme.primary}>认知伴随</text>
+              <text fg={theme.primary}>Companion</text>
               <text fg={theme.primary}>Intent Agent</text>
               <text fg={theme.text} flexShrink={1} overflow="hidden" wrapMode="none">
                 {promptMetadataText()}

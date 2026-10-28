@@ -1,10 +1,16 @@
 import { defineConfig } from "drizzle-kit"
+import { homedir } from "node:os"
+import path from "node:path"
+
+const dataDirectory = process.env.XDG_DATA_HOME ?? path.join(homedir(), ".local", "share")
+const database = process.env.OPENCODE_DB ?? "opencode.db"
 
 export default defineConfig({
   dialect: "sqlite",
   schema: "./src/**/*.sql.ts",
   out: "./migration",
   dbCredentials: {
-    url: "/home/thdxr/.local/share/opencode/opencode.db",
+    url:
+      database === ":memory:" || path.isAbsolute(database) ? database : path.join(dataDirectory, "opencode", database),
   },
 })

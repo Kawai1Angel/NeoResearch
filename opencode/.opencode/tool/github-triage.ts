@@ -1,18 +1,25 @@
 /// <reference path="../env.d.ts" />
 import { tool } from "@opencode-ai/plugin"
+
+function owners(team: string) {
+  return (process.env[`TRIAGE_${team}_OWNERS`] ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+}
+
 const TEAM = {
-  desktop: ["adamdotdevin", "iamdavidhill", "Brendonovich", "nexxeln"],
-  zen: ["fwang", "MrMushrooooom"],
-  tui: ["kommander", "rekram1-node", "simonklee"],
-  core: ["kitlangton", "rekram1-node", "jlongster"],
-  docs: ["R44VC0RP"],
-  windows: ["Hona"],
+  desktop: owners("DESKTOP"),
+  zen: owners("ZEN"),
+  opentui: owners("OPENTUI"),
+  core: owners("CORE"),
+  docs: owners("DOCS"),
+  windows: owners("WINDOWS"),
+  nix: owners("NIX"),
 } as const
 
-const ASSIGNEES = [...new Set(Object.values(TEAM).flat())]
-
 function pick<T>(items: readonly T[]) {
-  return items[Math.floor(Math.random() * items.length)]!
+  return items[Math.floor(Math.random() * items.length)]
 }
 
 function getIssueNumber(): number {
@@ -45,10 +52,7 @@ Pick the most fitting labels for the issue and assign one owner.
 
 If unsure, choose the team/section with the most overlap with the issue and assign a member from that team at random.`,
   args: {
-    assignee: tool.schema
-      .enum(ASSIGNEES as [string, ...string[]])
-      .describe("The username of the assignee")
-      .default("rekram1-node"),
+    assignee: tool.schema.string().describe("A repository maintainer configured for this deployment").optional(),
     labels: tool.schema
       .array(tool.schema.enum(["nix", "opentui", "perf", "web", "desktop", "zen", "docs", "windows", "core"]))
       .describe("The labels(s) to add to the issue")
@@ -56,8 +60,8 @@ If unsure, choose the team/section with the most overlap with the issue and assi
   },
   async execute(args) {
     const issue = getIssueNumber()
-    const owner = "anomalyco"
-    const repo = "opencode"
+    const [owner, repo, extra] = (process.env.GITHUB_REPOSITORY ?? "").split("/")
+    if (!owner || !repo || extra) throw new Error("GITHUB_REPOSITORY must be configured as owner/repository")
 
     const results: string[] = []
     let labels = [...new Set(args.labels.map((x) => (x === "desktop" ? "web" : x)))]
@@ -71,30 +75,35 @@ If unsure, choose the team/section with the most overlap with the issue and assi
       results.push("Dropped label: nix (issue does not mention nix)")
     }
 
-    const assignee = nix ? "rekram1-node" : web ? pick(TEAM.desktop) : args.assignee
+    const assignee =
+      (nix ? pick(TEAM.nix) : web ? pick(TEAM.desktop) : undefined) ??
+      args.assignee ??
+      process.env.TRIAGE_DEFAULT_ASSIGNEE ??
+      pick(TEAM.core)
+    if (!assignee) throw new Error("Configure a triage owner or provide an explicit assignee")
 
     if (labels.includes("zen") && !zen) {
       throw new Error("Only add the zen label when issue title/body contains 'zen'")
     }
 
-    if (web && !nix && !(TEAM.desktop as readonly string[]).includes(assignee)) {
-      throw new Error("Web issues must be assigned to adamdotdevin, iamdavidhill, Brendonovich, or nexxeln")
+    if (web && !nix && TEAM.desktop.length > 0 && !TEAM.desktop.includes(assignee)) {
+      throw new Error("Web issues must be assigned to a configured desktop owner")
     }
 
-    if ((TEAM.zen as readonly string[]).includes(assignee) && !labels.includes("zen")) {
-      throw new Error("Only zen issues should be assigned to fwang or MrMushrooooom")
+    if (TEAM.zen.includes(assignee) && !labels.includes("zen")) {
+      throw new Error("Only zen issues should be assigned to a configured zen owner")
     }
 
-    if (assignee === "Hona" && !labels.includes("windows")) {
-      throw new Error("Only windows issues should be assigned to Hona")
+    if (TEAM.windows.includes(assignee) && !labels.includes("windows")) {
+      throw new Error("Only windows issues should be assigned to a configured windows owner")
     }
 
-    if (assignee === "R44VC0RP" && !labels.includes("docs")) {
-      throw new Error("Only docs issues should be assigned to R44VC0RP")
+    if (TEAM.docs.includes(assignee) && !labels.includes("docs")) {
+      throw new Error("Only docs issues should be assigned to a configured docs owner")
     }
 
-    if (assignee === "kommander" && !labels.includes("opentui")) {
-      throw new Error("Only opentui issues should be assigned to kommander")
+    if (TEAM.opentui.includes(assignee) && !labels.includes("opentui")) {
+      throw new Error("Only opentui issues should be assigned to a configured opentui owner")
     }
 
     await githubFetch(`/repos/${owner}/${repo}/issues/${issue}/assignees`, {

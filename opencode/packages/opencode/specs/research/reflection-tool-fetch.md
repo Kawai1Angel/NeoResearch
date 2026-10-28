@@ -2,56 +2,56 @@
 
 ## Background
 
-HypoPlanner 通过工具调用（`read_reflection`、`experiment_results`、`hypothesis_list` 等）主动拉取所需数据。Reflection Agent 目前的模式相反：service.ts 在调用前把所有数据预加载，序列化成一个 fat JSON 通过 `buildReflectionLLMUserPrompt` 注入给 LLM。
+HypoPlanner takes the required data voluntarily by means of a tool call (`read_reflection`, `experiment_results`, `hypothesis_list` etc.). Reflecting Agent is the opposite of the current pattern: service.ts preloads all data before calling, transforms it into a fat JSON injects LLM through `buildReflectionLLMUserPrompt`.
 
-本计划新增两个工具（`read_training_curve`、`read_memory_lessons`），使 Reflection 也能切换到工具驱动的数据获取模式。
+This plan adds two tools (`read_training_curve`, `read_memory_lessons`) to enable Reflection also to switch to tool-driven data acquisition mode.
 
 ---
 
-## 现状分析
+## Situation analysis
 
-### service.ts 预加载逻辑（7659–7712 行）
+### service.ts preload logic (7659 – 7712 row)
 
-`runReflectionAgent` 在进入 session 之前完成以下工作：
+`runReflectionAgent` completes the following tasks before entering session:
 
-| 预加载项 | 来源 | 对应工具 |
+| Preload | Source | Counterpart Tool |
 |---|---|---|
-| 近期 run 结果（status、metric、error） | `listRuns` + 排序 | `experiment_results`（已有） |
-| 上一轮 Reflection 产物 | 读文件系统 | `read_reflection`（已有） |
-| 最新 training curve | 查 `runner_progress_jsonl` artifact → 读 JSONL 文件 | **`read_training_curve`（新增）** |
-| recent memory lessons（最近 2 条） | `listMemory` + 排序 | **`read_memory_lessons`（新增）** |
-| best memory lesson（历史最优 metric 对应） | 同上，遍历找最优 | **`read_memory_lessons`（新增）** |
+| Recent Run Results (status, metric, error) | Sort `listRuns`+ | `experiment_results` (available) |
+| Previous Reflection | Read File System | `read_reflection` (available) |
+| The newest train | Check `runner_progress_jsonl` description Read JSONL files | ** `read_training_curve` (new)** |
+| 2 | Sort `listMemory`+ | ** `read_memory_lessons` (new)** |
+| Best memory lesson | I've been looking all over for the best. | ** `read_memory_lessons` (new)** |
 
-新增两个工具后，`ReflectionLLMContext` 构造和 `buildReflectionLLMUserPrompt` 的 fat JSON 可随之删除。
+With the addition of two tools, `ReflectionLLMContext` construction and fat JSON for `buildReflectionLLMUserPrompt` can be deleted.
 
 ---
 
-## 新增工具规格
+## Add Tool Specification
 
 ### Tool 1: `read_training_curve`
 
-**文件：** `src/tool/research-context.ts`
+**Document:** `src/tool/research-context.ts`
 
-**描述：**
+**Description:**
 Read the training curve (epoch-by-epoch val loss) for a run in the current research task.
 Returns an ordered array of `{ epoch, valLoss, horizon?, elapsedS? }` points, uniformly
 sampled to `maxPoints` if the raw log is longer. Returns `{ available: false }` if no
 progress artifact exists for the requested run.
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 默认 | 说明 |
+| Parameters | Type | Default | Annotations |
 |---|---|---|---|
-| `runID` | `string?` | 省略 | 指定 run；省略则自动选最近一次 `succeeded` run，再 fallback 到最近任意 run |
-| `maxPoints` | `number?` | `60` | 返回点数上限（1–120），超出则均匀采样，始终保留首尾点 |
+| `runID` | `string?` | Ignore | Specify run; Automatically select the last `succeeded` run, then fallback to any recent run |
+| `maxPoints` | `number?` | `60` | Returns the maximum number of points (1 — 120), selects evenly in excess, always keeping the end point |
 
-**执行流程：**
-1. `resolveTaskIDBySessionID(ctx.sessionID)` → taskID；未解析返回 `NOT_IN_RESEARCH_SESSION`
-2. 若传了 `runID`，查 `ResearchRunTable` 验证归属；否则按 `time_updated DESC` 找最近 `succeeded`，再 fallback 到最新任意 run
-3. 查 `ResearchArtifactTable` where `task_id = taskID AND run_id = runID AND kind = "runner_progress_jsonl"` 取 `uri`
-4. 读取文件（`file://` 前缀去掉），按行解析 JSONL：`{ epoch, val_loss|valLoss, horizon?, elapsed_s|elapsedS? }`，跳过解析失败行
-5. 若点数 > maxPoints：均匀采样，`step = (n-1)/(maxPoints-1)`，始终包含第 0 和最后一个点
-6. 返回：
+**Implementation process:**
+1. `resolveTaskIDBySessionID(ctx.sessionID)` → taskID; Unsolved Return `NOT_IN_RESEARCH_SESSION`
+2. If `runID` is passed, check `ResearchRunTable` for attribution; Otherwise press `time_updated DESC` to find the nearest `succeeded`, fallback to any new run
+3. Check `ResearchArtifactTable` where `task_id = taskID AND run_id = runID AND kind = "runner_progress_jsonl"` for `uri`
+4. Read the file after removing `file://`, parse JSONL lines as `{ epoch, val_loss|valLoss, horizon?, elapsed_s|elapsedS? }`, and skip invalid lines.
+5. If Point > maxPoints: even sample, `step = (n-1)/(maxPoints-1)` always contains the 0 and last point
+6. Return:
 ```json
 {
   "available": true,
@@ -61,37 +61,37 @@ progress artifact exists for the requested run.
   "curve": [{ "epoch": 1, "valLoss": 0.45 }, ...]
 }
 ```
-找不到 artifact 时返回 `{ "available": false }`
+Return `{ "available": false }` when no artifact is found
 
-**依赖搬移：** `extractTrainingCurve` 当前是 `service.ts` 私有函数，需提取到 `research-context.ts`（或单独的 `src/research/training-curve.ts`）并 export；`service.ts` 改为 import。
+**Reliance on removal:** `extractTrainingCurve` is currently a private function of `service.ts`, to be extracted to `research-context.ts` (or separate `src/research/training-curve.ts`) and export; For `service.ts` read iport.
 
 ---
 
 ### Tool 2: `read_memory_lessons`
 
-**文件：** `src/tool/research-context.ts`
+**Document:** `src/tool/research-context.ts`
 
-**描述：**
+**Description:**
 Read historical experiment memory for the current research task. Returns the most recent
 lessons and, optionally, the lesson from the run that achieved the best primary metric.
 Use this to avoid repeating known-failing designs and to ground new hypotheses in evidence.
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 默认 | 说明 |
+| Parameters | Type | Default | Annotations |
 |---|---|---|---|
-| `recentLimit` | `number?` | `2` | 最近 N 条 lesson（1–10） |
-| `includeBest` | `boolean?` | `true` | 是否返回历史最优 metric 对应的 lesson（去重，不与 recent 重复） |
+| `recentLimit` | `number?` | `2` | Recent N lesson (1 – 10) |
+| `includeBest` | `boolean?` | `true` | Whether or not to return the best metric corresponding lesson (dread, not duplicate with recent) |
 
-**执行流程：**
+**Implementation process:**
 1. `resolveTaskIDBySessionID(ctx.sessionID)` → taskID
-2. 查 `ResearchMemoryTable` where `task_id = taskID`，按 `time_created DESC` 取全量
-3. 取前 `recentLimit` 条 → `recentLessons: string[]`
-4. 若 `includeBest`：
-   - 额外查 `ResearchTaskTable.objective` 拿 `direction`（`"minimize"` | `"maximize"`）
-   - 遍历全量 memories，读 `candidate_summary.bestMetric`（number），按 direction 找最优
-   - 若最优 memory 不在 recentLessons 里 → `bestLesson: string`
-5. 返回：
+2. Check `ResearchMemoryTable` where `task_id = taskID`, press `time_created DESC` to take the full amount
+3. Pre-`recentLimit` `recentLessons: string[]`
+4. If `includeBest`:
+   - Check extra `ResearchTaskTable.objective` for `direction` (`"minimize"`) | `"maximize"`)
+   - Full mass of memories, read `candidate_summary.bestMetric` (number), press direction to find the best
+   - If best memory is not in recentLessons `bestLesson: string`
+5. Return:
 ```json
 {
   "totalMemories": 7,
@@ -99,35 +99,35 @@ Use this to avoid repeating known-failing designs and to ground new hypotheses i
   "bestLesson": "..."
 }
 ```
-无记录时 `recentLessons: []`，`bestLesson` 省略
+`recentLessons: []`, `bestLesson` omitted when no record
 
 ---
 
-## 变更文件列表
+## Change File List
 
-| 文件 | 变更类型 | 内容 |
+| Documentation | Change Type | Contents |
 |---|---|---|
-| `src/tool/research-context.ts` | 新增 | `ReadTrainingCurveTool`、`ReadMemoryLessonsTool`；搬入 `extractTrainingCurve` 逻辑 |
-| `src/tool/registry.ts` | 修改 | import 两个新工具；`yield*` 初始化；加入 `tool map` 和 `builtin` 列表 |
-| `src/research/service.ts` | 修改 | import `extractTrainingCurve`（若提取为独立文件）；**后续阶段**删除 7659–7712 预加载块、`ReflectionLLMContext`、`buildReflectionLLMUserPrompt` |
-| `src/agent/prompt/research-reflection.txt` | 修改 | **后续阶段**改为 HypoPlanner 风格 workflow，描述 4 步工具调用流程 |
+| `src/tool/research-context.ts` | Add | `ReadTrainingCurveTool`,`ReadMemoryLessonsTool`; Move to `extractTrainingCurve` Logic |
+| `src/tool/registry.ts` | Modify | Two new tools; Initialization of `yield*`; Add `tool map` and `builtin` lists |
+| `src/research/service.ts` | Modify | Report `extractTrainingCurve` (if extracted as a separate file);**Subsequent phase** Delete 7659 — 7712 preload blocks, `ReflectionLLMContext`, `buildReflectionLLMUserPrompt` |
+| `src/agent/prompt/research-reflection.txt` | Modify | **Follow-up phase** to HypoPlanner style workflow, describing the 4 step tool call process |
 
-> `src/research/service.ts` 和 prompt 的修改属于**后续阶段**，不在本次范围内。本次只交付两个工具 + registry 注册。
+> Changes to `src/research/service.ts` and prompt fall under the follow-up phase** and are not included in this scope. This time only two tools + registration are delivered.
 
 ---
 
-## 注册方式（registry.ts）
+## Registration mode (registry.ts)
 
 ```ts
 // import
 import {
   ReadReflectionTool,
   ExperimentResultsTool,
-  ReadTrainingCurveTool,   // 新增
-  ReadMemoryLessonsTool,   // 新增
+  ReadTrainingCurveTool,   // Add
+  ReadMemoryLessonsTool,   // Add
 } from "./research-context"
 
-// Layer 内 yield*
+// ♪ Layer inside yield*
 const readTrainingCurve = yield* ReadTrainingCurveTool
 const readMemoryLessons = yield* ReadMemoryLessonsTool
 
@@ -135,16 +135,16 @@ const readMemoryLessons = yield* ReadMemoryLessonsTool
 readTrainingCurve: Tool.init(readTrainingCurve),
 readMemoryLessons: Tool.init(readMemoryLessons),
 
-// builtin 列表（紧跟 readReflection / experimentResults）
+// biltin list (following readReflection/ experimentResults)
 tool.readTrainingCurve,
 tool.readMemoryLessons,
 ```
 
 ---
 
-## 后续阶段：Reflection prompt workflow（参考）
+## Follow-up phase: Reflection process workflow (reference)
 
-工具添加完成后，`research-reflection.txt` 改为：
+After tool addition is completed, `research-reflection.txt` becomes:
 
 ```
 ## Workflow
@@ -156,15 +156,15 @@ tool.readMemoryLessons,
 5. Output the 7-key JSON object.
 ```
 
-`buildReflectionLLMUserPrompt` 的 fat JSON payload 和 service.ts 7659–7712 的预加载块随之删除。
+`buildReflectionLLMUserPrompt`'s fat JPON payload and service.ts 7659 – 7712 preloads were then deleted.
 
 ---
 
-## 实现顺序
+## Order of realization
 
-1. 提取 `extractTrainingCurve` 逻辑（从 service.ts 搬到 research-context.ts）
-2. 实现 `ReadTrainingCurveTool`
-3. 实现 `ReadMemoryLessonsTool`
-4. 更新 `registry.ts`
-5. 跑 typecheck + 相关 tests
-6. （后续）service.ts 预加载删除 + prompt 改写
+1. Extract `extractTrainingCurve` logic (from service.ts to research-context.ts)
+2. Achieved `ReadTrainingCurveTool`
+3. Achieved `ReadMemoryLessonsTool`
+4. Update `registry.ts`
+5. Run typecheck + associated tests
+6. (following) service.ts preload delete +prompt redraft

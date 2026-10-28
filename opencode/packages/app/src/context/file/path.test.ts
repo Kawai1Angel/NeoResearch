@@ -86,16 +86,16 @@ describe("encodeFilePath", () => {
 
   describe("macOS paths", () => {
     test("should handle macOS absolute path", () => {
-      const macPath = "/Users/kelvin/Projects/opencode/README.md"
+      const macPath = "/Users/user/Projects/opencode/README.md"
       const result = encodeFilePath(macPath)
       const fileUrl = `file://${result}`
 
       expect(() => new URL(fileUrl)).not.toThrow()
-      expect(result).toBe("/Users/kelvin/Projects/opencode/README.md")
+      expect(result).toBe("/Users/user/Projects/opencode/README.md")
     })
 
     test("should handle macOS path with spaces", () => {
-      const macPath = "/Users/kelvin/My Documents/file.txt"
+      const macPath = "/Users/user/My Documents/file.txt"
       const result = encodeFilePath(macPath)
       const fileUrl = `file://${result}`
 
@@ -230,13 +230,13 @@ describe("encodeFilePath", () => {
     })
 
     test("should encode Unicode characters", () => {
-      const unicodePath = "/home/user/文档/README.md"
+      const unicodePath = "/home/user/café/README.md"
       const result = encodeFilePath(unicodePath)
       const fileUrl = `file://${result}`
 
       expect(() => new URL(fileUrl)).not.toThrow()
       // Unicode should be encoded
-      expect(result).toContain("%E6%96%87%E6%A1%A3")
+      expect(result).toContain("caf%C3%A9")
     })
 
     test("should handle already normalized Windows path", () => {

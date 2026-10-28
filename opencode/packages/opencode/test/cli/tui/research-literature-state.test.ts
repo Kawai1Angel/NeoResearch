@@ -8,7 +8,7 @@ test("literature view isolates tasks, bounds streams, deduplicates progress and 
   for (let i = 0; i < 100; i++) state = updateLiteratureView(state, "task_a", emit("progress", { runID: "run_a", step: "parse", paperID: "paper_a", status: "running" }))
   expect(state?.rows).toHaveLength(1)
   state = updateLiteratureView(state, "task_a", emit("progress", { runID: "run_a", step: "assemble_evidence", status: "completed", cached: true }))
-  expect(state?.rows.at(-1)?.text).toContain("缓存命中")
+  expect(state?.rows.at(-1)?.text).toContain("Cache hit")
   expect(updateLiteratureView(state, "task_a", emit("failed", { taskID: "task_b" }))).toBe(state)
   for (let i = 0; i < 100; i++) state = updateLiteratureView(state, "task_a", emit("part.updated", { partID: String(i), kind: "text", text: "x".repeat(10000) }))
   expect(state?.rows.length).toBe(40)

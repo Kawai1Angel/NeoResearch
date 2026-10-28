@@ -41,6 +41,7 @@ import {
   selectNextBestAction,
   shouldRefreshResearchCockpitOnEvent,
   sortResearchCockpitTasks,
+  slotFromSocraticQuestion,
   updateResearchCockpitTaskInteractionMode,
   updateResearchCockpitTaskRunnerRoot,
   type ResearchCockpitApproval,
@@ -171,17 +172,17 @@ describe("research cockpit data helpers", () => {
           }),
         ),
       ),
-    ).toBe("认知伴随")
+    ).toBe("Companion")
 
     expect(researchInteractionModeLabel(interactionModeForTask(task({ id: "auto_default", mode: "autonomous" })))).toBe(
-      "苏格拉底",
+      "Socratic",
     )
 
     expect(
       researchInteractionModeLabel(
         interactionModeForTask(task({ id: "top_level_companion", mode: "autonomous", interactionMode: "companion" })),
       ),
-    ).toBe("认知伴随")
+    ).toBe("Companion")
   })
 
   test("updates research interaction mode without changing execution mode", () => {
@@ -482,7 +483,7 @@ describe("research cockpit data helpers", () => {
           id: "approval_intent",
           kind: "protocol" as const,
           status: "approved" as const,
-          reason: "[checkpoint:intent_confirmed]\n需求交流已确认。",
+          reason: "[checkpoint:intent_confirmed]\nRequirements confirmed.",
           time: { created: 1, updated: 1 },
         },
       ],
@@ -558,7 +559,7 @@ describe("research cockpit data helpers", () => {
             id: "approval_intent",
             kind: "protocol",
             status: "approved",
-            reason: "[checkpoint:intent_confirmed]\n需求交流已确认。",
+            reason: "[checkpoint:intent_confirmed]\nRequirements confirmed.",
             time: { created: 1, updated: 1 },
           },
         ],
@@ -633,7 +634,7 @@ describe("research cockpit data helpers", () => {
           id: "approval_requirements",
           kind: "protocol",
           status: "pending",
-          reason: "[checkpoint:requirements_confirmed]\n确认需求后再进入 HypoPlanner。",
+          reason: "[checkpoint:requirements_confirmed]\nConfirm requirements before entering HypoPlanner.",
           time: { created: 1, updated: 1 },
         },
       ],
@@ -661,7 +662,7 @@ describe("research cockpit data helpers", () => {
           id: "approval_requirements",
           kind: "protocol",
           status: "approved",
-          reason: "[checkpoint:requirements_confirmed]\n确认需求后再进入 HypoPlanner。",
+          reason: "[checkpoint:requirements_confirmed]\nConfirm requirements before entering HypoPlanner.",
           time: { created: 1, updated: 1 },
         },
       ],
@@ -1674,6 +1675,19 @@ describe("research cockpit data helpers", () => {
     expect(formatResearchCockpitProfile({})).toBe("-")
   })
 
+  test("recognizes English clarification questions, including early-stopping limits", () => {
+    const questions = [
+      ["What exactly are you forecasting?", "forecast_object"],
+      ["Should this task use Socratic mode?", "interaction_mode"],
+      ["Which errors matter most?", "error_preferences"],
+      ["What limits apply to model parameters or resource usage?", "parameter_budget"],
+      ["Where will the final model be deployed?", "deployment_target"],
+      ["After how many consecutive NAS iterations without improvement should search stop early?", "max_no_improve"],
+      ["How many NAS iterations are planned?", "max_iterations"],
+    ] as const
+    for (const [question, slot] of questions) expect(slotFromSocraticQuestion(question)).toBe(slot)
+  })
+
   test("builds Socratic clarification state from pending protocol approvals", () => {
     const result = buildSocraticClarificationState(
       task({
@@ -1688,9 +1702,9 @@ describe("research cockpit data helpers", () => {
           kind: "protocol",
           status: "pending",
           reason: [
-            "运行自主研究流水线前需要先澄清研究意图。",
-            "- NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
-            "- 需要预测哪些目标列？",
+            "Clarify research intent before running the autonomous research pipeline.",
+            "- Which CSV dataset path should NeoResearch use for profiling and execution?",
+            "- Which target columns should be forecast?",
           ].join("\n"),
           time: { created: 1, updated: 1 },
         },
@@ -1698,19 +1712,19 @@ describe("research cockpit data helpers", () => {
     )
     expect(result.active).toBe(true)
     expect(result.missingSlots).toEqual(["data_source", "target_columns"])
-    expect(result.nextQuestion).toBe("NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
+    expect(result.nextQuestion).toBe("Which CSV dataset path should NeoResearch use for profiling and execution?")
     expect(result.questionCount).toBe(2)
     expect(result.slots).toHaveLength(17)
     expect(result.slots.find((s) => s.id === "data_source")).toMatchObject({
       id: "data_source",
-      label: "CSV 数据集路径",
-      question: "NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
+      label: "CSV dataset path",
+      question: "Which CSV dataset path should NeoResearch use for profiling and execution?",
       status: "missing",
     })
     expect(result.slots.find((s) => s.id === "target_columns")).toMatchObject({
       id: "target_columns",
-      label: "目标列",
-      question: "需要预测哪些目标列？",
+      label: "Target columns",
+      question: "Which target columns should be forecast?",
       status: "missing",
     })
     expect(result.slots.find((s) => s.id === "interaction_mode")).toMatchObject({
@@ -1761,8 +1775,8 @@ describe("research cockpit data helpers", () => {
       value: "24",
     })
     expect(result.slots.find((s) => s.id === "primary_metric")).toMatchObject({
-      label: "主指标",
-      question: "模型搜索应该优化哪个验证指标？",
+      label: "Primary metric",
+      question: "Which validation metric should model search optimize?",
       status: "missing",
     })
     expect(result.slots.find((s) => s.id === "max_iterations")).toMatchObject({
@@ -1790,14 +1804,14 @@ describe("research cockpit data helpers", () => {
           id: "approval_protocol",
           kind: "protocol",
           status: "pending",
-          reason: ["需要澄清研究意图：", "- 预测对象是什么？"].join("\n"),
+          reason: ["Research intent clarification required:", "- What is the forecast object?"].join("\n"),
           time: { created: 1, updated: 1 },
         },
       ],
       { includeCompanion: true },
     )
     expect(result.active).toBe(true)
-    expect(result.nextQuestion).toBe("预测对象是什么？")
+    expect(result.nextQuestion).toBe("What is the forecast object?")
   })
 
   test("shows user-confirmed NAS limits and hides the system run cap in the Intent checkpoint", () => {
@@ -1821,7 +1835,7 @@ describe("research cockpit data helpers", () => {
   })
 
   test("prefers a newer intent_confirmed checkpoint approval over a stale unresolved ask_user clarification", () => {
-    // ask_user never resolves its own pending "需要澄清研究意图" approval — once check_taskspec
+    // ask_user never resolves its own pending "Research intent clarification required" approval — once check_taskspec
     // opens the intent_confirmed checkpoint, that newer approval should win so the cockpit
     // renders the checkpoint content instead of getting stuck showing the old question forever.
     const result = buildSocraticClarificationState(
@@ -1843,7 +1857,7 @@ describe("research cockpit data helpers", () => {
           id: "approval_ask_user",
           kind: "protocol",
           status: "pending",
-          reason: ["需要澄清研究意图：", "- 预测对象是什么？"].join("\n"),
+          reason: ["Research intent clarification required:", "- What is the forecast object?"].join("\n"),
           time: { created: 1, updated: 1 },
         },
       ],

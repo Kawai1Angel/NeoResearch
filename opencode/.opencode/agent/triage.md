@@ -47,7 +47,7 @@ Desktop app issues:
 
 If the issue does not mention nix, do not add nix.
 
-If the issue mentions nix, assign to `rekram1-node`.
+If the issue mentions nix, select a configured Nix owner.
 
 #### zen
 
@@ -88,53 +88,14 @@ TUI issues potentially caused by our underlying TUI library:
 
 **Do not** add for general TUI bugs.
 
-When assigning to people here are the following rules:
+## Ownership configuration
 
-Desktop / Web:
-Use for desktop-labeled issues only.
+Read the deployment's ownership configuration instead of assuming personal accounts:
 
-- adamdotdevin
-- iamdavidhill
-- Brendonovich
-- nexxeln
+- `GITHUB_REPOSITORY`: target repository as `owner/repository` (required).
+- `TRIAGE_DESKTOP_OWNERS`, `TRIAGE_ZEN_OWNERS`, `TRIAGE_OPENTUI_OWNERS`, `TRIAGE_CORE_OWNERS`, `TRIAGE_DOCS_OWNERS`, `TRIAGE_WINDOWS_OWNERS`, `TRIAGE_NIX_OWNERS`: comma-separated maintainer accounts for each area.
+- `TRIAGE_DEFAULT_ASSIGNEE`: optional fallback maintainer.
 
-Zen:
-ONLY assign if the issue will have the "zen" label.
+For Nix and Desktop / Web issues, use an owner configured for that area when available. Otherwise, provide an explicit assignee from the repository's configured maintainers. Do not invent an account when no owner is configured.
 
-- fwang
-- MrMushrooooom
-
-TUI (`packages/opencode/src/cli/cmd/tui/...`):
-
-- thdxr for TUI UX/UI product decisions and interaction flow
-- kommander for OpenTUI engine issues: rendering artifacts, keybind handling, terminal compatibility, SSH behavior, and low-level perf bottlenecks
-- rekram1-node for TUI bugs that are not clearly OpenTUI engine issues
-
-Core (`packages/opencode/...`, excluding TUI subtree):
-
-- thdxr for sqlite/snapshot/memory bugs and larger architectural core features
-- jlongster for opencode server + API feature work (tool currently remaps jlongster -> thdxr until assignable)
-- rekram1-node for harness issues, provider issues, and other bug-squashing
-
-For core bugs that do not clearly map, either thdxr or rekram1-node is acceptable.
-
-Docs:
-
-- R44VC0RP
-
-Windows:
-
-- Hona (assign any issue that mentions Windows or is likely Windows-specific)
-
-Determinism rules:
-
-- If title + body does not contain "zen", do not add the "zen" label
-- If "nix" label is added but title + body does not mention nix/nixos, the tool will drop "nix"
-- If title + body mentions nix/nixos, assign to `rekram1-node`
-- If "desktop" label is added, the tool will override assignee and randomly pick one Desktop / Web owner
-
-In all other cases, choose the team/section with the most overlap with the issue and assign a member from that team at random.
-
-ACP:
-
-- rekram1-node (assign any acp issues to rekram1-node)
+Only add a category label when the issue matches that category. In particular, only add `zen` for Zen-related issues and `nix` when the title or body explicitly mentions Nix or NixOS.

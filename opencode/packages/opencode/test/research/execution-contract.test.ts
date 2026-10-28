@@ -157,7 +157,7 @@ test("Gate A rejects a different hypothesis and backbone", () => {
   ).toEqual(["hypothesis_id", "backbone"])
 })
 test("canonical digest preserves action order and ECMAScript number encoding", () => {
-  expect(canonicalize({ z: 1e-5, a: [1, "中文", 1e-7, 1e21] })).toBe('{"a":[1,"中文",1e-7,1e+21],"z":0.00001}')
+  expect(canonicalize({ z: 1e-5, a: [1, "café", 1e-7, 1e21] })).toBe('{"a":[1,"café",1e-7,1e+21],"z":0.00001}')
   expect(digest({ a: 1, b: 2 })).toBe(digest({ b: 2, a: 1 }))
   expect(digest(["a", "b"])).not.toBe(digest(["b", "a"]))
 })
@@ -423,7 +423,7 @@ for (const exhausted of [false, true]) {
           expect(prompts).toHaveLength(2)
           const approvals = await run((svc) => svc.listApprovals({ taskID: task.id }))
           expect(approvals).toHaveLength(1)
-          expect(approvals[0]!.reason).toContain("Agent 已尝试 2 次自动修复")
+          expect(approvals[0]!.reason).toContain("The agent attempted 2 automatic repairs")
           expect((await run((svc) => svc.getTask(task.id))).status).toBe("paused")
           expect((await run((svc) => svc.listRuns(task.id))).map((item) => item.status)).toEqual(["invalid", "invalid", "invalid"])
           expect(await run((svc) => svc.getChampion(task.id))).toBeUndefined()

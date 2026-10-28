@@ -297,7 +297,7 @@ describe("structured-output.createStructuredOutputTool", () => {
 
     // Valid nested object - AI SDK validates before calling execute()
     const validResult = await tool.execute!(
-      { user: { name: "John", email: "john@test.com" } },
+      { user: { name: "User", email: "user@example.com" } },
       {
         toolCallId: "test-call-id",
         messages: [],
@@ -305,7 +305,7 @@ describe("structured-output.createStructuredOutputTool", () => {
       },
     )
 
-    expect(capturedOutput).toEqual({ user: { name: "John", email: "john@test.com" } })
+    expect(capturedOutput).toEqual({ user: { name: "User", email: "user@example.com" } })
     expect(validResult.metadata.valid).toBe(true)
 
     // Verify schema has correct nested structure

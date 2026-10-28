@@ -135,8 +135,8 @@ test("full-recipe LLM proposals require review instead of auto-approval", async 
     riskLevel: "medium",
     approvalStatus: "pending",
   })
-  expect(JSON.stringify(requestBody)).toContain("中文")
-  expect(JSON.stringify(requestBody)).toContain("JSON 字段")
+  expect(JSON.stringify(requestBody)).toContain("English")
+  expect(JSON.stringify(requestBody)).toContain("JSON field")
 })
 
 test("full-recipe LLM proposals can be auto-approved when content is bridge-safe and conservative", async () => {

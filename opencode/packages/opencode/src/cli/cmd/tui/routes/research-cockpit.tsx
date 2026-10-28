@@ -270,11 +270,11 @@ function isHumanCheckpointRequired(err: unknown): boolean {
 
 function formatCheckpointMessage(err: unknown): string {
   const blocked = parseBlockedErrorPayload(err)
-  if (!blocked) return "等待 checkpoint 确认"
-  if (blocked.reason === "human_checkpoint_rejected") return `${blocked.checkpointPhase ?? "当前"} 已拒绝，流程已暂停；修改决定并批准后才会继续。`
-  if (blocked.reason === "execution_contract_violation") return "执行契约不一致，任务已暂停。实现错误修复后 /approve 重试原 candidate；candidate 设计错误则 /reject 废弃并重新设计。"
-  if (blocked.reason === "reflection_requested_human_review") return "Reflection Agent 建议人工介入 — /approve 确认后继续发布"
-  return blocked.checkpointPhase ? `等待 ${blocked.checkpointPhase} checkpoint 确认` : "等待 checkpoint 确认"
+  if (!blocked) return "Waiting for checkpoint approval"
+  if (blocked.reason === "human_checkpoint_rejected") return `${blocked.checkpointPhase ?? "Current"} was rejected; the workflow is paused until the decision is revised and approved.`
+  if (blocked.reason === "execution_contract_violation") return "Execution contract mismatch; task paused. After fixing implementation errors, /approve to retry the original candidate. For candidate design errors, /reject to discard and redesign."
+  if (blocked.reason === "reflection_requested_human_review") return "Reflection Agent recommends human review — /approve to continue publishing"
+  return blocked.checkpointPhase ? `Waiting for ${blocked.checkpointPhase} checkpoint approval` : "Waiting for checkpoint approval"
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {
@@ -407,9 +407,9 @@ function overlayLiveResearchStageStatus(
 
 function localResearchChatReply(value: string) {
   const normalized = value.trim().toLowerCase().replace(/[!！.。?？\s]+$/g, "")
-  const greetings = new Set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽", "在吗"])
+  const greetings = new Set(["hi", "hello", "hey", "greetings", "hiya", "howdy", "are you there"])
   if (!greetings.has(normalized)) return undefined
-  return "你好，我在。可以直接告诉我研究目标、CSV 数据路径，或让我解释当前任务状态。"
+  return "Hello! Tell me your research goal or CSV dataset path, or ask me to explain the current task status."
 }
 
 function socraticSlotLine(slot: ReturnType<typeof buildSocraticClarificationState>["slots"][number]) {
@@ -548,15 +548,15 @@ function isRunRecommendedPrompt(value: string) {
   const compact = normalized.replace(/\s+/g, "")
   if (
     [
-      "开始",
-      "开始预测",
-      "开始运行",
-      "开始实验",
-      "继续",
-      "执行",
-      "执行下一步",
-      "运行",
-      "下一步",
+      "begin",
+      "start forecasting",
+      "start running",
+      "start experiment",
+      "continue",
+      "execute",
+      "execute next step",
+      "run",
+      "next step",
       "start",
       "run",
       "continue",
@@ -617,10 +617,10 @@ const streamLineDisplayLimit = 100
 const neoResearchVersion = InstallationVersion === "local" ? packageJson.version : InstallationVersion
 const researchCockpitOnboardingFile = path.join(Global.Path.data, "onboarded.json")
 const researchCockpitOnboardingText = [
-  "欢迎来到 NeoResearch。",
-  "本系统主要通过对话使用，直接告诉我你想做什么即可。",
-  "常用斜杠命令：/new csv、/dataset prepare、/loop start、/help。",
-  "核心快捷键：Enter、Esc、Ctrl+J/K、Ctrl+L、Ctrl+C。",
+  "Welcome to NeoResearch.",
+  "Tell me what you want to do to use the conversational interface.",
+  "Common slash commands: /new csv, /dataset prepare, /loop start, /help.",
+  "Keyboard shortcuts: Enter, Esc, Ctrl+J/K, Ctrl+L, Ctrl+C.",
 ].join("\n")
 const interactionModeOptions: Array<{
   key: string
@@ -1105,19 +1105,19 @@ function formatTaskRequirementSummaryLines(task?: ResearchCockpitTask) {
   const metric = typeof objective.primaryMetric === "string" && objective.primaryMetric.length > 0 ? objective.primaryMetric : undefined
   const maxRuns = typeof budget.maxRuns === "number" && Number.isFinite(budget.maxRuns) ? budget.maxRuns : undefined
   const primaryParts = [
-    metric ? `指标=${metric}` : undefined,
-    prompt ? `需求=${promptTaskTitle(prompt)}` : undefined,
+    metric ? `metric=${metric}` : undefined,
+    prompt ? `goal=${promptTaskTitle(prompt)}` : undefined,
   ].filter((part): part is string => Boolean(part))
   const detailParts = [
-    datasetName ? `数据=${datasetName}` : undefined,
-    targets.length > 0 ? `目标=${targets.join(",")}` : undefined,
-    horizons.length > 0 ? `预测=${horizons.join(",")}` : undefined,
-    contextLength ? `上下文=${contextLength}` : undefined,
-    maxRuns ? `预算=${maxRuns} runs` : undefined,
+    datasetName ? `data=${datasetName}` : undefined,
+    targets.length > 0 ? `targets=${targets.join(",")}` : undefined,
+    horizons.length > 0 ? `horizons=${horizons.join(",")}` : undefined,
+    contextLength ? `context=${contextLength}` : undefined,
+    maxRuns ? `budget=${maxRuns} runs` : undefined,
   ].filter((part): part is string => Boolean(part))
 
-  if (primaryParts.length === 0 && detailParts.length === 0) return [`需求摘要 ${promptTaskTitle(task.title)}`]
-  return [`需求摘要 ${primaryParts.join(" / ") || promptTaskTitle(task.title)}`, ...(detailParts.length > 0 ? [detailParts.join(" / ")] : [])]
+  if (primaryParts.length === 0 && detailParts.length === 0) return [`Requirements ${promptTaskTitle(task.title)}`]
+  return [`Requirements ${primaryParts.join(" / ") || promptTaskTitle(task.title)}`, ...(detailParts.length > 0 ? [detailParts.join(" / ")] : [])]
 }
 
 function InteractionModeDialog(props: {
@@ -1438,15 +1438,15 @@ export function ResearchCockpit() {
     }
     const removedShortcut =
       evt.ctrl && name === "n"
-        ? "Ctrl+N 已移除。请使用 /new csv 或直接描述一个 CSV 任务。"
+        ? "Ctrl+N was removed. Use /new csv or describe a CSV task."
         : evt.ctrl && name === "b"
-          ? "Ctrl+B 已移除。请使用 /seed。"
+          ? "Ctrl+B was removed. Use /seed."
           : evt.ctrl && name === "e"
-            ? "Ctrl+E 已移除。请使用 /export bundle。"
+            ? "Ctrl+E was removed. Use /export bundle."
             : evt.meta && (name === "left" || name === "right")
-              ? "Alt+Left/Right 已移除。请使用 /candidate prev 或 /candidate next。"
+              ? "Alt+Left/Right was removed. Use /candidate prev or /candidate next."
               : evt.meta && name === "h"
-                ? "Alt+H 已移除。请使用 /home。"
+                ? "Alt+H was removed. Use /home."
                 : undefined
     if (removedShortcut) {
       if (!removedShortcutHints.has(removedShortcut)) {
@@ -1599,9 +1599,9 @@ export function ResearchCockpit() {
     try { return await readState<ResearchCockpitTask>(`/research/tasks/${encodeURIComponent(id)}`) }
     catch (error) {
       if (selectedTaskID() === id) {
-        const text = `无法打开研究 ${id}：${formatError(error)}`
+        const text = `Cannot open research ${id}:${formatError(error)}`
         setError(text)
-        setErrorEvents([{ id: ++streamEventID, action: "历史研究", text }])
+        setErrorEvents([{ id: ++streamEventID, action: "Research history", text }])
       }
       return undefined
     }
@@ -1694,34 +1694,34 @@ export function ResearchCockpit() {
   async function appendResearch() {
     const taskID = selectedTask()?.id
     if (!taskID) return
-    const value = await DialogPrompt.show(dialog, "追加研究：迭代预算（系统运行安全上限固定为 200）", { placeholder: "例如 5", value: "5" })
+    const value = await DialogPrompt.show(dialog, "Extend research: iteration budget (system safety cap: 200)", { placeholder: "For example, 5", value: "5" })
     if (!value) return
     const maxIterations = Number(value)
-    if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 200) { toast.show({ variant: "error", message: "请输入 1–200 的整数" }); return }
+    if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 200) { toast.show({ variant: "error", message: "Enter an integer from 1 to 200" }); return }
     const state = await researchRequest<ResumeState>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume-state`)
-    await runAction("追加研究", async () => {
+    await runAction("Extend research", async () => {
       await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/cycles`, { method: "POST", body: JSON.stringify({ expectedRevision: state.revision, requestKey: crypto.randomUUID(), maxIterations, maxRuns: RESEARCH_MAX_RUNS_SAFETY_LIMIT }) })
-      return "新研究周期已创建；点击继续研究开始执行"
+      return "A new research cycle was created; select Resume research to start"
     })
   }
 
-  const recoveryActionLabel = () => ({ running: "查看运行", waiting_input: "查看问题 / 审批", resumable: "继续研究", needs_reconciliation: "检查状态", blocked: "查看原因", completed: "查看结果" })[recovery()?.recoveryState ?? "resumable"]
+  const recoveryActionLabel = () => ({ running: "View running operation", waiting_input: "View questions / Approvals", resumable: "Resume research", needs_reconciliation: "Check status", blocked: "View reason", completed: "View results" })[recovery()?.recoveryState ?? "resumable"]
   async function resumeResearch() {
     const taskID = selectedTask()?.id
     if (!taskID) return
     const state = await researchRequest<ResumeState>(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume-state`)
     if (state.activeOperation && !state.activeOperation.recoveryRequired) {
-      await runAction("查看运行", async (signal) => {
+      await runAction("View running operation", async (signal) => {
         await waitForResearchOperation({ operation: state.activeOperation!, url: new URL(sdk.url), headers: new Headers(sdk.directory ? { "x-opencode-directory": sdk.directory } : {}), signal, fetch: (url, init) => sdk.fetch(url, init) })
-        return "研究操作已结束"
+        return "The research operation has ended"
       }, { startedAt: state.activeOperation.startedAt })
       return
     }
     if (state.recoveryState === "completed") { dialog.replace(() => <DialogResearchResults taskID={taskID} />); return }
     if (state.recoveryState !== "resumable" && state.recoveryState !== "needs_reconciliation") { appendCockpitNotice("resume-state", state.summary); return }
-    await runAction("继续研究", async (signal) => {
+    await runAction("Resume research", async (signal) => {
       await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/resume`, { method: "POST", signal, body: JSON.stringify({ expectedRevision: state.revision, requestKey: crypto.randomUUID() }) })
-      return "研究已继续，状态已更新"
+      return "Research resumed; status updated"
     })
   }
 
@@ -2016,7 +2016,7 @@ export function ResearchCockpit() {
       // IntentAgent is multi-turn: a new "started" event fires for every session turn (kickoff,
       // then once per user reply). Only wipe the accumulated tool-call log when this is genuinely
       // a different task — otherwise keep appending, so earlier turns in the same intent-gathering
-      // conversation stay visible instead of flashing back to "等待 IntentAgent 启动..." each turn.
+      // conversation stay visible instead of flashing back to "Waiting for IntentAgent to start..." each turn.
       const isNewTask = intentStream()?.taskID !== taskID
       setIntentStream({ id: ++streamEventID, taskID, done: false })
       if (isNewTask) {
@@ -2109,7 +2109,7 @@ export function ResearchCockpit() {
         const partID = `intent-failed-${++streamEventID}`
         setIntentPartMap((prev) => {
           const next = new Map(prev)
-          next.set(partID, { partID, kind: "text", text: `⚠ IntentAgent 未能启动：${reason ?? error ?? "未知错误"}`, seq: ++streamEventID })
+          next.set(partID, { partID, kind: "text", text: `⚠ IntentAgent could not start:${reason ?? error ?? "Unknown error"}`, seq: ++streamEventID })
           return next
         })
         setIntentPartOrder((prev) => [...prev, partID])
@@ -2212,7 +2212,7 @@ export function ResearchCockpit() {
         const modelLabel = llmModel ?? llmProvider ?? "LLM"
         if (llmStatus === "used") {
           const recipePart = recipeID ? ` / ${recipeID}` : ""
-          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] LLM ${modelLabel} → 生成成功${recipePart}`, tone: "success" })
+          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] LLM ${modelLabel} → Generation succeeded${recipePart}`, tone: "success" })
           if (llmHypothesis) {
             const h = llmHypothesis.length > 120 ? `${llmHypothesis.slice(0, 117)}...` : llmHypothesis
             newLines.push({ id: ++streamEventID, taskID, text: `  ${h}`, tone: "muted" })
@@ -2227,7 +2227,7 @@ export function ResearchCockpit() {
           const recipePart = recipeID ? ` / ${recipeID}` : ""
           const riskPart = riskLevel && riskLevel !== "low" ? ` [${riskLevel}]` : ""
           const baselinePart = isBaseline ? " [baseline]" : ""
-          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] 复用候选${idPart}${recipePart}${baselinePart}${riskPart}`, tone: "muted" })
+          newLines.push({ id: ++streamEventID, taskID, text: `[ModelDesigner] Reusing candidate${idPart}${recipePart}${baselinePart}${riskPart}`, tone: "muted" })
         }
         const eventCandidateSpec =
           meta.candidateSpec !== null && typeof meta.candidateSpec === "object" && !Array.isArray(meta.candidateSpec)
@@ -2256,7 +2256,7 @@ export function ResearchCockpit() {
         // Push HypoPlanner result into the chronological designLLMLines so it appears
         // after Reflection output at the bottom — not above it in the fixed stream block.
         const hypoNewLines: Array<{ id: number; taskID?: string; text: string; tone: StreamLine["tone"] }> = []
-        hypoNewLines.push({ id: ++streamEventID, taskID, text: "[HypoPlanner] 假设已更新", tone: "muted" })
+        hypoNewLines.push({ id: ++streamEventID, taskID, text: "[HypoPlanner] Hypotheses updated", tone: "muted" })
         const partOrderSnap = hypoPartOrder()
         const partMapSnap = hypoPartMap()
         if (partOrderSnap.length > 0) {
@@ -2299,7 +2299,7 @@ export function ResearchCockpit() {
       const task = selectedTask()
       if (task && taskID && taskID !== task.id) return
       setLiveAgentEventStage("publish")
-      appendDesignLLMLines([{ id: ++streamEventID, taskID, text: "[Publish] 开始发布 — 运行冠军 ref_test 并打包模型...", tone: "muted" as const }])
+      appendDesignLLMLines([{ id: ++streamEventID, taskID, text: "[Publish] Publishing — running champion ref_test and packaging the model...", tone: "muted" as const }])
       return
     }
     if (researchPayload.type === "research.agent.publish.completed") {
@@ -2325,7 +2325,7 @@ export function ResearchCockpit() {
       const primaryMetricName = typeof task?.objective.primaryMetric === "string" ? task.objective.primaryMetric : "cv_avg_mse"
       const metricPart = championPrimaryMetric !== undefined ? ` / ${primaryMetricName}=${championPrimaryMetric.toFixed(4)}` : ""
       const utilityPart = championUtility !== undefined ? ` / utility=${championUtility.toFixed(3)}` : ""
-      newLines.push({ id: ++streamEventID, taskID, text: `[Publish] 发布完成 / ${kind ?? "model_export_package"}${metricPart}${utilityPart}`, tone: "success" })
+      newLines.push({ id: ++streamEventID, taskID, text: `[Publish] Publication complete / ${kind ?? "model_export_package"}${metricPart}${utilityPart}`, tone: "success" })
       if (championCandidateID) {
         const recipePart = recipeID ? ` / ${recipeID}` : ""
         newLines.push({ id: ++streamEventID, taskID, text: `  Champion: ${championCandidateID}${recipePart}`, tone: "muted" })
@@ -2363,7 +2363,7 @@ export function ResearchCockpit() {
       if (artifactPath) newLines.push({ id: ++streamEventID, taskID, text: `  ${artifactPath}`, tone: "muted" })
       if (reportPath) {
         const target = reportPath.startsWith("file://") ? reportPath.slice("file://".length) : reportPath
-        newLines.push({ id: ++streamEventID, taskID, text: `  最终研究报告: ${target}`, tone: "success" })
+        newLines.push({ id: ++streamEventID, taskID, text: `  Final research report: ${target}`, tone: "success" })
       }
       appendDesignLLMLines(newLines)
       setLiveAgentEventStage(undefined)
@@ -2379,7 +2379,7 @@ export function ResearchCockpit() {
       const errMsg = typeof meta.message === "string" ? meta.message : typeof meta.error === "string" ? meta.error : "unknown error"
       const refTestSkipped = meta.refTestSkipped === true
       const tone: StreamLine["tone"] = refTestSkipped ? "warning" : "error"
-      const label = refTestSkipped ? "[Publish] ref_test 跳过" : "[Publish] 发布失败"
+      const label = refTestSkipped ? "[Publish] ref_test skipped" : "[Publish] Publication failed"
       appendDesignLLMLines([{ id: ++streamEventID, taskID, text: `${label}: ${errMsg.slice(0, 120)}`, tone }])
       setLiveAgentEventStage(undefined)
       requestRefresh()
@@ -2818,7 +2818,7 @@ export function ResearchCockpit() {
       if (message) {
         setActionEvents((events) => [
           ...events.slice(-(promptEventHistoryLimit - 1)),
-          { id: ++streamEventID, action: message.startsWith("请求已提交给 ") ? "chat-status" : "chat", text: message },
+          { id: ++streamEventID, action: message.startsWith("Request submitted to ") ? "chat-status" : "chat", text: message },
         ])
         toast.show({ variant: "info", message })
       }
@@ -3136,8 +3136,8 @@ export function ResearchCockpit() {
     const run = latestRun()
     const context = [
       "You are NeoResearch's Research Agent inside a time-series forecasting cockpit.",
-      "尽量用中文回答用户，并用简洁、可执行的方式帮助用户操作当前研究 workspace。",
-      "保留 JSON 字段名、schema 名称、指标名、命令、文件路径、模型族和技术术语的英文原文。",
+      "Respond in English and provide concise, actionable help for the current research workspace.",
+      "Preserve JSON field names, schema names, metric names, commands, file paths, model families, and technical terms.",
       "Do not claim that an experiment ran unless the Research OS task state or run history says so.",
       task ? `Task: ${task.title} / ${task.mode} / ${task.status}` : "Task: none selected",
       task ? `Objective: ${task.objective.primaryMetric ?? "unknown"} ${task.objective.direction ?? ""}`.trim() : "",
@@ -3189,7 +3189,7 @@ export function ResearchCockpit() {
           },
           chatRequestTimeoutMs,
         )
-        return `请求已提交给 ${defaults.modelLabel}，正在等待回复流...`
+        return `Request submitted to ${defaults.modelLabel}; waiting for the response stream...`
       } catch (err) {
         if (signal.aborted) throw err
         const message = formatError(err)
@@ -3568,7 +3568,7 @@ export function ResearchCockpit() {
       promptInput?.focus()
       toast.show({
         variant: "info",
-        message: "描述一个预测目标来创建下一个研究任务。",
+        message: "Describe a forecasting goal to create the next research task.",
         duration: 4000,
       })
       return
@@ -4077,8 +4077,8 @@ export function ResearchCockpit() {
         await researchRequest(sdk, `/research/tasks/${encodeURIComponent(task.id)}/intent/modify`, {
           method: "POST", signal,
           body: JSON.stringify({ message: value }),
-        }, 90_000, () => toast.show({ variant: "info", message: "回答已保留，等待上一轮 IntentAgent 结束后自动发送。" }))
-        return "需求修改已发送至 IntentAgent"
+        }, 90_000, () => toast.show({ variant: "info", message: "Your answer was saved and will be sent automatically after the current IntentAgent turn finishes." }))
+        return "Requirement updates sent to IntentAgent"
       })
       promptInput?.focus()
       return
@@ -4172,9 +4172,9 @@ export function ResearchCockpit() {
   }
 
   command.register(() => [
-    { title: "历史研究", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
-    { title: "追加研究（设置新周期预算）", value: "research.append", category: "Research", slash: { name: "append" }, onSelect: () => void appendResearch() },
-    { title: recovery()?.recoveryState === "running" ? "查看运行" : "继续研究 / 查看恢复状态", value: "research.resume", category: "Research", slash: { name: "resume" }, onSelect: () => void resumeResearch() },
+    { title: "Research history", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
+    { title: "Extend research (set new cycle budget)", value: "research.append", category: "Research", slash: { name: "append" }, onSelect: () => void appendResearch() },
+    { title: recovery()?.recoveryState === "running" ? "View running operation" : "Resume research / View recovery status", value: "research.resume", category: "Research", slash: { name: "resume" }, onSelect: () => void resumeResearch() },
     {
       title: "Create or import research task",
       description: "/new csv --mode autonomous --full",
@@ -4311,7 +4311,7 @@ export function ResearchCockpit() {
         const artifact = taskArtifacts().find((item) => item.kind === "task_evidence_bundle_json")
         const sessionID = literatureView()?.taskID === selectedTask()?.id ? literatureView()?.sessionID ?? artifact?.metadata.sessionID : artifact?.metadata.sessionID
         if (typeof sessionID === "string") route.navigate({ type: "session", sessionID })
-        else appendCockpitNotice("literature", "当前任务尚无 Literature child session。")
+        else appendCockpitNotice("literature", "This task has no Literature child session yet.")
       },
     },
     {
@@ -4758,7 +4758,7 @@ export function ResearchCockpit() {
         lines.push(
           {
             id: "intent-review-header",
-            text: "Intent 已驳回 — 请描述你想修改的内容，LLM 会识别并更新对应字段；确认无误后输入 /confirm 继续",
+            text: "Intent rejected — describe your changes and the LLM will update the relevant fields; enter /confirm when ready to continue",
             tone: "warning",
           },
           ...clarification.slots.map((slot) => ({
@@ -4773,7 +4773,7 @@ export function ResearchCockpit() {
         // mid-turn before calling ask_user) — render it standalone until the real tool call lands.
         lines.push({
           id: "socratic-next-question",
-          text: `Question: ${clarification.nextQuestion ?? "请确认缺失的研究意图。"}`,
+          text: `Question: ${clarification.nextQuestion ?? "Please confirm the missing research intent."}`,
           tone: "text",
         })
       }
@@ -5017,22 +5017,22 @@ export function ResearchCockpit() {
           // running its first intent-gathering turn (reading the dataset, reading the taskspec)
           // before any ask_user checkpoint exists, so clarification.active is still false here.
           if (!istreamPersistent && restoredIntentMessages.length === 0) {
-            persistentLines.push({ id: `idle-task-${mode}-waiting`, text: "等待 IntentAgent 启动...", tone: "muted", spinner: true })
+            persistentLines.push({ id: `idle-task-${mode}-waiting`, text: "Waiting for IntentAgent to start...", tone: "muted", spinner: true })
           }
         } else {
           persistentLines.push(
-            { id: "idle-task", text: "研究输出会在 agent 运行时显示在这里。", tone: "muted" },
+            { id: "idle-task", text: "Research output will appear here while agents run.", tone: "muted" },
             {
               id: "idle-task-hint",
-              text: "提示：点击顶栏 /loop 启动自主搜索，或 /run baseline 跑一个手动候选。",
+              text: "Tip: select /loop in the top bar to start autonomous search, or /run baseline to run a manual candidate.",
               tone: "muted",
             },
           )
         }
       } else {
         persistentLines.push(
-          { id: "idle-empty", text: "描述一个预测目标，或创建 CSV 任务开始研究。", tone: "muted" },
-          { id: "idle-empty-hint", text: "提示：点击顶栏 /new 创建任务，或输入 /help 查看所有命令。", tone: "muted" },
+          { id: "idle-empty", text: "Describe a forecasting goal or create a CSV task to start research.", tone: "muted" },
+          { id: "idle-empty-hint", text: "Tip: select /new in the top bar to create a task, or enter /help to list commands.", tone: "muted" },
         )
       }
     }
@@ -5040,7 +5040,7 @@ export function ResearchCockpit() {
       history.messages.forEach((message, index) => {
         if (message.source !== "chat") return
         const text = message.parts.filter((part) => part.type === "text" && !part.synthetic).map((part) => part.text ?? "").join("\n")
-        if (text && text !== streamingChat()?.text) persistentLines.push({ id: `history-chat-${index}`, text: `${message.info.role === "user" ? "你" : "Research Agent"}: ${text}`, tone: "muted" })
+        if (text && text !== streamingChat()?.text) persistentLines.push({ id: `history-chat-${index}`, text: `${message.info.role === "user" ? "You" : "Research Agent"}: ${text}`, tone: "muted" })
       })
     }
     const timeline = [
@@ -5092,17 +5092,17 @@ export function ResearchCockpit() {
           timelineLines.push(
             {
               id: `streaming-chat-${item.event.id}-proposal-command`,
-              text: `我建议执行：${proposal.command}`,
+              text: `Suggested command:${proposal.command}`,
               tone: "primary",
             },
             {
               id: `streaming-chat-${item.event.id}-proposal-reason`,
-              text: `原因：${proposal.reason || proposal.title}`,
+              text: `Reason:${proposal.reason || proposal.title}`,
               tone: "muted",
             },
             {
               id: `streaming-chat-${item.event.id}-proposal-confirm`,
-              text: proposal.requireConfirm ? "[Enter 执行]   [Esc 取消]" : "只读建议可直接执行。",
+              text: proposal.requireConfirm ? "[Enter to run]   [Esc to cancel]" : "Read-only suggestions can run immediately.",
               tone: "success",
             },
           )
@@ -5121,7 +5121,7 @@ export function ResearchCockpit() {
       if (item.kind === "chat-loading") {
         timelineLines.push({
           id: `chat-loading-${item.event.id}`,
-          text: "Research Agent 正在生成回复...",
+          text: "Research Agent is generating a response...",
           tone: "primary",
           spinner: true,
         })
@@ -5148,7 +5148,7 @@ export function ResearchCockpit() {
     if (finalReport) {
       const target = finalReport.uri.startsWith("file://") ? finalReport.uri.slice("file://".length) : finalReport.uri
       if (!lines.some((line) => line.text.includes(target))) {
-        lines.push({ id: `final-report-${finalReport.id}`, text: `[Publish] 最终研究报告: ${target}`, tone: "success" })
+        lines.push({ id: `final-report-${finalReport.id}`, text: `[Publish] Final research report: ${target}`, tone: "success" })
       }
     }
     if (activeRunID && !isFinalModelSelectionPending) {
@@ -5168,7 +5168,7 @@ export function ResearchCockpit() {
       lines.push({ id: `runner-live-${activeRunID}`, text: `[TrainEval live | ${run!.stage} | ${activeRunID}]`, tone: "primary" })
       const recentProgress = [...uniqueProgress.values()].slice(-40)
       if (recentProgress.length === 0) {
-        lines.push({ id: `runner-live-waiting-${activeRunID}`, text: "等待 runner 输出首个训练进度…", tone: "muted", spinner: true })
+        lines.push({ id: `runner-live-waiting-${activeRunID}`, text: "Waiting for the runner's first training update…", tone: "muted", spinner: true })
       } else {
         lines.push(...recentProgress)
       }
@@ -5176,13 +5176,13 @@ export function ResearchCockpit() {
     return internStreamLines(lines.slice(-streamLineDisplayLimit))
   })
   const promptPlaceholder = createMemo(() => {
-    if (!selectedTask()) return "询问 Research Agent，或使用 /new csv 创建带数据集的任务..."
-    if (socraticClarification().reviewMode) return "描述你想修改的内容（LLM 自动识别字段），或输入 /confirm 确认..."
-    if (socraticClarification().active) return "回答当前 Socratic 问题..."
-    if (!intentConfirmed()) return "确认需求后进入 Data Analysis，或继续补充需求..."
-    if (taskInteractionMode() === "companion") return "请求建议、批准 checkpoint，或导出 bundle..."
-    if (taskInteractionMode() === "socratic") return "回答下一个澄清问题、请求实验或导出..."
-    return "请求下一个实验、批准 gate，或导出报告..."
+    if (!selectedTask()) return "Ask Research Agent, or use /new csv to create a task with a dataset..."
+    if (socraticClarification().reviewMode) return "Describe your changes (the LLM identifies fields automatically), or enter /confirm..."
+    if (socraticClarification().active) return "Answer the current Socratic question..."
+    if (!intentConfirmed()) return "Confirm requirements to enter Data Analysis, or add more details..."
+    if (taskInteractionMode() === "companion") return "Ask for advice, approve a checkpoint, or export a bundle..."
+    if (taskInteractionMode() === "socratic") return "Answer the next clarification question, request an experiment, or export..."
+    return "Request the next experiment, approve a gate, or export a report..."
   })
   const chatMetadataSource = createMemo(() => currentChatDefaultsKey())
   const [chatMetadata] = createResource(chatMetadataSource, async () => {
@@ -5546,7 +5546,7 @@ export function ResearchCockpit() {
             <text fg={cockpitColors.primary} onMouseUp={() => route.navigate({ type: "home" })}>
               Home
             </text>
-            <text fg={cockpitColors.primary} onMouseUp={() => dialog.replace(() => <DialogResearchHistory />)}>历史研究</text>
+            <text fg={cockpitColors.primary} onMouseUp={() => dialog.replace(() => <DialogResearchHistory />)}>Research history</text>
             <Show when={selectedTask()}><text fg={cockpitColors.primary} onMouseUp={() => void resumeResearch()}>{recoveryActionLabel()}</text></Show>
             <text fg={cockpitColors.primary} onMouseUp={() => insertSlashPrefix("/new")}>
               /new
@@ -5625,7 +5625,7 @@ export function ResearchCockpit() {
                 {`▶ Next: ${action().title} (${action().command})`}
               </text>
               <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                Enter 执行 · 输入其他问题可追问/跳过
+                Enter to run · Type another question to follow up or skip
               </text>
             </box>
           )}
@@ -5745,14 +5745,14 @@ export function ResearchCockpit() {
 
               <box gap={0} paddingTop={1}>
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                  任务
+                  Task
                 </text>
                 <text fg={cockpitColors.textMuted}>{taskSummary()}</text>
               </box>
 
               <box gap={0} paddingTop={1}>
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                  下一步
+                  Next step
                 </text>
                 <text fg={cockpitColors.primary} width="100%" overflow="hidden" wrapMode="none">
                   {sidebarRecommendation().title}
@@ -5797,7 +5797,7 @@ export function ResearchCockpit() {
 
               <box gap={0} paddingTop={1}>
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                  ▾ AutoResearch进展
+                  ▾ AutoResearch progress
                 </text>
                 <text fg={agentStageColor(researchAgentStages()[0]!)}>
                   {agentStageText(researchAgentStages()[0]!)}
@@ -5859,7 +5859,7 @@ export function ResearchCockpit() {
                     </text>
                     <text fg={cockpitColors.warning}>{approval().kind} pending</text>
                     <text fg={cockpitColors.textMuted} width="100%" overflow="hidden" wrapMode="none">
-                      /approve 继续 · /reject 驳回
+                      /approve to continue · /reject to decline
                     </text>
                   </box>
                 )}

@@ -7,8 +7,6 @@ const numbered = [
   "ターミナル {{number}}",
   "터미널 {{number}}",
   "เทอร์มินัล {{number}}",
-  "终端 {{number}}",
-  "終端機 {{number}}",
 ]
 
 export function defaultTitle(number: number) {

@@ -11,7 +11,7 @@ OpenCode TSF run plans use `taskSpec.runtime` to locate Neo-Cast:
 {
   "runtime": {
     "bridgeOnly": true,
-    "neoCastProjectRoot": "/Users/chengmingyue/human_agent_collaboration/research_working/idea/neo_research_for_tsf/neo-research/neo_cast",
+    "neoCastProjectRoot": "/path/to/NeoResearch/neo_cast",
     "pythonExecutable": "python3",
     "currentCandidatePath": ".neo-cast/current_candidate.json",
     "resolvedCandidatePath": ".neo-cast/resolved_candidate.json",
@@ -138,7 +138,7 @@ cd opencode
 bun run packages/opencode/src/index.ts research create \
   --mode review \
   --title "NeoResearch TSF E2E" \
-  --neo-cast-root /Users/chengmingyue/human_agent_collaboration/research_working/idea/neo_research_for_tsf/neo-research/neo_cast
+  --neo-cast-root /path/to/NeoResearch/neo_cast
 ```
 
 Then seed baselines, approve one if required, and run:

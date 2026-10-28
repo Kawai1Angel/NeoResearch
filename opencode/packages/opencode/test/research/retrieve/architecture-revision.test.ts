@@ -68,7 +68,7 @@ for (const problem of ["operator", "replication", "input_output", "logical_condi
         revisionPayload = payload
         const previous = payload.previousDecision as any
         return { text: JSON.stringify({ decision: { ...previous,
-          prefer: problem === "operator" ? "采用可实现的仿射时间建模家族" : previous.prefer,
+          prefer: problem === "operator" ? "Use an implementable affine temporal modeling family" : previous.prefer,
           limitations: [...previous.limitations, "Preserve operator differences and source scope; no transferred local gain"],
         }, reason: "Narrow wording or correct applicability using the original sources" }) }
       }
@@ -96,7 +96,7 @@ for (const problem of ["operator", "replication", "input_output", "logical_condi
     expect(revisionPayload.cards[0].sources).toEqual(card.sources)
     expect(packet.decisions).toHaveLength(1)
     expect(packet.decisions[0]!.decisionID).toBe(revisionPayload.previousDecision.decisionID)
-    if (problem === "operator") expect(packet.decisions[0]!.prefer).toBe("采用可实现的仿射时间建模家族")
+    if (problem === "operator") expect(packet.decisions[0]!.prefer).toBe("Use an implementable affine temporal modeling family")
     expect(card).toEqual(originalCard)
     const files = await readdir(path.join(tmp.path, "audit"))
     expect(files.some((f) => f.startsWith("revise-"))).toBe(true)

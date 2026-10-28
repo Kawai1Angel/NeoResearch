@@ -194,7 +194,7 @@ export function DialogSessionList() {
       keybind={[
         {
           keybind: { name: "r", ctrl: true, shift: false, meta: false, super: false, leader: false },
-          title: "打开研究",
+          title: "Open research",
           onTrigger: async (option) => {
             const url = new URL(`/research/sessions/${encodeURIComponent(option.value)}/tasks`, sdk.url)
             if (sdk.directory) url.searchParams.set("directory", sdk.directory)
@@ -205,7 +205,7 @@ export function DialogSessionList() {
             }
             const tasks = (await response.json()) as Array<{ id: string; title: string }>
             if (!tasks.length) {
-              toast.show({ variant: "info", message: "此对话未绑定研究会话" })
+              toast.show({ variant: "info", message: "This conversation is not linked to a research session" })
               return
             }
             const open = (taskID: string) => {
@@ -218,7 +218,7 @@ export function DialogSessionList() {
             }
             dialog.replace(() => (
               <DialogSelect
-                title="选择研究会话"
+                title="Select research session"
                 options={tasks.map((task) => ({ title: task.title, value: task.id }))}
                 onSelect={(item) => open(item.value)}
               />

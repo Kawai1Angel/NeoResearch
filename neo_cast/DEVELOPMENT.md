@@ -1,45 +1,45 @@
-# neo-cast 安装与调试指南
+# neo-cast Installation and Debugging Guide
 
-> 本文档面向源码开发者。如果你只是使用 neo-cast，直接 `npm install -g neo-cast` 即可。
+> This document is for source developers. To use neo-cast, run `npm install -g neo-cast`.
 
 ---
 
-## 环境要求
+## Requirements
 
-| 依赖 | 最低版本 | 说明 |
+| Dependency | Minimum version | Notes |
 |---|---|---|
-| Node.js | >= 20 | 使用 `node --version` 检查 |
-| Python | >= 3.10 | 由 `init-runtime` 自动安装到项目 venv |
-| uv | 最新稳定 | Python 包管理，`curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| macOS / Linux | macOS 12+ / Ubuntu 22.04+ | 暂不支持 Windows |
+| Node.js | >= 20 | Check with `node --version` |
+| Python | >= 3.10 | Installed into the project venv by `init-runtime` |
+| uv | Latest stable | Python package manager: `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| macOS / Linux | macOS 12+ / Ubuntu 22.04+ | Windows is not supported yet |
 
 ---
 
-## 一次性环境初始化
+## One-time Environment Setup
 
 ```bash
-# 1. 克隆仓库
+# 1. Clone the repository
 git clone <repo-url> neo-cast
 cd neo-cast
 
-# 2. 安装 Node.js 依赖
+# 2. Install Node.js dependencies
 npm install
 
-# 3. 配置 API key
+# 3. Configure the API key
 cp .env.example .env
-# 用编辑器打开 .env，填入 ANTHROPIC_API_KEY
-# 如果使用 OpenAI 兼容接口（如 AIGCBEST）见下方"多 LLM 接入"
+# Edit .env and enter ANTHROPIC_API_KEY
+# For OpenAI-compatible endpoints (such as AIGCBEST), see "Multiple LLM Providers" below
 
-# 4. 初始化 Python 运行时（在项目目录内 .neo-cast/runtime/.venv）
+# 4. Initialize the Python runtime in .neo-cast/runtime/.venv
 node bin/neo-cast.js init-runtime
 
-# 5. 准备数据（需要 ETTh1.csv）
-# 下载：https://github.com/thuml/Time-Series-Library（dataset/ETT-small/ETTh1.csv）
+# 5. Prepare data (requires ETTh1.csv)
+# Download: https://github.com/thuml/Time-Series-Library (dataset/ETT-small/ETTh1.csv)
 node bin/neo-cast.js prepare-data --source /path/to/ETTh1.csv
 
-# 6. 验证环境
+# 6. Verify the environment
 node bin/neo-cast.js doctor
-# 预期输出：
+# Expected output:
 # [OK] python3: Python 3.12.x [runtime venv]
 # [OK] uv: ...
 # [OK] anthropic_api_key: ANTHROPIC_API_KEY is set.
@@ -49,19 +49,19 @@ node bin/neo-cast.js doctor
 
 ---
 
-## 安装方式
+## Installation Methods
 
-### 方式一：直接用 node 运行（最轻量，推荐开发时用）
+### Method 1: Run with Node (lightweight; recommended for development)
 
-不需要安装，改源码后立即生效：
+No installation is needed; source changes take effect immediately:
 
 ```bash
 node bin/neo-cast.js <command> [flags]
 
-# 等价于 neo-cast doctor
+# Equivalent to neo-cast doctor
 node bin/neo-cast.js doctor
 
-# mock 模式跑一次 design
+# Run design once in mock mode
 node bin/neo-cast.js design \
   --requirement "small nlinear baseline" \
   --mode companion \
@@ -69,130 +69,130 @@ node bin/neo-cast.js design \
   --mock-llm
 ```
 
-### 方式二：npm link（本地全局命令）
+### Method 2: npm link (local global command)
 
-在本机注册 `neo-cast` 命令，源码改动立即生效，无需重装：
+Register `neo-cast` locally. Source changes take effect without reinstalling:
 
 ```bash
-npm link            # 注册全局命令（需要 sudo 或 npm 全局目录在 PATH 里）
+npm link            # Register the global command (requires sudo or the npm global bin directory on PATH)
 
 neo-cast doctor
 neo-cast design --requirement "..." --mock-llm
 
-npm run unlink      # 撤销（或 npm unlink -g neo-cast）
+npm run unlink      # Unregister (or npm unlink -g neo-cast)
 ```
 
-> **注意**：`npm link` 创建的是符号链接，修改 `src/` 下的源码后**不需要**重新 link，直接运行即生效。
+> **Note:** `npm link` creates a symbolic link. Changes under `src/` take effect immediately without relinking.
 
-### 方式三：npm publish 发布到 npmjs.com
+### Method 3: Publish to npmjs.com
 
 ```bash
-# 确认版本号（package.json 的 version 字段）
-npm version patch   # 自动 bump 补丁版本
+# Check the version field in package.json
+npm version patch   # Increment the patch version automatically
 
-# 登录 npmjs.com（需要有账号和 token）
+# Log in to npmjs.com (requires an account and token)
 npm login
 
-# 发布
+# Publish
 npm publish
 
-# 用户安装
+# User installation
 npm install -g neo-cast
 ```
 
 ---
 
-## npm scripts 速查
+## npm Script Reference
 
 ```bash
-npm run doctor          # 检查环境，等价于 node bin/neo-cast.js doctor
-npm run design:mock     # companion 模式 mock 设计，快速冒烟
-npm test                # 跑 CLI e2e + Python unit tests
-npm run test:watch      # 监听模式跑完整测试入口
-npm run dev             # 等价于 node bin/neo-cast.js（需要自己追加子命令）
-npm run dev:debug       # 开启 Node.js inspector，等待调试器连接
+npm run doctor          # Check the environment; equivalent to node bin/neo-cast.js doctor
+npm run design:mock     # Quick smoke test with mock design in companion mode
+npm test                # Run CLI e2e and Python unit tests
+npm run test:watch      # Run the full test entrypoint in watch mode
+npm run dev             # Equivalent to node bin/neo-cast.js; append a subcommand
+npm run dev:debug       # Start the Node.js inspector and wait for a debugger
 ```
 
 ---
 
-## VS Code 调试
+## VS Code Debugging
 
-仓库已包含 `.vscode/launch.json`，在 VS Code 中按 **F5** 选择配置直接启动：
+The repository includes `.vscode/launch.json`. Press **F5** in VS Code and select a configuration:
 
-| 配置名 | 用途 |
+| Configuration | Purpose |
 |---|---|
-| `design (mock, companion)` | 最常用，无需 API key，companion 模式 2 轮 mock 训练 |
-| `design (mock, socratic)` | 无需 API key，苏格拉底模式 |
-| `design (Claude API, companion)` | 读 `.env` 里的 key，真实 LLM 调用 |
-| `doctor` | 快速检查环境 |
-| `runner status` | 查看当前实验状态 |
-| `e2e tests` | 调试 e2e 测试（可打断点） |
+| `design (mock, companion)` | Common setup; no API key; two mock training rounds in companion mode |
+| `design (mock, socratic)` | Socratic mode without an API key |
+| `design (Claude API, companion)` | Real LLM calls using the key from `.env` |
+| `doctor` | Quick environment check |
+| `runner status` | Inspect the current experiment |
+| `e2e tests` | Debug end-to-end tests with breakpoints |
 
-**真实 LLM 调试步骤：**
+**Debugging real LLM calls:**
 
-1. 确保 `.env` 里有 `ANTHROPIC_API_KEY=sk-ant-...`
-2. 在 VS Code 左侧 Run & Debug 面板选 `design (Claude API, companion)`
-3. 在 `src/llm.js` 或 `src/cli.js` 设断点
-4. 按 **F5** 启动
+1. Set `ANTHROPIC_API_KEY=sk-ant-...` in `.env`.
+2. Select `design (Claude API, companion)` in VS Code's Run & Debug panel.
+3. Set breakpoints in `src/llm.js` or `src/cli.js`.
+4. Press **F5**.
 
-**Node.js inspector 调试（不用 VS Code）：**
+**Node.js inspector without VS Code:**
 
 ```bash
 npm run dev:debug -- design --requirement "test" --mock-llm
-# 然后用 Chrome 打开 chrome://inspect 连接
+# Open chrome://inspect in Chrome to connect
 ```
 
 ---
 
-## 常用命令参考
+## Common Commands
 
 ```bash
-# 检查环境
+# Check the environment
 neo-cast doctor
 
-# 苏格拉底模式（先问清需求再自动跑）
+# Socratic mode: clarify requirements, then run automatically
 neo-cast design \
-  --requirement "需要一个参数量小、长 horizon 表现好的预测模型" \
+  --requirement "A small forecasting model with strong long-horizon performance" \
   --mode socratic \
   --max-candidates 5
 
-# 认知伴随模式（边训练边解释，可随时输入 stop）
+# Companion mode: explain progress during training; enter stop at any time
 neo-cast design \
   --requirement "transformer based model for ETTh1" \
   --mode companion \
   --max-candidates 5
 
-# mock 模式（不调用 LLM，用启发式规则生成候选）
+# Mock mode: use heuristic candidates without calling an LLM
 neo-cast design \
   --requirement "patch mlp model" \
   --mode companion \
   --max-candidates 3 \
   --mock-llm
 
-# 跳过 smoke run（加速开发调试）
+# Skip smoke runs to speed up development
 neo-cast design --requirement "..." --mock-llm --skip-smoke
 
-# 查看当前最优结果
+# View the best result
 neo-cast runner status
 
-# 手动触发 ref-test 评估
+# Trigger reference-test evaluation manually
 neo-cast runner ref-test
 
-# 查看 artifact
+# Inspect artifacts
 ls .neo-cast/artifacts/
 ```
 
 ---
 
-## 多 LLM 接入
+## Multiple LLM Providers
 
-### Anthropic（默认）
+### Anthropic (default)
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-用户级配置（`~/.config/neo-cast/config.json`）：
+User configuration (`~/.config/neo-cast/config.json`):
 
 ```json
 {
@@ -205,13 +205,13 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 }
 ```
 
-### OpenAI 兼容接口（如 AIGCBEST、本地 vLLM 等）
+### OpenAI-compatible endpoints (AIGCBEST, local vLLM, etc.)
 
 ```bash
 export NEO_CAST_LLM_API_KEY="your-key"
 ```
 
-用户级配置：
+User configuration:
 
 ```json
 {
@@ -225,51 +225,51 @@ export NEO_CAST_LLM_API_KEY="your-key"
 }
 ```
 
-`neo-cast config init` 会在 `~/.config/neo-cast/config.json` 生成默认配置文件，编辑后 `neo-cast config show` 可验证生效。
+`neo-cast config init` creates `~/.config/neo-cast/config.json`. Edit it, then verify with `neo-cast config show`.
 
 ---
 
-## 项目结构速查
+## Project Structure Reference
 
 ```
 neo-cast/
-  bin/neo-cast.js          ← CLI 入口
+  bin/neo-cast.js          <- CLI entrypoint
   src/
-    cli.js                 ← 命令解析与 design 主流程
-    config.js              ← 配置加载（env / 用户级 / 项目级）
-    doctor.js              ← 环境检查
-    llm.js                 ← Claude API / OpenAI 兼容调用 + 启发式 fallback
-    python-bridge.js       ← spawn Python 子进程
-    runtime.js             ← Python venv 管理
-    session.js             ← results.tsv 读取
-    output.js              ← 机器可读输出格式（key=value）
+    cli.js                 <- Command parsing and the main design workflow
+    config.js              <- Configuration loading (environment/user/project)
+    doctor.js              <- Environment checks
+    llm.js                 <- Claude/OpenAI-compatible calls and heuristic fallback
+    python-bridge.js       <- Python subprocess spawning
+    runtime.js             <- Python venv management
+    session.js             <- results.tsv reader
+    output.js              <- Machine-readable key=value output
     modes/
-      socratic.js          ← 苏格拉底模式交互收集需求
-      companion.js         ← 认知伴随模式叙述输出 + stop 监听
+      socratic.js          <- Interactive Socratic requirements gathering
+      companion.js         <- Companion narration and stop listener
   test/
-    e2e.test.js            ← 端到端测试（node --test）
-    python-unit.test.js    ← Python unittest 包装入口
-  py/                      ← Python 后端（训练 / 验证 / 导出）
-    train.py               ← 训练入口，dispatch 到 families/
-    runner.py              ← keep/discard 状态机
-    renderer.py            ← candidate JSON → 训练配置
-    validate.py            ← schema 校验 + smoke run
-    export.py              ← artifact 10 文件导出
-    families/              ← 模型族：nlinear / tiny_transformer / patch_mlp
+    e2e.test.js            <- End-to-end tests (node --test)
+    python-unit.test.js    <- Python unittest wrapper
+  py/                      <- Python backend (training/validation/export)
+    train.py               <- Training entrypoint; dispatches to families/
+    runner.py              <- Keep/discard state machine
+    renderer.py            <- Candidate JSON to training configuration
+    validate.py            <- Schema validation and smoke runs
+    export.py              <- Ten-file artifact export
+    families/              <- Model families: nlinear/tiny_transformer/patch_mlp
     schemas/               ← candidate_schema.json / metadata_schema.json
-  .vscode/launch.json      ← VS Code 调试配置（6 个预设）
-  .env.example             ← 环境变量模板
+  .vscode/launch.json      <- VS Code debugging with six presets
+  .env.example             <- Environment variable template
 ```
 
 ---
 
-## 故障排查
+## Troubleshooting
 
-| 现象 | 排查步骤 |
+| Symptom | Steps |
 |---|---|
-| `python3: not available` | 运行 `neo-cast init-runtime` 初始化 venv |
-| `ANTHROPIC_API_KEY is not set` | 设置环境变量或 `--mock-llm` 测试 |
-| `data not found` | 运行 `neo-cast prepare-data --source /path/to/ETTh1.csv` |
-| 训练 crash / shape mismatch | 查看 `.neo-cast/results.tsv`，status=crash 行有描述 |
-| `npm link` 后命令找不到 | 检查 npm 全局 bin 目录是否在 `$PATH`：`npm bin -g` |
-| LLM 生成的 candidate 被 validator 拒绝 | 检查 `py/schemas/candidate_schema.json` 约束，或用 `--mock-llm` 绕过 |
+| `python3: not available` | Run `neo-cast init-runtime` to initialize the venv |
+| `ANTHROPIC_API_KEY is not set` | Set the environment variable or test with `--mock-llm` |
+| `data not found` | Run `neo-cast prepare-data --source /path/to/ETTh1.csv` |
+| Training crash / shape mismatch | Inspect crash rows in `.neo-cast/results.tsv` |
+| Command missing after `npm link` | Check the global npm bin directory is on `$PATH`: `npm bin -g` |
+| Validator rejects an LLM candidate | Inspect `py/schemas/candidate_schema.json`, or use `--mock-llm` |

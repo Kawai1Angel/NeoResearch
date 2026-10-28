@@ -196,8 +196,8 @@ class ExecutionContractTests(unittest.TestCase):
 
     def test_canonical_numbers_and_unicode(self):
         self.assertEqual(
-            canonicalize({"z": 1e-5, "a": [1.0, "中文", 1e-7, 1e21]}),
-            '{"a":[1,"中文",1e-7,1e+21],"z":0.00001}',
+            canonicalize({"z": 1e-5, "a": [1.0, "café", 1e-7, 1e21]}),
+            '{"a":[1,"café",1e-7,1e+21],"z":0.00001}',
         )
 
     def test_smoke_violation_precedes_optimizer_and_first_epoch(self):

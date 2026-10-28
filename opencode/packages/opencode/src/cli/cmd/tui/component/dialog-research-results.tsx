@@ -32,10 +32,10 @@ export function DialogResearchResults(props: { taskID: string }) {
       return { items: [], error: String(error) }
     }
   })
-  const artifactTitle = (kind: string) => kind === "final_report_md" ? "最终研究报告" : kind
+  const artifactTitle = (kind: string) => kind === "final_report_md" ? "Final research report" : kind
   return (
     <DialogSelect
-      title={artifacts()?.error || "研究结果与产物"}
+      title={artifacts()?.error || "Research results and artifacts"}
       options={(artifacts()?.items ?? []).toSorted((left, right) => {
         if (left.kind === "final_report_md") return right.kind === "final_report_md" ? 0 : -1
         if (right.kind === "final_report_md") return 1
@@ -64,7 +64,7 @@ export function DialogResearchResults(props: { taskID: string }) {
             <scrollbox height={20}>
               <text fg={theme.text}>{text}</text>
             </scrollbox>
-            <text fg={theme.textMuted}>{artifact.uri} · Esc 返回</text>
+            <text fg={theme.textMuted}>{artifact.uri} · Esc to go back</text>
           </box>
         ))
       }}

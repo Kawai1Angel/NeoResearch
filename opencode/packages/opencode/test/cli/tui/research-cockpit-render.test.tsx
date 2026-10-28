@@ -627,7 +627,7 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={emptyFetch} />, { width: 160, height: 48 })
 
     try {
-      // Onboarding used to render as a "Research Agent: 欢迎来到 NeoResearch..." status line —
+      // Onboarding used to render as a "Research Agent: Welcome to NeoResearch..." status line —
       // that's gone now (operation-result/notice noise, not an AskUser dialogue), but the
       // "mark as seen" side effect (writing onboardingPath) must still happen exactly once.
       let persisted: Record<string, unknown> = {}
@@ -642,7 +642,7 @@ describe("ResearchCockpit render", () => {
       }
       const frame = app.captureCharFrame()
 
-      expect(frame).not.toContain("欢迎来到 NeoResearch")
+      expect(frame).not.toContain("Welcome to NeoResearch")
       expect(persisted.cockpit).toBe(true)
     } finally {
       app.renderer.destroy()
@@ -663,12 +663,12 @@ describe("ResearchCockpit render", () => {
       const frame = await waitForFrame(app, "Research Agent")
 
       expect(frame).toContain("NeoResearch Workspace")
-      expect(frame).toContain("描述一个预测目标，或创建 CSV 任务开始研究。")
+      expect(frame).toContain("Describe a forecasting goal or create a CSV task to start research.")
       expect(frame).toContain("/new")
       expect(frame).not.toContain("New CSV Task")
-      expect(frame).not.toContain("阶段")
+      expect(frame).not.toContain("Stage")
       expect(frame).toContain("Intent Agent")
-      expect(frame).toContain("下一步")
+      expect(frame).toContain("Next step")
       expect(frame).not.toContain("Quick Start")
       expect(frame).not.toContain("Next Action")
       expect(frame).not.toContain("Create research task")
@@ -701,7 +701,7 @@ describe("ResearchCockpit render", () => {
         input,
         init,
         posts,
-        "我可以先帮你确认数据集、预测长度和 runner 环境；创建实验请使用 New CSV Task。",
+        "I can help check the dataset, forecast length, and runner environment; use New CSV Task to create an experiment.",
         events,
       )
       if (handled) return handled
@@ -720,7 +720,7 @@ describe("ResearchCockpit render", () => {
       let frame = app.captureCharFrame()
       expect(frame).toContain("Forecast ETTh1 horizon 24")
       app.mockInput.pressEnter()
-      frame = await waitForFrame(app, "Research Agent: 我可以先帮你确认数据集")
+      frame = await waitForFrame(app, "Research Agent: I can help check the dataset")
       expect(posts.map((post) => post.path)).toEqual(["/session", "/session/session_research_chat/prompt_async"])
       expect(posts.map((post) => post.path)).not.toContain("/research/tasks")
       expect(frame).toContain("Forecast ETTh1 horizon 24")
@@ -743,11 +743,11 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "Research Agent")
-      await app.mockInput.typeText("你好")
+      await app.mockInput.typeText("hello")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Research Agent: 你好，我在。")
+      const frame = await waitForFrame(app, "Research Agent: Hello!")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/chat`)
       expect(posts.map((post) => post.path)).not.toContain("/session/session_research_chat/message")
       expect(posts.map((post) => post.path)).not.toContain("/session/session_research_chat/prompt_async")
@@ -798,7 +798,7 @@ describe("ResearchCockpit render", () => {
         input,
         init,
         posts,
-        "建议先处理当前 smoke run 的失败原因，再启动下一轮实验。",
+        "Resolve the current smoke run failure before starting the next experiment.",
         events,
       )
       if (handled) return handled
@@ -811,15 +811,15 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请给出下一步实验建议")
+      await app.mockInput.typeText("Suggest the next experiment")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Research Agent: 建议先处理当前 smoke run")
+      const frame = await waitForFrame(app, "Research Agent: Resolve the current smoke run")
 
       expect(posts.map((post) => post.path)).toContain("/session/session_research_chat/prompt_async")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
-      expect(frame).toContain("请给出下一步实验建议")
+      expect(frame).toContain("Suggest the next experiment")
     } finally {
       app.renderer.destroy()
     }
@@ -833,9 +833,9 @@ describe("ResearchCockpit render", () => {
     const posts: Array<{ path: string; body: unknown }> = []
     const proposal = JSON.stringify({
       kind: "action_proposal",
-      title: "为当前任务准备数据集",
+      title: "Prepare the dataset for the current task",
       command: "/dataset prepare",
-      reason: "数据集指纹不匹配",
+      reason: "Dataset fingerprint mismatch",
       reversible: true,
       requireConfirm: true,
     })
@@ -871,13 +871,13 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("数据集需要处理吗")
+      await app.mockInput.typeText("Does the dataset need preparation?")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      let frame = await waitForFrame(app, "我建议执行：/dataset prepare")
-      expect(frame).toContain("原因：数据集指纹不匹配")
-      expect(frame).toContain("[Enter 执行]   [Esc 取消]")
+      let frame = await waitForFrame(app, "Suggested command:/dataset prepare")
+      expect(frame).toContain("Reason:Dataset fingerprint mismatch")
+      expect(frame).toContain("[Enter to run]   [Esc to cancel]")
       expect(frame).not.toContain("/why")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/prepare-dataset`)
 
@@ -909,7 +909,7 @@ describe("ResearchCockpit render", () => {
         posts.push({ path: url.pathname, body: await requestJson(input, init) })
         return new Promise<Response>(() => {})
       }
-      const handled = await mockChatResponse(input, init, posts, "排队中的研究动作不会阻塞聊天提交。", events)
+      const handled = await mockChatResponse(input, init, posts, "Queued research actions do not block chat submissions.", events)
       if (handled) return handled
       return mockResearchFetch(input, init)
     }) as typeof fetch
@@ -930,7 +930,7 @@ describe("ResearchCockpit render", () => {
       }
       expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/autonomous/loop`)
 
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
@@ -1015,7 +1015,7 @@ describe("ResearchCockpit render", () => {
         input,
         init,
         posts,
-        "当前任务还在 smoke 阶段，下一步应先修复 runner 路径再继续实验。",
+        "The current task is still at smoke; fix the runner path before the next experiment.",
         events,
       )
       if (handled) return handled
@@ -1029,15 +1029,15 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Research Agent: 当前任务还在 smoke 阶段")
+      const frame = await waitForFrame(app, "Research Agent: The current task is still at smoke")
       expect(posts.map((post) => post.path)).toContain(`/research/tasks/${taskID}/chat`)
       expect(posts.map((post) => post.path)).toContain("/session/session_research_chat/prompt_async")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
-      expect(frame).toContain("请解释当前状态")
+      expect(frame).toContain("Explain the current status")
       expect(posts.find((post) => post.path === "/session/session_research_chat/prompt_async")?.body).toMatchObject({
         agent: "Research Agent",
         model: { providerID: "openai", modelID: "gpt-test" },
@@ -1045,11 +1045,11 @@ describe("ResearchCockpit render", () => {
           expect.objectContaining({
             type: "text",
             synthetic: true,
-            text: expect.stringContaining("尽量用中文回答"),
+            text: expect.stringContaining("Respond in English"),
           }),
           expect.objectContaining({
             type: "text",
-            text: "请解释当前状态",
+            text: "Explain the current status",
           }),
         ]),
       })
@@ -1093,7 +1093,7 @@ describe("ResearchCockpit render", () => {
                 sessionID: "session_research_chat",
                 messageID: "msg_stream_reply",
                 type: "text",
-                text: "当前",
+                text: "The current task",
                 time: { start: now },
               },
               time: now,
@@ -1106,7 +1106,7 @@ describe("ResearchCockpit render", () => {
               messageID: "msg_stream_reply",
               partID: "part_stream_reply",
               field: "text",
-              delta: "任务",
+              delta: "Task",
             },
           })
         }, 0)
@@ -1122,19 +1122,19 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const streamingFrame = await waitForFrame(app, "Research Agent: 当前任务")
+      const streamingFrame = await waitForFrame(app, "Research Agent: The current task")
       expect(streamingFrame).not.toContain("Waiting for GPT Test response")
 
-      emitAssistantText(events, "当前任务已完成。", {
+      emitAssistantText(events, "The current task is complete.", {
         messageID: "msg_stream_reply",
         partID: "part_stream_reply",
       })
 
-      await waitForFrame(app, "Research Agent: 当前任务已完成。")
+      await waitForFrame(app, "Research Agent: The current task is complete.")
     } finally {
       app.renderer.destroy()
     }
@@ -1175,7 +1175,7 @@ describe("ResearchCockpit render", () => {
                 sessionID: "session_research_chat",
                 messageID: "msg_multi_part_reply",
                 type: "text",
-                text: "第一段",
+                text: "First segment",
               },
             },
           })
@@ -1186,7 +1186,7 @@ describe("ResearchCockpit render", () => {
               messageID: "msg_multi_part_reply",
               partID: "part_body",
               field: "text",
-              delta: "第二段",
+              delta: "Second segment",
             },
           })
         }, 0)
@@ -1202,13 +1202,13 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请拼接多段回复")
+      await app.mockInput.typeText("Combine the response segments")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "第二段")
-      expect(frame).toContain("Research Agent: 第一段")
-      expect(frame).toContain("  第二段")
+      const frame = await waitForFrame(app, "Second segment")
+      expect(frame).toContain("Research Agent: First segment")
+      expect(frame).toContain("  Second segment")
     } finally {
       app.renderer.destroy()
     }
@@ -1249,7 +1249,7 @@ describe("ResearchCockpit render", () => {
                 sessionID: "session_research_chat",
                 messageID: "msg_async_reply",
                 type: "text",
-                text: "异步回复已开始",
+                text: "The asynchronous response has started",
                 time: { start: now },
               },
               time: now,
@@ -1268,11 +1268,11 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Research Agent: 异步回复已开始")
+      const frame = await waitForFrame(app, "Research Agent: The asynchronous response has started")
       expect(posts.map((post) => post.path)).toContain("/session/session_research_chat/prompt_async")
       expect(posts.map((post) => post.path)).not.toContain("/session/session_research_chat/message")
       expect(frame).not.toContain("Waiting for GPT Test response")
@@ -1297,12 +1297,12 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Status: 请求已提交给 GPT Test，正在等待回复流")
-      expect(frame).toContain("Research Agent 正在生成回复")
+      const frame = await waitForFrame(app, "Status: Request submitted to GPT Test; waiting for the response stream")
+      expect(frame).toContain("Research Agent is generating a response")
       expect(frame).not.toContain("Research Agent: Chat request accepted")
     } finally {
       app.renderer.destroy()
@@ -1364,7 +1364,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
@@ -1641,7 +1641,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "Usage Task A")
-      await app.mockInput.typeText("解释 A")
+      await app.mockInput.typeText("Explain A")
       await app.renderOnce()
       app.mockInput.pressEnter()
       await waitForFrame(app, "Usage recorded on task A.")
@@ -1686,12 +1686,12 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
       const waitingFrame = await waitForFrame(app, "Working / chat GPT Test")
-      expect(waitingFrame).toContain("Research Agent 正在生成回复")
+      expect(waitingFrame).toContain("Research Agent is generating a response")
       expect(waitingFrame).toMatch(/Working \/ chat GPT Test \/ 0s \[[=> ]+\]/)
       expect(waitingFrame).not.toContain("Waiting for GPT Test response")
       expect(waitingFrame).not.toContain("0s esc interrupt")
@@ -1732,10 +1732,10 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
-      await waitForFrame(app, "Research Agent 正在生成回复")
+      await waitForFrame(app, "Research Agent is generating a response")
 
       await app.mockInput.typeText("/abort")
       await app.renderOnce()
@@ -1771,7 +1771,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("请解释当前状态")
+      await app.mockInput.typeText("Explain the current status")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
@@ -1850,12 +1850,12 @@ describe("ResearchCockpit render", () => {
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
     const reply = [
-      "**实验管理**",
+      "**Experiment management**",
       "",
-      "- 生成候选模型/配方",
+      "- Generate candidate models/recipes",
       "",
       "",
-      "- 执行评估实验",
+      "- Run evaluation experiments",
       "",
       ...Array.from({ length: 24 }, (_, index) => `dense layout line ${String(index + 1).padStart(2, "0")}`),
     ].join("\n")
@@ -1874,16 +1874,16 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "smoke succeeded")
-      await app.mockInput.typeText("整理当前可做的事情")
+      await app.mockInput.typeText("List available actions")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
       const frame = await waitForFrame(app, "dense layout line 24")
-      const headingLine = frameLine(frame, "Research Agent: **实验管理**")
-      const firstBulletLine = frameLine(frame, "- 生成候选模型/配方")
-      const secondBulletLine = frameLine(frame, "- 执行评估实验")
+      const headingLine = frameLine(frame, "Research Agent: **Experiment management**")
+      const firstBulletLine = frameLine(frame, "- Generate candidate models/recipes")
+      const secondBulletLine = frameLine(frame, "- Run evaluation experiments")
       const finalReplyLine = frameLine(frame, "dense layout line 24")
-      const promptLine = frameLine(frame, "回答下一个澄清问题")
+      const promptLine = frameLine(frame, "Answer the next clarification question")
 
       expect(firstBulletLine - headingLine).toBe(1)
       expect(secondBulletLine - firstBulletLine).toBe(1)
@@ -2064,7 +2064,7 @@ describe("ResearchCockpit render", () => {
         input,
         init,
         posts,
-        "可以尝试 mixer，但先确认当前 PatchTST 基线是否稳定。",
+        "You can try a mixer, but first confirm that the current PatchTST baseline is stable.",
         events,
       )
       if (handled) return handled
@@ -2082,7 +2082,7 @@ describe("ResearchCockpit render", () => {
       await app.renderOnce()
       app.mockInput.pressEnter()
 
-      const frame = await waitForFrame(app, "Research Agent: 可以尝试 mixer")
+      const frame = await waitForFrame(app, "Research Agent: You can try a mixer")
       expect(posts.map((post) => post.path)).toContain("/session/session_research_chat/prompt_async")
       expect(posts.map((post) => post.path)).not.toContain(`/research/tasks/${taskID}/autonomous/iterate`)
       expect(frame).toContain("try mixer next")
@@ -2147,8 +2147,8 @@ describe("ResearchCockpit render", () => {
       expect(route?.data.type).toBe("cockpit")
 
       app.mockInput.pressKey("h", { meta: true })
-      const hintFrame = await waitForFrame(app, "Alt+H 已移除")
-      expect(hintFrame).toContain("请使用 /home")
+      const hintFrame = await waitForFrame(app, "Alt+H was removed")
+      expect(hintFrame).toContain("Use /home")
       expect(route?.data.type).toBe("cockpit")
     } finally {
       app.renderer.destroy()
@@ -2538,17 +2538,17 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("Research Agent")
       expect(frame).toContain("smoke succeeded")
       expect(frame).toContain("Neo-Cast Autonomous TSF")
-      expect(frame).toContain("苏格拉底")
-      expect(frame).not.toContain("交互模式")
+      expect(frame).toContain("Socratic")
+      expect(frame).not.toContain("Interaction mode")
       // After B-3 fix: with a smoke-succeeded run + champion but no train run,
       // the active stage is TrainEval Agent (not Reflection — historical
       // champion no longer drives Reflection active).
       expect(
         frame
           .split("\n")
-          .some((line) => line.includes("苏格拉底") && line.includes("TrainEval Agent") && line.includes("Research Agent")),
+          .some((line) => line.includes("Socratic") && line.includes("TrainEval Agent") && line.includes("Research Agent")),
       ).toBe(true)
-      expect(frame).toContain("AutoResearch进展")
+      expect(frame).toContain("AutoResearch progress")
       expect(frame).toContain("Intent Agent")
       expect(frame).toContain("Data Analysis Agent")
       expect(frame).toContain("HypoPlanner Agent")
@@ -2558,18 +2558,18 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("Reflection Agent")
       expect(frame).not.toContain("NAS Agent")
       expect(frame).toContain("Publish Agent")
-      expect(frame).toContain("需求摘要")
-      expect(frame).toContain("预测=24")
-      expect(frame).toContain("上下文=96")
-      expect(frame).toContain("指标=val_avg_mse")
+      expect(frame).toContain("Requirements")
+      expect(frame).toContain("horizons=24")
+      expect(frame).toContain("context=96")
+      expect(frame).toContain("metric=val_avg_mse")
       expect(frame).toContain("Profile rows=1024")
-      expect(frame).not.toContain("用户需求输入")
+      expect(frame).not.toContain("User requirements")
       expect(frame).not.toContain("Data Profile")
-      expect(frame).not.toContain("自主探索")
-      expect(frame).not.toContain("结果整理")
+      expect(frame).not.toContain("Autonomous exploration")
+      expect(frame).not.toContain("Result preparation")
       expect(frame).toContain("best val_avg_mse=0.1234")
-      expect(frame).toContain("任务")
-      expect(frame).toContain("下一步")
+      expect(frame).toContain("Task")
+      expect(frame).toContain("Next step")
       expect(frame).toContain("Export final bundle")
       expect(frame).toContain("Champion")
       expect(frame).toContain("NeoResearch v0.1.0-alpha.0")
@@ -2589,7 +2589,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).not.toContain("No champion selected")
       expect(frame).not.toContain("Next Action")
       expect(frame).toContain("▶ Next: Run autonomous loop")
-      expect(frame).toContain("Enter 执行 · 输入其他问题可追问/跳过")
+      expect(frame).toContain("Enter to run · Type another question to follow up or skip")
       expect(frame).not.toContain("/skip")
       expect(frame).not.toContain("/why")
       expect(frame).not.toContain("Run Next /next")
@@ -2605,7 +2605,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("tab agents")
       expect(frameLine(frame, "NeoResearch v0.1.0-alpha.0")).toBeGreaterThanOrEqual(48)
       expect(occurrenceCount(frame, "Workflow")).toBe(0)
-      const promptFooterLine = frameLine(frame, "苏格拉底 TrainEval Agent Research Agent")
+      const promptFooterLine = frameLine(frame, "Socratic TrainEval Agent Research Agent")
       expect(promptFooterLine).toBeGreaterThanOrEqual(42)
       expect(frameLine(frame, "esc interrupt")).toBe(frameLine(frame, "tab agents"))
       expect(frameLine(frame, "ctrl+p commands")).toBeGreaterThan(promptFooterLine)
@@ -2648,14 +2648,14 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={onboardingFetch} />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "等待 IntentAgent 启动")
+      const frame = await waitForFrame(app, "Waiting for IntentAgent to start")
 
-      expect(frame).toContain("等待 IntentAgent 启动")
+      expect(frame).toContain("Waiting for IntentAgent to start")
       expect(frame).toContain("Confirm requirements")
-      expect(frame).toContain("确认需求后进入 Data Analysis")
+      expect(frame).toContain("Confirm requirements to enter Data Analysis")
       expect(frame).toContain("→ Intent Agent")
       expect(frame).toContain("• Data Analysis Agent")
-      expect(frame).not.toContain("研究输出会在 agent 运行时显示在这里。")
+      expect(frame).not.toContain("Research output will appear here while agents run.")
     } finally {
       app.renderer.destroy()
     }
@@ -2702,13 +2702,13 @@ describe("ResearchCockpit render", () => {
       // (per specs/research/intent-agent-tui-streaming.md §3.5), replaced by a "waiting for
       // the session to start" placeholder instead.
       expect(frame).toContain("Review new dataset")
-      expect(frame).toContain("等待 IntentAgent 启动")
-      expect(frame).not.toContain("交互模式: companion")
-      expect(frame).not.toContain("→ 预测对象")
+      expect(frame).toContain("Waiting for IntentAgent to start")
+      expect(frame).not.toContain("Interaction mode: companion")
+      expect(frame).not.toContain("→ Forecast object")
       expect(frame).toContain("→ Intent Agent")
       expect(frame).toContain("• Data Analysis Agent")
       expect(frame).toContain("Confirm requirements")
-      expect(frame).toContain("确认需求后进入 Data Analysis")
+      expect(frame).toContain("Confirm requirements to enter Data Analysis")
       expect(frame).not.toContain("Companion checkpoint: review the proposed next step")
     } finally {
       app.renderer.destroy()
@@ -2753,8 +2753,8 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      await waitForFrame(app, "等待 IntentAgent 启动")
-      await app.mockInput.typeText("预测对象是 ETTh2 的 OT")
+      await waitForFrame(app, "Waiting for IntentAgent to start")
+      await app.mockInput.typeText("The forecast object is ETTh2 OT")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
@@ -2769,11 +2769,11 @@ describe("ResearchCockpit render", () => {
       expect(intentAnswerPosts.length).toBeGreaterThan(0)
       const post = intentAnswerPosts[0]!
       expect(post.path).toBe("/research/tasks/task_new_socratic/intent/modify")
-      expect(post.body).toEqual({ message: "预测对象是 ETTh2 的 OT" })
+      expect(post.body).toEqual({ message: "The forecast object is ETTh2 OT" })
 
       // Socratic onboarding context must still be visible
       const frame = app.captureCharFrame()
-      expect(frame).toContain("等待 IntentAgent 启动")
+      expect(frame).toContain("Waiting for IntentAgent to start")
     } finally {
       app.renderer.destroy()
     }
@@ -2829,7 +2829,7 @@ describe("ResearchCockpit render", () => {
       expect(frame).toContain("Approval requested")
       expect(frame).toContain("/approve")
       expect(frame).toContain("/reject")
-      expect(frame).toContain("请求建议、批准 checkpoint")
+      expect(frame).toContain("Ask for advice, approve a checkpoint")
       expect(frame).toContain("Companion checkpoint")
     } finally {
       app.renderer.destroy()
@@ -2868,8 +2868,8 @@ describe("ResearchCockpit render", () => {
               kind: "protocol",
               status: "pending",
               reason: [
-                "运行自主研究流水线前需要先澄清研究意图。",
-                "- NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？",
+                "Clarify research intent before running the autonomous research pipeline.",
+                "- Which CSV dataset path should NeoResearch use for profiling and execution?",
               ].join("\n"),
               time: { created: now, updated: now },
             },
@@ -2883,14 +2883,14 @@ describe("ResearchCockpit render", () => {
     const app = await testRender(() => <ResearchCockpitHarness fetch={clarificationFetch} />, { width: 160, height: 48 })
 
     try {
-      const frame = await waitForFrame(app, "Question: NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
+      const frame = await waitForFrame(app, "Question: Which CSV dataset path should NeoResearch use for profiling and execution?")
 
       // Per specs/research/intent-agent-tui-streaming.md §3.5, the "slots: ..." summary line
       // and slot checklist are gone — only the "Question: ..." line (sourced from the real
       // ask_user/approval text) and the live IntentAgent log remain.
       expect(frame).not.toContain("Socratic clarification: slots:")
-      expect(frame).toContain("Question: NeoResearch 应该使用哪个 CSV 数据集路径进行 profiling 和执行？")
-      expect(frame).toContain("回答当前 Socratic 问题")
+      expect(frame).toContain("Question: Which CSV dataset path should NeoResearch use for profiling and execution?")
+      expect(frame).toContain("Answer the current Socratic question")
     } finally {
       app.renderer.destroy()
     }
@@ -2927,7 +2927,7 @@ describe("ResearchCockpit render", () => {
               taskID: "task_clarify",
               kind: "protocol",
               status: "pending",
-              reason: ["运行自主研究流水线前需要先澄清研究意图。", "- 数据集在哪里？"].join("\n"),
+              reason: ["Clarify research intent before running the autonomous research pipeline.", "- Where is the dataset?"].join("\n"),
               time: { created: now, updated: now },
             },
           ]),
@@ -2945,15 +2945,15 @@ describe("ResearchCockpit render", () => {
     )
 
     try {
-      await waitForFrame(app, "Question: 数据集在哪里？")
+      await waitForFrame(app, "Question: Where is the dataset?")
 
       events.emit({ type: "research.agent.intent.started", properties: { taskID: "task_clarify" } })
       await waitForFrame(app, "[IntentAgent]")
       events.emit({
         type: "research.agent.intent.part.updated",
-        properties: { taskID: "task_clarify", partID: "part_q1", kind: "text", text: "数据集在哪里？" },
+        properties: { taskID: "task_clarify", partID: "part_q1", kind: "text", text: "Where is the dataset?" },
       })
-      // "数据集在哪里？" already matches once via the standalone "Question: ..." fallback line
+      // "Where is the dataset?" already matches once via the standalone "Question: ..." fallback line
       // (still showing because no live ask_user tool part has landed yet) — the SDK's event
       // source also debounces bursts within a 16ms window (sdk.tsx handleEvent), so a single
       // frame.includes() check can resolve before the part is applied. Wait for a second,
@@ -2962,30 +2962,30 @@ describe("ResearchCockpit render", () => {
       for (let attempt = 0; attempt < 80; attempt++) {
         await app.renderOnce()
         frame = app.captureCharFrame()
-        if (occurrenceCount(frame, "数据集在哪里？") >= 2) break
+        if (occurrenceCount(frame, "Where is the dataset?") >= 2) break
         await Bun.sleep(25)
       }
-      expect(occurrenceCount(frame, "数据集在哪里？")).toBeGreaterThanOrEqual(2)
-      expect(frameLine(frame, "[IntentAgent]")).toBeLessThan(frameLine(frame, "数据集在哪里？"))
+      expect(occurrenceCount(frame, "Where is the dataset?")).toBeGreaterThanOrEqual(2)
+      expect(frameLine(frame, "[IntentAgent]")).toBeLessThan(frameLine(frame, "Where is the dataset?"))
 
-      await app.mockInput.typeText("数据在 /tmp/etth1.csv")
+      await app.mockInput.typeText("The dataset is at /tmp/etth1.csv")
       await app.renderOnce()
       app.mockInput.pressEnter()
       await app.renderOnce()
 
       events.emit({
         type: "research.agent.intent.part.updated",
-        properties: { taskID: "task_clarify", partID: "part_q2", kind: "text", text: "目标列是什么？" },
+        properties: { taskID: "task_clarify", partID: "part_q2", kind: "text", text: "What are the target columns?" },
       })
-      frame = await waitForFrame(app, "目标列是什么？")
+      frame = await waitForFrame(app, "What are the target columns?")
 
       // The original question, the user's echoed answer, and the agent's next question must
       // all still be visible, in that causal order — not just the latest LLM turn replacing
       // the conversation, and not the answer trailing behind in an unrelated bottom timeline.
-      expect(frame).toContain("数据集在哪里？")
-      expect(frame).toContain("You: 数据在 /tmp/etth1.csv")
-      expect(frameLine(frame, "数据集在哪里？")).toBeLessThan(frameLine(frame, "You: 数据在 /tmp/etth1.csv"))
-      expect(frameLine(frame, "You: 数据在 /tmp/etth1.csv")).toBeLessThan(frameLine(frame, "目标列是什么？"))
+      expect(frame).toContain("Where is the dataset?")
+      expect(frame).toContain("You: The dataset is at /tmp/etth1.csv")
+      expect(frameLine(frame, "Where is the dataset?")).toBeLessThan(frameLine(frame, "You: The dataset is at /tmp/etth1.csv"))
+      expect(frameLine(frame, "You: The dataset is at /tmp/etth1.csv")).toBeLessThan(frameLine(frame, "What are the target columns?"))
     } finally {
       app.renderer.destroy()
     }
@@ -3003,7 +3003,7 @@ describe("ResearchCockpit render", () => {
       const frame = await waitForFrame(app, "smoke succeeded")
 
       expect(frame).not.toContain("Candidate Table")
-      expect(frame).not.toContain("AutoResearch进展")
+      expect(frame).not.toContain("AutoResearch progress")
       expect(frame).not.toContain("Champion")
     } finally {
       app.renderer.destroy()
@@ -3034,7 +3034,7 @@ describe("ResearchCockpit render", () => {
       // agent — match any cockpit agent label.
       const roleLine = lines.findIndex(
         (line) =>
-          line.includes("苏格拉底") &&
+          line.includes("Socratic") &&
           /\bAgent\b/.test(line) &&
           (line.includes("GPT Test") || line.includes("Research Agent")),
       )
@@ -3124,15 +3124,15 @@ describe("ResearchCockpit render", () => {
 
     const cases = [
       ["empty", undefined, "Intent Agent"],
-      ["created", "苏格拉底", "Intent Agent"],
-      ["profile", "苏格拉底", "Data Analysis Agent"],
-      ["profile_confirmed", "苏格拉底", "Data Analysis Agent"],
-      ["explore", "苏格拉底", "ModelDesigner Agent"],
+      ["created", "Socratic", "Intent Agent"],
+      ["profile", "Socratic", "Data Analysis Agent"],
+      ["profile_confirmed", "Socratic", "Data Analysis Agent"],
+      ["explore", "Socratic", "ModelDesigner Agent"],
       // After the B-3 fix, a task with a champion but no successful train run
       // lands on Publish Agent (champion alone no longer activates Reflection
       // Agent in the absence of train evidence). This matches the intent
       // captured by the `validChampion()` shortcut in automaticPromptAgentLabel.
-      ["results", "苏格拉底", "Publish Agent"],
+      ["results", "Socratic", "Publish Agent"],
     ] as const
 
     for (const [phase, modeLabel, agentLabel] of cases) {
@@ -3217,25 +3217,25 @@ describe("ResearchCockpit render", () => {
 
     try {
       let frame = await waitForFrame(app, "Data Analysis Agent")
-      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("Data Analysis Agent"))).toBe(true)
+      expect(frame.split("\n").some((line) => line.includes("Socratic") && line.includes("Data Analysis Agent"))).toBe(true)
 
       app.mockInput.pressKey("TAB")
       for (let attempt = 0; attempt < 20; attempt++) {
         await app.renderOnce()
         frame = app.captureCharFrame()
-        if (frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("LiteratureAgent"))) break
+        if (frame.split("\n").some((line) => line.includes("Socratic") && line.includes("LiteratureAgent"))) break
         await Bun.sleep(25)
       }
-      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("LiteratureAgent"))).toBe(true)
+      expect(frame.split("\n").some((line) => line.includes("Socratic") && line.includes("LiteratureAgent"))).toBe(true)
 
       app.mockInput.pressKey("TAB", { shift: true })
       for (let attempt = 0; attempt < 20; attempt++) {
         await app.renderOnce()
         frame = app.captureCharFrame()
-        if (frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("Data Analysis Agent"))) break
+        if (frame.split("\n").some((line) => line.includes("Socratic") && line.includes("Data Analysis Agent"))) break
         await Bun.sleep(25)
       }
-      expect(frame.split("\n").some((line) => line.includes("苏格拉底") && line.includes("Data Analysis Agent"))).toBe(true)
+      expect(frame.split("\n").some((line) => line.includes("Socratic") && line.includes("Data Analysis Agent"))).toBe(true)
     } finally {
       app.renderer.destroy()
     }
@@ -3809,7 +3809,7 @@ describe("ResearchCockpit render", () => {
       await waitForFrame(app, "/new")
       app.mockInput.pressKey("n", { ctrl: true })
 
-      const frame = await waitForFrame(app, "Ctrl+N 已移除")
+      const frame = await waitForFrame(app, "Ctrl+N was removed")
       expect(frame).toContain("/new csv")
       expect(frame).not.toContain("Interaction mode")
     } finally {
@@ -4243,7 +4243,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "Seed baselines")
-      await app.mockInput.typeText("开始预测")
+      await app.mockInput.typeText("start forecasting")
       await app.renderOnce()
       app.mockInput.pressEnter()
 
@@ -4987,7 +4987,7 @@ describe("ResearchCockpit render", () => {
 
     const traceback = [
       "Error: Traceback (most recent call last):",
-      '  File "/Users/chengmingyue/project/neo_cast/py/prepare_tsf_dataset.py", line 44, in <module>',
+      '  File "/Users/user/project/neo_cast/py/prepare_tsf_dataset.py", line 44, in <module>',
       "    main()",
       "ValueError: target column OT not found in exchange_rate.csv",
     ].join("\n")
@@ -5197,7 +5197,7 @@ describe("ResearchCockpit render", () => {
 
     try {
       await waitForFrame(app, "Runner dataset mismatch")
-      await app.mockInput.typeText("开始预测")
+      await app.mockInput.typeText("start forecasting")
       app.mockInput.pressEnter()
       for (let attempt = 0; attempt < 40 && posts.length === 0; attempt++) {
         await app.renderOnce()
@@ -5445,7 +5445,7 @@ describe("ResearchCockpit render", () => {
     }) as typeof fetch
 
     const app = await testRender(
-      () => <ResearchCockpitHarness fetch={missingScriptFetch} directory="/Users/chengmingyue/human_agent_collaboration/research_working/idea/neo_research_for_tsf" />,
+      () => <ResearchCockpitHarness fetch={missingScriptFetch} directory="/path/to/NeoResearch" />,
       { width: 140, height: 48 },
     )
 
@@ -5775,19 +5775,19 @@ test("Literature streams tools, caches and data-only completion while rejecting 
     events.emit({ type: "research.agent.literature.part.updated", properties: { taskID, partID: "lit-tool", kind: "tool", toolName: "literature_run", toolState: "running" } })
     await waitForFrame(app, "literature_run")
     for (let i = 0; i < 10; i++) events.emit({ type: "research.agent.literature.progress", properties: { taskID, runID: "retrieve_test", step: "assemble_evidence", status: "completed", cached: true } })
-    const progress = await waitForFrame(app, "缓存命中")
-    expect(progress.split("缓存命中")).toHaveLength(2)
+    const progress = await waitForFrame(app, "Cache hit")
+    expect(progress.split("Cache hit")).toHaveLength(2)
     events.emit({ type: "research.agent.literature.failed", properties: { taskID: "another_task" } })
     await app.renderOnce()
-    expect(app.captureCharFrame()).not.toContain("证据未交付")
+    expect(app.captureCharFrame()).not.toContain("Evidence was not delivered")
     events.emit({ type: "research.agent.literature.completed", properties: { taskID, metadata: { retrieveRunID: "retrieve_test", readiness: "ready_data_only", callPath: "direct", gapCount: 2 } } })
     const completed = await waitForFrame(app, "ready_data_only")
     expect(completed).toContain("0 papers / 0 cards")
     expect(completed).toContain("literature_run")
-    expect(completed).toContain("缓存命中")
+    expect(completed).toContain("Cache hit")
     events.emit({ type: "research.agent.literature.started", properties: { taskID } })
     events.emit({ type: "research.agent.literature.failed", properties: { taskID } })
-    await waitForFrame(app, "证据未交付")
+    await waitForFrame(app, "Evidence was not delivered")
   } finally { app.renderer.destroy() }
 })
 
@@ -5812,7 +5812,7 @@ test("Literature paper and card results stay above HypoPlanner after both comple
     events.emit({ type: "research.agent.hypoPlanner.started", properties: { taskID } })
     events.emit({ type: "research.agent.hypoPlanner.part.updated", properties: { taskID, partID: "hypo-text", kind: "text", text: "Use patch-based forecasting." } })
     let frame = await waitForFrame(app, "Use patch-based forecasting.")
-    expect(frame).toContain("提取卡片")
+    expect(frame).toContain("Extracted card")
     expect(frameLine(frame, "Long patches can lose detail.")).toBeLessThan(frameLine(frame, "[HypoPlanner]"))
     expect(frameLine(frame, "[HypoPlanner]")).toBeLessThan(frameLine(frame, "Use patch-based forecasting."))
     events.emit({ type: "research.agent.hypoPlanner.completed", properties: { taskID } })
@@ -5870,8 +5870,8 @@ test("PublishAgent completion shows the final report path in the cockpit", async
         },
       },
     })
-    const frame = await waitForFrame(app, "最终研究报告: /tmp/final_report.md")
-    expect(frame).toContain("[Publish] 发布完成 / model_export_package")
+    const frame = await waitForFrame(app, "Final research report: /tmp/final_report.md")
+    expect(frame).toContain("[Publish] Publication complete / model_export_package")
   } finally {
     app.renderer.destroy()
   }
@@ -5881,13 +5881,13 @@ test("historical route opens a task outside the recent page and restores chat wi
   const historicalID = "task_historical_outside_page"
   const requests: Array<{ path: string; method: string }> = []
   const recent = await (await mockResearchFetch(new URL("http://mock.local/research/tasks"))).json()
-  const historical = { ...recent[0], id: historicalID, title: "历史任务单独加载", status: "completed" }
+  const historical = { ...recent[0], id: historicalID, title: "Load a historical task separately", status: "completed" }
   const historyFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = requestURL(input)
     requests.push({ path: url.pathname, method: init?.method ?? "GET" })
     if (url.pathname === `/research/tasks/${historicalID}`) return response(historical)
-    if (url.pathname === `/research/tasks/${historicalID}/resume-state`) return response({ taskID: historicalID, revision: 3, chatSessionID: "session_saved_chat", recoveryState: "completed", summary: "从已保存的进度继续", eventCursor: 0 })
-    if (url.pathname === "/session/session_saved_chat/message") return response([{ info: { role: "assistant" }, parts: [{ type: "text", text: "这是重新进入后的历史对话" }] }])
+    if (url.pathname === `/research/tasks/${historicalID}/resume-state`) return response({ taskID: historicalID, revision: 3, chatSessionID: "session_saved_chat", recoveryState: "completed", summary: "Resume from saved progress", eventCursor: 0 })
+    if (url.pathname === "/session/session_saved_chat/message") return response([{ info: { role: "assistant" }, parts: [{ type: "text", text: "This is the restored historical conversation" }] }])
     if (url.pathname === `/research/tasks/${historicalID}/approvals`) return response([{
       id: "stale_pending", taskID: historicalID, kind: "protocol", status: "pending", reason: "stale gate",
       time: { created: now - 1, updated: now - 1 },
@@ -5896,23 +5896,23 @@ test("historical route opens a task outside the recent page and restores chat wi
       { id: "artifact_package", taskID: historicalID, kind: "model_export_package", uri: "file:///tmp/package", metadata: {}, time: { created: now + 1, updated: now + 1 } },
       { id: "artifact_saved", taskID: historicalID, kind: "final_report_md", uri: "file:///tmp/saved-report.md", metadata: {}, time: { created: now, updated: now } },
     ])
-    if (url.pathname === "/file/content") return response({ type: "text", content: "历史报告正文：训练已完成" })
+    if (url.pathname === "/file/content") return response({ type: "text", content: "Historical report: training completed" })
     if (url.pathname.startsWith(`/research/tasks/${historicalID}/`)) return response(url.pathname.endsWith("champion") ? null : url.pathname.endsWith("fingerprint") ? {} : [])
     return mockResearchFetch(input, init)
   }) as typeof fetch
   const app = await testRender(() => <ResearchCockpitHarness fetch={historyFetch} initialRoute={{ type: "cockpit", taskID: historicalID }} />, { width: 170, height: 48 })
   try {
-    const frame = await waitForFrame(app, "这是重新进入后的历史对话")
-    expect(frame).toContain("历史任务单独加载")
-    expect(frame).toContain("[Publish] 最终研究报告: /tmp/saved-report.md")
+    const frame = await waitForFrame(app, "This is the restored historical conversation")
+    expect(frame).toContain("Load a historical task separately")
+    expect(frame).toContain("[Publish] Final research report: /tmp/saved-report.md")
     expect(frame).toContain("Review final report")
     expect(requests.some((request) => request.path === `/research/tasks/${historicalID}`)).toBe(true)
     app.mockInput.pressEnter()
-    await waitForFrame(app, "研究结果与产物")
+    await waitForFrame(app, "Research results and artifacts")
     await app.renderOnce()
     await Bun.sleep(50)
     app.mockInput.pressEnter()
-    await waitForFrame(app, "历史报告正文：训练已完成")
+    await waitForFrame(app, "Historical report: training completed")
     expect(requests.filter((request) => request.method !== "GET")).toHaveLength(0)
   } finally { app.renderer.destroy() }
 })
@@ -5920,7 +5920,7 @@ test("historical route opens a task outside the recent page and restores chat wi
 test("restored IntentAgent history stays in its stage block instead of the bottom chat history", async () => {
   const restoredTaskID = "task_restored_intent_order"
   const recent = await (await mockResearchFetch(new URL("http://mock.local/research/tasks"))).json()
-  const restoredTask = { ...recent[0], id: restoredTaskID, title: "恢复 Intent 顺序", status: "completed" }
+  const restoredTask = { ...recent[0], id: restoredTaskID, title: "Restore Intent order", status: "completed" }
   const restoredFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = requestURL(input)
     if (url.pathname === `/research/tasks/${restoredTaskID}`) return response(restoredTask)
@@ -5931,29 +5931,29 @@ test("restored IntentAgent history stays in its stage block instead of the botto
         chatSessionID: "session_restored_chat",
         intentSessionID: "session_restored_intent",
         recoveryState: "completed",
-        summary: "研究已完成，可查看结果",
+        summary: "Research is complete; view results",
         eventCursor: 0,
       })
     }
     if (url.pathname === "/session/session_restored_chat/message") {
-      return response([{ info: { role: "assistant", time: { created: now + 10 } }, parts: [{ type: "text", text: "这是普通 cockpit 对话" }] }])
+      return response([{ info: { role: "assistant", time: { created: now + 10 } }, parts: [{ type: "text", text: "This is a regular cockpit conversation" }] }])
     }
     if (url.pathname === "/session/session_restored_intent/message") {
       return response([
         {
           info: { role: "user", time: { created: now } },
-          parts: [{ type: "text", synthetic: true, text: `Begin intent gathering for research task "恢复 Intent 顺序".\nFollow your workflow:` }],
+          parts: [{ type: "text", synthetic: true, text: `Begin intent gathering for research task "Restore Intent order".\nFollow your workflow:` }],
         },
         {
           info: { role: "assistant", time: { created: now + 1 } },
           parts: [
             { id: "intent-read", type: "tool", tool: "read_taskspec", state: { status: "completed", input: {}, output: "Task spec loaded", time: { start: now, end: now + 4 } } },
-            { id: "intent-summary", type: "text", text: "这是恢复后的 IntentAgent 内容" },
+            { id: "intent-summary", type: "text", text: "This is the restored IntentAgent content" },
           ],
         },
         {
           info: { role: "user", time: { created: now + 2 } },
-          parts: [{ id: "intent-answer", type: "text", text: "预测目标是 OT" }],
+          parts: [{ id: "intent-answer", type: "text", text: "The forecast target is OT" }],
         },
       ])
     }
@@ -5967,14 +5967,14 @@ test("restored IntentAgent history stays in its stage block instead of the botto
     { width: 170, height: 52 },
   )
   try {
-    const frame = await waitForFrame(app, "这是恢复后的 IntentAgent 内容")
+    const frame = await waitForFrame(app, "This is the restored IntentAgent content")
     expect(frame).toContain("[IntentAgent]")
     expect(frame).toContain("[✓] read_taskspec 4ms")
-    expect(frame).toContain("You: 预测目标是 OT")
-    expect(frame).toContain("Research Agent: 这是普通 cockpit 对话")
-    expect(frame).not.toContain("Research Agent: 这是恢复后的 IntentAgent 内容")
-    expect(frameLine(frame, "[IntentAgent]")).toBeLessThan(frameLine(frame, "这是恢复后的 IntentAgent 内容"))
-    expect(frameLine(frame, "这是恢复后的 IntentAgent 内容")).toBeLessThan(frameLine(frame, "Research Agent: 这是普通 cockpit 对话"))
+    expect(frame).toContain("You: The forecast target is OT")
+    expect(frame).toContain("Research Agent: This is a regular cockpit conversation")
+    expect(frame).not.toContain("Research Agent: This is the restored IntentAgent content")
+    expect(frameLine(frame, "[IntentAgent]")).toBeLessThan(frameLine(frame, "This is the restored IntentAgent content"))
+    expect(frameLine(frame, "This is the restored IntentAgent content")).toBeLessThan(frameLine(frame, "Research Agent: This is a regular cockpit conversation"))
   } finally { app.renderer.destroy() }
 })
 
@@ -5998,7 +5998,7 @@ for (const mode of ["autonomous", "companion", "socratic"] as const) {
     const posts: Array<{ path: string; body: unknown }> = []
     const requestKeys: Array<string | null> = []
     let busyOnce = mode === "autonomous"
-    const edit = "把数据路径改成 /data/new.csv，预测长度改成 48"
+    const edit = "Change the dataset path to /data/new.csv and the forecast length to 48"
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const pathname = requestURL(input).pathname
       if (pathname === "/research/tasks") {
@@ -6025,7 +6025,7 @@ for (const mode of ["autonomous", "companion", "socratic"] as const) {
           }
           events.emit({ type: "research.agent.intent.started", properties: { taskID } })
           events.emit({ type: "research.agent.intent.part.updated", properties: {
-            taskID, partID: "edit-reply", kind: "text", text: "正在原 IntentAgent 会话中处理修改",
+            taskID, partID: "edit-reply", kind: "text", text: "Processing changes in the original IntentAgent session",
           } })
           events.emit({ type: "research.agent.intent.completed", properties: { taskID } })
           return response({ taskID })
@@ -6039,7 +6039,7 @@ for (const mode of ["autonomous", "companion", "socratic"] as const) {
       await app.mockInput.typeText(edit)
       await app.renderOnce()
       app.mockInput.pressEnter()
-      await waitForFrame(app, "正在原 IntentAgent 会话中处理修改")
+      await waitForFrame(app, "Processing changes in the original IntentAgent session")
       const expected = { path: `/research/tasks/${taskID}/intent/modify`, body: { message: edit } }
       expect(posts).toEqual(mode === "autonomous" ? [expected, expected] : [expected])
       expect(requestKeys[0]).toBeTruthy()

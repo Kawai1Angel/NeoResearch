@@ -512,9 +512,9 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     return canonical !== undefined && canonical !== null ? canonical : intentSlots[slotKey]
   }
   return [
-    "## 需求交流确认完成后，才能结束 Intent Agent",
+    "## Complete and confirm requirements before finishing Intent Agent",
     "",
-    "请确认 Intent Agent 已完成需求交流，下面这些研究意图可以作为后续 Data Analysis、HypoPlanner 和实验循环的输入。",
+    "Confirm that Intent Agent has finished gathering requirements and that the following research intent is ready for Data Analysis, HypoPlanner, and the experiment loop.",
     `Intent signature: ${intentCheckpointSignature(task)}`,
     `Interaction mode: ${compactIntentValue(taskInteractionMode(task) ?? task.mode)}`,
     `Task: ${task.title}`,
@@ -541,7 +541,7 @@ function buildIntentCheckpointReason(task: ResearchTask) {
     `Deployment target: ${compactIntentValue(intentSlots.deployment_target ?? spec.deploymentTarget)}`,
     `Business context: ${compactIntentValue(intentSlots.business_context ?? metadata.businessContext ?? metadata.business_context)}`,
     "",
-    "**建议操作：** 确认以上需求后 approve，系统才会结束 Intent Agent 并进入 Data Analysis；如需补充需求，请 reject 并逐一修改 slots 后重新确认。",
+    "**Recommended action:** approve these requirements to finish Intent Agent and enter Data Analysis; to add requirements, reject, update the slots individually, and confirm again.",
   ].join("\n")
 }
 
@@ -1903,14 +1903,14 @@ function renderDatasetQualitativeAnalysis(
       `- ${dataAnalysisSignal(shift, 0.5, "Distribution shift is visible; robust loss or reweighting should be considered.", "Distribution shift is not the dominant risk.")}`,
       `- ${missing !== undefined && missing > 0 ? "Missing values are present; candidate recipes should include missing-aware preprocessing." : "Missing values are not a primary concern in the profiled targets."}`,
       "",
-      "## 领域解读",
+      "## Domain interpretation",
       "",
-      `- 字段语义: target=${Array.isArray(dataset.targetCols) ? dataset.targetCols.join(", ") : "-"}; loader=${markdownValue(dataset.loaderID)}.`,
-      `- 业务机制: ${dataAnalysisSignal(seasonality, 0.4, "周期信号明显，可能对应生产节律、日历周期或批处理节奏。", "周期信号不强，业务解读应优先关注趋势和局部变化。")}`,
-      `- 外部因素: ${dataAnalysisSignal(crossVar, 0.5, "多变量联动较强，外生变量、同步扰动或共享上游驱动值得纳入建模假设。", "同期线性相关性弱或尚未测得，不能据此排除外生变量的滞后或非线性影响。")}`,
-      `- 潜在事件: change_point=${markdownValue(context.statistics.changepoint.index)} severity=${markdownValue(context.statistics.changepoint.severity)}，需要人工核对该时间段是否存在口径、设备或环境变化。`,
-      `- 风险: ${dataAnalysisSignal(shift, 0.5, "存在分布漂移，离线验证和线上表现可能不一致。", "分布漂移风险较低，但仍需保留 holdout 检查。")}`,
-      `- 领域建模建议: ${context.statistics.crossLag.source ? `关注 ${context.statistics.crossLag.source}->${context.statistics.crossLag.target} 的 lag=${context.statistics.crossLag.lag} lead-lag 关系。` : "当前未取得有效跨变量滞后诊断，不能据此判定外生变量无用。"}`,
+      `- Field semantics: target=${Array.isArray(dataset.targetCols) ? dataset.targetCols.join(", ") : "-"}; loader=${markdownValue(dataset.loaderID)}.`,
+      `- Business mechanisms: ${dataAnalysisSignal(seasonality, 0.4, "Strong periodicity may reflect production rhythms, calendar cycles, or batch schedules.", "Periodicity is weak; prioritize trends and local changes when interpreting the business context.")}`,
+      `- External factors: ${dataAnalysisSignal(crossVar, 0.5, "Strong multivariate coupling suggests testing exogenous variables, synchronized disturbances, or shared upstream drivers.", "Contemporaneous linear correlation is weak or unmeasured; this does not exclude lagged or nonlinear exogenous effects.")}`,
+      `- Potential events: change_point=${markdownValue(context.statistics.changepoint.index)} severity=${markdownValue(context.statistics.changepoint.severity)}; manually check this period for changes in measurement, equipment, or environment.`,
+      `- Risks: ${dataAnalysisSignal(shift, 0.5, "Distribution shift may cause offline validation and production performance to differ.", "Distribution shift risk is low, but holdout checks remain necessary.")}`,
+      `- Domain modeling recommendations: ${context.statistics.crossLag.source ? `Examine the ${context.statistics.crossLag.source}->${context.statistics.crossLag.target} lead-lag relationship at lag=${context.statistics.crossLag.lag}.` : "No valid cross-variable lag diagnosis is available; this does not establish that exogenous variables are unhelpful."}`,
       "",
     )
   }
@@ -4822,7 +4822,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           taskID: task.id,
           candidateID: candidate.id,
           kind: "protocol",
-          reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n${recovery ? `Agent 已尝试 ${recovery.attempt} 次自动修复，仍未通过验证。` : ""}实验执行契约不一致，任务已暂停。\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\n实现已修复时 approve，以重新验证原 candidate；candidate 设计本身错误时 reject，以废弃该 candidate 并重新运行 ModelDesigner。`,
+          reason: `[checkpoint:execution_contract_violation:${contractDigest}:attempt-${previous.length + 1}]\n${recovery ? `The agent attempted ${recovery.attempt} automatic repairs; validation still fails.` : ""}Experiment execution contract mismatch; task paused.\n${mismatches.map((item) => `${item.path}: expected=${JSON.stringify(item.expected)} actual=${JSON.stringify(item.actual)}`).join("\n")}\nCandidate: ${candidate.id}\nHypothesis: ${candidate.hypothesisID ?? "unknown"}\nBlocker artifact: ${artifact.id}\nRecommended owner: pipeline_maintainer\nAfter fixing the implementation, approve to revalidate the original candidate; if the candidate design is wrong, reject to discard it and rerun ModelDesigner.`,
         })
         yield* db((d) =>
           d
@@ -6343,7 +6343,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           yield* ensurePendingApproval({
             taskID: task.id,
             kind: "protocol",
-            reason: `[checkpoint:model_design_validation]\nModelDesigner could not produce a valid candidate after ${maxModelDesignerAttempts} attempts.\n${issueText}\n修正模型设计或配置后 approve 以重新运行 ModelDesigner。`,
+            reason: `[checkpoint:model_design_validation]\nModelDesigner could not produce a valid candidate after ${maxModelDesignerAttempts} attempts.\n${issueText}\nAfter correcting the model design or configuration, approve to rerun ModelDesigner.`,
           })
           yield* updateTaskStatus({ taskID: task.id, status: "paused" })
           throw new PipelineBlockedError({
@@ -6804,7 +6804,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const artifact = yield* createArtifact({ taskID, kind: "model_design_blocker_json", uri: `file://${file}`,
         metadata: { status: "needs_repair", reason, checkpointPhase: "model_design_repair" } })
       yield* ensurePendingApproval({ taskID, kind: "protocol",
-        reason: `[checkpoint:model_design_repair]\n${reason}\nBlocker artifact: ${artifact.id}\n模型设计修复未完成，搜索未正常结束；保留原任务、cycle、预算和已验证结果。修复契约或实现后 approve，再续跑原任务。` })
+        reason: `[checkpoint:model_design_repair]\n${reason}\nBlocker artifact: ${artifact.id}\nModel design repair is incomplete and search has not finished normally; the original task, cycle, budget, and verified results are retained. Fix the contract or implementation and approve to resume the original task.` })
       yield* updateTaskStatus({ taskID, status: "paused" })
       recordResearchEvent(Instance.directory, "research.design.repair_blocked", { taskID, reason, blockerArtifactID: artifact.id })
       throw new PipelineBlockedError({ taskID, reason: "human_checkpoint_required", checkpointPhase: "model_design_repair", blockerArtifactID: artifact.id })
@@ -7998,7 +7998,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
 	    // Mirrors taskspec-store.ts's ASK_USER_CLARIFICATION_MARKER — service.ts doesn't import that
     // module (see taskspec-store.ts's standalone-module note), so keep this string in sync by hand.
-    const INTENT_ASK_USER_MARKER = "需要澄清研究意图："
+    const INTENT_ASK_USER_MARKER = "Research intent clarification required:"
 
     const intentSessionTitle = (taskID: ResearchTaskID) => `IntentAgent · ${taskID}`
 
@@ -8307,7 +8307,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    }))
 
 	    const answerIntentQuestion = Effect.fn("Research.answerIntentQuestion")(function* (input: AnswerIntentInput) {
-	      const message = `用户回答（结构化字段）：\n${JSON.stringify(input.slots, null, 2)}`
+	      const message = `User answer (structured fields):\n${JSON.stringify(input.slots, null, 2)}`
 	      return yield* continueIntentAgentSession({ taskID: input.taskID, message })
 	    })
 
@@ -9937,7 +9937,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (intent.missingFields.length > 0) {
         // runIntentAgent() already drove the session-based ask_user tool when a session/model
         // was available — that path creates its own pending "protocol" approval
-        // (taskspec-store.ts recordAskUserQuestions, marker "需要澄清研究意图：") carrying the
+        // (taskspec-store.ts recordAskUserQuestions, marker "Research intent clarification required:") carrying the
         // LLM's actual live question. Only fall back to this deterministic
         // analyzeIntentTask()-derived approval when no live one exists yet (e.g. the LLM/session
         // genuinely couldn't run) — otherwise this used to fire unconditionally on every pipeline
@@ -9948,7 +9948,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             taskID: input.taskID,
             kind: "protocol",
             reason: [
-              "运行自主研究流水线前需要先澄清研究意图。",
+              "Clarify research intent before running the autonomous research pipeline.",
               ...intent.clarifyingQuestions.map((question) => `- ${question}`),
             ].join("\n"),
           })
@@ -10088,18 +10088,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           .join("\n")
         const ssPreferencesSection =
           ssSearchPreferences && ssSearchPreferences.length > 0
-            ? ["**搜索偏好：**", ...ssSearchPreferences.map((p) => `- ${p}`), ""]
+            ? ["**Search preferences:**", ...ssSearchPreferences.map((p) => `- ${p}`), ""]
             : []
         const ssReason = [
-          "## 搜索空间已确认，等待确认后开始模型搜索",
+          "## Search space ready; waiting for approval to start model search",
           "",
           ...ssPreferencesSection,
-          isZeroResearch(currentTask.taskSpec) ? "**自主模型设计：**" : "**计划 Baseline 方案：**",
+          isZeroResearch(currentTask.taskSpec) ? "**Autonomous model design:**" : "**Planned baseline:**",
           isZeroResearch(currentTask.taskSpec)
-            ? `由 hypoPlanner 选择假设并交给 ModelDesigner 设计首个模型。当前选择：${JSON.stringify(hypoPlanning.plan.nextExperiment ?? null)}`
+            ? `hypoPlanner selects a hypothesis for ModelDesigner to design the first model. Current selection:${JSON.stringify(hypoPlanning.plan.nextExperiment ?? null)}`
             : baselineList,
           "",
-          "**建议操作：** 确认搜索方向正确后 approve，或 reject 并调整 taskSpec 后重新运行。",
+          "**Recommended action:** Approve the search direction, or reject, adjust taskSpec, and rerun.",
         ].join("\n")
         if (shouldRunSearchSpaceCheckpoint) {
           const ssCheckpoint = yield* ensureHumanCheckpoint({
@@ -10163,13 +10163,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             taskID: input.taskID,
             phase: "experiment_budget_extended",
             reason: [
-              "## NAS 搜索已达迭代上限",
+              "## NAS search reached its iteration limit",
               "",
-              `**完成迭代：** ${nas.iterationCount} 轮`,
-              `**成功运行：** ${nas.succeededCount}，**失败：** ${nas.failedCount}`,
+              `**Completed iterations:** ${nas.iterationCount} iterations`,
+              `**Successful runs:** ${nas.succeededCount}, **Failed:** ${nas.failedCount}`,
               "",
-              nas.leaderboardMarkdown.replace(/^# Leaderboard/, "### 当前工作区实验结果"),
-              "**建议操作：** approve 继续搜索（将增加 maxIterations），reject 接受当前结果。",
+              nas.leaderboardMarkdown.replace(/^# Leaderboard/, "### Current workspace experiment results"),
+              "**Recommended action:** Approve to continue searching (increases maxIterations), or reject to accept current results.",
             ].join("\n"),
           })
           yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "experiment_budget_extended" })
@@ -10204,19 +10204,19 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           taskID: input.taskID,
           phase: "final_model_selection",
           reason: [
-            "## 模型搜索完成，请确认最终候选模型",
+            "## Model search complete; confirm the final candidate",
             "",
             champion
               ? [
-                  `**当前 Champion：** ${champion.candidateID}`,
-                  `**Primary metric：** ${champion.primaryMetric.toFixed(4)}`,
-                  `**Utility score：** ${champion.utility.toFixed(3)}`,
+                  `**Current champion:** ${champion.candidateID}`,
+                  `**Primary metric:** ${champion.primaryMetric.toFixed(4)}`,
+                  `**Utility score:** ${champion.utility.toFixed(3)}`,
                 ].join("\n")
-              : "**当前无 Champion**（所有 run 均未成功）",
+              : "**No current champion** (no run succeeded)",
             "",
-            nas.leaderboardMarkdown.replace(/^# Leaderboard/m, "### 验证集排行榜（所有候选模型）"),
+            nas.leaderboardMarkdown.replace(/^# Leaderboard/m, "### Validation leaderboard (all candidates)"),
             "",
-            "**建议操作：** approve 接受此模型并进入反思与发布阶段，reject 中止发布。",
+            "**Recommended action:** Approve to accept this model and proceed to reflection and publication, or reject to stop publication.",
           ].join("\n"),
         })
         yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
@@ -10235,17 +10235,17 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           taskID: input.taskID,
           phase: "final_model_selection",
           reason: [
-            "## 模型搜索完成（Socratic 模式自动确认）",
+            "## Model search complete (automatically confirmed in Socratic mode)",
             "",
             champion
               ? [
-                  `**当前 Champion：** ${champion.candidateID}`,
-                  `**Primary metric：** ${champion.primaryMetric.toFixed(4)}`,
-                  `**Utility score：** ${champion.utility.toFixed(3)}`,
+                  `**Current champion:** ${champion.candidateID}`,
+                  `**Primary metric:** ${champion.primaryMetric.toFixed(4)}`,
+                  `**Utility score:** ${champion.utility.toFixed(3)}`,
                 ].join("\n")
-              : "**当前无 Champion**（所有 run 均未成功）",
+              : "**No current champion** (no run succeeded)",
             "",
-            nas.leaderboardMarkdown.replace(/^# Leaderboard/m, "### 验证集排行榜（所有候选模型）"),
+            nas.leaderboardMarkdown.replace(/^# Leaderboard/m, "### Validation leaderboard (all candidates)"),
           ].join("\n"),
         })
         yield* updateTaskWorkflow({ taskID: input.taskID, lastCheckpoint: "final_model_selection" })
@@ -10259,7 +10259,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const review = yield* ensureHumanCheckpoint({
           taskID: input.taskID,
           phase: "reflection_review",
-          reason: ["Reflection Agent 建议人工介入：", reflection.analysis.decisionReason].join("\n"),
+          reason: ["Reflection Agent recommends human review:", reflection.analysis.decisionReason].join("\n"),
         })
         if (review.status !== "approved") {
           yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
@@ -10279,12 +10279,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           taskID: input.taskID,
           phase: "report_release",
           reason: [
-            "## 准备发布模型报告",
+            "## Ready to publish the model report",
             "",
-            `**Reflection 决策：** ${reflection.analysis.decision}`,
-            `**决策依据：** ${reflection.analysis.decisionReason}`,
+            `**Reflection decision:** ${reflection.analysis.decision}`,
+            `**Decision rationale:** ${reflection.analysis.decisionReason}`,
             "",
-            "**建议操作：** approve 发布最终模型包，reject 放弃本次发布。",
+            "**Recommended action:** Approve to publish the final model package, or reject to cancel publication.",
           ].join("\n"),
         })
         if (releaseCheckpoint.status !== "approved") {

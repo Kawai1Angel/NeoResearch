@@ -1,25 +1,25 @@
-# Dataset 解读
+# Dataset Interpretation
 
-## 1. 这是什么数据
+## 1. Dataset Overview
 
-当前 `dataset/` 目录下只有一个文件：
+The `dataset/` directory currently contains one file:
 
 - `load.csv`
 
-从字段和数值分布看，这是一份**小时级负荷预测数据**：
+Its fields and value distributions indicate **hourly load forecasting data**:
 
-- 主目标列是 `LOAD`
-- 时间列是 `TIMESTAMP`
-- 还有 25 个外生特征 `w1 ~ w25`
-- `ZONEID` 目前只有一个取值：`1`
+- Primary target: `LOAD`
+- Timestamp: `TIMESTAMP`
+- 25 exogenous features: `w1 ~ w25`
+- `ZONEID` has one value: `1`
 
-因此，这个数据集更适合被理解为：
+The dataset is therefore best described as:
 
-**单区域、单目标、带 25 维辅助特征的小时级时间序列数据集**
+**A single-zone, single-target hourly time series with 25 auxiliary features.**
 
-## 2. 表结构
+## 2. Table Structure
 
-`load.csv` 一共 28 列：
+`load.csv` has 28 columns:
 
 1. `ZONEID`
 2. `TIMESTAMP`
@@ -29,161 +29,161 @@
 6. `...`
 7. `w25`
 
-可以把它分成三类：
+The fields have these roles:
 
-- `ZONEID`：区域编号
-- `TIMESTAMP`：时间戳
-- `LOAD`：预测目标
-- `w1 ~ w25`：外生协变量
+- `ZONEID`: zone identifier
+- `TIMESTAMP`: timestamp
+- `LOAD`: prediction target
+- `w1 ~ w25`: exogenous covariates
 
-## 3. 数据规模
+## 3. Dataset Size
 
-基础统计如下：
+Basic statistics:
 
-- 总行数：`15456`
-- 列数：`28`
-- 区域数：`1`
-- 缺失值：`0`
+- Rows: `15456`
+- Columns: `28`
+- Zones: `1`
+- Missing values: `0`
 
-在正确解析时间戳后，这是一条**完整连续的小时序列**：
+After correct timestamp parsing, this is a **complete, contiguous hourly sequence**:
 
-- 起点：`2008-12-22 01:00`
-- 终点：`2010-09-27 00:00`
-- 总小时数：`15456`
+- Start: `2008-12-22 01:00`
+- End: `2010-09-27 00:00`
+- Hours: `15456`
 
-这说明它不是按样本窗口切好的监督学习表，而是**原始时序表**。
+This is a **raw time-series table**, rather than prewindowed supervised examples.
 
-## 4. `TIMESTAMP` 是这个数据里最需要注意的地方
+## 4. Timestamp Parsing Needs Particular Care
 
-原始时间戳长这样：
+Original timestamps look like:
 
 - `12222008 1:00`
 - `1102009 0:00`
 - `112009 0:00`
 
-它的问题是：
+The issues are:
 
-- 月和日**没有统一补零**
-- 不能直接放心交给普通 `%m%d%Y %H:%M` 解析
+- Months and days are **not consistently zero-padded**.
+- Standard `%m%d%Y %H:%M` parsing is therefore ambiguous.
 
-例如：
+For example:
 
-- `1102009` 直觉上应读作 `1/10/2009`
-- 但很多标准解析器会把它误读成 `11/02/2009` 或其他歧义形式
+- `1102009` appears intended to mean `1/10/2009`.
+- Many standard parsers may read it as `11/02/2009` or another ambiguous form.
 
-更稳妥的读法是：
+A more reliable approach is:
 
-- 年：最后 4 位
-- 月日：前面的 2 到 4 位
-- 月、日都允许 1 到 2 位
-- 再结合时间连续性去消歧
+- Year: final four digits.
+- Month/day: preceding two to four digits.
+- Allow one or two digits for both month and day.
+- Resolve ambiguity using temporal continuity.
 
-换句话说，这个数据在建模前最好先做一次**标准化时间戳清洗**。
+Perform **timestamp normalization** before modeling.
 
-## 5. `LOAD` 列可以怎么理解
+## 5. Interpreting LOAD
 
-`LOAD` 看起来就是该区域在对应小时上的负荷值，数值为连续实数。
+`LOAD` appears to be the zone's load at each hour, represented by continuous real values.
 
-基础统计：
+Basic statistics:
 
-- 最小值：`64.4`
-- 最大值：`315.6`
-- 均值：`155.54`
+- Minimum: `64.4`
+- Maximum: `315.6`
+- Mean: `155.54`
 
-从序列模式看，它有很明显的时间结构：
+The series has clear temporal structure:
 
-- 日内低谷大约在 `04:00`
-- 日内高峰大约在 `19:00`
-- 月均值最高在 `8 月`
-- 月均值最低在 `4 月`
+- Daily trough around `04:00`.
+- Daily peak around `19:00`.
+- Highest monthly mean in August.
+- Lowest monthly mean in April.
 
-这说明它同时带有：
+This suggests:
 
-- 明显的**日周期**
-- 明显的**季节性**
-- 一定程度的趋势/节假日/天气驱动变化
+- Clear **daily periodicity**.
+- Clear **seasonality**.
+- Some trend, holiday, or weather-driven variation.
 
-## 6. `w1 ~ w25` 是什么
+## 6. Interpreting w1 through w25
 
-本地目录里没有额外元数据，所以**无法从仓库内证据精确确认**这 25 列的真实语义。
+The local directory contains no additional metadata, so repository evidence **cannot establish the exact meanings** of these 25 columns.
 
-但从命名和数值范围看，它们很像一组外生观测变量，常见解释包括：
+Names and ranges resemble exogenous observations, possibly:
 
-- 多个天气站观测值
-- 多个相关传感器读数
-- 一组同时刻的辅助环境变量
+- Multiple weather-station observations.
+- Related sensor readings.
+- Synchronous environmental measurements.
 
-目前能确认的是：
+The evidence does establish:
 
-- 一共有 `25` 个外生特征
-- 数值大多是整数或接近整数
-- 取值范围大致在 `4 ~ 102`
-- 与 `LOAD` 同步按小时记录
+- There are `25` exogenous features.
+- Values are mostly integers or near integers.
+- Approximate range: `4 ~ 102`.
+- They are recorded hourly alongside `LOAD`.
 
-因此，在没有额外说明文档时，最稳妥的说法是：
+Without further documentation, the defensible description is:
 
-**`w1 ~ w25` 是 25 维同步外生协变量，具体物理含义未知。**
+**w1 through w25 are synchronous exogenous covariates whose physical meanings are unknown.**
 
-## 7. 这个数据适合做什么任务
+## 7. Suitable Tasks
 
-最直接适合的任务有：
+Direct applications include:
 
-- **单变量时间序列预测**
-  只用 `LOAD` 历史预测未来负荷
+- **Univariate forecasting**
+  Predict future load from LOAD history.
 
-- **多变量时间序列预测**
-  用 `LOAD + w1~w25` 一起预测未来负荷
+- **Multivariate forecasting**
+  Predict load from LOAD plus w1 through w25.
 
-- **短期负荷预测**
-  例如预测未来 1 小时、24 小时、48 小时
+- **Short-term load forecasting**
+  For example, one, 24, or 48 hours ahead.
 
-- **带外生变量的时序建模**
-  例如 Transformer、PatchTST、DLinear、TimesNet、iTransformer 一类模型
+- **Time-series modeling with exogenous variables**
+  For example, Transformer, PatchTST, DLinear, TimesNet, or iTransformer models.
 
-## 8. 不太适合什么
+## 8. Less Suitable Tasks
 
-它不太适合：
+Limitations include:
 
-- **跨区域建模**
-  因为只有一个 `ZONEID`
+- **Cross-zone modeling**
+  Only one ZONEID is present.
 
-- **严格的多实体面板建模**
-  没有多个用户/区域/站点
+- **Strict multi-entity panel modeling**
+  There are no multiple users, zones, or stations.
 
-- **需要强语义解释的因果分析**
-  因为 `w1 ~ w25` 的含义目前不清楚
+- **Causal analysis requiring strong semantic interpretation**
+  The meanings of w1 through w25 are unclear.
 
-## 9. 建模前建议先做的预处理
+## 9. Recommended Preprocessing
 
-如果后续要拿它做实验，我建议先做这几步：
+Before experiments:
 
-1. 先把 `TIMESTAMP` 统一清洗成标准 `datetime`
-2. 检查并固定采样频率为 `1H`
-3. 按时间顺序切分 train / val / test，不要随机打乱
-4. 明确 `w1 ~ w25` 是不是未来可用特征
-5. 视模型需要，对 `LOAD` 和 `w1 ~ w25` 分别做标准化
+1. Normalize TIMESTAMP to standard datetime values.
+2. Check and fix the sampling frequency to `1H`.
+3. Split train/validation/test chronologically, without shuffling.
+4. Establish whether w1 through w25 are available in the future.
+5. Normalize LOAD and the covariates separately as required by the model.
 
-第 4 点尤其重要：
+Future availability is particularly significant:
 
-- 如果 `w1 ~ w25` 在预测时刻的未来值不可得，那么它们不能被直接当作已知未来协变量使用
-- 如果它们是历史可观测变量，则可以作为 encoder 输入
+- Covariates unavailable at prediction time must not be treated as known future inputs.
+- Historically observed covariates can be encoder inputs.
 
-## 10. 一个简明结论
+## 10. Assessment
 
-这个 `dataset` 本质上是一个：
+This dataset is:
 
-**单区域、小时级、以 `LOAD` 为目标、附带 25 维外生协变量的负荷预测数据集。**
+**Single-zone hourly load forecasting with LOAD as the target and 25 exogenous covariates.**
 
-它的优点是：
+Strengths:
 
-- 数据完整
-- 时间连续
-- 周期性明显
-- 非常适合做 TSF baseline
+- Complete data.
+- Temporal continuity.
+- Clear periodicity.
+- Well suited to time-series forecasting baselines.
 
-它的主要注意点是：
+Main caveats:
 
-- `TIMESTAMP` 编码不标准
-- `w1 ~ w25` 的真实含义在当前目录里没有元数据支撑
+- Nonstandard TIMESTAMP encoding.
+- No local metadata establishing the meanings of w1 through w25.
 
-如果后面你要基于这个数据继续做实验，建议先单独生成一个“清洗后的标准版本”，把时间列先规范掉。
+Before further experiments, produce a separate cleaned version with normalized timestamps.

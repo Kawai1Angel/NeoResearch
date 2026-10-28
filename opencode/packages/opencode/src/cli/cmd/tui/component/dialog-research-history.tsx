@@ -36,8 +36,8 @@ export function DialogResearchHistory() {
   )
   return (
     <DialogSelect<string>
-      title={page()?.error ? `历史研究：${page()?.error}` : page.loading ? "历史研究 · 加载中" : "历史研究"}
-      placeholder="搜索标题或研究 ID"
+      title={page()?.error ? `Research history:${page()?.error}` : page.loading ? "Research history · Loading" : "Research history"}
+      placeholder="Search by title or research ID"
       skipFilter
       onFilter={(query) => {
         setCursor(undefined)
@@ -48,10 +48,10 @@ export function DialogResearchHistory() {
           title: task.title,
           value: task.id,
           description: `${task.mode} · ${task.recovery.currentPhase} · ${task.recovery.summary}`,
-          footer: `${task.recovery.completedRuns} 次完成 · ${new Date(task.time.updated).toLocaleString()}`,
+          footer: `${task.recovery.completedRuns} completed runs · ${new Date(task.time.updated).toLocaleString()}`,
         })),
-        ...(page()?.nextCursor ? [{ title: "下一页 →", value: "__next__" }] : []),
-        ...(cursor() ? [{ title: "← 返回首页", value: "__first__" }] : []),
+        ...(page()?.nextCursor ? [{ title: "Next page →", value: "__next__" }] : []),
+        ...(cursor() ? [{ title: "← First page", value: "__first__" }] : []),
       ]}
       onSelect={(option) => {
         if (option.value === "__next__") {

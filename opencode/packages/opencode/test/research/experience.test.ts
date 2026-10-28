@@ -344,7 +344,7 @@ it.live(
             relationship: "same_domain",
             polarity: "negative",
           })
-          const searched = JSON.parse((yield* reader.execute({ scope: "shared", query: "学习率 learning rate intervention", limit: 1 }, context(b.task, "research-hypo-planner"))).output)
+          const searched = JSON.parse((yield* reader.execute({ scope: "shared", query: "learning rate intervention", limit: 1 }, context(b.task, "research-hypo-planner"))).output)
           expect(searched.experiences[0].id).toBe(saved.experience.id)
           expect(searched.experiences[0].facts).toBeUndefined()
           expect(searched.experiences[0].sourceRuns[0].runID).toBe(a.run.id)
