@@ -1,4 +1,5 @@
-import { abandonUntrainedDesign, activeDesign, cycleTrialResults, designTrials, candidateTrial, trialDesign, startDesign, resolveTrialContract, recordTrialRun, reserveTrialExecution, completeTrial, appendTrainingTrial, saveOptimizerDecision, finishDesign, setDesignPhase, currentCycle, type TrainingTrial, type ResearchDesign } from "./design-store"
+import { ResearchDeadline, ResearchDeadlineExceeded, withinResearchDeadline } from "./deadline"
+import { abandonUntrainedDesign, activeDesign, cycleTrialResults, designTrials, candidateTrial, trialDesign, startDesign, resolveTrialContract, recordTrialRun, reserveTrialExecution, completeTrial, appendTrainingTrial, saveOptimizerDecision, requireDesignPhase, designPhaseReceipt, saveDesignPhaseReceipt, finishDesign, setDesignPhase, currentCycle, type TrainingTrial, type ResearchDesign } from "./design-store"
 import { TrainingStrategy } from "./design-contract"
 import { OptimizerDecision, validateOptimizerDecision } from "./agents/optimizer-agent"
 import PROMPT_RESEARCH_OPTIMIZER from "../agent/prompt/research-optimizer.txt"
@@ -138,7 +139,7 @@ import {
   type DomainValidationIssue,
 } from "./domain"
 import { DomainRegistry } from "./domain-registry"
-import { apiKeyFor, llmProposalValidationIssues, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata as buildLLMMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
+import { apiKeyFor, llmProposalValidationIssues, buildLLMProposalFromText, buildUserPrompt, extractJsonObject, mapToModelRef, proposeLLMCandidate, withLLMAbortSignal, requestNeoCastLLM, requestNeoCastLLMStream, resolveNeoCastLLMConfig, resolveApiKeyFromAuthJson, resolveEffectiveLLMConfig, usageToMetadata, ZERO_USAGE, camelizeKnown, pruneCandidateSpec, candidateGovernance, llmMetadata as buildLLMMetadata, type AuthJsonKeyResult, type LLMTokenUsage, type OpencodeModelRef } from "./llm-proposal"
 import { analyzeDatasetProfileForPrompt, compactPromptContext } from "./prompt-context"
 import { createFileResearchRuntime, researchJobFromRunPlan } from "./runtime"
 import { analyzeIntentTask, type IntentAgentResult } from "./agents/intent-agent"
@@ -2903,16 +2904,10 @@ async function executeRunnerPlan(
   signal?: AbortSignal,
   onSpawn?: (pid: number) => void,
   onStderrLine?: (line: string) => void,
+  deadlineAt?: number,
 ): Promise<RunnerExecution> {
   const cwd = plan.command.cwd ?? process.cwd()
   signal?.throwIfAborted()
-  await ensureRunnerStateInitialized(plan, signal)
-  for (const item of plan.writes) {
-    const file = runnerPath(cwd, item.path)
-    await mkdir(path.dirname(file), { recursive: true })
-    await writeFile(file, `${JSON.stringify(item.content, null, 2)}\n`, "utf8")
-  }
-
   const abortController = new AbortController()
   let abortReason: string | undefined
   let idleTimer: ReturnType<typeof setTimeout> | undefined
@@ -2949,33 +2944,61 @@ async function executeRunnerPlan(
     onProgressLine?.(line)
   }
   resetIdleTimer()
-  if (plan.command.timeoutMs !== undefined) {
+  const remaining = deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now())
+  const timeoutMs =
+    remaining === undefined ? plan.command.timeoutMs : Math.min(plan.command.timeoutMs ?? Infinity, remaining)
+  if (timeoutMs !== undefined) {
     commandTimer = setTimeout(
-      () => abortRunner(`Runner command timeout: exceeded ${plan.command.timeoutMs}ms`),
-      plan.command.timeoutMs,
+      () =>
+        abortRunner(
+          remaining !== undefined && timeoutMs === remaining
+            ? "Shared research deadline exhausted"
+            : `Runner command timeout: exceeded ${timeoutMs}ms`,
+        ),
+      timeoutMs,
     )
   }
-  const result = await Process.runStreaming([plan.command.executable, ...plan.command.args], {
-    cwd,
-    env: plan.command.env,
-    abort: signal ? AbortSignal.any([signal, abortController.signal]) : abortController.signal,
-    tree: true,
-    kill: "SIGKILL",
-    timeout: RUNNER_ABORT_KILL_GRACE_MS,
-    nothrow: true,
-    onSpawn,
-    onStdoutLine: handleStdoutLine,
-    onStderrLine: (line) => { resetIdleTimer(); onStderrLine?.(line) },
-  }).finally(clearRunnerTimers)
-  const stdout = result.stdout.toString()
-  const stderr = [result.stderr.toString(), abortReason].filter((item) => item && item.length > 0).join("\n")
-  return {
-    exitCode: abortReason === undefined ? result.code : result.code === 0 ? 1 : result.code,
-    stdout,
-    stderr,
-    records: parseRunnerRecords(stdout),
+  const runSignal = signal ? AbortSignal.any([signal, abortController.signal]) : abortController.signal
+  try {
+    await ensureRunnerStateInitialized(plan, runSignal)
+    for (const item of plan.writes) {
+      runSignal.throwIfAborted()
+      const file = runnerPath(cwd, item.path)
+      await mkdir(path.dirname(file), { recursive: true })
+      await writeFile(file, `${JSON.stringify(item.content, null, 2)}\n`, "utf8")
+    }
+    runSignal.throwIfAborted()
+    const result = await Process.runStreaming([plan.command.executable, ...plan.command.args], {
+      cwd,
+      env: plan.command.env,
+      abort: runSignal,
+      tree: true,
+      kill: "SIGKILL",
+      timeout: RUNNER_ABORT_KILL_GRACE_MS,
+      nothrow: true,
+      onSpawn,
+      onStdoutLine: handleStdoutLine,
+      onStderrLine: (line) => {
+        resetIdleTimer()
+        onStderrLine?.(line)
+      },
+    })
+    const stdout = result.stdout.toString()
+    const stderr = [result.stderr.toString(), abortReason].filter((item) => item && item.length > 0).join("\n")
+    return {
+      exitCode: abortReason === undefined ? result.code : result.code === 0 ? 1 : result.code,
+      stdout,
+      stderr,
+      records: parseRunnerRecords(stdout),
+    }
+  } catch (error) {
+    if (abortReason === undefined) throw error
+    return { exitCode: 1, stdout: "", stderr: abortReason, records: [] }
+  } finally {
+    clearRunnerTimers()
   }
 }
+
 
 async function sha256File(file: string) {
   try {
@@ -3488,6 +3511,7 @@ export interface Interface {
   readonly runRetrieveAgent: (input: RunRetrieveAgentInput) => Effect.Effect<RetrieveResult>
   readonly runHypoPlannerAgent: (input: {
     readonly taskID: ResearchTaskID
+    readonly designID?: string
     readonly outputDir?: string
     readonly taskEvidenceArtifactID?: ResearchArtifactID
   }) => Effect.Effect<HypoPlannerResult>
@@ -3844,81 +3868,88 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       taskID: ResearchTaskID
       hypothesisPlan: ExperimentPlan
       abandonedHypotheses?: readonly { statement: string }[]
+      designPhase?: { designID: string; result: HypoPlannerResult }
     }) {
-      const task = yield* getTask(input.taskID)
-      const metadata = recordValue(task.taskSpec.metadata)
-      const nextTaskSpec = {
-        ...task.taskSpec,
-        metadata: {
-          ...metadata,
-          baselineStrategy: input.hypothesisPlan.baselineStrategy,
-          searchBiases: input.hypothesisPlan.searchBiases,
-          stopConditions: input.hypothesisPlan.stopConditions,
-          nextExperiment: input.hypothesisPlan.nextExperiment as unknown as JsonRecord ?? null,
-          ...(input.hypothesisPlan.referenceBaseline === undefined
-            ? {}
-            : { referenceBaseline: input.hypothesisPlan.referenceBaseline }),
-          ...(input.abandonedHypotheses === undefined
-            ? {}
-            : { abandonedHypotheses: input.abandonedHypotheses.map((h) => ({ statement: h.statement })) }),
-        } as unknown as JsonRecord,
-      }
-      const row = yield* db((d) =>
-        d
-          .update(ResearchTaskTable)
-          .set({
-            task_spec: nextTaskSpec,
-            time_updated: Date.now(),
-          })
-          .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
-          .returning()
-          .get(),
-      )
-      if (!row) throw missing("Research task", input.taskID)
-      // A candidate's hypothesis is part of its execution contract. Refreshing the
-      // search plan must not delete or reinterpret that historical binding.
-      const candidates = yield* listCandidates(input.taskID)
-      const boundIDs = candidates.flatMap((candidate) => candidate.hypothesisID ? [candidate.hypothesisID] : [])
-      const hypotheses = input.hypothesisPlan.hypotheses.filter((h) => !boundIDs.includes(h.id))
-      yield* db((d) =>
-        d.delete(ResearchHypothesisTable).where(and(
-          eq(ResearchHypothesisTable.task_id, input.taskID),
-          ...(boundIDs.length ? [notInArray(ResearchHypothesisTable.hypo_id, boundIDs)] : []),
-        )).run(),
-      )
-      if (hypotheses.length > 0) {
-        const time = nowTime()
-        yield* db((d) =>
-          d
-            .insert(ResearchHypothesisTable)
-            .values(
-              hypotheses.map((h) => ({
-                id: ResearchHypothesisID.ascending(),
-                task_id: input.taskID,
-                hypo_id: h.id,
-                statement: h.statement,
-                motivation: [...h.motivation],
-                expected_outcome: h.expectedOutcome,
-                suggested_backbones: [...h.suggestedBackbones],
-                suggested_preprocessing: [...h.suggestedPreprocessing],
-                priority: "medium",
-                experiment_contract: h.experimentContract ?? null,
-                required_mechanisms: [...(h.requiredMechanisms ?? [])],
-                risk: h.risk,
-                testable: h.testable,
-                dataset_evidence_paths: [...h.datasetEvidencePaths],
-                literature_evidence: [...h.literatureEvidence],
-                applicability_assumptions: [...h.applicabilityAssumptions],
-                falsification_criteria: [...h.falsificationCriteria],
-                evidence_level: h.evidenceLevel,
-                status: h.status ?? "pending",
-                time_created: time.created,
-                time_updated: time.updated,
-              })),
+      const row = yield* Effect.sync(() =>
+        Database.transaction((d) => {
+          const current = d
+            .select()
+            .from(ResearchTaskTable)
+            .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
+            .get()
+          if (!current) throw missing("Research task", input.taskID)
+          const metadata = recordValue(current.task_spec.metadata)
+          const taskSpec = {
+            ...current.task_spec,
+            metadata: {
+              ...metadata,
+              baselineStrategy: input.hypothesisPlan.baselineStrategy,
+              searchBiases: input.hypothesisPlan.searchBiases,
+              stopConditions: input.hypothesisPlan.stopConditions,
+              nextExperiment: (input.hypothesisPlan.nextExperiment as unknown as JsonRecord) ?? null,
+              ...(input.hypothesisPlan.referenceBaseline === undefined
+                ? {}
+                : { referenceBaseline: input.hypothesisPlan.referenceBaseline }),
+              ...(input.abandonedHypotheses === undefined ? {} : { abandonedHypotheses: [...input.abandonedHypotheses] }),
+            } as unknown as JsonRecord,
+          }
+          const row = d
+            .update(ResearchTaskTable)
+            .set({ task_spec: taskSpec, time_updated: Date.now() })
+            .where(eq(ResearchTaskTable.id, input.taskID))
+            .returning()
+            .get()!
+          // A candidate-bound hypothesis remains immutable when refreshing proposals.
+          const boundIDs = d
+            .select()
+            .from(ResearchCandidateTable)
+            .where(eq(ResearchCandidateTable.task_id, input.taskID))
+            .all()
+            .flatMap((candidate) => (candidate.hypothesis_id ? [candidate.hypothesis_id] : []))
+          d.delete(ResearchHypothesisTable)
+            .where(
+              and(
+                eq(ResearchHypothesisTable.task_id, input.taskID),
+                ...(boundIDs.length ? [notInArray(ResearchHypothesisTable.hypo_id, boundIDs)] : []),
+              ),
             )
-            .run(),
-        )
-      }
+            .run()
+          const hypotheses = input.hypothesisPlan.hypotheses.filter((h) => !boundIDs.includes(h.id))
+          if (hypotheses.length) {
+            const time = nowTime()
+            d.insert(ResearchHypothesisTable)
+              .values(
+                hypotheses.map((h) => ({
+                  id: ResearchHypothesisID.ascending(),
+                  task_id: input.taskID,
+                  hypo_id: h.id,
+                  statement: h.statement,
+                  motivation: [...h.motivation],
+                  expected_outcome: h.expectedOutcome,
+                  suggested_backbones: [...h.suggestedBackbones],
+                  suggested_preprocessing: [...h.suggestedPreprocessing],
+                  priority: "medium",
+                  experiment_contract: h.experimentContract ?? null,
+                  required_mechanisms: [...(h.requiredMechanisms ?? [])],
+                  risk: h.risk,
+                  testable: h.testable,
+                  dataset_evidence_paths: [...h.datasetEvidencePaths],
+                  literature_evidence: [...h.literatureEvidence],
+                  applicability_assumptions: [...h.applicabilityAssumptions],
+                  falsification_criteria: [...h.falsificationCriteria],
+                  evidence_level: h.evidenceLevel,
+                  status: h.status ?? "pending",
+                  time_created: time.created,
+                  time_updated: time.updated,
+                })),
+              )
+              .run()
+          }
+          if (input.designPhase)
+            saveDesignPhaseReceipt(input.designPhase.designID, "hypoplanner.result", input.designPhase.result, "completed")
+          return row
+        }),
+      )
       const updated = mapTask(row)
       yield* bus.publish(Event.TaskUpdated, { task: updated })
       return updated
@@ -5092,7 +5123,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           ...(resolveTrialContract(candidate) ? { trainingTrial: (() => {
             const bound = resolveTrialContract(candidate)!
             return { designID: bound.design.id, trialID: bound.trial.id, index: bound.trial.trial_index,
-              contract: bound.trial.contract, outerContract: bound.design.outer_contract,
+              contract: bound.trial.contract, repairSourceRunID: bound.trial.repair_run_id, outerContract: bound.design.outer_contract,
               scope: bound.trial.contract ? "optimization" : "architecture" }
           })() } : {}),
         },
@@ -5333,6 +5364,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
 
       let recoveryBlocker: ResearchArtifact | undefined
+      const contextDeadline = yield* ResearchDeadline
+      const boundTrial = prepared.run.candidateID ? candidateTrial(prepared.run.candidateID) : undefined
+      const storedDeadline = boundTrial ? currentCycle(trialDesign(boundTrial).cycle_id).deadline_at : undefined
+      const deadlineAt = contextDeadline === undefined ? storedDeadline ?? undefined
+        : Math.min(contextDeadline, storedDeadline ?? Infinity)
+      if (!options.recoveredExecution && deadlineAt !== undefined && Date.now() >= deadlineAt)
+        throw new ResearchDeadlineExceeded()
       const executionTask = yield* getTask(prepared.run.taskID)
       if (executionTask.domainID === "tsf" && prepared.run.stage !== "ref_test" && prepared.run.stage !== "blind_test") {
         recoveryBlocker = yield* assertExecutionCheckpoint(executionTask.id, prepared.run.candidateID, prepared.run.stage)
@@ -5412,7 +5450,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             ...running.resourceUsage,
             execution: { worker: executionOwner(running.id, pid), attemptID: running.id, planDigest: digest(prepared.runPlan), workspace: prepared.runPlan.command.cwd ?? Instance.directory },
           } }).where(eq(ResearchRunTable.id, running.id)).run())
-        }, (line) => appendLog(liveProgressPath, { stream: "stderr", line })).catch((error) => {
+        }, (line) => appendLog(liveProgressPath, { stream: "stderr", line }), deadlineAt).catch((error) => {
           appendLog(liveProgressPath, { event: signal.aborted ? "runner_canceled" : "runner_failed", error: String(error), runID: running.id })
           throw error
         })
@@ -5601,7 +5639,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               d.insert(ResearchRunnerLockTable).values({ workspace: canonical, run_id: prepared.run.id }).run()
               return true
             }, { behavior: "immediate" })),
-            (acquired) => acquired ? executePreparedRunInternal(prepared, options) : Effect.succeed(undefined),
+            (acquired) => acquired ? executePreparedRunInternal(prepared, options).pipe(Effect.onInterrupt(() => Effect.gen(function* () {
+              // abortable waits for the process tree to exit before this
+              // finalizer releases its workspace or records a terminal failure.
+              const deadline = yield* ResearchDeadline
+              if (deadline === undefined || Date.now() < deadline) return
+              const current = yield* getRunForTask(task.id, prepared.run.id)
+              if (current.status === "running") yield* updateRunStatus({ runID: current.id, status: "failed",
+                error: "Shared research deadline exhausted; original runner process terminated" })
+            }))) : Effect.succeed(undefined),
             (acquired) => Effect.sync(() => {
               if (acquired) Database.use((d) => d.delete(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.run_id, prepared.run.id)).run())
             }),
@@ -5610,7 +5656,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           yield* Effect.sleep("50 millis")
         }
       })
-      return yield* experimentScheduler(Instance.directory).execute(task.id, limit, workspace, execute)
+      const scheduled = experimentScheduler(Instance.directory).execute(task.id, limit, workspace, execute)
+      if (options.recoveredExecution) return yield* scheduled
+      const contextDeadline = yield* ResearchDeadline
+      const trial = prepared.run.candidateID ? candidateTrial(prepared.run.candidateID) : undefined
+      const storedDeadline = trial ? currentCycle(trialDesign(trial).cycle_id).deadline_at : undefined
+      const deadline = contextDeadline === undefined ? storedDeadline ?? undefined
+        : Math.min(contextDeadline, storedDeadline ?? Infinity)
+      return yield* withinResearchDeadline(scheduled).pipe(Effect.provideService(ResearchDeadline, deadline))
     }))
 
     const reconcileInterruptedRuns = Effect.fn("Research.reconcileInterruptedRuns")(function* (taskID: ResearchTaskID) {
@@ -5960,13 +6013,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       readonly iterations: AutonomousIterationResult[]
       readonly stoppedReason: AutonomousLoopStoppedReason
       readonly maxIterations: number
+      readonly skipReflection?: boolean
     }) {
       const artifact = yield* writeAutonomousLoopArtifact(input)
 
       // Run ReflectionAgent exactly once per loop completion — it persists its result (artifacts +
       // reflection_result.json, including the LLM output) to disk. The outer pipeline re-reads that
       // persisted result instead of calling ReflectionAgent again or threading it through memory.
-      if (input.iterations.length > 0) {
+      if (input.iterations.length > 0 && !input.skipReflection) {
         yield* runReflectionAgent({
           taskID: input.task.id,
           stoppedReason: input.stoppedReason,
@@ -6506,14 +6560,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                   llmError: "ModelDesigner response did not contain a valid candidate JSON object",
                 }),
               }
-            : yield* Effect.promise(() =>
+            : yield* abortable((signal) => withLLMAbortSignal(signal, () =>
                 proposeLLMCandidate({
                   ...promptInput,
                   workspaceRoot: Instance.directory,
                   ...(isZeroResearch(task.taskSpec) ? { maxAttempts: 1 } : {}),
                   ...(authJsonKey ? { authJsonKey } : {}),
                 }),
-              )
+              ))
           llmMetadata = { ...llmResult.metadata, llmAttempt: attempt }
           if (llmResult.evidenceRequest) {
             if (++historyRequests > 5) throw new DesignPlanningStopped({ reason: "ModelDesigner exceeded the bounded evidence/history-request budget without proposing an experiment." })
@@ -7058,14 +7112,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (latest.optimizer_decision) return OptimizerDecision.parse(latest.optimizer_decision)
       yield* bus.publish(Event.OptimizerAgentStarted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "started" })
       const comparison = design.best_run_id ? comparisonRecipe(task.id, design.best_run_id) : undefined
+      const latestResult = latest.result as unknown as AutonomousIterationResult | null
+      const recipe = comparison ?? latestResult?.candidate.candidateSpec
+      if (!recipe) throw new Error("OptimizerAgent requires the persisted trial recipe")
       let decision: OptimizerDecision
-      if (!comparison) {
-        decision = { action: "return_to_outer", rationale: "No independently verified full result is available for a controlled training comparison." }
-      } else {
+      {
         const artifacts = yield* listArtifacts(task.id)
         const history = yield* Effect.promise(() => Promise.all(trials.map(async (trial) => {
           const result = trial.result as unknown as AutonomousIterationResult | null
-          const progress = artifacts.find((artifact) => artifact.runID === trial.full_run_id && artifact.kind === "runner_progress_jsonl")
+          const progress = artifacts.find((artifact) => artifact.runID === (trial.full_run_id ?? trial.smoke_run_id) && artifact.kind === "runner_progress_jsonl")
           return { trialID: trial.id, index: trial.trial_index, run: result?.run,
             trainingStrategy: result?.candidate.candidateSpec.trainingStrategy,
             trainingCurve: progress?.uri.startsWith("file://") ? await extractTrainingCurve(progress.uri.slice(7)) : [] }
@@ -7074,20 +7129,24 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const effective = yield* Effect.promise(() => resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory,
           neoCastProjectRoot: typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined }))
         const user = JSON.stringify({ agent: "OptimizerAgent", designID: design.id, hypothesisID: design.hypothesis_id,
-          fixedDesignDigest: design.design_digest, recipe: comparison, history,
+          fixedDesignDigest: design.design_digest, recipe, history,
+          trialPurpose: comparison ? "controlled_optimization" : "failure_repair", comparisonRunID: design.best_run_id,
           selectionMetric: objectiveMetricName(task.objective), constraints: task.taskSpec.constraints ?? {},
           remainingIterations: currentCycle(design.cycle_id).policy.maxIterations! - currentCycle(design.cycle_id).iterations,
+          deadlineAt: currentCycle(design.cycle_id).deadline_at,
+          remainingTimeSeconds: currentCycle(design.cycle_id).deadline_at === null ? undefined
+            : Math.max(0, (currentCycle(design.cycle_id).deadline_at! - Date.now()) / 1000),
           experiences: readExperiences(task.id, { scope: "shared", query: "optimizer learning rate", intent: "intervention", limit: 3 }).map(experienceSummaryForPrompt),
           responseSchema: z.toJSONSchema(OptimizerDecision) })
         try {
           const session = yield* requestViaSession({ rootSessionID: task.sessionID, taskID: task.id,
             agent: "research-optimizer", stageLabel: "OptimizerAgent", user,
             modelRef: effective ? mapToModelRef(effective.config) : undefined, onDelta: () => Effect.void })
-          const response = session ?? (effective ? yield* Effect.promise(() => requestNeoCastLLM(effective.config, effective.apiKey, PROMPT_RESEARCH_OPTIMIZER, user)) : undefined)
+          const response = session ?? (effective ? yield* abortable((signal) => withLLMAbortSignal(signal, () => requestNeoCastLLM(effective.config, effective.apiKey, PROMPT_RESEARCH_OPTIMIZER, user))) : undefined)
           if (!response) throw new Error("OptimizerAgent has no configured reasoning model")
-          decision = validateOptimizerDecision(extractJsonObject(response.text), comparison, (task.taskSpec.constraints ?? {}) as JsonRecord)
+          decision = validateOptimizerDecision(extractJsonObject(response.text), recipe, (task.taskSpec.constraints ?? {}) as JsonRecord)
           if (decision.action === "tune") {
-            const next = { ...comparison, trainingStrategy: decision.trainingStrategy }
+            const next = { ...recipe, trainingStrategy: decision.trainingStrategy }
             const validation = DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec: next as JsonRecord })
             if (!validation.ok) throw new Error(`OptimizerAgent produced an invalid training recipe: ${validation.issues.map((issue) => issue.message).join("; ")}`)
           }
@@ -7127,11 +7186,29 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const direction = objectiveDirection(task.objective)
       const iterations = cycleTrialResults(cycle.id) as unknown as AutonomousIterationResult[]
       const stopClock = cycleClock(cycle.id)
+      const deadline = cycle.deadline_at ?? undefined
       const finish = (reason: AutonomousLoopStoppedReason) => Effect.gen(function* () {
         const design = activeDesign(task.id)
-        if (design && reason !== "approval_required" && !designTrials(design.id).some((trial) => trial.status !== "completed"))
+        if (design && reason === "time_budget_exhausted") {
+          const pending = designTrials(design.id).find((trial) => trial.status === "pending")
+          const linked = pending?.full_run_id ?? pending?.smoke_run_id
+          const run = linked ? yield* getRunForTask(task.id, linked) : undefined
+          if (run?.status === "running")
+            throw new Error("Training trial execution is unconfirmed; reconcile the original runner before resuming")
+          // Finalize only terminal executions. A passed smoke must never dispatch
+          // its full training after the deadline, including during recovery.
+          if (pending && run && !["running", "queued"].includes(run.status) && (run.stage === "full" || run.status !== "succeeded")) {
+            const result = yield* runPendingTrainingTrial({ taskID: task.id, stage: "full" }, pending)
+            if (!iterations.some((item) => item.run.id === result.run.id)) iterations.push(result)
+          }
+        }
+        if (design && reason !== "approval_required" && !designTrials(design.id).some((trial) => trial.status !== "completed")) {
+          if (reason !== "time_budget_exhausted" && (deadline === undefined || Date.now() < deadline))
+            yield* withinResearchDeadline(runReflectionAgent({ taskID: task.id, designID: design.id, maxIterations })).pipe(
+              Effect.catchCause((cause) => Cause.squash(cause) instanceof ResearchDeadlineExceeded ? Effect.void : Effect.failCause(cause)))
           finishDesign(design.id, reason)
-        return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason })
+        }
+        return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason, skipReflection: true })
       })
       return yield* Effect.gen(function* () {
         while (true) {
@@ -7149,7 +7226,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           const metrics = sessionLocalMetricState({ runs: runs.filter((run) => run.status === "succeeded" && recordValue(run.resourceUsage.verification).eligibleForRanking !== false),
             stage: "full", primaryMetricName: metricName, direction, minRelativeImprovement: policy.minRelativeImprovement ?? 0 })
           if (!finalizing) {
-            if (policy.timeBudgetSeconds !== undefined && state.elapsed_ms >= policy.timeBudgetSeconds * 1000) return yield* finish("time_budget_exhausted")
+            if ((deadline !== undefined && Date.now() >= deadline) || (policy.timeBudgetSeconds !== undefined && state.elapsed_ms >= policy.timeBudgetSeconds * 1000)) return yield* finish("time_budget_exhausted")
             if (state.iterations >= maxIterations && !pending?.charged) return yield* finish("max_iterations")
             if (state.crash_streak >= (policy.maxCrashStreak ?? 3)) return yield* finish("crash_streak_exceeded")
             if (metrics.noImproveStreak >= (policy.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE)) return yield* finish("plateau")
@@ -7172,8 +7249,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               setDesignPhase(design.id, "reflecting", decision.rationale)
             }
             if (activeDesign(task.id)?.status === "reflecting") {
-              yield* runReflectionAgent({ taskID: task.id, maxIterations })
-              setDesignPhase(design.id, "planning")
+              yield* runReflectionAgent({ taskID: task.id, maxIterations, designID: design.id })
             }
             const initialization = yield* getReferenceBaselineInitialization(yield* getTask(task.id))
             if (initialization && !initialization.completed) return yield* finish("seed_failed")
@@ -7187,8 +7263,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                   trials: trials.map((trial) => ({ trialID: trial.id, runID: trial.full_run_id, contract: trial.contract })) },
                 instruction: "This design's inner optimization has finished. Use its best model and full history to choose the next architecture. Tuning comparisons do not isolate architecture effects.",
               } } }, time_updated: Date.now() }).where(eq(ResearchTaskTable.id, task.id)).run())
-            yield* runHypoPlannerAgent({ taskID: task.id })
-            finishDesign(design.id, activeDesign(task.id)?.stop_reason ?? "optimization_complete")
+            yield* runHypoPlannerAgent({ taskID: task.id, designID: design.id })
             continue
           }
           if (!finalizing) {
@@ -7224,7 +7299,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           if (full.length >= 3 && full.slice(-3).every((run) => run.resourceUsage.duplicateExperiment === true)) return yield* finish("no_new_candidate")
           yield* updateTaskStatus({ taskID: task.id, status: "searching" })
         }
-      }).pipe(Effect.ensuring(Effect.sync(stopClock)))
+      }).pipe(withinResearchDeadline, Effect.catchCause((cause) =>
+        Cause.squash(cause) instanceof ResearchDeadlineExceeded ? finish("time_budget_exhausted") : Effect.failCause(cause)),
+        Effect.provideService(ResearchDeadline, deadline), Effect.ensuring(Effect.sync(stopClock)))
     })
 
     const runAutonomousLoop = logPhaseMethod("runAutonomousLoop", Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
@@ -7467,30 +7544,56 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return rows.map(mapRun)
     })
 
-    const createArtifact = Effect.fn("Research.createArtifact")(function* (input: CreateArtifactInput) {
+    const createArtifact = Effect.fn("Research.createArtifact")(function* (
+      input: CreateArtifactInput,
+      receipt?: { designID: string; key: string },
+    ) {
+      const cached = designPhaseReceipt<ResearchArtifact>(receipt?.designID, receipt?.key ?? "")
+      if (cached) return cached
       const task = yield* getTask(input.taskID)
       if (input.runID) yield* getRunForTask(input.taskID, input.runID)
       if (input.runID) {
-        const existing = yield* db((d) => d.select().from(ResearchArtifactTable).where(and(eq(ResearchArtifactTable.task_id, input.taskID), eq(ResearchArtifactTable.run_id, input.runID!), eq(ResearchArtifactTable.kind, input.kind), eq(ResearchArtifactTable.uri, input.uri))).get())
+        const existing = yield* db((d) =>
+          d
+            .select()
+            .from(ResearchArtifactTable)
+            .where(
+              and(
+                eq(ResearchArtifactTable.task_id, input.taskID),
+                eq(ResearchArtifactTable.run_id, input.runID!),
+                eq(ResearchArtifactTable.kind, input.kind),
+                eq(ResearchArtifactTable.uri, input.uri),
+              ),
+            )
+            .get(),
+        )
         if (existing) return mapArtifact(existing)
       }
       const snapshot = yield* Effect.promise(() => snapshotPhaseArtifact(Instance.directory, input))
       const time = nowTime()
-      const row = yield* db((d) =>
-        d
-          .insert(ResearchArtifactTable)
-          .values({
-            id: ResearchArtifactID.ascending(),
-            task_id: input.taskID,
-            run_id: input.runID,
-            kind: input.kind,
-            uri: snapshot?.uri ?? input.uri,
-            metadata: { ...input.metadata, ...(isZeroResearch(task.taskSpec) ? { researchVariant: "zero" } : {}), ...(snapshot ? { sourceURI: snapshot.sourceURI, sha256: snapshot.sha256 } : {}) },
-            time_created: time.created,
-            time_updated: time.updated,
-          })
-          .returning()
-          .get(),
+      const row = yield* Effect.sync(() =>
+        Database.transaction((d) => {
+          const row = d
+            .insert(ResearchArtifactTable)
+            .values({
+              id: ResearchArtifactID.ascending(),
+              task_id: input.taskID,
+              run_id: input.runID,
+              kind: input.kind,
+              uri: snapshot?.uri ?? input.uri,
+              metadata: {
+                ...input.metadata,
+                ...(isZeroResearch(task.taskSpec) ? { researchVariant: "zero" } : {}),
+                ...(snapshot ? { sourceURI: snapshot.sourceURI, sha256: snapshot.sha256 } : {}),
+              },
+              time_created: time.created,
+              time_updated: time.updated,
+            })
+            .returning()
+            .get()!
+          if (receipt) saveDesignPhaseReceipt(receipt.designID, receipt.key, mapArtifact(row))
+          return row
+        }),
       )
       const artifact = mapArtifact(row)
       yield* bus.publish(Event.ArtifactCreated, { artifact })
@@ -8933,9 +9036,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 
 	    const runHypoPlannerAgent = logPhaseMethod("runHypoPlannerAgent", Effect.fn("Research.runHypoPlannerAgent")(function* (input: {
 	      readonly taskID: ResearchTaskID
+          readonly designID?: string
 	      readonly outputDir?: string
 	      readonly taskEvidenceArtifactID?: ResearchArtifactID
 	    }) {
+      const phaseTask = yield* getTask(input.taskID)
+      const phaseDesign = requireDesignPhase(input.taskID, input.designID)
+      if (phaseDesign && currentCycle(phaseDesign.cycle_id).input_digest !== cycleDigest(phaseTask))
+        throw new Error("Fixed-design data or evaluation protocol changed before phase recovery")
+      const completed = designPhaseReceipt<HypoPlannerResult>(input.designID, "hypoplanner.result")
+      if (completed) return completed
       yield* assertExecutionCheckpoint(input.taskID, undefined, "hypoplanner")
 	      yield* updateTaskStatus({ taskID: input.taskID, status: "hypo_planning" })
 	      yield* bus.publish(Event.HypoPlannerAgentStarted, {
@@ -8991,7 +9101,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           task_spec: { ...task.taskSpec, metadata: { ...recordValue(task.taskSpec.metadata), nextExperiment: null } },
           time_updated: Date.now(),
         }).where(eq(ResearchTaskTable.id, task.id)).run())
-        const hypoSessionAttempt = yield* requestViaSession({
+        const savedPlan = designPhaseReceipt<HypoPlannerResult>(input.designID, "hypoplanner.plan")
+        const savedSession = designPhaseReceipt<{ text: string; usage: LLMTokenUsage } | null>(input.designID, "hypoplanner.session")
+        const hypoSessionAttempt = savedSession !== undefined ? savedSession ?? undefined : savedPlan ? undefined : (yield* requestViaSession({
 	          evidenceBinding: { taskID: task.id, artifactID: evidenceArtifactID },
 	          rootSessionID: task.sessionID,
 	          agent: isZeroResearch(task.taskSpec) ? "research-hypo-planner-zero" : "research-hypo-planner",
@@ -9027,15 +9139,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             }
             return Effect.void
           },
-	        })
+	        }))
 	        const hypoCallPath: "session" | "direct" = hypoSessionAttempt ? "session" : "direct"
 	        logLLMCallPath("HypoPlanner", task.id, hypoCallPath)
 	        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "HypoPlanner", path: hypoCallPath })
-	        const llmHypothesesResult = hypoSessionAttempt
+	        const llmHypothesesResult = hypoSessionAttempt || savedPlan
 	          ? undefined
-	          : yield* Effect.promise(() =>
+	          : designPhaseReceipt<Awaited<ReturnType<typeof generateLLMHypotheses>>>(input.designID, "hypoplanner.proposal") ?? (yield* abortable((signal) => withLLMAbortSignal(signal, () =>
 	              generateLLMHypotheses(task, dataAnalysisSummary, Instance.directory, onDeltaHypo, existingHypotheses, abandonedHypotheses, taskEvidence, baselineOptions),
-	            )
+	            )))
+        if (llmHypothesesResult) saveDesignPhaseReceipt(input.designID, "hypoplanner.proposal", llmHypothesesResult)
 	        const llmHypoUsage = hypoSessionAttempt ? hypoSessionAttempt.usage : llmHypothesesResult?.usage
 	        // Session mode: agent used hypothesis_* tools to write to DB; read current pool state.
 	        const sessionPoolHypotheses = hypoSessionAttempt
@@ -9055,14 +9168,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            ? refreshedMetadata.referenceBaselineRationale
 	            : undefined
 	        const nextExperiment = hypoSessionAttempt
-          ? parseNextExperiment(refreshedMetadata.nextExperiment)
+          ? designPhaseReceipt<NonNullable<ExperimentPlan["nextExperiment"]>>(input.designID, "hypoplanner.selection") ?? parseNextExperiment(refreshedMetadata.nextExperiment)
           : llmHypothesesResult?.nextExperiment
         if (hypoSessionAttempt && !nextExperiment) throw new Error("HypoPlanner must explicitly call hypothesis_select before the next experiment")
         if (nextExperiment?.action === "experiment" && !sessionPoolHypotheses?.some((h) => h.id === nextExperiment.hypothesisID && isOpenHypothesis(h)) && hypoSessionAttempt)
           throw new Error(`HypoPlanner selection is no longer open: ${nextExperiment.hypothesisID}`)
         if (!isZeroResearch(task.taskSpec) && isFirstHypoPlannerCall && nextExperiment?.action === "experiment" && !toolReferenceBaseline)
           throw new Error("HypoPlanner must explicitly pick a reference baseline before the first experiment")
-        let result = buildHypoPlannerResult({
+        Database.transaction(() => {
+          saveDesignPhaseReceipt(input.designID, "hypoplanner.session", hypoSessionAttempt ?? null)
+          if (nextExperiment) saveDesignPhaseReceipt(input.designID, "hypoplanner.selection", nextExperiment)
+        })
+        let result = savedPlan ?? buildHypoPlannerResult({
 	          task,
 	          dataAnalysisSummary,
 	          runs,
@@ -9074,7 +9191,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               nextExperiment,
 	        })
 
-        if (!(hypoSessionAttempt && result.llm.status === "used")) {
+        if (!savedPlan && !(hypoSessionAttempt && result.llm.status === "used")) {
           // Direct planners reuse labels such as H1 across rounds. Version changed
           // definitions before writing artifacts so YAML, events and DB agree.
           const boundIDs = new Set((yield* listCandidates(task.id)).map((candidate) => candidate.hypothesisID))
@@ -9092,6 +9209,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           result = { ...result, plan, hypothesesYaml: buildHypothesesYaml(plan, taskEvidence?.readiness) }
           result = { ...result, planMarkdown: buildHypoPlanMarkdown(result) }
         }
+        result = designPhaseReceipt<HypoPlannerResult>(input.designID, "hypoplanner.plan") ?? result
+        saveDesignPhaseReceipt(input.designID, "hypoplanner.plan", result)
 	        const outputDir = path.join(
 	          Instance.directory,
 	          input.outputDir ?? path.join(".neo-research", "sessions", input.taskID, "hypotheses"),
@@ -9128,7 +9247,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              : {}),
 	            ...(llmHypoUsage && llmHypoUsage.inputTokens > 0 ? usageToMetadata(llmHypoUsage) : {}),
 	          },
-	        })
+	        }, input.designID ? { designID: input.designID, key: "hypoplanner.artifact.planArtifact" } : undefined)
 	        const yamlArtifact = yield* createArtifact({
 	          taskID: input.taskID,
 	          kind: "hypotheses_yaml",
@@ -9145,7 +9264,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            ...(result.plan.referenceBaselineSource === undefined ? {} : { referenceBaselineSource: result.plan.referenceBaselineSource }),
 	            ...(toolReferenceBaselineRationale ? { referenceBaselineRationale: toolReferenceBaselineRationale } : {}),
 	          },
-	        })
+	        }, input.designID ? { designID: input.designID, key: "hypoplanner.artifact.yamlArtifact" } : undefined)
 	        if (hypoSessionAttempt && result.llm.status === "used") {
 	          // Session mode: hypothesis rows managed by tools — update task metadata only.
 	          const t = yield* getTask(input.taskID)
@@ -9166,14 +9285,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	                : { referenceBaselineSource: result.plan.referenceBaselineSource }),
 	            } as unknown as JsonRecord,
 	          }
-	          const taskRow = yield* db((d) =>
-	            d
+	          const taskRow = yield* Effect.sync(() => Database.transaction((d) => {
+              const row = d
 	              .update(ResearchTaskTable)
 	              .set({ task_spec: nextTaskSpec, time_updated: Date.now() })
 	              .where(and(eq(ResearchTaskTable.id, input.taskID), eq(ResearchTaskTable.project_id, Instance.project.id)))
 	              .returning()
-	              .get(),
-	          )
+	              .get()
+              if (row) saveDesignPhaseReceipt(input.designID, "hypoplanner.result", result, "completed")
+              return row
+            }))
 	          if (taskRow) yield* bus.publish(Event.TaskUpdated, { task: mapTask(taskRow) })
 	        } else {
 	          // Direct mode: replace unbound proposals, retaining candidate-bound snapshots.
@@ -9188,8 +9309,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            taskID: input.taskID,
 	            hypothesisPlan: result.plan,
 	            abandonedHypotheses: mergedAbandoned,
+                ...(input.designID ? { designPhase: { designID: input.designID, result } } : {}),
 	          })
 	        }
+        saveDesignPhaseReceipt(input.designID, "hypoplanner.result", result, "completed")
 	        yield* bus.publish(Event.HypoPlannerAgentCompleted, {
 	          taskID: input.taskID,
 	          agent: "HypoPlannerAgent",
@@ -9428,6 +9551,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    }))
 
 	    const runReflectionAgent = logPhaseMethod("runReflectionAgent", Effect.fn("Research.runReflectionAgent")(function* (input: ReflectionAgentInput) {
+      const phaseTask = yield* getTask(input.taskID)
+      const phaseDesign = requireDesignPhase(input.taskID, input.designID)
+      if (phaseDesign && currentCycle(phaseDesign.cycle_id).input_digest !== cycleDigest(phaseTask))
+        throw new Error("Fixed-design data or evaluation protocol changed before phase recovery")
+      const completed = designPhaseReceipt<ReflectionAgentResult>(input.designID, "reflection.result")
+      if (completed) return completed
       yield* assertExecutionCheckpoint(input.taskID, undefined, "reflection")
 	      yield* bus.publish(Event.ReflectionAgentStarted, {
 	        taskID: input.taskID,
@@ -9477,7 +9606,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          resolveNeoCastLLMConfig({ workspaceRoot: Instance.directory, neoCastProjectRoot: reflectionNeoCastRoot }),
 	        ))
             const reflectionKnowledge = yield* Effect.promise(() => readReflectionKnowledge(task.id))
-	        const reflectionSessionAttempt = yield* requestViaSession({
+        const savedSynthesis = designPhaseReceipt<ReflectionAgentResult>(input.designID, "reflection.synthesis")
+        const savedSession = designPhaseReceipt<{ text: string; usage: LLMTokenUsage } | null>(input.designID, "reflection.session")
+	        const reflectionSessionAttempt = savedSession !== undefined ? savedSession ?? undefined : savedSynthesis ? undefined : (yield* requestViaSession({
 	          evidenceBinding: { taskID: task.id, artifactID: artifacts.find((artifact) => artifact.kind === "task_evidence_bundle_json")?.id },
 	          rootSessionID: task.sessionID,
 	          agent: "research-reflection",
@@ -9506,15 +9637,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	            }
 	            return Effect.void
 	          },
-	        })
+	        }))
+        saveDesignPhaseReceipt(input.designID, "reflection.session", reflectionSessionAttempt ?? null)
 	        const reflectionCallPath: "session" | "direct" = reflectionSessionAttempt ? "session" : "direct"
 	        logLLMCallPath("Reflection", task.id, reflectionCallPath)
 	        yield* bus.publish(Event.LLMCallPath, { taskID: task.id, agent: "Reflection", path: reflectionCallPath })
 	        // Direct-path fallback: lazily build full LLM context (training curve + memories) for
 	        // the non-session code path that calls the LLM API directly without tool access.
-	        const synthesis = reflectionSessionAttempt
+	        const synthesis = savedSynthesis ?? (reflectionSessionAttempt
 	          ? buildReflectionResultFromText(baseResult, reflectionConfig.model, reflectionSessionAttempt.text, reflectionSessionAttempt.usage)
-	          : yield* Effect.promise(async () => {
+	          : yield* abortable((signal) => withLLMAbortSignal(signal, async () => {
 	              const progressArtifact = latestRunForContext
 	                ? artifacts.find((a) => a.kind === "runner_progress_jsonl" && a.runID === latestRunForContext.id)
 	                : undefined
@@ -9564,7 +9696,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	              return generateLLMReflectionSynthesis(task, baseResult, llmContext).catch(() => ({
 	                ...baseResult, llm: { status: 'failed' as const },
 	              }))
-	            })
+	            })))
+            saveDesignPhaseReceipt(input.designID, "reflection.synthesis", synthesis)
             const experienceWriteResults: { saved: boolean; id?: string; error?: string }[] = []
             if (reflectionSessionAttempt) {
               const previousIDs = new Set(memories.map((memory) => memory.id))
@@ -9607,7 +9740,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               }
             }
             const result: ReflectionAgentResult = { ...synthesis, experienceWriteResults, knowledgeValidationResults }
-	        const reflectRunId = `reflect_${Date.now()}`
+	        const reflectRunId = input.designID ? `reflect_design_${input.designID}` : `reflect_${Date.now()}`
 	        const directory = input.outputDir
 	          ? path.join(runnerPath(Instance.directory, input.outputDir), task.id, reflectRunId)
 	          : path.join(Instance.directory, ".neo-research", "sessions", task.id, reflectRunId)
@@ -9649,19 +9782,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	          kind: "reflection_notes_md",
 	          uri: `file://${notesPath}`,
 	          metadata: { ...baseMetadata, role: "reflection-agent", format: "markdown" },
-	        })
+	        }, input.designID ? { designID: input.designID, key: "reflection.artifact.notesArtifact" } : undefined)
 	        const planArtifact = yield* createArtifact({
 	          taskID: task.id,
 	          kind: "next_experiment_plan_md",
 	          uri: `file://${planPath}`,
 	          metadata: { ...baseMetadata, role: "reflection-agent", format: "markdown" },
-	        })
+	        }, input.designID ? { designID: input.designID, key: "reflection.artifact.planArtifact" } : undefined)
 	        const failureLogArtifact = yield* createArtifact({
 	          taskID: task.id,
 	          kind: "failure_log_md",
 	          uri: `file://${failureLogPath}`,
 	          metadata: { ...baseMetadata, role: "reflection-agent", format: "markdown" },
-	        })
+	        }, input.designID ? { designID: input.designID, key: "reflection.artifact.failureLogArtifact" } : undefined)
+        saveDesignPhaseReceipt(input.designID, "reflection.result", result, "planning")
 	        yield* bus.publish(Event.ReflectionAgentCompleted, {
 	          taskID: input.taskID,
 	          agent: "ReflectionAgent",

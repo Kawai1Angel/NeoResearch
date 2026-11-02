@@ -29,7 +29,7 @@ export function optimizedRecipe(base: JsonRecord, strategy: TrainingStrategy): J
   return candidate as unknown as JsonRecord
 }
 
-export function trainingContract(base: JsonRecord, next: JsonRecord, comparisonRunID: string): ExperimentConstraints {
+function trainingChanges(base: JsonRecord, next: JsonRecord): ExperimentConstraints["changes"] {
   if (designDigest(base) !== designDigest(next)) throw new Error("Training trials must preserve the fixed design")
   const before = TSFCandidateRecipe.parse(base).trainingStrategy
   const after = TSFCandidateRecipe.parse(next).trainingStrategy
@@ -40,7 +40,31 @@ export function trainingContract(base: JsonRecord, next: JsonRecord, comparisonR
     changes.push({ operation: "set", path: `trainingStrategy.${key}`, before: before[key], after: after[key] })
   }
   if (!changes.length) throw new Error("OptimizerAgent proposed an unchanged training configuration")
-  return { mode: "controlled", comparisonRunID, changes, frozenPaths: [], requiredValues: [], forbiddenMechanisms: [] }
+  return changes
+}
+
+export function trainingContract(base: JsonRecord, next: JsonRecord, comparisonRunID: string): ExperimentConstraints {
+  return {
+    mode: "controlled",
+    comparisonRunID,
+    changes: trainingChanges(base, next),
+    frozenPaths: [],
+    requiredValues: [],
+    forbiddenMechanisms: [],
+  }
+}
+
+// Failed attempts are diagnostic evidence, never performance controls. Pin the
+// complete training strategy so repair trials retain an executable contract.
+export function trainingRepairContract(base: JsonRecord, next: JsonRecord): ExperimentConstraints {
+  trainingChanges(base, next)
+  return {
+    mode: "exploratory",
+    changes: [],
+    frozenPaths: [],
+    forbiddenMechanisms: [],
+    requiredValues: [{ path: "trainingStrategy", value: TSFCandidateRecipe.parse(next).trainingStrategy }],
+  }
 }
 
 export function checkTrainingTrial(input: {

@@ -5,7 +5,15 @@ import { Research } from "../../src/research"
 import { TSFCandidateRecipe, buildTSFBaselines } from "../../src/research/domains/tsf"
 import { addHypothesisToPool, selectNextExperimentInPool } from "../../src/research/hypothesis-store"
 
-export const createDualLoopFixture = Effect.fn(function* (root: string, options: { rejectTuned?: boolean } = {}) {
+export const createDualLoopFixture = Effect.fn(function* (
+  root: string,
+  options: {
+    rejectTuned?: boolean
+    failFullLR?: number
+    failSmokeLR?: number
+    delayFullMs?: number
+  } = {},
+) {
   const service = yield* Research.Service
   const runner = path.join(root, "runner")
   yield* Effect.promise(() => mkdir(path.join(runner, "py"), { recursive: true }))
@@ -16,11 +24,18 @@ const c = JSON.parse(fs.readFileSync(process.env.NEO_CAST_EXECUTION_CONTRACT))
 const recipe = JSON.parse(fs.readFileSync(process.env.NEO_CAST_CONTRACT_CANDIDATE))
 const lr = (recipe.training_strategy || recipe.model_config?.recipe?.training_strategy)?.optimizer?.lr || 0.001
 const metric = lr === 0.0005 ? ${options.rejectTuned ? -0.2 : 0.2} : lr === 0.0001 ? 0.25 : 0.3
-fs.appendFileSync(${JSON.stringify(path.join(root, "training-calls.jsonl"))}, JSON.stringify({ candidateID: c.candidate_id, stage: process.argv.includes("smoke") ? "smoke" : "full", lr }) + "\\n")
+const smoke = process.argv.includes("smoke")
+fs.appendFileSync(${JSON.stringify(path.join(root, "training-calls.jsonl"))}, JSON.stringify({ candidateID: c.candidate_id, stage: smoke ? "smoke" : "full", lr, pid: process.pid }) + "\\n")
 const d = crypto.createHash("sha256").update(canonical(c)).digest("hex")
 const manifest = { event: "executed_model_manifest", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: d, actual: c.expected }
 console.log(JSON.stringify(manifest))
 console.log(JSON.stringify({ event: "execution_contract_verified", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: d, status: "verified", manifest }))
+if (smoke ? lr === ${options.failSmokeLR ?? -1} : lr === ${options.failFullLR ?? -1}) {
+  console.error("CUDA out of memory during training")
+  console.log(JSON.stringify({ event: "done", status: "failed" }))
+  process.exit(1)
+}
+if (!smoke && ${options.delayFullMs ?? 0} > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${options.delayFullMs ?? 0})
 console.log(JSON.stringify({ event: "epoch_end", epoch: 1, horizon: 8, val_loss: metric }))
 console.log(JSON.stringify({ event: "smoke_eval_done", val_avg_mse: metric }))
 console.log(JSON.stringify({ event: "eval_done", val_avg_mse: metric, val_h8_mse: metric, val_avg_mae: 0.4 }))
@@ -99,7 +114,15 @@ export function optimizerFixture() {
   process.env.NEO_CAST_LLM_BASE_URL = "http://dual-loop.fixture/v1"
   process.env.NEO_CAST_LLM_MODEL = "fixture-model"
   process.env.NEO_CAST_LLM_API_KEY = "fixture-key"
-  const calls = { optimizer: 0, planner: 0, interrupt: false, invalidDesign: false }
+  const calls = {
+    optimizer: 0,
+    planner: 0,
+    reflection: 0,
+    interrupt: false,
+    invalidDesign: false,
+    hangOptimizer: false,
+    aborted: false,
+  }
   globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body))
     const system: string = body.messages[0].content
@@ -107,6 +130,15 @@ export function optimizerFixture() {
     if (system.startsWith("You are OptimizerAgent")) {
       if (calls.interrupt) throw new Error("simulated optimizer interruption")
       calls.optimizer++
+      if (calls.hangOptimizer)
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => {
+            calls.aborted = true
+            reject(new Error("fixture request aborted"))
+          }
+          if (init?.signal?.aborted) abort()
+          else init?.signal?.addEventListener("abort", abort, { once: true })
+        })
       const input = JSON.parse(body.messages[1].content)
       const strategy = structuredClone(input.recipe.trainingStrategy)
       strategy.optimizer.lr = calls.optimizer === 1 ? 0.0005 : 0.0001
@@ -123,6 +155,7 @@ export function optimizerFixture() {
         nextExperiment: { action: "stop", rationale: "The completed design answers this fixture's question" },
       }
     } else {
+      calls.reflection++
       result = Object.fromEntries(
         [
           "trainingHealthAssessment",

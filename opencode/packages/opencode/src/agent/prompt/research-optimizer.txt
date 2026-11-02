@@ -14,6 +14,9 @@ Preserve the seed and respect all task/remaining resource limits. Change only fi
 by observed evidence; an unchanged configuration is invalid. Multiple changed fields constitute
 a joint intervention, not isolated causal effects. Training loss does not change the fixed
 validation MSE used to select the best successfully evaluated trial.
-If there is no completed, independently verified full run to compare with, return_to_outer.
+When no verified full result exists, use the failed attempt's error and training configuration
+to propose a training-only repair (for example reduce batch size after OOM or lower learning
+rate after divergence). This is an exploratory repair, never a controlled performance claim.
+Return_to_outer only when the failure requires a design change or no justified training repair exists.
 Failures and lack of improvement support diagnosis; they do not by themselves refute the architecture.
 No tools or prose outside the JSON response are required.

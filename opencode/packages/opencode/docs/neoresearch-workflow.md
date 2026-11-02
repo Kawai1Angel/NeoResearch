@@ -257,6 +257,29 @@ Initial architecture comparisons keep the hypothesis contract. Later tuning tria
 have their own named same-design comparisons; both contracts remain in run facts.
 Tuning gains cannot be attributed to architecture changes.
 
+Failed smoke and full attempts can also return to OptimizerAgent for a bounded
+training-only repair. If no valid full control exists, the repair uses an
+exploratory contract that pins the proposed training strategy and records its
+failed source run (`repair_run_id`). It cannot establish a performance contrast.
+Once a valid full result exists, subsequent tuning uses that design's best valid
+full result as its control, even when the immediately preceding smoke failed.
+
+`timeBudgetSeconds` binds a durable absolute `deadline_at` when the search first
+starts (or when an existing cycle is upgraded). Queue waits, model reasoning,
+runner initialization, smoke and full execution all share this deadline. The
+runner process tree and direct LLM requests are canceled at expiry; final local
+result persistence may finish afterward. Restarting the application preserves
+the deadline, so downtime also uses the remaining wall-clock budget. Expired
+queued workers cannot dispatch; unknown running owners still require reconciliation.
+
+Design-scoped Reflection and HypoPlanner checkpoint accepted reasoning, artifacts
+and final results in `phase_receipts`. Reflection completion advances the design
+to planning in the same transaction. Applying a HypoPlanner plan, saving its
+result and closing the design are also atomic. Recovery reuses committed results
+without another model call, repeated plan application or duplicate artifact rows.
+An interrupted request that never produced a saved response may need to be sent
+again; remote model execution itself cannot be guaranteed exactly once.
+
 Recovery exposes `activeDesignID`, `activeTrialID` and `loopPhase`. A terminal linked
 run is replayed without launching training again or charging the budget twice.
 Unconfirmed running processes and queued runs without a persisted plan require

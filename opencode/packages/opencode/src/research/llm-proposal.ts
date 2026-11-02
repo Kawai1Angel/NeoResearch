@@ -1,4 +1,5 @@
 import { normalizedRecipeKey } from "./recipe-naming"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { DirectEvidenceRequestSchema, type EvidenceReadRequest } from "./retrieve/planning-evidence"
 import { DesignUnavailable, DesignHistoryRequest, type HistoryRequest, designTaskSpec, recipeConfiguration } from "./design-feedback"
 import { MODEL_CAPABILITIES } from "./model-capabilities"
@@ -12,6 +13,11 @@ import type { JsonRecord, ResearchTask } from "./schema"
 import PROMPT_RESEARCH_MODEL_DESIGNER from "../agent/prompt/research-model-designer.txt"
 
 type LLMProvider = "anthropic" | "openai-compatible"
+
+const llmAbortSignal = new AsyncLocalStorage<AbortSignal>()
+export function withLLMAbortSignal<T>(signal: AbortSignal, run: () => Promise<T>) {
+  return llmAbortSignal.run(signal, run)
+}
 
 export type LLMTokenUsage = {
   readonly inputTokens: number
@@ -473,6 +479,7 @@ async function requestOpenAICompatible(config: NeoCastLLMConfig, apiKey: string,
   if (!config.baseURL) throw new Error("OPENAI-compatible provider requires llm.base_url")
   const response = await fetch(`${config.baseURL.replace(/\/+$/, "")}/chat/completions`, {
     method: "POST",
+    signal: llmAbortSignal.getStore(),
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${apiKey}`,
@@ -513,6 +520,7 @@ async function requestAnthropic(config: NeoCastLLMConfig, apiKey: string, system
   const baseURL = config.baseURL ?? "https://api.anthropic.com/v1"
   const response = await fetch(`${baseURL.replace(/\/+$/, "")}/messages`, {
     method: "POST",
+    signal: llmAbortSignal.getStore(),
     headers: {
       "content-type": "application/json",
       "x-api-key": apiKey,
@@ -563,6 +571,7 @@ async function requestAnthropicStream(
   const baseURL = config.baseURL ?? "https://api.anthropic.com/v1"
   const response = await fetch(`${baseURL.replace(/\/+$/, "")}/messages`, {
     method: "POST",
+    signal: llmAbortSignal.getStore(),
     headers: {
       "content-type": "application/json",
       "x-api-key": apiKey,
@@ -632,6 +641,7 @@ async function requestOpenAICompatibleStream(
   if (!config.baseURL) throw new Error("OPENAI-compatible provider requires llm.base_url")
   const response = await fetch(`${config.baseURL.replace(/\/+$/, "")}/chat/completions`, {
     method: "POST",
+    signal: llmAbortSignal.getStore(),
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${apiKey}`,

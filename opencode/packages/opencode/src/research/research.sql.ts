@@ -265,6 +265,7 @@ export const ResearchCycleTable = sqliteTable("research_cycle", {
   iterations: integer().notNull().default(0),
   crash_streak: integer().notNull().default(0),
   elapsed_ms: integer().notNull().default(0),
+  deadline_at: integer(),
   input_digest: text().notNull(),
 })
 
@@ -315,6 +316,7 @@ export const ResearchDesignTable = sqliteTable("research_design", {
   best_run_id: text().$type<ResearchRunID>(),
   best_metric: real(),
   no_improve: integer().notNull().default(0),
+  phase_receipts: text({ mode: "json" }).notNull().default({}).$type<Record<string, JsonRecord>>(),
   ...Timestamps,
 }, (table) => [index("research_design_cycle_idx").on(table.cycle_id)])
 
@@ -324,6 +326,7 @@ export const ResearchTrainingTrialTable = sqliteTable("research_training_trial",
   trial_index: integer().notNull(),
   candidate_id: text().$type<ResearchCandidateID>().notNull().unique().references(() => ResearchCandidateTable.id, { onDelete: "cascade" }),
   contract: text({ mode: "json" }).$type<import("./experiment-constraints").ExperimentConstraints>(),
+  repair_run_id: text().$type<ResearchRunID>(),
   smoke_run_id: text().$type<ResearchRunID>(),
   full_run_id: text().$type<ResearchRunID>(),
   charged: integer({ mode: "boolean" }).notNull().default(false),

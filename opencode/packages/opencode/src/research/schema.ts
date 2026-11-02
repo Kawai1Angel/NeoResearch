@@ -559,6 +559,7 @@ export class VerifierAgentRunInput extends Schema.Class<VerifierAgentRunInput>("
 
 export class ReflectionAgentInput extends Schema.Class<ReflectionAgentInput>("ResearchReflectionAgentInput")({
   taskID: ResearchTaskID,
+  designID: Schema.optional(Schema.String),
   outputDir: Schema.optional(Schema.String),
   stoppedReason: Schema.optional(Schema.String),
   maxIterations: Schema.optional(Schema.Number),

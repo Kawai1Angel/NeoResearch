@@ -11,6 +11,7 @@ import {
   designDigest,
   checkTrainingTrial,
   trainingContract,
+  trainingRepairContract,
   optimizedRecipe,
   type TrainingStrategy,
 } from "./design-contract"
@@ -164,14 +165,17 @@ export function reserveTrialExecution(candidateID: ResearchCandidateID, runID: R
       const trial = candidateTrial(candidateID)
       if (!trial) return false
       if (trial.full_run_id !== runID) throw new Error("Training execution does not match the persisted trial")
-      if (trial.charged) return true
       const design = trialDesign(trial)
       const cycle = db.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.id, design.cycle_id)).get()!
       if (cycle.active_task !== design.task_id) throw new Error("The training trial's cycle is no longer active")
+      if (
+        (cycle.deadline_at !== null && Date.now() >= cycle.deadline_at) ||
+        (cycle.policy.timeBudgetSeconds !== undefined && cycle.elapsed_ms >= cycle.policy.timeBudgetSeconds * 1000)
+      )
+        throw new Error("Shared training time budget exhausted")
+      if (trial.charged) return true
       if (cycle.iterations >= (cycle.policy.maxIterations ?? 25))
         throw new Error("Shared training iteration budget exhausted")
-      if (cycle.policy.timeBudgetSeconds !== undefined && cycle.elapsed_ms >= cycle.policy.timeBudgetSeconds * 1000)
-        throw new Error("Shared training time budget exhausted")
       db.update(ResearchCycleTable)
         .set({ iterations: sql`${ResearchCycleTable.iterations} + 1` })
         .where(eq(ResearchCycleTable.id, design.cycle_id))
@@ -257,8 +261,8 @@ export function appendTrainingTrial(
         .from(ResearchTrainingTrialTable)
         .where(eq(ResearchTrainingTrialTable.id, previousTrialID))
         .get()
-      if (!previous || previous.design_id !== designID || previous.status !== "completed" || !previous.full_run_id)
-        throw new Error("OptimizerAgent requires a completed same-design full trial")
+      if (!previous || previous.design_id !== designID || previous.status !== "completed")
+        throw new Error("OptimizerAgent requires a completed same-design trial")
       const existing = db
         .select()
         .from(ResearchTrainingTrialTable)
@@ -272,29 +276,38 @@ export function appendTrainingTrial(
       if (existing) return existing
       const design = trialDesign(previous)
       if (!design.active_task) throw new Error("Cannot optimize a finished design")
-      const comparison = db
-        .select()
-        .from(ResearchRunTable)
-        .where(eq(ResearchRunTable.id, comparisonRunID ?? previous.full_run_id))
-        .get()
+      const sourceRunID = comparisonRunID ?? previous.full_run_id ?? previous.smoke_run_id
+      if (!sourceRunID) throw new Error("Training optimization requires a persisted execution")
+      const comparison = db.select().from(ResearchRunTable).where(eq(ResearchRunTable.id, sourceRunID)).get()
+      const repair =
+        !comparisonRunID &&
+        !design.best_run_id &&
+        comparison &&
+        ["failed", "invalid", "rejected"].includes(comparison.status)
       if (
         !comparison?.candidate_id ||
         comparison.task_id !== design.task_id ||
-        comparison.status !== "succeeded" ||
-        comparison.stage !== "full" ||
         comparison.resource_usage.independentEvidence === false ||
         comparison.resource_usage.duplicateExperiment === true ||
-        (comparison.resource_usage.executionContract as { status?: string } | undefined)?.status !== "verified" ||
+        (!repair &&
+          (comparison.status !== "succeeded" ||
+            comparison.stage !== "full" ||
+            (comparison.resource_usage.executionContract as { status?: string } | undefined)?.status !== "verified" ||
+            (comparison.resource_usage.verification as { eligibleForRanking?: boolean; status?: string } | undefined)
+              ?.eligibleForRanking === false ||
+            (comparison.resource_usage.verification as { status?: string } | undefined)?.status === "failed")) ||
         candidateTrial(comparison.candidate_id)?.design_id !== designID
       )
-        throw new Error("Training comparison must be an independently verified full run of this design")
+        throw new Error("Training source must be a verified full comparison or a failed attempt of this design")
       const base = db
         .select()
         .from(ResearchCandidateTable)
         .where(eq(ResearchCandidateTable.id, comparison.candidate_id))
         .get()!
       const next = optimizedRecipe(base.candidate_spec, strategy)
-      const contract = trainingContract(base.candidate_spec, next, comparison.id)
+      const contract = repair
+        ? trainingRepairContract(base.candidate_spec, next)
+        : trainingContract(base.candidate_spec, next, comparison.id)
       const time = Date.now()
       const candidateID = CandidateID.ascending()
       db.insert(ResearchCandidateTable)
@@ -317,6 +330,7 @@ export function appendTrainingTrial(
           trial_index: previous.trial_index + 1,
           candidate_id: candidateID,
           contract,
+          repair_run_id: repair ? comparison.id : null,
           time_created: time,
           time_updated: time,
         })
@@ -335,6 +349,50 @@ export function saveOptimizerDecision(trialID: string, decision: JsonRecord) {
       .where(eq(ResearchTrainingTrialTable.id, trialID))
       .run(),
   )
+}
+
+export function designPhaseReceipt<T>(designID: string | undefined, key: string): T | undefined {
+  if (!designID) return undefined
+  const design = Database.use((db) =>
+    db.select().from(ResearchDesignTable).where(eq(ResearchDesignTable.id, designID)).get(),
+  )
+  if (!design) throw new Error("Unknown fixed design phase")
+  return design.phase_receipts[key] as T | undefined
+}
+
+export function requireDesignPhase(taskID: ResearchTaskID, designID: string | undefined) {
+  if (!designID) return
+  const design = Database.use((db) =>
+    db.select().from(ResearchDesignTable).where(eq(ResearchDesignTable.id, designID)).get(),
+  )
+  if (!design || design.task_id !== taskID || designTrials(designID).some((trial) => trial.status !== "completed"))
+    throw new Error("Design phase requires a same-task design with completed trials")
+  return design
+}
+
+// Receipt and state transition share a transaction. A completion event can be
+// lost without causing another model call or replaying committed decisions.
+export function saveDesignPhaseReceipt(
+  designID: string | undefined,
+  key: string,
+  value: unknown,
+  next?: "planning" | "completed",
+) {
+  if (!designID) return
+  Database.transaction((db) => {
+    const design = db.select().from(ResearchDesignTable).where(eq(ResearchDesignTable.id, designID)).get()
+    if (!design) throw new Error("Unknown fixed design phase")
+    if (Object.hasOwn(design.phase_receipts, key)) return
+    db.update(ResearchDesignTable)
+      .set({
+        phase_receipts: { ...design.phase_receipts, [key]: JSON.parse(JSON.stringify(value)) },
+        ...(next ? { status: next } : {}),
+        ...(next === "completed" ? { active_task: null } : {}),
+        time_updated: Date.now(),
+      })
+      .where(eq(ResearchDesignTable.id, designID))
+      .run()
+  })
 }
 
 export function finishDesign(designID: string, reason: string) {
