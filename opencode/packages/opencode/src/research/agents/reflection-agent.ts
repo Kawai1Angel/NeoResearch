@@ -132,6 +132,9 @@ export interface ReflectionAgentResult {
   readonly nextExperimentPlanMarkdown: string
   readonly failureLogMarkdown: string
   readonly analysis: ReflectionAnalysis
+  readonly trainingReflection?: import("./scoped-reflection").TrainingReflection
+  readonly architectureReflection?: import("./scoped-reflection").ArchitectureReflection
+  readonly designSummary?: import("./scoped-reflection").DesignSummary
   readonly experienceWriteResults?: readonly { saved: boolean; id?: string; error?: string }[]
   readonly knowledgeValidationResults?: readonly { saved: boolean; cardID: string; updated?: boolean; confidence?: number; error?: string }[]
   readonly llm: {

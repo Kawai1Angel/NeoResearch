@@ -251,7 +251,15 @@ function interruptAfterReceipt(taskID: Research.ResearchTaskID, key: string) {
       const design = Database.use((db) =>
         db.select().from(ResearchDesignTable).where(eq(ResearchDesignTable.task_id, taskID)).get(),
       )
-      if (design?.phase_receipts[key]) {
+      if (
+        design &&
+        (/^(architecture|training)\./.test(key)
+          ? Object.keys(design.phase_receipts).some(
+              (saved) =>
+                saved.startsWith(`${key.split(".")[0]}-reflection:`) && saved.endsWith(`:v2.${key.split(".")[1]}`),
+            )
+          : design.phase_receipts[key])
+      ) {
         fired = true
         throw new Error(`simulated process loss after ${key} commit`)
       }
@@ -261,7 +269,14 @@ function interruptAfterReceipt(taskID: Research.ResearchTaskID, key: string) {
   return { restore: () => spy.mockRestore(), fired: () => fired }
 }
 
-for (const key of ["reflection.synthesis", "reflection.result", "hypoplanner.plan", "hypoplanner.result"]) {
+for (const key of [
+  "training.reasoning",
+  "training.result",
+  "architecture.reasoning",
+  "architecture.result",
+  "hypoplanner.plan",
+  "hypoplanner.result",
+]) {
   it.live(
     `resume after ${key} commit reuses the saved reasoning and commits the outer decision once`,
     () =>
@@ -282,6 +297,7 @@ for (const key of ["reflection.synthesis", "reflection.result", "hypoplanner.pla
             const loop = yield* service.runAutonomousLoop({ taskID: task.id })
             expect(loop.stoppedReason).toBe("planner_stopped")
             expect(fixture.calls.reflection).toBe(1)
+            expect(fixture.calls.trainingReflection).toBe(1)
             expect(fixture.calls.planner).toBe(1)
             expect(activeDesign(task.id)).toBeUndefined()
             expect(yield* Effect.promise(() => callsAt(directory))).toEqual(before)
@@ -342,8 +358,8 @@ test("a process killed after the planner commit reopens with the same deadline a
     status: "completed",
     consumed: 1,
     sameDeadline: true,
-    firstCalls: { reflection: 1, planner: 1 },
-    resumeCalls: { reflection: 0, planner: 0, optimizer: 0 },
+    firstCalls: { reflection: 1, trainingReflection: 1, planner: 1 },
+    resumeCalls: { reflection: 0, trainingReflection: 0, planner: 0, optimizer: 0 },
   })
   expect((await callsAt(directory.path)).filter((call) => call.stage === "full")).toHaveLength(1)
 }, 60000)

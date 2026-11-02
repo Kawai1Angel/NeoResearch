@@ -286,6 +286,52 @@ Unconfirmed running processes and queued runs without a persisted plan require
 reconciliation. Before the first full attempt, failed implementation repair may
 create a new outer design while retaining the rejected design and smoke evidence.
 
+### Scoped Reflection in the Dual Loop
+
+In a full dual-loop TSF search, each completed trial, including failed smoke/full attempts, has
+a `TrainingReflection` before OptimizerAgent decides the next training intervention.
+It captures exact execution evidence, the named same-design training control or
+failed repair source, comparison eligibility and separate phase/fold/horizon curve
+summaries. Its interpretation is limited to training diagnosis and questions for
+OptimizerAgent; it cannot return an architecture verdict or change a recipe.
+
+When inner optimization finishes, `DesignSummary` records all trial outcomes and
+the best eligible complete model separately from `architectureEvidence`. Architecture
+evidence uses the original outer-contract trial and its named control, with matched
+data, evaluation, training configuration and evaluated seed. The best tuned trial
+is never substituted into that architectural comparison. Joint architecture/training
+changes, failures, duplicate/cache results, smoke results and unmatched evaluations
+cannot establish an isolated architecture effect.
+
+`ArchitectureReflection` interprets that completed-design summary plus its training
+reflections, then hands the summary and assessment to HypoPlanner. The coordinator
+forces an inconclusive hypothesis assessment when architecture evidence is ineligible,
+even if the model claims support. Both modes are invoked as ReflectionAgent with
+separate prompts and strict output schemas; their sessions have no tool permissions.
+
+The service exposes `runTrainingReflection`, `getDesignSummary` and
+`runArchitectureReflection`. Existing `runReflectionAgent` callers can pass
+`designID` and `reflectionScope=training|architecture` (plus `trialID` for training).
+Design-scoped calls default to architecture mode. Calls without a design retain
+the legacy task-level API. Legacy report fields remain available alongside the
+typed results, with architectural change lists restricted to the named outer comparison.
+
+Versioned `training-reflection:<trialID>:v2` and
+`architecture-reflection:<designID>:v2` receipts retain facts, accepted reasoning,
+artifact receipts and final results. `design-summary:v2` retains the design summary.
+Old unscoped reflection receipts are preserved and do not satisfy these new stages.
+Recovery reports `training_reflection` when a terminal trial awaits its diagnosis.
+Both reasoning modes share the durable deadline and do not charge extra training
+iterations. At expiry, local factual records and an inconclusive design assessment
+are saved without another model call. Model execution whose response was never
+saved can still require a retry after an interrupted request.
+
+This stage adds scoped working reflections and artifacts, not shared-memory writes.
+The only memory purposes are `optimization` and `architecture`; execution failures
+are optimization observations. Existing experience maturity levels and claim types
+remain separate. Purpose-based shared-library storage, retrieval and an outbox for
+deliberate experience writes are subsequent work.
+
 ### 6. Runner Execution
 
 The domain builds TSF run plans for Neo-Cast execution.

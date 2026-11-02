@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { SessionTable } from "@/session/session.sql"
 import { cycleDigest } from "./cycle"
 import { activeDesign, designTrials } from "./design-store"
+import { trainingReflectionKey } from "./agents/scoped-reflection"
 import { RESEARCH_MAX_RUNS_SAFETY_LIMIT } from "./defaults"
 import z from "zod"
 import { existsSync } from "node:fs"
@@ -160,7 +161,11 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
               ? "completed"
               : "resumable"
     const design = activeDesign(taskID)
-    const trial = design ? designTrials(design.id).find((entry) => entry.status !== "completed") : undefined
+    const trials = design ? designTrials(design.id) : []
+    const trial = trials.find((entry) => entry.status !== "completed")
+    const latestCompleted = trials.filter((entry) => entry.status === "completed").at(-1)
+    const awaitingTrainingReflection = design?.status === "optimizing" && latestCompleted &&
+      !design.phase_receipts[`${trainingReflectionKey(latestCompleted.id)}.result`]
     const summary =
       recoveryState === "running"
         ? "Research is still running; view the original operation"
@@ -176,7 +181,7 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
       cycleID: cycle?.id ?? null,
       activeDesignID: design?.id ?? null,
       activeTrialID: trial?.id ?? null,
-      loopPhase: design ? trial ? "training" : design.status === "optimizing" ? "optimization" : design.status : null,
+      loopPhase: design ? trial ? "training" : awaitingTrainingReflection ? "training_reflection" : design.status === "optimizing" ? "optimization" : design.status : null,
       revision: task.state_revision,
       rootSessionID: task.session_id,
       chatSessionID: task.cockpit_chat_session_id,

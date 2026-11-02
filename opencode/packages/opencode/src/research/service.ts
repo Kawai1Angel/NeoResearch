@@ -1,3 +1,10 @@
+import {
+  TrainingReflection, ArchitectureReflection, DesignSummary, TrainingReflectionAnalysis, ArchitectureReflectionAnalysis,
+  buildTrainingReflection, buildDesignSummary, buildArchitectureReflection, applyArchitectureAnalysis, projectScopedReflection,
+  trainingReflectionKey, architectureReflectionKey, DESIGN_SUMMARY_KEY, type ReflectionEvidence,
+} from "./agents/scoped-reflection"
+import PROMPT_REFLECTION_TRAINING from "../agent/prompt/research-reflection-training.txt"
+import PROMPT_REFLECTION_ARCHITECTURE from "../agent/prompt/research-reflection-architecture.txt"
 import { ResearchDeadline, ResearchDeadlineExceeded, withinResearchDeadline } from "./deadline"
 import { abandonUntrainedDesign, activeDesign, cycleTrialResults, designTrials, candidateTrial, trialDesign, startDesign, resolveTrialContract, recordTrialRun, reserveTrialExecution, completeTrial, appendTrainingTrial, saveOptimizerDecision, requireDesignPhase, designPhaseReceipt, saveDesignPhaseReceipt, finishDesign, setDesignPhase, currentCycle, type TrainingTrial, type ResearchDesign } from "./design-store"
 import { TrainingStrategy } from "./design-contract"
@@ -2252,6 +2259,7 @@ function buildHypoPlannerUserPrompt(
         "Leave every other existingHypothesis unchanged — they have not been tested yet and there is no new evidence about them. " +
         "abandonedHypotheses lists ideas already abandoned in earlier rounds — do not regenerate hypotheses that restate or closely resemble these. " +
         "Ground each hypothesis's motivation in specific values from dataAnalysis or outcomes from previousReflection. " +
+        "When searchProgress.completedDesign is present, bestModel is the best observed tuned configuration, while architectureEvidence refers to the original matched architecture contrast. Only eligible architectureEvidence supports an architecture verdict. Training failures, repairs, tuning gains and local plateau cannot themselves refute the hypothesis. Read searchProgress.architectureReflection for the scoped interpretation. " +
         "Set expectedOutcome to a concrete, metric-referenced prediction. " +
         "Choose the next experiment yourself from the entire open pool, considering exploration, local plateau and completed results; no priority field controls scheduling. " +
         (opts?.sessionMode ? "Finish by calling hypothesis_select exactly once, with an open hypoID and an evidence-based rationale, or action=stop if no useful experiment remains. " : "Return hypotheses plus nextExperiment={action:experiment,hypothesisID,rationale} or {action:stop,rationale} in one JSON object. ") +
@@ -3504,6 +3512,9 @@ export interface Interface {
   readonly runAutonomousIteration: (input: AutonomousIterationInput) => Effect.Effect<AutonomousIterationResult>
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
   readonly runOptimizerAgent: (input: { taskID: ResearchTaskID; designID: string }) => Effect.Effect<OptimizerDecision>
+  readonly runTrainingReflection: (input: { taskID: ResearchTaskID; designID: string; trialID: string; factsOnly?: boolean }) => Effect.Effect<TrainingReflection>
+  readonly getDesignSummary: (input: { taskID: ResearchTaskID; designID: string }) => Effect.Effect<DesignSummary>
+  readonly runArchitectureReflection: (input: { taskID: ResearchTaskID; designID: string; maxIterations?: number; factsOnly?: boolean }) => Effect.Effect<ArchitectureReflection>
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
   readonly answerIntentQuestion: (input: AnswerIntentInput) => Effect.Effect<IntentAgentResult>
   readonly interpretAndApplySlotModification: (input: { taskID: ResearchTaskID; message: string }) => Effect.Effect<IntentAgentResult>
@@ -7102,6 +7113,375 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return hasBlockingApproval ? ("approval_required" as const) : undefined
     })
 
+    const loadScopedReflectionEvidence = Effect.fn("Research.loadScopedReflectionEvidence")(function* (input: {
+      taskID: ResearchTaskID
+      designID: string
+      trialID?: string
+    }) {
+      const task: ResearchTask = yield* getTask(input.taskID)
+      const trials = designTrials(input.designID)
+      const design = trials[0] ? trialDesign(trials[0]) : undefined
+      if (!design || design.task_id !== task.id) throw new Error("Reflection design does not belong to this task")
+      if (currentCycle(design.cycle_id).input_digest !== cycleDigest(task))
+        throw new Error("Fixed-design data or evaluation protocol changed before scoped reflection")
+      const trial = input.trialID ? trials.find((trial) => trial.id === input.trialID) : undefined
+      if (input.trialID && !trial) throw new Error("Reflection trial does not belong to this design")
+      const selected = trial ? [trial] : trials
+      const runIDs = [
+        ...new Set(
+          selected
+            .flatMap((item) => [
+              item.full_run_id ?? item.smoke_run_id,
+              ...(trial ? [item.contract?.comparisonRunID, item.repair_run_id] : []),
+            ])
+            .concat(trial ? [] : [design.outer_contract?.comparisonRunID])
+            .filter((id): id is ResearchRunID => Boolean(id)),
+        ),
+      ]
+      const runs: ResearchRun[] = yield* Effect.forEach(runIDs, (id) => getRunForTask(task.id, id))
+      const candidateIDs = [...new Set(runs.flatMap((run) => (run.candidateID ? [run.candidateID] : [])))]
+      const candidates: ResearchCandidate[] = yield* Effect.forEach(candidateIDs, (id) => getCandidateForTask(task.id, id))
+      return { task, design, trials, runs, candidates }
+    })
+
+    const scopedReflectionReasoning = Effect.fn("Research.scopedReflectionReasoning")(function* (input: {
+      evidence: ReflectionEvidence
+      key: string
+      reflectionScope: "training" | "architecture"
+      facts: TrainingReflection | ArchitectureReflection
+      schema: z.ZodType
+      factsOnly?: boolean
+    }) {
+      const { task, design } = input.evidence
+      const cached = designPhaseReceipt<{ analysis: unknown; model?: string }>(design.id, `${input.key}.reasoning`)
+      if (cached) return { response: cached, status: "used" as const }
+      const contextDeadline = yield* ResearchDeadline
+      const storedDeadline = currentCycle(design.cycle_id).deadline_at
+      const deadline =
+        contextDeadline === undefined
+          ? (storedDeadline ?? undefined)
+          : Math.min(contextDeadline, storedDeadline ?? Infinity)
+      if (input.factsOnly || (deadline !== undefined && Date.now() >= deadline))
+        return { response: undefined, status: "deadline_exhausted" as const }
+      const runtime = recordValue(task.taskSpec.runtime)
+      const effective = yield* Effect.promise(() =>
+        resolveEffectiveLLMConfig({
+          workspaceRoot: Instance.directory,
+          neoCastProjectRoot: typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined,
+        }),
+      )
+      const trainingReflections =
+        input.reflectionScope === "architecture"
+          ? input.evidence.trials.flatMap((trial) => {
+              const result = designPhaseReceipt<TrainingReflection>(design.id, `${trainingReflectionKey(trial.id)}.result`)
+              return result ? [TrainingReflection.parse(result)] : []
+            })
+          : undefined
+      const sourceRunID = input.facts.reflectionScope === "training" ? input.facts.runID
+        : input.facts.designSummary.architectureEvidence.runID
+      const sourceRun = input.evidence.runs.find((run) => run.id === sourceRunID)
+      const outerComparison = input.reflectionScope === "architecture"
+        ? input.evidence.runs.find((run) => run.id === design.outer_contract?.comparisonRunID) : undefined
+      const user = JSON.stringify({
+        agent: "ReflectionAgent",
+        reflectionScope: input.reflectionScope,
+        facts: input.facts,
+        trainingReflections,
+        fixedRecipe: design.recipe,
+        hypothesisSnapshot: sourceRun?.resourceUsage.hypothesisSnapshot ?? null,
+        outerContract: input.reflectionScope === "architecture" ? design.outer_contract : undefined,
+        outerComparison: outerComparison ? {
+          runID: outerComparison.id, stage: outerComparison.stage, status: outerComparison.status,
+          metrics: outerComparison.metrics,
+          recipe: input.evidence.candidates.find((candidate) => candidate.id === outerComparison.candidateID)?.candidateSpec,
+        } : undefined,
+        responseSchema: z.toJSONSchema(input.schema),
+      })
+      const reasoning = Effect.gen(function* () {
+        const session = yield* requestViaSession({
+          rootSessionID: task.sessionID,
+          taskID: task.id,
+          agent: input.reflectionScope === "training" ? "research-reflection-training" : "research-reflection-architecture",
+          stageLabel: "ReflectionAgent",
+          user,
+          modelRef: effective ? mapToModelRef(effective.config) : undefined,
+          onDelta: (delta) =>
+            bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta }),
+        })
+        const response =
+          session ??
+          (effective
+            ? yield* abortable((signal) =>
+                withLLMAbortSignal(signal, () =>
+                  requestNeoCastLLM(
+                    effective.config,
+                    effective.apiKey,
+                    input.reflectionScope === "training" ? PROMPT_REFLECTION_TRAINING : PROMPT_REFLECTION_ARCHITECTURE,
+                    user,
+                  ),
+                ),
+              )
+            : undefined)
+        if (!response) return { response: undefined, status: "not_configured" as const }
+        const accepted = { analysis: input.schema.parse(extractJsonObject(response.text)), model: effective?.config.model }
+        saveDesignPhaseReceipt(design.id, `${input.key}.reasoning`, accepted)
+        return { response: accepted, status: "used" as const }
+      })
+      return yield* withinResearchDeadline(reasoning).pipe(
+        Effect.provideService(ResearchDeadline, deadline),
+        Effect.catchCause((cause) =>
+          Cause.squash(cause) instanceof ResearchDeadlineExceeded
+            ? Effect.succeed({ response: undefined, status: "deadline_exhausted" as const })
+            : Effect.gen(function* () {
+                yield* bus.publish(Event.ReflectionAgentFailed, {
+                  taskID: task.id,
+                  agent: "ReflectionAgent",
+                  stage: "reflection",
+                  status: "failed",
+                  metadata: {
+                    reflectionScope: input.reflectionScope,
+                    designID: design.id,
+                    ...errorMetadata(Cause.squash(cause)),
+                  },
+                })
+                return yield* Effect.failCause(cause)
+              }),
+        ),
+      )
+    })
+
+    const runTrainingReflection = logPhaseMethod(
+      "runTrainingReflection",
+      Effect.fn("Research.runTrainingReflection")(function* (input: {
+        taskID: ResearchTaskID
+        designID: string
+        trialID: string
+        factsOnly?: boolean
+      }) {
+        const evidence = yield* loadScopedReflectionEvidence(input)
+        const trial = evidence.trials.find((trial) => trial.id === input.trialID)!
+        const key = trainingReflectionKey(trial.id)
+        const artifacts = yield* listArtifacts(input.taskID)
+        const progress = artifacts.find(
+          (artifact) =>
+            artifact.runID === (trial.full_run_id ?? trial.smoke_run_id) && artifact.kind === "runner_progress_jsonl",
+        )
+        const points = progress?.uri.startsWith("file://")
+          ? yield* Effect.promise(() => extractTrainingCurve(progress.uri.slice(7)))
+          : []
+        const fresh = buildTrainingReflection(evidence, trial, points)
+        const completed = designPhaseReceipt<TrainingReflection>(input.designID, `${key}.result`)
+        if (completed) {
+          if (completed.inputDigest !== fresh.inputDigest)
+            throw new Error("Training reflection evidence changed after completion")
+          return TrainingReflection.parse(completed)
+        }
+        const previous = designPhaseReceipt<TrainingReflection>(input.designID, `${key}.facts`)
+        if (previous && previous.inputDigest !== fresh.inputDigest)
+          throw new Error("Training reflection evidence changed before recovery")
+        saveDesignPhaseReceipt(input.designID, `${key}.facts`, fresh)
+        yield* bus.publish(Event.ReflectionAgentStarted, {
+          taskID: input.taskID,
+          agent: "ReflectionAgent",
+          stage: "reflection",
+          status: "started",
+          metadata: { reflectionScope: "training", designID: input.designID, trialID: trial.id },
+        })
+        const reasoning = yield* scopedReflectionReasoning({
+          evidence,
+          key,
+          reflectionScope: "training",
+          facts: fresh,
+          schema: TrainingReflectionAnalysis,
+          factsOnly: input.factsOnly,
+        })
+        const interpretation = reasoning.response
+          ? TrainingReflectionAnalysis.parse(reasoning.response.analysis)
+          : fresh.analysis
+        const result = TrainingReflection.parse({
+          ...fresh,
+          analysis: {
+            ...interpretation,
+            limitations: [...new Set([...fresh.analysis.limitations, ...interpretation.limitations])].slice(0, 12),
+          },
+          analysisStatus: reasoning.response ? "completed" : "facts_only",
+          llm: { status: reasoning.status, model: reasoning.response?.model },
+        })
+        const file = path.join(
+          Instance.directory,
+          ".neo-research",
+          "sessions",
+          input.taskID,
+          `training_reflect_${trial.id}`,
+          "training_reflection.json",
+        )
+        yield* Effect.promise(async () => {
+          await mkdir(path.dirname(file), { recursive: true })
+          await writeFile(file, JSON.stringify(result, null, 2))
+        })
+        yield* createArtifact(
+          {
+            taskID: input.taskID,
+            kind: "training_reflection_json",
+            uri: `file://${file}`,
+            metadata: {
+              reflectionScope: "training",
+              memoryPurpose: "optimization",
+              designID: input.designID,
+              trialID: trial.id,
+              runID: result.runID,
+            },
+          },
+          { designID: input.designID, key: `${key}.artifact` },
+        )
+        saveDesignPhaseReceipt(input.designID, `${key}.result`, result)
+        yield* bus.publish(Event.ReflectionAgentCompleted, {
+          taskID: input.taskID,
+          agent: "ReflectionAgent",
+          stage: "reflection",
+          status: "completed",
+          metadata: {
+            reflectionScope: "training",
+            designID: input.designID,
+            trialID: trial.id,
+            analysisStatus: result.analysisStatus,
+          },
+        })
+        return result
+      }),
+    )
+
+    const getDesignSummary = Effect.fn("Research.getDesignSummary")(function* (input: {
+      taskID: ResearchTaskID
+      designID: string
+    }) {
+      return buildDesignSummary(yield* loadScopedReflectionEvidence(input))
+    })
+
+    const runArchitectureReflection = logPhaseMethod(
+      "runArchitectureReflection",
+      Effect.fn("Research.runArchitectureReflection")(function* (input: {
+        taskID: ResearchTaskID
+        designID: string
+        maxIterations?: number
+        factsOnly?: boolean
+      }) {
+        const evidence = yield* loadScopedReflectionEvidence(input)
+        requireDesignPhase(input.taskID, input.designID)
+        for (const trial of evidence.trials)
+          yield* runTrainingReflection({
+            taskID: input.taskID,
+            designID: input.designID,
+            trialID: trial.id,
+            factsOnly: input.factsOnly,
+          })
+        const key = architectureReflectionKey(input.designID)
+        const summary = buildDesignSummary(evidence)
+        const completed = designPhaseReceipt<ArchitectureReflection>(input.designID, `${key}.result`)
+        if (completed) {
+          if (completed.inputDigest !== summary.inputDigest)
+            throw new Error("Architecture reflection evidence changed after completion")
+          return ArchitectureReflection.parse(completed)
+        }
+        const prior = designPhaseReceipt<DesignSummary>(input.designID, DESIGN_SUMMARY_KEY)
+        if (prior && prior.inputDigest !== summary.inputDigest)
+          throw new Error("Design summary evidence changed before recovery")
+        saveDesignPhaseReceipt(input.designID, DESIGN_SUMMARY_KEY, summary)
+        const facts = buildArchitectureReflection(prior ?? summary)
+        saveDesignPhaseReceipt(input.designID, `${key}.facts`, facts)
+        yield* bus.publish(Event.ReflectionAgentStarted, {
+          taskID: input.taskID,
+          agent: "ReflectionAgent",
+          stage: "reflection",
+          status: "started",
+          metadata: { reflectionScope: "architecture", designID: input.designID },
+        })
+        const reasoning = yield* scopedReflectionReasoning({
+          evidence,
+          key,
+          reflectionScope: "architecture",
+          facts,
+          schema: ArchitectureReflectionAnalysis,
+          factsOnly: input.factsOnly,
+        })
+        const result = reasoning.response
+          ? applyArchitectureAnalysis(facts, reasoning.response.analysis, reasoning.response.model)
+          : ArchitectureReflection.parse({ ...facts, llm: { status: reasoning.status } })
+        const projected = projectScopedReflection(evidence, result, input.maxIterations)
+        const directory = path.join(
+          Instance.directory,
+          ".neo-research",
+          "sessions",
+          input.taskID,
+          `reflect_design_${input.designID}`,
+        )
+        const outputs = [
+          {
+            kind: "design_summary_json",
+            name: "design_summary.json",
+            content: JSON.stringify(result.designSummary, null, 2),
+          },
+          {
+            kind: "architecture_reflection_json",
+            name: "architecture_reflection.json",
+            content: JSON.stringify(result, null, 2),
+          },
+          { kind: "reflection_notes_md", name: "reflection_notes.md", content: projected.reflectionNotesMarkdown },
+          {
+            kind: "next_experiment_plan_md",
+            name: "next_experiment_plan.md",
+            content: projected.nextExperimentPlanMarkdown,
+          },
+          { kind: "failure_log_md", name: "failure_log.md", content: projected.failureLogMarkdown },
+          {
+            kind: "reflection_result_json",
+            name: "reflection_result.json",
+            content: JSON.stringify(
+              {
+                ...projected,
+                decision: projected.analysis.decision,
+                decisionReason: projected.analysis.decisionReason,
+                succeededRuns: projected.analysis.succeededRuns,
+                failedRuns: projected.analysis.failedRuns,
+                inconclusiveRuns: projected.analysis.inconclusiveRuns,
+                plateauStreak: projected.analysis.plateauStreak,
+              },
+              null,
+              2,
+            ),
+          },
+        ]
+        yield* Effect.promise(() => mkdir(directory, { recursive: true }))
+        for (const output of outputs) {
+          const file = path.join(directory, output.name)
+          yield* Effect.promise(() => writeFile(file, output.content))
+          yield* createArtifact(
+            {
+              taskID: input.taskID,
+              kind: output.kind,
+              uri: `file://${file}`,
+              metadata: {
+                reflectionScope: "architecture",
+                memoryPurpose: "architecture",
+                designID: input.designID,
+                ...reflectionAgentMetadata(projected),
+              },
+            },
+            { designID: input.designID, key: `${key}.artifact.${output.kind}` },
+          )
+        }
+        saveDesignPhaseReceipt(input.designID, `${key}.result`, result, "planning")
+        yield* bus.publish(Event.ReflectionAgentCompleted, {
+          taskID: input.taskID,
+          agent: "ReflectionAgent",
+          stage: "reflection",
+          status: "completed",
+          metadata: { reflectionScope: "architecture", designID: input.designID, analysisStatus: result.analysisStatus },
+        })
+        return result
+      }),
+    )
+
     const runOptimizerAgent = logPhaseMethod("runOptimizerAgent", Effect.fn("Research.runOptimizerAgent")(function* (input: { taskID: ResearchTaskID; designID: string }) {
       const task = yield* getTask(input.taskID)
       const design = activeDesign(task.id)
@@ -7109,6 +7489,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const trials = designTrials(design.id)
       const latest = trials[trials.length - 1]
       if (!latest || latest.status !== "completed") throw new Error("Complete the active trial before requesting optimization")
+      const trainingReflection = yield* runTrainingReflection({ taskID: task.id, designID: design.id, trialID: latest.id })
       if (latest.optimizer_decision) return OptimizerDecision.parse(latest.optimizer_decision)
       yield* bus.publish(Event.OptimizerAgentStarted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "started" })
       const comparison = design.best_run_id ? comparisonRecipe(task.id, design.best_run_id) : undefined
@@ -7117,19 +7498,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (!recipe) throw new Error("OptimizerAgent requires the persisted trial recipe")
       let decision: OptimizerDecision
       {
-        const artifacts = yield* listArtifacts(task.id)
-        const history = yield* Effect.promise(() => Promise.all(trials.map(async (trial) => {
-          const result = trial.result as unknown as AutonomousIterationResult | null
-          const progress = artifacts.find((artifact) => artifact.runID === (trial.full_run_id ?? trial.smoke_run_id) && artifact.kind === "runner_progress_jsonl")
-          return { trialID: trial.id, index: trial.trial_index, run: result?.run,
-            trainingStrategy: result?.candidate.candidateSpec.trainingStrategy,
-            trainingCurve: progress?.uri.startsWith("file://") ? await extractTrainingCurve(progress.uri.slice(7)) : [] }
-        })))
+        const history = trials.map((trial) => ({ trialID: trial.id, index: trial.trial_index,
+          trainingReflection: designPhaseReceipt<TrainingReflection>(design.id, `${trainingReflectionKey(trial.id)}.result`),
+          trainingStrategy: (trial.result as unknown as AutonomousIterationResult | null)?.candidate.candidateSpec.trainingStrategy }))
         const runtime = recordValue(task.taskSpec.runtime)
         const effective = yield* Effect.promise(() => resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory,
           neoCastProjectRoot: typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined }))
         const user = JSON.stringify({ agent: "OptimizerAgent", designID: design.id, hypothesisID: design.hypothesis_id,
-          fixedDesignDigest: design.design_digest, recipe, history,
+          fixedDesignDigest: design.design_digest, recipe, trainingReflection, history,
           trialPurpose: comparison ? "controlled_optimization" : "failure_repair", comparisonRunID: design.best_run_id,
           selectionMetric: objectiveMetricName(task.objective), constraints: task.taskSpec.constraints ?? {},
           remainingIterations: currentCycle(design.cycle_id).policy.maxIterations! - currentCycle(design.cycle_id).iterations,
@@ -7202,10 +7578,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             if (!iterations.some((item) => item.run.id === result.run.id)) iterations.push(result)
           }
         }
+        const factsOnly = reason === "time_budget_exhausted" || deadline !== undefined && Date.now() >= deadline
+        if (design) for (const trial of designTrials(design.id).filter((trial) => trial.status === "completed"))
+          yield* runTrainingReflection({ taskID: task.id, designID: design.id, trialID: trial.id, factsOnly })
         if (design && reason !== "approval_required" && !designTrials(design.id).some((trial) => trial.status !== "completed")) {
-          if (reason !== "time_budget_exhausted" && (deadline === undefined || Date.now() < deadline))
-            yield* withinResearchDeadline(runReflectionAgent({ taskID: task.id, designID: design.id, maxIterations })).pipe(
-              Effect.catchCause((cause) => Cause.squash(cause) instanceof ResearchDeadlineExceeded ? Effect.void : Effect.failCause(cause)))
+          if (!designPhaseReceipt(design.id, `${architectureReflectionKey(design.id)}.result`))
+            setDesignPhase(design.id, "reflecting", reason)
+          yield* runArchitectureReflection({ taskID: task.id, designID: design.id, maxIterations, factsOnly })
           finishDesign(design.id, reason)
         }
         return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason, skipReflection: true })
@@ -7223,6 +7602,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           if (pendingRun?.status === "running" || pendingSmoke?.status === "running")
             throw new Error("Training trial execution is unconfirmed; reconcile the original runner before resuming")
           const finalizing = pendingRun && !["queued", "running"].includes(pendingRun.status)
+          for (const trial of trials.filter((trial) => trial.status === "completed"))
+            yield* runTrainingReflection({ taskID: task.id, designID: design!.id, trialID: trial.id })
           const metrics = sessionLocalMetricState({ runs: runs.filter((run) => run.status === "succeeded" && recordValue(run.resourceUsage.verification).eligibleForRanking !== false),
             stage: "full", primaryMetricName: metricName, direction, minRelativeImprovement: policy.minRelativeImprovement ?? 0 })
           if (!finalizing) {
@@ -7248,9 +7629,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               }
               setDesignPhase(design.id, "reflecting", decision.rationale)
             }
-            if (activeDesign(task.id)?.status === "reflecting") {
-              yield* runReflectionAgent({ taskID: task.id, maxIterations, designID: design.id })
-            }
+            const architectureReflection = yield* runArchitectureReflection({ taskID: task.id, maxIterations, designID: design.id })
             const initialization = yield* getReferenceBaselineInitialization(yield* getTask(task.id))
             if (initialization && !initialization.completed) return yield* finish("seed_failed")
             const current = yield* getTask(task.id)
@@ -7258,9 +7637,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               metadata: { ...recordValue(current.taskSpec.metadata), searchProgress: {
                 noImproveStreak: metrics.noImproveStreak, plateauThreshold: policy.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE,
                 remainingIterations: maxIterations - currentCycle(cycle.id).iterations,
-                completedDesign: { designID: design.id, hypothesisID: design.hypothesis_id,
-                  bestRunID: design.best_run_id, bestMetric: design.best_metric,
-                  trials: trials.map((trial) => ({ trialID: trial.id, runID: trial.full_run_id, contract: trial.contract })) },
+                completedDesign: JSON.parse(JSON.stringify(architectureReflection.designSummary)),
+                architectureReflection: JSON.parse(JSON.stringify(architectureReflection.analysis)),
                 instruction: "This design's inner optimization has finished. Use its best model and full history to choose the next architecture. Tuning comparisons do not isolate architecture effects.",
               } } }, time_updated: Date.now() }).where(eq(ResearchTaskTable.id, task.id)).run())
             yield* runHypoPlannerAgent({ taskID: task.id, designID: design.id })
@@ -9551,6 +9929,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
 	    }))
 
 	    const runReflectionAgent = logPhaseMethod("runReflectionAgent", Effect.fn("Research.runReflectionAgent")(function* (input: ReflectionAgentInput) {
+      if (input.reflectionScope && !input.designID) throw new Error("Scoped reflection requires designID")
+      if (input.reflectionScope === "training" && !input.trialID) throw new Error("Training reflection requires trialID")
+      if (input.designID) {
+        const reflection = input.reflectionScope === "training"
+          ? yield* runTrainingReflection({ taskID: input.taskID, designID: input.designID, trialID: input.trialID! })
+          : yield* runArchitectureReflection({ taskID: input.taskID, designID: input.designID, maxIterations: input.maxIterations })
+        return projectScopedReflection(yield* loadScopedReflectionEvidence({ taskID: input.taskID, designID: input.designID,
+          trialID: input.reflectionScope === "training" ? input.trialID : undefined }), reflection, input.maxIterations)
+      }
       const phaseTask = yield* getTask(input.taskID)
       const phaseDesign = requireDesignPhase(input.taskID, input.designID)
       if (phaseDesign && currentCycle(phaseDesign.cycle_id).input_digest !== cycleDigest(phaseTask))
@@ -10855,6 +11242,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       runAutonomousIteration,
       runAutonomousLoop,
       runOptimizerAgent,
+      runTrainingReflection,
+      getDesignSummary,
+      runArchitectureReflection,
       runIntentAgent,
       answerIntentQuestion,
       interpretAndApplySlotModification,

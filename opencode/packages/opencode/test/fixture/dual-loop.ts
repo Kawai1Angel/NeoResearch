@@ -118,11 +118,19 @@ export function optimizerFixture() {
     optimizer: 0,
     planner: 0,
     reflection: 0,
+    trainingReflection: 0,
+    interruptTrainingReflection: false,
+    interruptArchitectureReflection: false,
+    invalidTrainingReflection: false,
+    forceArchitectureSupport: false,
+    hangTrainingReflection: false,
     interrupt: false,
     invalidDesign: false,
     hangOptimizer: false,
     aborted: false,
   }
+  const inputs = { training: [] as any[], architecture: [] as any[], optimizer: [] as any[], planner: [] as any[] }
+  const order: string[] = []
   globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body))
     const system: string = body.messages[0].content
@@ -140,6 +148,8 @@ export function optimizerFixture() {
           else init?.signal?.addEventListener("abort", abort, { once: true })
         })
       const input = JSON.parse(body.messages[1].content)
+      inputs.optimizer.push(input)
+      order.push("optimizer")
       const strategy = structuredClone(input.recipe.trainingStrategy)
       strategy.optimizer.lr = calls.optimizer === 1 ? 0.0005 : 0.0001
       result = {
@@ -148,8 +158,48 @@ export function optimizerFixture() {
         trainingStrategy: strategy,
         ...(calls.invalidDesign ? { backbone: { type: "mlp" } } : {}),
       }
+    } else if (system.startsWith("You are ReflectionAgent in training mode")) {
+      if (calls.interruptTrainingReflection) throw new Error("simulated training reflection interruption")
+      calls.trainingReflection++
+      inputs.training.push(JSON.parse(body.messages[1].content))
+      order.push("training")
+      if (calls.hangTrainingReflection)
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => {
+            calls.aborted = true
+            reject(new Error("fixture request aborted"))
+          }
+          if (init?.signal?.aborted) abort()
+          else init?.signal?.addEventListener("abort", abort, { once: true })
+        })
+      result = {
+        executionAssessment: "Execution outcome follows the supplied exact records.",
+        trainingHealthAssessment: "A single observed epoch cannot establish convergence or generalization.",
+        nextTrainingQuestions: ["Which bounded learning rate intervention improves validation MSE?"],
+        limitations: ["No architectural hypothesis is assessed in training mode."],
+        ...(calls.invalidTrainingReflection
+          ? { hypothesisAssessment: { status: "supported", reason: "invalid cross-scope verdict" } }
+          : {}),
+      }
+    } else if (system.startsWith("You are ReflectionAgent in architecture mode")) {
+      if (calls.interruptArchitectureReflection) throw new Error("simulated architecture reflection interruption")
+      calls.reflection++
+      inputs.architecture.push(JSON.parse(body.messages[1].content))
+      order.push("architecture")
+      result = {
+        hypothesisAssessment: {
+          status: calls.forceArchitectureSupport ? "supported" : "inconclusive",
+          reason: "The supplied design summary distinguishes selected performance from matched architecture evidence.",
+        },
+        designAssessment: "The best eligible trial guides search; training comparisons do not isolate architecture.",
+        trainingConfounders: [],
+        nextArchitectureQuestions: ["Choose a matched architecture comparison."],
+        limitations: ["One dataset does not establish universal transferability."],
+      }
     } else if (system.startsWith("You are the NeoResearch HypoPlanner")) {
       calls.planner++
+      inputs.planner.push(JSON.parse(body.messages[1].content))
+      order.push("planner")
       result = {
         hypotheses: [],
         nextExperiment: { action: "stop", rationale: "The completed design answers this fixture's question" },
@@ -179,6 +229,8 @@ export function optimizerFixture() {
   }) as typeof fetch
   return {
     calls,
+    inputs,
+    order,
     restore() {
       globalThis.fetch = original
       keys.forEach((key, i) => {

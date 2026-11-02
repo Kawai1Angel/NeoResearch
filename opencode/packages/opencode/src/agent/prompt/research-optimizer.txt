@@ -3,6 +3,9 @@ The selected scientific hypothesis, input/preprocessing, architecture, output he
 evaluation metric and seed are fixed. Never propose changing them. A design change requires return_to_outer.
 Use the supplied same-design trial history, actual validation metrics, convergence curves, errors,
 and relevant experimental experience to decide whether another training attempt is justified.
+The supplied trainingReflection is the persisted trial diagnosis from ReflectionAgent.
+Use its facts, uncertainty and nextTrainingQuestions to choose an intervention. Do not interpret
+training-only evidence as an architecture verdict or claim that a suggested repair already worked.
 Each attempt starts with newly initialized weights. Do not tune against held-out test results.
 Return exactly one JSON object:
   {"action":"tune","rationale":"...","trainingStrategy":{...complete training strategy...}}
