@@ -216,6 +216,7 @@ async function captureFacts(task: TaskRow, runIDs: readonly string[]) {
           },
       ...(candidate ? { proposedModel: candidate.candidate_spec } : {}),
       ...(usage.hypothesisSnapshot ? { hypothesisSnapshot: record(usage.hypothesisSnapshot) } : {}),
+      ...(usage.trainingTrial ? { trainingTrial: record(usage.trainingTrial) } : {}),
       ...(hasSnapshot && snapshot.runtimeContext ? { runtimeContext: record(snapshot.runtimeContext) } : {}),
       ...(Object.keys(actual).length ? { executedModel: actual } : {}),
       executionVerified: execution.status === "verified" && Object.keys(actual).length > 0,
@@ -302,7 +303,7 @@ export async function writeExperience(taskID: ResearchTaskID, input: ExperienceD
       const contrasts = normalized.evidence.map((ref) => {
         const trial = facts.find((fact) => fact.runID === ref.runID)!
         const control = facts.find((fact) => fact.runID === ref.comparisonRunID)!
-        const changes = ExperimentConstraints.parse(trial.hypothesisSnapshot!.experimentContract).changes
+        const changes = ExperimentConstraints.parse(trial.trainingTrial?.contract ?? trial.hypothesisSnapshot?.experimentContract).changes
         return { ref, trial, control, changes, improved: trial.direction === "minimize" ? trial.primaryValue! < control.primaryValue! : trial.primaryValue! > control.primaryValue! }
       })
       const observation = contrasts.map(({ trial, control, changes }) => `${trial.runID} vs ${control.runID}: ${JSON.stringify(changes)}; ${trial.primaryMetric} ${control.primaryValue} -> ${trial.primaryValue} (${trial.direction}).`).join(" ")

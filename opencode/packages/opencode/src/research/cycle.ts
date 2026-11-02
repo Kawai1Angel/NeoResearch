@@ -74,6 +74,19 @@ export function chargeIteration(id: string) {
       .run(),
   )
 }
+
+/** Bind inner-loop policy once. An earlier standalone iteration keeps its spent budget. */
+export function configureDualLoopCycle(task: ResearchTask, runs: ResearchRun[], requested: Record<string, number | undefined>) {
+  const cycle = searchCycle(task, runs, { ...requested, dualLoopVersion: 1 })
+  if (cycle.policy.dualLoopVersion === 1) return cycle
+  return Database.transaction((db) => {
+    const current = db.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.id, cycle.id)).get()!
+    if (current.policy.dualLoopVersion === 1) return current
+    const policy = { ...requested, ...current.policy, dualLoopVersion: 1, iterationOnly: 0,
+      maxIterations: current.policy.iterationOnly === 1 ? requested.maxIterations : current.policy.maxIterations ?? requested.maxIterations }
+    return db.update(ResearchCycleTable).set({ policy }).where(eq(ResearchCycleTable.id, current.id)).returning().get()!
+  }, { behavior: "immediate" })
+}
 export function saveCrashStreak(id: string, crash_streak: number) {
   Database.use((db) => db.update(ResearchCycleTable).set({ crash_streak }).where(eq(ResearchCycleTable.id, id)).run())
 }

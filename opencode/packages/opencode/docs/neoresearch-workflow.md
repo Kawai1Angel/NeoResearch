@@ -228,6 +228,41 @@ Companion mode also has post-NAS checkpoints:
 - experiment_budget_extended: decide whether to extend the iteration budget.
 - final_model_selection: confirm the champion or accept current results.
 
+### Fixed-Design Inner Optimization
+
+Full TSF searches persist an outer architecture design and its inner training trials.
+HypoPlanner and ModelDesigner select a hypothesis and materialize a design once.
+OptimizerAgent then uses same-design validation results, training curves and experience
+ to propose complete training configurations. Preprocessing, structural dimensions,
+branches, output heads, evaluation protocol and seed stay fixed. Compatible loss,
+optimizer, learning rate, weight decay, scheduler, clipping, batch size and bounded
+training duration may change. Every trial starts with newly initialized weights.
+
+`maxTrialsPerDesign` defaults to 3, including the initial trial;
+`maxNoImprovePerDesign` defaults to 2. Both may be supplied to the loop/pipeline API
+or under `budget.loop`. Setting `maxTrialsPerDesign=1` disables iterative optimization.
+The selected reference baseline is evaluated once before discovery begins.
+
+The two loops share `maxIterations` (default 25). A full execution reserves one
+iteration transactionally before dispatch, including failed attempts. Reopening a
+search preserves consumed iterations and elapsed time. Verified cache hits refund
+the reservation and do not create independent evidence or advance plateau counters.
+Smoke checks do not consume full-training iterations and remain bounded by failure
+and resource limits. Inner stopping returns to the outer planner; global plateau,
+target and resource limits stop the research search.
+
+The `research_design` and `research_training_trial` tables retain immutable recipes,
+trial contracts, execution links, optimizer decisions and the best eligible full run.
+Initial architecture comparisons keep the hypothesis contract. Later tuning trials
+have their own named same-design comparisons; both contracts remain in run facts.
+Tuning gains cannot be attributed to architecture changes.
+
+Recovery exposes `activeDesignID`, `activeTrialID` and `loopPhase`. A terminal linked
+run is replayed without launching training again or charging the budget twice.
+Unconfirmed running processes and queued runs without a persisted plan require
+reconciliation. Before the first full attempt, failed implementation repair may
+create a new outer design while retaining the rejected design and smoke evidence.
+
 ### 6. Runner Execution
 
 The domain builds TSF run plans for Neo-Cast execution.

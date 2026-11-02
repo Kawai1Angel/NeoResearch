@@ -1,0 +1,157 @@
+import { Effect } from "effect"
+import { mkdir, writeFile } from "node:fs/promises"
+import path from "node:path"
+import { Research } from "../../src/research"
+import { TSFCandidateRecipe, buildTSFBaselines } from "../../src/research/domains/tsf"
+import { addHypothesisToPool, selectNextExperimentInPool } from "../../src/research/hypothesis-store"
+
+export const createDualLoopFixture = Effect.fn(function* (root: string, options: { rejectTuned?: boolean } = {}) {
+  const service = yield* Research.Service
+  const runner = path.join(root, "runner")
+  yield* Effect.promise(() => mkdir(path.join(runner, "py"), { recursive: true }))
+  const script = `const fs = require("fs"), crypto = require("crypto")
+if (process.argv.includes("init")) process.exit(0)
+const canonical = v => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v)
+const c = JSON.parse(fs.readFileSync(process.env.NEO_CAST_EXECUTION_CONTRACT))
+const recipe = JSON.parse(fs.readFileSync(process.env.NEO_CAST_CONTRACT_CANDIDATE))
+const lr = (recipe.training_strategy || recipe.model_config?.recipe?.training_strategy)?.optimizer?.lr || 0.001
+const metric = lr === 0.0005 ? ${options.rejectTuned ? -0.2 : 0.2} : lr === 0.0001 ? 0.25 : 0.3
+fs.appendFileSync(${JSON.stringify(path.join(root, "training-calls.jsonl"))}, JSON.stringify({ candidateID: c.candidate_id, stage: process.argv.includes("smoke") ? "smoke" : "full", lr }) + "\\n")
+const d = crypto.createHash("sha256").update(canonical(c)).digest("hex")
+const manifest = { event: "executed_model_manifest", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: d, actual: c.expected }
+console.log(JSON.stringify(manifest))
+console.log(JSON.stringify({ event: "execution_contract_verified", candidate_id: c.candidate_id, candidate_spec_sha256: c.candidate_spec_sha256, contract_digest: d, status: "verified", manifest }))
+console.log(JSON.stringify({ event: "epoch_end", epoch: 1, horizon: 8, val_loss: metric }))
+console.log(JSON.stringify({ event: "smoke_eval_done", val_avg_mse: metric }))
+console.log(JSON.stringify({ event: "eval_done", val_avg_mse: metric, val_h8_mse: metric, val_avg_mae: 0.4 }))
+console.log(JSON.stringify({ event: "cv_eval_done", cv_avg_mse: metric, cv_std_mse: 0.01, val_avg_mse: metric }))
+console.log(JSON.stringify({ event: "done", status: "success" }))
+`
+  yield* Effect.promise(() =>
+    Promise.all(["validate.py", "runner.py"].map((file) => writeFile(path.join(runner, "py", file), script))),
+  )
+  const taskSpec = {
+    contextLength: 12,
+    predictionLengths: [8],
+    dataset: { loaderID: "local_csv", targetCols: ["OT"] },
+    evaluation: { protocol: "fixed_split", metricPrimary: "val_avg_mse", seeds: [42] },
+    runtime: { pythonExecutable: process.execPath, neoCastProjectRoot: runner, bridgeOnly: true },
+  }
+  const recipe = TSFCandidateRecipe.parse(buildTSFBaselines(taskSpec)[0]!.candidateSpec)
+  const task = yield* service.createTask({
+    title: "Dual-loop fixture",
+    domainID: "tsf",
+    mode: "autonomous",
+    taskSpec: { ...taskSpec, metadata: { researchVariant: "zero" } },
+    objective: { primaryMetric: "val_avg_mse", direction: "minimize" },
+    budget: { maxRuns: 20 },
+  })
+  const hypothesis = yield* Effect.promise(() =>
+    addHypothesisToPool(task.id, {
+      id: "H-fixed",
+      statement: "A fixed temporal design tests the observed signal.",
+      suggestedBackbones: [recipe.backbone.type],
+      suggestedPreprocessing: [],
+      requiredMechanisms: [],
+      motivation: ["Current-task temporal observations"],
+      expectedOutcome: "Lower validation MSE",
+      risk: "low",
+      testable: true,
+      datasetEvidencePaths: [],
+      literatureEvidence: [],
+      applicabilityAssumptions: [],
+      falsificationCriteria: ["No validation improvement"],
+      evidenceLevel: "data_only",
+      experimentContract: {
+        mode: "exploratory",
+        changes: [],
+        frozenPaths: [],
+        requiredValues: [],
+        forbiddenMechanisms: [],
+      },
+    }),
+  )
+  yield* Effect.promise(() =>
+    selectNextExperimentInPool(task.id, {
+      action: "experiment",
+      hypothesisID: hypothesis.id,
+      rationale: "Execute the fixed design first",
+    }),
+  )
+  const candidate = yield* service.createCandidate({
+    taskID: task.id,
+    domainID: "tsf",
+    hypothesisID: hypothesis.id,
+    candidateSpec: recipe as Research.JsonRecord,
+    rationale: "Initial fixed design",
+    generatedBy: "human",
+    riskLevel: "low",
+    approvalStatus: "auto_approved",
+  })
+  return { task, candidate, hypothesis, recipe }
+})
+
+export function optimizerFixture() {
+  const keys = ["NEO_CAST_LLM_PROVIDER", "NEO_CAST_LLM_BASE_URL", "NEO_CAST_LLM_MODEL", "NEO_CAST_LLM_API_KEY"] as const
+  const previous = keys.map((key) => process.env[key])
+  const original = globalThis.fetch
+  process.env.NEO_CAST_LLM_PROVIDER = "openai-compatible"
+  process.env.NEO_CAST_LLM_BASE_URL = "http://dual-loop.fixture/v1"
+  process.env.NEO_CAST_LLM_MODEL = "fixture-model"
+  process.env.NEO_CAST_LLM_API_KEY = "fixture-key"
+  const calls = { optimizer: 0, planner: 0, interrupt: false, invalidDesign: false }
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body))
+    const system: string = body.messages[0].content
+    let result: unknown
+    if (system.startsWith("You are OptimizerAgent")) {
+      if (calls.interrupt) throw new Error("simulated optimizer interruption")
+      calls.optimizer++
+      const input = JSON.parse(body.messages[1].content)
+      const strategy = structuredClone(input.recipe.trainingStrategy)
+      strategy.optimizer.lr = calls.optimizer === 1 ? 0.0005 : 0.0001
+      result = {
+        action: "tune",
+        rationale: "The measured convergence supports testing another learning rate",
+        trainingStrategy: strategy,
+        ...(calls.invalidDesign ? { backbone: { type: "mlp" } } : {}),
+      }
+    } else if (system.startsWith("You are the NeoResearch HypoPlanner")) {
+      calls.planner++
+      result = {
+        hypotheses: [],
+        nextExperiment: { action: "stop", rationale: "The completed design answers this fixture's question" },
+      }
+    } else {
+      result = Object.fromEntries(
+        [
+          "trainingHealthAssessment",
+          "hypothesisValidation",
+          "attributionAnalysis",
+          "historicalComparison",
+          "modelDesignReflection",
+          "nextStepRecommendation",
+          "distillableMemory",
+        ].map((key) => [key, "Observed fixed-design training results; no independent architectural attribution."]),
+      )
+    }
+    const content = JSON.stringify(result)
+    return body.stream
+      ? new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, {
+          headers: { "content-type": "text/event-stream" },
+        })
+      : new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+          headers: { "content-type": "application/json" },
+        })
+  }) as typeof fetch
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = original
+      keys.forEach((key, i) => {
+        if (previous[i] === undefined) delete process.env[key]
+        else process.env[key] = previous[i]
+      })
+    },
+  }
+}

@@ -303,11 +303,12 @@ export function analyzeReflection(input: ReflectionInputs): ReflectionAnalysis {
       }
       const candidate = run.candidateID ? candidatesByID.get(run.candidateID) : undefined
       const snapshot = recordValue(run.resourceUsage.hypothesisSnapshot)
-      const comparisonID = recordValue(snapshot.experimentContract).comparisonRunID
+      const trainingTrial = recordValue(run.resourceUsage.trainingTrial)
+      const comparisonID = recordValue(trainingTrial.contract ?? snapshot.experimentContract).comparisonRunID
       const comparison = input.runs.find((r) => r.id === comparisonID)
       const comparisonCandidate = comparison?.candidateID ? candidatesByID.get(comparison.candidateID) : undefined
-      const assessment = assessAttribution({ executionVerified: recordValue(run.resourceUsage.executionContract).status === "verified", proposedModel: candidate?.candidateSpec, hypothesisSnapshot: snapshot }, comparisonCandidate ? { proposedModel: comparisonCandidate.candidateSpec } : undefined)
-      if (assessment.status === "eligible") hypothesisTestedRuns++
+      const assessment = assessAttribution({ executionVerified: recordValue(run.resourceUsage.executionContract).status === "verified", proposedModel: candidate?.candidateSpec, hypothesisSnapshot: snapshot, trainingTrial }, comparisonCandidate ? { proposedModel: comparisonCandidate.candidateSpec } : undefined)
+      if (assessment.status === "eligible" && assessment.scope === "architecture") hypothesisTestedRuns++
       else unattributableRuns++
       latestMetric = value
       const delta = bestMetric === undefined ? 0 : value - bestMetric

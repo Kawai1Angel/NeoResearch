@@ -143,7 +143,7 @@ export const CandidateApprovalStatus = Schema.Literals(["pending", "approved", "
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type CandidateApprovalStatus = Schema.Schema.Type<typeof CandidateApprovalStatus>
 
-export const CandidateGenerator = Schema.Literals(["llm", "heuristic", "mutation", "human"])
+export const CandidateGenerator = Schema.Literals(["llm", "heuristic", "mutation", "human", "optimizer"])
   .annotate({ identifier: "ResearchCandidateGenerator" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type CandidateGenerator = Schema.Schema.Type<typeof CandidateGenerator>
@@ -543,6 +543,8 @@ export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("Rese
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
   explorationRate: Schema.optional(Schema.Number),
+  maxTrialsPerDesign: Schema.optional(Schema.Number),
+  maxNoImprovePerDesign: Schema.optional(Schema.Number),
 }) {
   static readonly zod = zod(this)
 }
@@ -575,6 +577,8 @@ export class RunFullPipelineInput extends Schema.Class<RunFullPipelineInput>("Re
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
   explorationRate: Schema.optional(Schema.Number),
+  maxTrialsPerDesign: Schema.optional(Schema.Number),
+  maxNoImprovePerDesign: Schema.optional(Schema.Number),
   outputDir: Schema.optional(Schema.String),
   forceDatasetPreparation: Schema.optional(Schema.Boolean),
 }) {

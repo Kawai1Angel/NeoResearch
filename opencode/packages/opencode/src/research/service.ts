@@ -1,3 +1,7 @@
+import { abandonUntrainedDesign, activeDesign, cycleTrialResults, designTrials, candidateTrial, trialDesign, startDesign, resolveTrialContract, recordTrialRun, reserveTrialExecution, completeTrial, appendTrainingTrial, saveOptimizerDecision, finishDesign, setDesignPhase, currentCycle, type TrainingTrial, type ResearchDesign } from "./design-store"
+import { TrainingStrategy } from "./design-contract"
+import { OptimizerDecision, validateOptimizerDecision } from "./agents/optimizer-agent"
+import PROMPT_RESEARCH_OPTIMIZER from "../agent/prompt/research-optimizer.txt"
 import { finalMetrics, finalEvaluationRecords } from "./runner-evidence"
 import { copyModelExportRuntime } from "./model-export-runtime"
 import { ExperimentConstraints, conflictingMechanismRequirements } from "./experiment-constraints"
@@ -24,7 +28,7 @@ import { appendLog, recordResearchEvent, snapshotPhaseArtifact } from "./log-arc
 import { logPhaseMethod } from "./phase-log"
 import { executionOwner, runnerGroupExited } from "./owner"
 import { recordCompletedPhases } from "./phase-store"
-import { searchCycle, chargeIteration, saveCrashStreak, cycleClock, extendSearchCycle } from "./cycle"
+import { cycleDigest, configureDualLoopCycle, searchCycle, chargeIteration, saveCrashStreak, cycleClock, extendSearchCycle } from "./cycle"
 import {
   NAS_DEFAULT_MAX_ITERATIONS,
   NAS_DEFAULT_MAX_NO_IMPROVE,
@@ -3476,6 +3480,7 @@ export interface Interface {
   readonly resumeExecutionContractCheckpoint: (taskID: ResearchTaskID) => Effect.Effect<PreparedRun | undefined>
   readonly runAutonomousIteration: (input: AutonomousIterationInput) => Effect.Effect<AutonomousIterationResult>
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
+  readonly runOptimizerAgent: (input: { taskID: ResearchTaskID; designID: string }) => Effect.Effect<OptimizerDecision>
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
   readonly answerIntentQuestion: (input: AnswerIntentInput) => Effect.Effect<IntentAgentResult>
   readonly interpretAndApplySlotModification: (input: { taskID: ResearchTaskID; message: string }) => Effect.Effect<IntentAgentResult>
@@ -4658,8 +4663,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const time = nowTime()
       const activeCycle = yield* db((d) => d.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.active_task, input.taskID)).get())
       const experienceContext = yield* Effect.promise(() => captureExperienceContext(task))
-      const row = yield* db((d) =>
-        d
+      const row = yield* db(() => Database.transaction((d) => {
+        const row = d
           .insert(ResearchRunTable)
           .values({
             id: ResearchRunID.ascending(),
@@ -4675,8 +4680,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             time_started: status === "running" ? time.created : undefined,
           })
           .returning()
-          .get(),
-      )
+          .get()!
+        if (row.candidate_id) recordTrialRun(row.candidate_id, row.id, row.stage)
+        return row
+      }))
       const run = mapRun(row)
       yield* bus.publish(Event.RunCreated, { run })
       if (
@@ -4977,6 +4984,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const task = yield* getTask(input.taskID)
       const candidate = yield* getCandidateForTask(input.taskID, input.candidateID)
       assertCandidateApproved(task.id, candidate)
+      if (candidateTrial(candidate.id) && input.seed !== undefined &&
+          input.seed !== recordValue(recordValue(candidate.candidateSpec.trainingStrategy).budget).seed)
+        throw new Error("A fixed-design training trial cannot override its seed")
 
       const stage = input.stage ?? "smoke"
       yield* ensureRunApprovalGates(task, candidate, stage)
@@ -5079,6 +5089,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         status: "queued",
         resourceUsage: { ...(input.seed === undefined ? {} : { seed: input.seed }), ...(interrupted ? { retry_of: interrupted.id } : {}),
           hypothesisSnapshot: JSON.parse(JSON.stringify((yield* listHypotheses(task.id)).find((h) => h.id === candidate.hypothesisID) ?? null)),
+          ...(resolveTrialContract(candidate) ? { trainingTrial: (() => {
+            const bound = resolveTrialContract(candidate)!
+            return { designID: bound.design.id, trialID: bound.trial.id, index: bound.trial.trial_index,
+              contract: bound.trial.contract, outerContract: bound.design.outer_contract,
+              scope: bound.trial.contract ? "optimization" : "architecture" }
+          })() } : {}),
         },
       })
 
@@ -5321,6 +5337,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (executionTask.domainID === "tsf" && prepared.run.stage !== "ref_test" && prepared.run.stage !== "blind_test") {
         recoveryBlocker = yield* assertExecutionCheckpoint(executionTask.id, prepared.run.candidateID, prepared.run.stage)
         const candidate = yield* getCandidateForTask(executionTask.id, prepared.run.candidateID!)
+        const trial = candidateTrial(candidate.id)
+        if (trial && currentCycle(trialDesign(trial).cycle_id).input_digest !== cycleDigest(executionTask))
+          throw new Error("Fixed-design data or evaluation protocol changed; create an explicit new research cycle")
         const spec = typeof prepared.run.resourceUsage.seed === "number" ? candidateSpecWithSeed(candidate.candidateSpec, prepared.run.resourceUsage.seed) : candidate.candidateSpec
         const currentPlan = DomainRegistry.createRunPlan(executionTask.domainID, { taskSpec: executionTask.taskSpec, candidateSpec: spec, stage: prepared.run.stage as DomainRunStage })
         const currentContract = buildExecutionContract(executionTask, candidate, currentPlan.writes[0].content)
@@ -5339,6 +5358,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           yield* blockExecutionContract(executionTask, candidate, currentContract, mismatches, invalidRun)
         }
       }
+      if (prepared.run.stage === "full" && prepared.run.candidateID)
+        reserveTrialExecution(prepared.run.candidateID, prepared.run.id)
       const running = yield* updateRunStatus({ runID: prepared.run.id, status: "running" })
       const liveProgressPath = path.join(Instance.directory, ".neo-research", "runner-progress", running.taskID, `${running.id}.jsonl`)
       appendLog(liveProgressPath, { event: "runner_started", runID: running.id, taskID: running.taskID, stage: running.stage })
@@ -5568,6 +5589,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               const canonical = existsSync(workspace) ? realpathSync(workspace) : workspace
               const owned = d.select().from(ResearchRunnerLockTable).where(eq(ResearchRunnerLockTable.workspace, canonical)).get()
               if (owned) throw new Error(`Runner workspace is still owned by another attempt: ${canonical}`)
+              if (prepared.run.candidateID && candidateTrial(prepared.run.candidateID)) {
+                const latest = d.select().from(ResearchRunTable).where(eq(ResearchRunTable.id, prepared.run.id)).get()
+                if (latest?.status !== "queued") throw new Error("Training trial was already started or finalized; reconcile the persisted execution")
+              }
               const active = d.select({ taskID: ResearchRunTable.task_id }).from(ResearchRunnerLockTable)
                 .innerJoin(ResearchRunTable, eq(ResearchRunnerLockTable.run_id, ResearchRunTable.id))
                 .innerJoin(ResearchTaskTable, eq(ResearchRunTable.task_id, ResearchTaskTable.id))
@@ -5956,11 +5981,264 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       }
     })
 
+    // Replay an existing terminal stage; an unknown running stage requires the normal owner reconciliation.
+    const executeTrialStage = Effect.fn("Research.executeTrialStage")(function* (input: PrepareRunInput) {
+      const trial = candidateTrial(input.candidateID)
+      if (trial && currentCycle(trialDesign(trial).cycle_id).input_digest !== cycleDigest(yield* getTask(input.taskID)))
+        throw new Error("Fixed-design data or evaluation protocol changed; create an explicit new research cycle")
+      const linked = input.stage === "smoke" ? trial?.smoke_run_id : input.stage === "full" ? trial?.full_run_id : undefined
+      const existing = linked ? yield* getRunForTask(input.taskID, linked) : undefined
+      if (!existing) return yield* executeRun(input)
+      if (existing.status === "queued") {
+        const queued = yield* loadQueuedPreparedRun(input)
+        if (!queued || queued.run.id !== existing.id) throw new Error("Persisted queued training trial has no verified plan; reconcile before resuming")
+        return yield* executePreparedRun(queued)
+      }
+      if (existing.status === "running") throw new Error("Training trial execution is unconfirmed; reconcile the original runner before resuming")
+      const plan = yield* Effect.promise(async () => {
+        const payload = JSON.parse(await readFile(path.join(Instance.directory, ".neo-research/run-plans", input.taskID, `${existing.id}.json`), "utf8"))
+        if (payload.taskID !== input.taskID || payload.runID !== existing.id || payload.candidateID !== input.candidateID)
+          throw new Error("Persisted training trial plan identity changed")
+        return DomainRunPlanSchema.parse(payload.runPlan)
+      })
+      return { run: existing, runPlan: plan }
+    })
+
+    const runPendingTrainingTrial = Effect.fn("Research.runPendingTrainingTrial")(function* (input: AutonomousIterationInput, trial: TrainingTrial) {
+      const task = yield* getTask(input.taskID)
+      const candidate = yield* getCandidateForTask(task.id, trial.candidate_id)
+      resolveTrialContract(candidate)
+      const managerTrace: ResearchManagerStep[] = [managerStep("design", "completed",
+        "Resumed the persisted fixed design; no architecture planning was performed.",
+        { designID: trial.design_id, trialID: trial.id, trialIndex: trial.trial_index, agent: "OptimizerAgent" })]
+      const evaluated = yield* compileAndEvaluateCandidate({ task, candidate, input, managerTrace })
+      const selectionArtifact = yield* writeCandidateSelectionArtifact({ task, candidate, run: evaluated.finalRun,
+        taskFingerprint: { designID: trial.design_id, trialID: trial.id, loop: "inner" }, selectionSource: "existing_frontier",
+        rankings: [], readyCandidateIDs: [candidate.id], attemptedCandidateIDs: [], inconclusiveCandidateIDs: [] })
+      let run = yield* attachArtifactRefToRun(evaluated.finalRun, selectionArtifact.id)
+      const trace = yield* writeManagerTraceArtifact({ task, candidate, run, managerTrace })
+      run = yield* attachArtifactRefToRun(run, trace.id)
+      const result: AutonomousIterationResult = { ...evaluated.executed, run, candidate, seededCandidates: [], approvals: [], managerTrace, selectionArtifact }
+      completeTrial(candidate.id, JSON.parse(JSON.stringify(result)), run, objectiveMetricName(task.objective), objectiveDirection(task.objective))
+      return result
+    })
+
+    const compileAndEvaluateCandidate = Effect.fn("Research.compileAndEvaluateCandidate")(function* (args: {
+      task: ResearchTask; candidate: ResearchCandidate; input: AutonomousIterationInput;
+      seed?: number; managerTrace: ResearchManagerStep[];
+    }) {
+      const { task, candidate, input, managerTrace } = args
+      const resumeSeed = args.seed
+      const runs = yield* listRuns(task.id)
+      const primaryMetricName = objectiveMetricName(task.objective)
+      const requestedStage = input.stage ?? "full"
+      if (
+        requestedStage !== "smoke" &&
+        stageRequiresDomainActionApproval(requestedStage) &&
+        candidateUsesNativeDomainAction(candidate.candidateSpec)
+      ) {
+        yield* ensureRunApprovalGates(task, candidate, requestedStage)
+      }
+
+      const memoryBeforeRun = yield* listMemory(task.id)
+      let compileRun = yield* executeTrialStage({
+        taskID: task.id,
+        candidateID: candidate.id,
+        stage: "smoke",
+        seed: resumeSeed,
+        description: input.description,
+      })
+      const compilerResult = buildModelCompilerResult({
+        taskID: task.id,
+        candidateID: candidate.id,
+        smokeRun: compileRun.run,
+      })
+      if (compilerResult.status !== "passed" && compileRun.run.status !== "failed") {
+        compileRun = {
+          ...compileRun,
+          run: yield* updateRunStatus({
+            runID: compileRun.run.id,
+            status: "failed",
+            error: compilerResult.failureReason ?? `ModelCompilerAgent marked smoke as ${compilerResult.status}.`,
+          }),
+        }
+      }
+      const compileArtifact = yield* writeModelCompileArtifact({
+        task,
+        run: compileRun.run,
+        compilerResult,
+      })
+      compileRun = {
+        ...compileRun,
+        run: yield* attachArtifactRefToRun(compileRun.run, compileArtifact.id),
+      }
+
+      let executed = compileRun
+      if (requestedStage !== "smoke" && compilerResult.status === "passed") {
+        executed = yield* executeTrialStage({
+          taskID: task.id,
+          candidateID: candidate.id,
+          stage: requestedStage,
+          seed: resumeSeed,
+          description: input.description,
+        })
+      }
+      // --- Verifier Agent: run post-execution checks only when primary metric is present ---
+      let finalRun = executed.run
+      const primaryMetric = metricValue(executed.run.metrics, primaryMetricName)
+      let verifierReportForTrainEval: VerifierReport | undefined
+      if (executed.run.status === "succeeded" && primaryMetric !== undefined) {
+        const prevRuns =
+          executed.run.id === compileRun.run.id
+            ? runs.filter((r) => r.id !== executed.run.id)
+            : [...runs, compileRun.run].filter((r) => r.id !== executed.run.id)
+        const currentChampion = yield* getChampion(task.id)
+        const verReport = runVerifiers({
+          task,
+          run: executed.run,
+          candidate,
+          previousRuns: prevRuns,
+          champion: currentChampion,
+        })
+        verifierReportForTrainEval = verReport
+        yield* db((d) => d.update(ResearchRunTable).set({ resource_usage: { ...executed.run.resourceUsage, verification: { status: verReport.status, checks: JSON.parse(JSON.stringify(verReport.results)), eligibleForRanking: verReport.eligibleForRanking } } as JsonRecord }).where(eq(ResearchRunTable.id, executed.run.id)).run())
+        const evalMarkdown = buildEvaluationResultMarkdown({
+          task,
+          run: executed.run,
+          candidate,
+          report: verReport,
+        })
+        const decisionRecord = buildVerifierDecisionRecord({
+          task,
+          run: executed.run,
+          candidate,
+          report: verReport,
+        })
+        const evalDir = path.join(Instance.directory, ".neo-research", "evaluation-results", task.id)
+        const evalPath = path.join(evalDir, `${executed.run.id}.md`)
+        const decisionPath = path.join(evalDir, `${executed.run.id}.verifier_decision.json`)
+        yield* Effect.promise(async () => {
+          await mkdir(evalDir, { recursive: true })
+          await writeFile(evalPath, evalMarkdown, "utf8")
+          await writeFile(decisionPath, `${JSON.stringify(decisionRecord, null, 2)}\n`, "utf8")
+        })
+        const evalArtifact = yield* createArtifact({
+          taskID: task.id,
+          runID: executed.run.id,
+          kind: "evaluation_result_md",
+          uri: `file://${evalPath}`,
+          metadata: {
+            accepted: verReport.accepted,
+            rejectReason: verReport.rejectReason ?? null,
+            verifierCount: verReport.results.length,
+            rejectedVerifiers: verReport.results.filter((r) => r.status === "failed").map((r) => r.name),
+          },
+        })
+        const decisionArtifact = yield* createArtifact({
+          taskID: task.id,
+          runID: executed.run.id,
+          kind: "verifier_decision_json",
+          uri: `file://${decisionPath}`,
+          metadata: {
+            accepted: decisionRecord.accepted,
+            decision: decisionRecord.decision,
+            rejectReason: decisionRecord.rejectReason,
+            failureCategory: decisionRecord.failure?.category ?? null,
+            recoveryAction: decisionRecord.failure?.recoveryAction.type ?? null,
+            verifierCount: decisionRecord.checks.length,
+          },
+        })
+        if (verReport.status === "failed") {
+          finalRun = yield* updateRunStatus({
+            runID: executed.run.id,
+            status: "rejected",
+            error: verReport.rejectReason ?? "Rejected by VerifierAgent",
+            artifactRefs: [...executed.run.artifactRefs, evalArtifact.id, decisionArtifact.id],
+          })
+          yield* bus.publish(Event.RunRejectedByVerifier, {
+            taskID: task.id,
+            agent: "VerifierAgent",
+            stage: "verification",
+            status: "completed",
+            metadata: {
+              runID: executed.run.id,
+              accepted: false,
+              rejectReason: verReport.rejectReason ?? null,
+              verifierCount: verReport.results.length,
+            },
+          })
+        } else {
+          finalRun = yield* attachArtifactRefToRun(executed.run, evalArtifact.id)
+          finalRun = yield* attachArtifactRefToRun(finalRun, decisionArtifact.id)
+          yield* bus.publish(Event.RunVerified, {
+            taskID: task.id,
+            agent: "VerifierAgent",
+            stage: "verification",
+            status: "completed",
+            metadata: {
+              runID: executed.run.id,
+              accepted: verReport.accepted,
+              verificationStatus: verReport.status,
+              verifierCount: verReport.results.length,
+            },
+          })
+        }
+        managerTrace.push(
+          managerStep(
+            "verifier",
+            verReport.status === "failed" ? "blocked" : "completed",
+            verReport.status === "insufficient_evidence" ? "VerifierAgent retained the observation with incomplete verification; missing checks did not pass." : verReport.accepted
+              ? "VerifierAgent accepted the run after all checks passed."
+              : `VerifierAgent rejected the run: ${verReport.rejectReason}`,
+            {
+              runID: executed.run.id,
+              selectedCandidateID: candidate.id,
+              verifierAccepted: verReport.accepted,
+              ...(verReport.rejectReason !== undefined ? { rejectReason: verReport.rejectReason } : {}),
+              rejectedVerifiers: verReport.results.filter((r) => r.status === "failed").map((r) => r.name),
+            },
+          ),
+        )
+      }
+
+      const trainEvalResult: TrainEvalResult | undefined =
+        requestedStage === "low_fidelity" || requestedStage === "full"
+          ? buildTrainEvalResult({
+              taskID: task.id,
+              run: finalRun,
+              candidate,
+              stage: requestedStage,
+              primaryMetricName,
+              ...(verifierReportForTrainEval === undefined ? {} : { verifierReport: verifierReportForTrainEval }),
+            })
+          : undefined
+
+      finalRun = yield* getRunForTask(task.id, finalRun.id)
+      // Runner completion may provisionally promote a model before post-run verification.
+      // A rejected tuning trial must not remain the task champion or block later valid trials.
+      if (finalRun.status !== "succeeded" && (yield* getChampion(task.id))?.runID === finalRun.id) {
+        yield* db((db) => db.delete(ResearchChampionTable).where(and(eq(ResearchChampionTable.task_id, task.id), eq(ResearchChampionTable.run_id, finalRun.id))).run())
+        const eligible = (yield* listRuns(task.id)).filter((run) => run.stage === "full" && run.status === "succeeded" &&
+          recordValue(run.resourceUsage.executionContract).status === "verified" &&
+          recordValue(run.resourceUsage.verification).status !== "failed" && recordValue(run.resourceUsage.verification).eligibleForRanking !== false)
+        for (const run of eligible.sort((a, b) => a.time.created - b.time.created)) yield* evaluateSucceededRun(run)
+      }
+      return { executed, compilerResult, finalRun, trainEvalResult, primaryMetric, memoryBeforeRun }
+    })
+
     const runAutonomousIterationAttempt = Effect.fn("Research.runAutonomousIterationAttempt")(function* (
       input: AutonomousIterationInput,
     ) {
       const task = yield* getTask(input.taskID)
       const recovery = yield* ContractRecovery
+      if (task.domainID === "tsf" && (input.stage ?? "full") === "full") {
+        const design = activeDesign(task.id)
+        if (design && recovery?.feedback) abandonUntrainedDesign(design)
+        else {
+          const pending = design && designTrials(design.id).find((trial) => trial.status !== "completed")
+          if (pending) return yield* runPendingTrainingTrial(input, pending)
+        }
+      }
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
       const resumeBlocker = yield* assertExecutionCheckpoint(task.id)
       const resumeCandidate = resumeBlocker ? yield* getCandidateForTask(task.id, String(resumeBlocker.metadata.candidateID) as ResearchCandidateID) : undefined
@@ -6511,187 +6789,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         ),
       )
 
-      const requestedStage = input.stage ?? "full"
-      if (
-        requestedStage !== "smoke" &&
-        stageRequiresDomainActionApproval(requestedStage) &&
-        candidateUsesNativeDomainAction(candidate.candidateSpec)
-      ) {
-        yield* ensureRunApprovalGates(task, candidate, requestedStage)
+      if (task.domainID === "tsf" && (input.stage ?? "full") === "full") {
+        const cycle = searchCycle(task, yield* listRuns(task.id), {
+          maxIterations: autonomousLoopMaxIterations(undefined, task), iterationOnly: 1,
+        })
+        startDesign(cycle.id, candidate, candidateHypothesis)
       }
-
-      const memoryBeforeRun = yield* listMemory(task.id)
-      let compileRun = yield* executeRun({
-        taskID: task.id,
-        candidateID: candidate.id,
-        stage: "smoke",
-        seed: resumeSeed,
-        description: input.description,
-      })
-      const compilerResult = buildModelCompilerResult({
-        taskID: task.id,
-        candidateID: candidate.id,
-        smokeRun: compileRun.run,
-      })
-      if (compilerResult.status !== "passed" && compileRun.run.status !== "failed") {
-        compileRun = {
-          ...compileRun,
-          run: yield* updateRunStatus({
-            runID: compileRun.run.id,
-            status: "failed",
-            error: compilerResult.failureReason ?? `ModelCompilerAgent marked smoke as ${compilerResult.status}.`,
-          }),
-        }
-      }
-      const compileArtifact = yield* writeModelCompileArtifact({
-        task,
-        run: compileRun.run,
-        compilerResult,
-      })
-      compileRun = {
-        ...compileRun,
-        run: yield* attachArtifactRefToRun(compileRun.run, compileArtifact.id),
-      }
-
-      let executed = compileRun
-      if (requestedStage !== "smoke" && compilerResult.status === "passed") {
-        executed = yield* executeRun({
-          taskID: task.id,
-          candidateID: candidate.id,
-          stage: requestedStage,
-          seed: resumeSeed,
-          description: input.description,
-        })
-      }
-      // --- Verifier Agent: run post-execution checks only when primary metric is present ---
-      let finalRun = executed.run
-      const primaryMetric = metricValue(executed.run.metrics, primaryMetricName)
-      let verifierReportForTrainEval: VerifierReport | undefined
-      if (executed.run.status === "succeeded" && primaryMetric !== undefined) {
-        const prevRuns =
-          executed.run.id === compileRun.run.id
-            ? runs.filter((r) => r.id !== executed.run.id)
-            : [...runs, compileRun.run].filter((r) => r.id !== executed.run.id)
-        const currentChampion = yield* getChampion(task.id)
-        const verReport = runVerifiers({
-          task,
-          run: executed.run,
-          candidate,
-          previousRuns: prevRuns,
-          champion: currentChampion,
-        })
-        verifierReportForTrainEval = verReport
-        yield* db((d) => d.update(ResearchRunTable).set({ resource_usage: { ...executed.run.resourceUsage, verification: { status: verReport.status, checks: JSON.parse(JSON.stringify(verReport.results)), eligibleForRanking: verReport.eligibleForRanking } } as JsonRecord }).where(eq(ResearchRunTable.id, executed.run.id)).run())
-        const evalMarkdown = buildEvaluationResultMarkdown({
-          task,
-          run: executed.run,
-          candidate,
-          report: verReport,
-        })
-        const decisionRecord = buildVerifierDecisionRecord({
-          task,
-          run: executed.run,
-          candidate,
-          report: verReport,
-        })
-        const evalDir = path.join(Instance.directory, ".neo-research", "evaluation-results", task.id)
-        const evalPath = path.join(evalDir, `${executed.run.id}.md`)
-        const decisionPath = path.join(evalDir, `${executed.run.id}.verifier_decision.json`)
-        yield* Effect.promise(async () => {
-          await mkdir(evalDir, { recursive: true })
-          await writeFile(evalPath, evalMarkdown, "utf8")
-          await writeFile(decisionPath, `${JSON.stringify(decisionRecord, null, 2)}\n`, "utf8")
-        })
-        const evalArtifact = yield* createArtifact({
-          taskID: task.id,
-          runID: executed.run.id,
-          kind: "evaluation_result_md",
-          uri: `file://${evalPath}`,
-          metadata: {
-            accepted: verReport.accepted,
-            rejectReason: verReport.rejectReason ?? null,
-            verifierCount: verReport.results.length,
-            rejectedVerifiers: verReport.results.filter((r) => r.status === "failed").map((r) => r.name),
-          },
-        })
-        const decisionArtifact = yield* createArtifact({
-          taskID: task.id,
-          runID: executed.run.id,
-          kind: "verifier_decision_json",
-          uri: `file://${decisionPath}`,
-          metadata: {
-            accepted: decisionRecord.accepted,
-            decision: decisionRecord.decision,
-            rejectReason: decisionRecord.rejectReason,
-            failureCategory: decisionRecord.failure?.category ?? null,
-            recoveryAction: decisionRecord.failure?.recoveryAction.type ?? null,
-            verifierCount: decisionRecord.checks.length,
-          },
-        })
-        if (verReport.status === "failed") {
-          finalRun = yield* updateRunStatus({
-            runID: executed.run.id,
-            status: "rejected",
-            error: verReport.rejectReason ?? "Rejected by VerifierAgent",
-            artifactRefs: [...executed.run.artifactRefs, evalArtifact.id, decisionArtifact.id],
-          })
-          yield* bus.publish(Event.RunRejectedByVerifier, {
-            taskID: task.id,
-            agent: "VerifierAgent",
-            stage: "verification",
-            status: "completed",
-            metadata: {
-              runID: executed.run.id,
-              accepted: false,
-              rejectReason: verReport.rejectReason ?? null,
-              verifierCount: verReport.results.length,
-            },
-          })
-        } else {
-          finalRun = yield* attachArtifactRefToRun(executed.run, evalArtifact.id)
-          finalRun = yield* attachArtifactRefToRun(finalRun, decisionArtifact.id)
-          yield* bus.publish(Event.RunVerified, {
-            taskID: task.id,
-            agent: "VerifierAgent",
-            stage: "verification",
-            status: "completed",
-            metadata: {
-              runID: executed.run.id,
-              accepted: verReport.accepted,
-              verificationStatus: verReport.status,
-              verifierCount: verReport.results.length,
-            },
-          })
-        }
-        managerTrace.push(
-          managerStep(
-            "verifier",
-            verReport.status === "failed" ? "blocked" : "completed",
-            verReport.status === "insufficient_evidence" ? "VerifierAgent retained the observation with incomplete verification; missing checks did not pass." : verReport.accepted
-              ? "VerifierAgent accepted the run after all checks passed."
-              : `VerifierAgent rejected the run: ${verReport.rejectReason}`,
-            {
-              runID: executed.run.id,
-              selectedCandidateID: candidate.id,
-              verifierAccepted: verReport.accepted,
-              ...(verReport.rejectReason !== undefined ? { rejectReason: verReport.rejectReason } : {}),
-              rejectedVerifiers: verReport.results.filter((r) => r.status === "failed").map((r) => r.name),
-            },
-          ),
-        )
-      }
-
-      const trainEvalResult: TrainEvalResult | undefined =
-        requestedStage === "low_fidelity" || requestedStage === "full"
-          ? buildTrainEvalResult({
-              taskID: task.id,
-              run: finalRun,
-              candidate,
-              stage: requestedStage,
-              primaryMetricName,
-              ...(verifierReportForTrainEval === undefined ? {} : { verifierReport: verifierReportForTrainEval }),
-            })
-          : undefined
+      const { executed, compilerResult, finalRun, trainEvalResult, primaryMetric, memoryBeforeRun } =
+        yield* compileAndEvaluateCandidate({ task, candidate, input, seed: resumeSeed, managerTrace })
 
       const runSucceeded = finalRun.status === "succeeded"
       managerTrace.push(
@@ -6783,15 +6888,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       })
       const run = yield* attachArtifactRefToRun(selectedRun, managerTraceArtifact.id)
 
-      return {
-        ...executed,
-        run,
-        candidate,
-        seededCandidates: seeded.candidates,
-        approvals: [...seeded.approvals, ...proposalApprovals],
-        managerTrace,
-        selectionArtifact,
+      const result = {
+        ...executed, run, candidate, seededCandidates: seeded.candidates,
+        approvals: [...seeded.approvals, ...proposalApprovals], managerTrace, selectionArtifact,
       }
+      completeTrial(candidate.id, JSON.parse(JSON.stringify(result)), run, primaryMetricName, objectiveDirection(task.objective))
+      return result
     })
 
     const blockModelDesign = Effect.fn("Research.blockModelDesign")(function* (taskID: ResearchTaskID, reason: string) {
@@ -6946,7 +7048,188 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       return hasBlockingApproval ? ("approval_required" as const) : undefined
     })
 
+    const runOptimizerAgent = logPhaseMethod("runOptimizerAgent", Effect.fn("Research.runOptimizerAgent")(function* (input: { taskID: ResearchTaskID; designID: string }) {
+      const task = yield* getTask(input.taskID)
+      const design = activeDesign(task.id)
+      if (!design || design.id !== input.designID) throw new Error("OptimizerAgent requires the active design")
+      const trials = designTrials(design.id)
+      const latest = trials[trials.length - 1]
+      if (!latest || latest.status !== "completed") throw new Error("Complete the active trial before requesting optimization")
+      if (latest.optimizer_decision) return OptimizerDecision.parse(latest.optimizer_decision)
+      yield* bus.publish(Event.OptimizerAgentStarted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "started" })
+      const comparison = design.best_run_id ? comparisonRecipe(task.id, design.best_run_id) : undefined
+      let decision: OptimizerDecision
+      if (!comparison) {
+        decision = { action: "return_to_outer", rationale: "No independently verified full result is available for a controlled training comparison." }
+      } else {
+        const artifacts = yield* listArtifacts(task.id)
+        const history = yield* Effect.promise(() => Promise.all(trials.map(async (trial) => {
+          const result = trial.result as unknown as AutonomousIterationResult | null
+          const progress = artifacts.find((artifact) => artifact.runID === trial.full_run_id && artifact.kind === "runner_progress_jsonl")
+          return { trialID: trial.id, index: trial.trial_index, run: result?.run,
+            trainingStrategy: result?.candidate.candidateSpec.trainingStrategy,
+            trainingCurve: progress?.uri.startsWith("file://") ? await extractTrainingCurve(progress.uri.slice(7)) : [] }
+        })))
+        const runtime = recordValue(task.taskSpec.runtime)
+        const effective = yield* Effect.promise(() => resolveEffectiveLLMConfig({ workspaceRoot: Instance.directory,
+          neoCastProjectRoot: typeof runtime.neoCastProjectRoot === "string" ? runtime.neoCastProjectRoot : undefined }))
+        const user = JSON.stringify({ agent: "OptimizerAgent", designID: design.id, hypothesisID: design.hypothesis_id,
+          fixedDesignDigest: design.design_digest, recipe: comparison, history,
+          selectionMetric: objectiveMetricName(task.objective), constraints: task.taskSpec.constraints ?? {},
+          remainingIterations: currentCycle(design.cycle_id).policy.maxIterations! - currentCycle(design.cycle_id).iterations,
+          experiences: readExperiences(task.id, { scope: "shared", query: "optimizer learning rate", intent: "intervention", limit: 3 }).map(experienceSummaryForPrompt),
+          responseSchema: z.toJSONSchema(OptimizerDecision) })
+        try {
+          const session = yield* requestViaSession({ rootSessionID: task.sessionID, taskID: task.id,
+            agent: "research-optimizer", stageLabel: "OptimizerAgent", user,
+            modelRef: effective ? mapToModelRef(effective.config) : undefined, onDelta: () => Effect.void })
+          const response = session ?? (effective ? yield* Effect.promise(() => requestNeoCastLLM(effective.config, effective.apiKey, PROMPT_RESEARCH_OPTIMIZER, user)) : undefined)
+          if (!response) throw new Error("OptimizerAgent has no configured reasoning model")
+          decision = validateOptimizerDecision(extractJsonObject(response.text), comparison, (task.taskSpec.constraints ?? {}) as JsonRecord)
+          if (decision.action === "tune") {
+            const next = { ...comparison, trainingStrategy: decision.trainingStrategy }
+            const validation = DomainRegistry.validateCandidate(task.domainID, { taskSpec: task.taskSpec, candidateSpec: next as JsonRecord })
+            if (!validation.ok) throw new Error(`OptimizerAgent produced an invalid training recipe: ${validation.issues.map((issue) => issue.message).join("; ")}`)
+          }
+        } catch (error) {
+          yield* bus.publish(Event.OptimizerAgentFailed, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "failed", metadata: { designID: design.id, error: String(error) } })
+          throw error
+        }
+      }
+      saveOptimizerDecision(latest.id, JSON.parse(JSON.stringify(decision)))
+      yield* bus.publish(Event.OptimizerAgentCompleted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "completed",
+        metadata: { designID: design.id, trialID: latest.id, decision: JSON.parse(JSON.stringify(decision)) } })
+      return decision
+    }))
+
+    const runDualLoopSearch = Effect.fn("Research.runDualLoopSearch")(function* (input: AutonomousLoopInput) {
+      const task = yield* getTask(input.taskID)
+      if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
+      yield* assertExecutionCheckpoint(task.id)
+      const positive = (value: number | undefined, fallback: number) => {
+        const result = value ?? fallback
+        if (!Number.isInteger(result) || result < 1) throw new Error("Dual-loop limits must be positive integers")
+        return result
+      }
+      const cycle = configureDualLoopCycle(task, yield* listRuns(task.id), {
+        maxIterations: autonomousLoopMaxIterations(input.maxIterations, task),
+        maxNoImprove: loopPolicyInteger(input.maxNoImprove, task, "maxNoImprove", "maxNoImproveRounds") ?? NAS_DEFAULT_MAX_NO_IMPROVE,
+        maxTrialsPerDesign: positive(input.maxTrialsPerDesign ?? loopPolicyInteger(undefined, task, "maxTrialsPerDesign"), 3),
+        maxNoImprovePerDesign: positive(input.maxNoImprovePerDesign ?? loopPolicyInteger(undefined, task, "maxNoImprovePerDesign"), 2),
+        timeBudgetSeconds: loopPolicyValue(input.timeBudgetSeconds, task, "timeBudgetSeconds", "timeBudgetS"),
+        targetMetricValue: loopPolicyValue(input.targetMetricValue, task, "targetMetricValue", "target"),
+        minRelativeImprovement: loopPolicyValue(input.minRelativeImprovement, task, "minRelativeImprovement", "minImprovement") ?? 0,
+        maxCrashStreak: loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak") ?? 3,
+      })
+      const policy = cycle.policy
+      const maxIterations = policy.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS
+      const metricName = objectiveMetricName(task.objective)
+      const direction = objectiveDirection(task.objective)
+      const iterations = cycleTrialResults(cycle.id) as unknown as AutonomousIterationResult[]
+      const stopClock = cycleClock(cycle.id)
+      const finish = (reason: AutonomousLoopStoppedReason) => Effect.gen(function* () {
+        const design = activeDesign(task.id)
+        if (design && reason !== "approval_required" && !designTrials(design.id).some((trial) => trial.status !== "completed"))
+          finishDesign(design.id, reason)
+        return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason })
+      })
+      return yield* Effect.gen(function* () {
+        while (true) {
+          const state = currentCycle(cycle.id)
+          const design = activeDesign(task.id)
+          if (design && design.cycle_id !== cycle.id) throw new Error("Active design belongs to a different research cycle")
+          const trials = design ? designTrials(design.id) : []
+          const pending = trials.find((trial) => trial.status !== "completed")
+          const runs = (yield* listRuns(task.id)).filter((run) => run.resourceUsage.cycleID === cycle.id)
+          const pendingRun = pending?.full_run_id ? runs.find((run) => run.id === pending.full_run_id) : undefined
+          const pendingSmoke = pending?.smoke_run_id ? runs.find((run) => run.id === pending.smoke_run_id) : undefined
+          if (pendingRun?.status === "running" || pendingSmoke?.status === "running")
+            throw new Error("Training trial execution is unconfirmed; reconcile the original runner before resuming")
+          const finalizing = pendingRun && !["queued", "running"].includes(pendingRun.status)
+          const metrics = sessionLocalMetricState({ runs: runs.filter((run) => run.status === "succeeded" && recordValue(run.resourceUsage.verification).eligibleForRanking !== false),
+            stage: "full", primaryMetricName: metricName, direction, minRelativeImprovement: policy.minRelativeImprovement ?? 0 })
+          if (!finalizing) {
+            if (policy.timeBudgetSeconds !== undefined && state.elapsed_ms >= policy.timeBudgetSeconds * 1000) return yield* finish("time_budget_exhausted")
+            if (state.iterations >= maxIterations && !pending?.charged) return yield* finish("max_iterations")
+            if (state.crash_streak >= (policy.maxCrashStreak ?? 3)) return yield* finish("crash_streak_exceeded")
+            if (metrics.noImproveStreak >= (policy.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE)) return yield* finish("plateau")
+            if (policy.targetMetricValue !== undefined && metrics.bestMetric !== undefined &&
+                (direction === "minimize" ? metrics.bestMetric <= policy.targetMetricValue : metrics.bestMetric >= policy.targetMetricValue)) return yield* finish("target_reached")
+          }
+          if (design && !pending) {
+            const latest = trials[trials.length - 1]!
+            if (design.status === "optimizing") {
+              const duplicate = (latest.result as unknown as AutonomousIterationResult | null)?.run.resourceUsage.duplicateExperiment === true
+              const bounded = design.reference || duplicate || trials.length >= (policy.maxTrialsPerDesign ?? 3) || design.no_improve >= (policy.maxNoImprovePerDesign ?? 2)
+              const decision = bounded ? { action: "finish_design" as const, rationale: design.reference ? "Reference initialization completed" : duplicate ? "Duplicate experiment" : "Inner-loop stopping limit reached" }
+                : yield* runOptimizerAgent({ taskID: task.id, designID: design.id })
+              if (decision.action === "tune") {
+                const trial = appendTrainingTrial(design.id, latest.id, decision.trainingStrategy, decision.rationale, design.best_run_id ?? undefined)
+                const candidate = yield* getCandidateForTask(task.id, trial.candidate_id)
+                yield* bus.publish(Event.CandidateCreated, { candidate })
+                continue
+              }
+              setDesignPhase(design.id, "reflecting", decision.rationale)
+            }
+            if (activeDesign(task.id)?.status === "reflecting") {
+              yield* runReflectionAgent({ taskID: task.id, maxIterations })
+              setDesignPhase(design.id, "planning")
+            }
+            const initialization = yield* getReferenceBaselineInitialization(yield* getTask(task.id))
+            if (initialization && !initialization.completed) return yield* finish("seed_failed")
+            const current = yield* getTask(task.id)
+            yield* db((db) => db.update(ResearchTaskTable).set({ task_spec: { ...current.taskSpec,
+              metadata: { ...recordValue(current.taskSpec.metadata), searchProgress: {
+                noImproveStreak: metrics.noImproveStreak, plateauThreshold: policy.maxNoImprove ?? NAS_DEFAULT_MAX_NO_IMPROVE,
+                remainingIterations: maxIterations - currentCycle(cycle.id).iterations,
+                completedDesign: { designID: design.id, hypothesisID: design.hypothesis_id,
+                  bestRunID: design.best_run_id, bestMetric: design.best_metric,
+                  trials: trials.map((trial) => ({ trialID: trial.id, runID: trial.full_run_id, contract: trial.contract })) },
+                instruction: "This design's inner optimization has finished. Use its best model and full history to choose the next architecture. Tuning comparisons do not isolate architecture effects.",
+              } } }, time_updated: Date.now() }).where(eq(ResearchTaskTable.id, task.id)).run())
+            yield* runHypoPlannerAgent({ taskID: task.id })
+            finishDesign(design.id, activeDesign(task.id)?.stop_reason ?? "optimization_complete")
+            continue
+          }
+          if (!finalizing) {
+            const exceeded = yield* getRunBudgetExceeded(yield* getTask(task.id), "queued")
+            if (exceeded) {
+              yield* ensureBudgetApproval(task, undefined, exceeded)
+              return yield* finish("budget_exhausted")
+            }
+          }
+          const blocked = yield* getAutonomousLoopStopReason(task)
+          if (blocked) return yield* finish(blocked)
+          if (!design) {
+            const current = yield* getTask(task.id)
+            const decision = parseNextExperiment(recordValue(current.taskSpec.metadata).nextExperiment)
+            if (decision?.action === "stop") return yield* finish("planner_stopped")
+            if (!decision && isZeroResearch(current.taskSpec)) yield* runHypoPlannerAgent({ taskID: task.id })
+          }
+          let iterationStop: AutonomousLoopStoppedReason = "approval_required"
+          const result = yield* runAutonomousIteration({ taskID: task.id, stage: "full", description: input.description }).pipe(
+            Effect.catchCause((cause) => {
+              const error = Cause.squash(cause)
+              if (BudgetExceededError.isInstance(error)) { iterationStop = "budget_exhausted"; return Effect.succeed(undefined) }
+              if (SeedBaselinesError.isInstance(error)) { iterationStop = "seed_failed"; return Effect.succeed(undefined) }
+              if (ApprovalRequiredError.isInstance(error)) return Effect.succeed(undefined)
+              return Effect.failCause(cause)
+            }))
+          if (!result) return yield* finish(iterationStop)
+          if (!iterations.some((iteration) => iteration.run.id === result.run.id)) iterations.push(result)
+          const failed = result.run.status === "failed" || result.run.status === "invalid"
+          saveCrashStreak(cycle.id, failed ? currentCycle(cycle.id).crash_streak + 1 : 0)
+          const full = (yield* listRuns(task.id)).filter((run) => run.stage === "full" && run.resourceUsage.cycleID === cycle.id)
+            .sort((a, b) => a.time.created - b.time.created)
+          if (full.length >= 3 && full.slice(-3).every((run) => run.resourceUsage.duplicateExperiment === true)) return yield* finish("no_new_candidate")
+          yield* updateTaskStatus({ taskID: task.id, status: "searching" })
+        }
+      }).pipe(Effect.ensuring(Effect.sync(stopClock)))
+    })
+
     const runAutonomousLoop = logPhaseMethod("runAutonomousLoop", Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
+      if ((input.stage ?? "full") === "full" && (yield* getTask(input.taskID)).domainID === "tsf")
+        return yield* runDualLoopSearch(input)
       const iterations: AutonomousIterationResult[] = []
       yield* assertExecutionCheckpoint(input.taskID)
       const task = yield* getTask(input.taskID)
@@ -10148,6 +10431,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               targetMetricValue: input.targetMetricValue,
               minRelativeImprovement: input.minRelativeImprovement,
               maxNoImprove: input.maxNoImprove,
+              maxTrialsPerDesign: input.maxTrialsPerDesign,
+              maxNoImprovePerDesign: input.maxNoImprovePerDesign,
               timeBudgetSeconds: input.timeBudgetSeconds,
               maxCrashStreak: input.maxCrashStreak ?? 5,
               explorationRate: input.explorationRate,
@@ -10192,6 +10477,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               targetMetricValue: input.targetMetricValue,
               minRelativeImprovement: input.minRelativeImprovement,
               maxNoImprove: input.maxNoImprove,
+              maxTrialsPerDesign: input.maxTrialsPerDesign,
+              maxNoImprovePerDesign: input.maxNoImprovePerDesign,
               timeBudgetSeconds: input.timeBudgetSeconds,
               maxCrashStreak: input.maxCrashStreak ?? 5,
               explorationRate: input.explorationRate,
@@ -10433,6 +10720,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       resumeExecutionContractCheckpoint,
       runAutonomousIteration,
       runAutonomousLoop,
+      runOptimizerAgent,
       runIntentAgent,
       answerIntentQuestion,
       interpretAndApplySlotModification,

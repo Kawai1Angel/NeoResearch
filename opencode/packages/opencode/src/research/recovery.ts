@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { SessionTable } from "@/session/session.sql"
 import { cycleDigest } from "./cycle"
+import { activeDesign, designTrials } from "./design-store"
 import { RESEARCH_MAX_RUNS_SAFETY_LIMIT } from "./defaults"
 import z from "zod"
 import { existsSync } from "node:fs"
@@ -14,6 +15,7 @@ import {
   ResearchCycleTable,
   ResearchEventTable,
   ResearchChampionTable,
+  ResearchDesignTable,
 } from "./research.sql"
 import { ResearchTaskID } from "./schema"
 import { mapTask } from "./task-mapper"
@@ -157,6 +159,8 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
             : task.status === "completed"
               ? "completed"
               : "resumable"
+    const design = activeDesign(taskID)
+    const trial = design ? designTrials(design.id).find((entry) => entry.status !== "completed") : undefined
     const summary =
       recoveryState === "running"
         ? "Research is still running; view the original operation"
@@ -170,6 +174,9 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
       intentSessionID: intentSession?.id ?? null,
       eventCursor,
       cycleID: cycle?.id ?? null,
+      activeDesignID: design?.id ?? null,
+      activeTrialID: trial?.id ?? null,
+      loopPhase: design ? trial ? "training" : design.status === "optimizing" ? "optimization" : design.status : null,
       revision: task.state_revision,
       rootSessionID: task.session_id,
       chatSessionID: task.cockpit_chat_session_id,
@@ -269,6 +276,8 @@ export function createResearchCycle(projectID: string, taskID: ResearchTaskID, i
       const task = db.select().from(ResearchTaskTable).where(eq(ResearchTaskTable.id, taskID)).get()!
       const current = db.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.active_task, taskID)).get()
       db.update(ResearchCycleTable).set({ active_task: null }).where(eq(ResearchCycleTable.active_task, taskID)).run()
+      db.update(ResearchDesignTable).set({ active_task: null, status: "completed", stop_reason: "explicit_new_cycle", time_updated: Date.now() })
+        .where(eq(ResearchDesignTable.active_task, taskID)).run()
       const inputDigest = cycleDigest(mapTask(task))
       const compatible = current?.input_digest === inputDigest
       if (!compatible) db.delete(ResearchChampionTable).where(eq(ResearchChampionTable.task_id, taskID)).run()

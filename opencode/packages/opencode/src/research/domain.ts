@@ -71,7 +71,7 @@ export const DomainCandidateProposal = z
     rationale: z.string(),
     riskLevel: z.enum(["low", "medium", "high"]),
     approvalStatus: z.enum(["pending", "approved", "auto_approved", "rejected"]),
-    generatedBy: z.enum(["llm", "heuristic", "mutation", "human"]),
+    generatedBy: z.enum(["llm", "heuristic", "mutation", "human", "optimizer"]),
   })
   .strict()
 export type DomainCandidateProposal = z.infer<typeof DomainCandidateProposal>

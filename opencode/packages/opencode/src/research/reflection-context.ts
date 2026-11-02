@@ -24,7 +24,7 @@ export function reflectionRunSelection(taskID: ResearchTaskID) {
       hypothesis = { experimentContract: row?.experiment_contract, literatureEvidence: row?.literature_evidence }
     }
   }
-  const named = record(hypothesis.experimentContract).comparisonRunID
+  const named = record(record(record(current?.resource_usage).trainingTrial).contract ?? hypothesis.experimentContract).comparisonRunID
   const champion = Database.use((db) => db.select().from(ResearchChampionTable).where(eq(ResearchChampionTable.task_id, taskID)).get())
   const comparisonRunID = typeof named === "string" ? named : champion?.run_id
   const runIDs = [...new Set([current?.id, comparisonRunID].filter((id): id is string => typeof id === "string"))]

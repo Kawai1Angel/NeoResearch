@@ -109,7 +109,8 @@ export async function readDesignHistory(taskID: ResearchTaskID, args: HistoryReq
         ...buildExperimentResultEvidence({
           executionVerified: (r.resource_usage.executionContract as { status?: string } | undefined)?.status === "verified",
           hypothesisSnapshot: r.resource_usage.hypothesisSnapshot as Record<string, unknown> | undefined,
-          comparisonSpec: comparisonRecipe(taskID, ((r.resource_usage.hypothesisSnapshot as any)?.experimentContract)?.comparisonRunID),
+          trainingTrial: r.resource_usage.trainingTrial as Record<string, unknown> | undefined,
+          comparisonSpec: comparisonRecipe(taskID, ((r.resource_usage.trainingTrial as any)?.contract ?? (r.resource_usage.hypothesisSnapshot as any)?.experimentContract)?.comparisonRunID),
           evaluationEvidence: r.resource_usage.evaluationEvidence,
           runID: r.id,
           stage: r.stage,

@@ -20,6 +20,7 @@ import PROMPT_RESEARCH_HYPO_PLANNER_ZERO from "./prompt/research-hypo-planner-ze
 import PROMPT_RESEARCH_HYPO_PLANNER from "./prompt/research-hypo-planner.txt"
 import PROMPT_RESEARCH_REFLECTION from "./prompt/research-reflection.txt"
 import PROMPT_RESEARCH_MODEL_DESIGNER from "./prompt/research-model-designer.txt"
+import PROMPT_RESEARCH_OPTIMIZER from "./prompt/research-optimizer.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@opencode-ai/core/global"
@@ -393,6 +394,16 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_RESEARCH_REFLECTION,
+          },
+          "research-optimizer": {
+            name: "research-optimizer",
+            description: "OptimizerAgent — fixed-design inner-loop training optimization.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(defaults, Permission.fromConfig({ "*": "deny" }), user),
+            prompt: PROMPT_RESEARCH_OPTIMIZER,
           },
           "research-model-designer": {
             name: "research-model-designer",

@@ -87,6 +87,7 @@ export const ExperimentFactSchema = z
     evaluation: json,
     proposedModel: json.optional(),
     hypothesisSnapshot: json.optional(),
+    trainingTrial: json.optional(),
     executedModel: json.optional(),
     executionVerified: z.boolean(),
     independentEvidence: z.boolean(),
@@ -270,7 +271,7 @@ export function projectExperience(experience: ResearchExperience) {
     interpretationStatus: "Model-authored claims, conditions, diagnoses and plans are unverified interpretations. Inspect representation for factual scope and changes.",
     supportDatasetCount: experience.supportDatasetCount,
     facts: experience.facts.map(experienceFactForPrompt).map((fact) => ({
-      attribution: assessAttribution(fact, experience.facts.find((x) => x.runID === (fact.hypothesisSnapshot?.experimentContract as { comparisonRunID?: string } | undefined)?.comparisonRunID)),
+      attribution: assessAttribution(fact, experience.facts.find((x) => x.runID === ((fact.trainingTrial?.contract ?? fact.hypothesisSnapshot?.experimentContract) as { comparisonRunID?: string } | undefined)?.comparisonRunID)),
       taskID: fact.taskID,
       runID: fact.runID,
       candidateID: fact.candidateID,

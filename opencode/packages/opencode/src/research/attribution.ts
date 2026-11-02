@@ -9,10 +9,10 @@ import type { ExperimentFact } from "./experience"
 
 /** Metric validity is independent from eligibility to test or explain a mechanism. */
 export function assessAttribution(
-  fact: Pick<ExperimentFact, "executionVerified" | "proposedModel" | "hypothesisSnapshot">,
+  fact: Pick<ExperimentFact, "executionVerified" | "proposedModel" | "hypothesisSnapshot" | "trainingTrial">,
   comparison?: { proposedModel?: Record<string, unknown> },
 ) {
-  const parsed = ExperimentConstraints.safeParse(fact.hypothesisSnapshot?.experimentContract)
+  const parsed = ExperimentConstraints.safeParse(fact.trainingTrial?.contract ?? fact.hypothesisSnapshot?.experimentContract)
   if (!parsed.success)
     return {
       status: "insufficient_evidence" as const,
@@ -41,6 +41,7 @@ export function assessAttribution(
     }
   return {
     status: "eligible" as const,
+    scope: fact.trainingTrial?.contract ? "optimization" as const : "architecture" as const,
     reasons: [],
     comparisonRunID: contract.comparisonRunID,
     changedPaths: changedFields(recipeFields(comparison!.proposedModel!), recipeFields(fact.proposedModel)),
