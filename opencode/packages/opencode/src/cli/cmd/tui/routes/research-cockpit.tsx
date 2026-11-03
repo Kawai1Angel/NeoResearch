@@ -1,4 +1,7 @@
 import { createResearchReads, createResearchRefresh } from "./research-refresh"
+import { LoopStateSchema } from "@/research/loop-state-schema"
+import { ResearchLoopPanel } from "../component/research-loop-panel"
+import { loopBudgetLines, loopWorkflow, updateLoopAgentViews, type LoopAgentView } from "./research-loop-state"
 import { DialogResearchResults } from "@tui/component/dialog-research-results"
 import { useKV } from "@tui/context/kv"
 import { DialogResearchHistory } from "@tui/component/dialog-research-history"
@@ -113,6 +116,9 @@ const researchAgentWorkflowOrder = [
   "ModelDesigner Agent",
   "ModelCompiler Agent",
   "TrainEval Agent",
+  "Training Reflection",
+  "OptimizerAgent",
+  "Architecture Reflection",
   "Reflection Agent",
 ]
 const researchAgentFullStageOrder = ["intent", "data", ...researchAgentWorkflowOrder, "publish"]
@@ -1246,6 +1252,10 @@ export function ResearchCockpit() {
   const [selectedCandidateIndex, setSelectedCandidateIndex] = createSignal(0)
   const [selectedCandidateID, setSelectedCandidateID] = createSignal<string>()
   const [selectedAgentStageIndex, setSelectedAgentStageIndex] = createSignal<number>()
+  const [loopAgentViews, setLoopAgentViews] = createSignal<Record<string, LoopAgentView>>({})
+  const [loopNow, setLoopNow] = createSignal(Date.now())
+  const loopTimer = setInterval(() => setLoopNow(Date.now()), 1000)
+  onCleanup(() => clearInterval(loopTimer))
   const [busy, setBusy] = createSignal<string>()
   const [busyStartedAt, setBusyStartedAt] = createSignal<number>()
   const [chatBusy, setChatBusy] = createSignal<string>()
@@ -1625,6 +1635,34 @@ export function ResearchCockpit() {
   })
   const [recovery] = createResource(selectedTaskSource, async ({ taskID }) =>
     readState<ResumeState>(`/research/tasks/${encodeURIComponent(taskID)}/resume-state`))
+  const [loopSnapshot, { refetch: refetchLoopSnapshot }] = createResource(selectedTaskSource, async ({ taskID }) => {
+    try {
+      const state = LoopStateSchema.parse(await readState(`/research/tasks/${encodeURIComponent(taskID)}/loop-state`))
+      if (state.taskID !== taskID) throw new Error("Loop snapshot belongs to another task")
+      return { taskID, state, error: undefined }
+    } catch (error) {
+      return { taskID, state: undefined, error: formatError(error) }
+    }
+  })
+  const loopState = createMemo(() => {
+    const state = loopSnapshot()?.taskID === selectedTaskKey() ? loopSnapshot()?.state : undefined
+    const task = selectedTask()
+    return task?.domainID === "tsf" && task.mode === "autonomous" && state &&
+      (!state.cycleID || state.policy?.dualLoopVersion === 1 || state.designs.length > 0) ? state : undefined
+  })
+  createEffect(() => {
+    if (!selectedTaskKey()) return
+    const timer = setInterval(() => { void refetchLoopSnapshot() }, 5000)
+    onCleanup(() => clearInterval(timer))
+  })
+  const showLoopHistory = () => dialog.replace(() => <box padding={1} flexDirection="column">
+    <text attributes={TextAttributes.BOLD}>Design / Trial history</text>
+    <scrollbox height={Math.max(5, dimensions().height - 8)}>
+      <Show when={loopState()} fallback={<text>Loop state unavailable. Refresh the task to retry.</text>}>
+        {(state) => <ResearchLoopPanel state={state()} now={loopNow()} colors={cockpitColors} />}
+      </Show>
+    </scrollbox>
+  </box>)
   const [historyEvents, setHistoryEvents] = createSignal<Array<{ sequence: number; summary: string }>>([])
   createEffect(() => {
     const taskID = selectedTaskKey()
@@ -1732,6 +1770,7 @@ export function ResearchCockpit() {
     if (selectedAgentStageTaskID === taskID) return
     selectedAgentStageTaskID = taskID
     setStreamingChat(undefined)
+    setLoopAgentViews({})
     setPromptEvents([])
     setActionEvents([])
     setErrorEvents([])
@@ -1773,6 +1812,24 @@ export function ResearchCockpit() {
       return
     }
     if (researchPayload.type === "research.agent.llm.call_path") {
+      return
+    }
+    const scopedLoopEvent = updateLoopAgentViews(loopAgentViews(), selectedTask()?.id,
+      researchPayload as { type: string; properties?: Record<string, unknown> })
+    if (scopedLoopEvent) {
+      if (scopedLoopEvent.views !== loopAgentViews()) {
+        setLoopAgentViews(scopedLoopEvent.views)
+        const view = scopedLoopEvent.view
+        if (view?.status === "started") setLiveAgentEventStage(view.label)
+        if (view && scopedLoopEvent.terminal) {
+          appendDesignLLMLines([
+            { id: ++streamEventID, taskID: view.taskID, text: `[${view.label}] ${view.status} · ${view.summary}${view.durationMs !== undefined ? ` (${Math.round(view.durationMs / 1000)}s)` : ""}`, tone: view.status === "failed" ? "error" : "muted" },
+            ...view.text.split("\n").filter(Boolean).map((text) => ({ id: ++streamEventID, taskID: view.taskID, text, tone: "muted" as const })),
+          ])
+          setLiveAgentEventStage(undefined)
+        }
+      }
+      if (!researchPayload.type.endsWith(".stream.delta")) requestRefresh()
       return
     }
     if (researchPayload.type.startsWith("research.agent.literature.")) {
@@ -2649,8 +2706,13 @@ export function ResearchCockpit() {
       setSelectedCandidateIndex(index)
     }
   })
+  const loopResumeRecommendation = () => {
+    const state = loopState()
+    if (!state?.activeDesignID || !["resumable", "needs_reconciliation", "running"].includes(state.recovery.recoveryState)) return undefined
+    return { command: "/resume", action: "review_state" as const, title: state.recovery.recoveryState === "running" ? "View running operation" : state.recovery.recoveryState === "needs_reconciliation" ? "Inspect original execution" : "Resume saved design", detail: state.recovery.summary }
+  }
   const recommendation = createMemo(() =>
-    buildResearchCockpitRecommendation({
+    loopResumeRecommendation() ?? buildResearchCockpitRecommendation({
       task: selectedTask(),
       candidates: taskCandidates(),
       runs: taskRuns(),
@@ -2663,7 +2725,7 @@ export function ResearchCockpit() {
     }),
   )
   const nextBestAction = createMemo(() =>
-    selectNextBestAction({
+    loopState()?.recovery.recoveryState === "running" ? null : loopResumeRecommendation() ?? selectNextBestAction({
       task: selectedTask(),
       candidates: taskCandidates(),
       runs: taskRuns(),
@@ -3141,7 +3203,7 @@ export function ResearchCockpit() {
       "Do not claim that an experiment ran unless the Research OS task state or run history says so.",
       task ? `Task: ${task.title} / ${task.mode} / ${task.status}` : "Task: none selected",
       task ? `Objective: ${task.objective.primaryMetric ?? "unknown"} ${task.objective.direction ?? ""}`.trim() : "",
-      task ? `Budget: ${succeededRuns()}/${Number(task.budget.maxRuns ?? 0)} succeeded runs` : "",
+      task ? loopState() ? loopBudgetLines(loopState()!, loopNow())[0]! : `Run record limit: ${task.budget.maxRuns ?? "unbound"}` : "",
       candidate ? `Selected candidate: ${candidate.id} / ${researchCockpitCandidateTitle(candidate)}` : "",
       run ? `Latest run: ${run.id} / ${run.stage ?? "run"} / ${run.status} / ${metricText(run.metrics)}` : "",
     ]
@@ -3564,6 +3626,7 @@ export function ResearchCockpit() {
     const task = selectedTask()
     const recommended = recommendation()
     const next = recommended.action
+    if (loopResumeRecommendation()) { await resumeResearch(); return }
     if (!task) {
       promptInput?.focus()
       toast.show({
@@ -3744,6 +3807,7 @@ export function ResearchCockpit() {
     }
     if (name === "history") { dialog.replace(() => <DialogResearchHistory />); return }
     if (name === "append") { await appendResearch(); return }
+    if (name === "loop-status") { showLoopHistory(); return }
     if (name === "resume") { await resumeResearch(); return }
     if (name === "task") {
       if (arg(0) === "next") {
@@ -4174,6 +4238,7 @@ export function ResearchCockpit() {
   command.register(() => [
     { title: "Research history", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
     { title: "Extend research (set new cycle budget)", value: "research.append", category: "Research", slash: { name: "append" }, onSelect: () => void appendResearch() },
+    { title: "View Design / Trial history and loop budgets", value: "research.loop-status", category: "Research", slash: { name: "loop-status" }, onSelect: showLoopHistory },
     { title: recovery()?.recoveryState === "running" ? "View running operation" : "Resume research / View recovery status", value: "research.resume", category: "Research", slash: { name: "resume" }, onSelect: () => void resumeResearch() },
     {
       title: "Create or import research task",
@@ -5320,7 +5385,7 @@ export function ResearchCockpit() {
     findBestResearchCockpitMetric(selectedTask()?.objective ?? {}, taskRuns(), validChampion() ?? null),
   )
   const agentWorkflowProgress = createMemo(() =>
-    buildResearchCockpitAgentWorkflow({
+    loopWorkflow(buildResearchCockpitAgentWorkflow({
       task: selectedTask(),
       candidates: taskCandidates(),
       runs: taskRuns(),
@@ -5330,7 +5395,7 @@ export function ResearchCockpit() {
       fingerprint: taskFingerprint() ?? {},
       runnerReady: runnerReady(),
       runnerRepairAction: isDatasetRepairRunnerStatus(runnerStatus()) ? "prepare_dataset" : "configure_runner",
-    }),
+    }), loopState()),
   )
   const hasLiveRunnerProgress = createMemo(() => {
     const task = selectedTask()
@@ -5338,6 +5403,7 @@ export function ResearchCockpit() {
   })
   const liveResearchStage = createMemo(() => {
     const action = busy()
+    if (loopState()?.cycleID) return undefined // The persisted loop snapshot owns these stage indicators.
     if (!action) return undefined
     // Reflection stage is tracked precisely via SSE events
     const eventStage = liveAgentEventStage()
@@ -5377,7 +5443,7 @@ export function ResearchCockpit() {
     agentWorkflowProgress().some((item) => item.label === "TrainEval Agent" && item.status === "done"),
   )
   const reflectionDone = createMemo(() =>
-    agentWorkflowProgress().some((item) => item.label === "Reflection Agent" && item.status === "done"),
+    agentWorkflowProgress().some((item) => ["Reflection Agent", "Architecture Reflection"].includes(item.label) && item.status === "done"),
   )
   const hasCandidateDesignProgress = createMemo(() => taskCandidates().length > 0)
   const hasSuccessfulExperimentProgress = createMemo(() => succeededRuns() > 0)
@@ -5538,7 +5604,7 @@ export function ResearchCockpit() {
         paddingTop={1}
         paddingBottom={1}
       >
-        <box flexShrink={0} paddingBottom={1} gap={1}>
+        <box flexShrink={0} paddingBottom={loopState() && dimensions().height < 36 ? 0 : 1} gap={loopState() && dimensions().height < 36 ? 0 : 1}>
           <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
             NeoResearch Workspace
           </text>
@@ -5567,6 +5633,13 @@ export function ResearchCockpit() {
               /help
             </text>
           </box>
+          <Show when={loopState()}>{(state) => <box flexDirection="column" gap={0}>
+            <ResearchLoopPanel state={state()} now={loopNow()} colors={cockpitColors} compact minimal={dimensions().height < 36} onOpenHistory={showLoopHistory} />
+            <text fg={cockpitColors.primary} onMouseUp={showLoopHistory}>/loop-status · Design / Trial history</text>
+          </box>}</Show>
+          <Show when={loopSnapshot()?.taskID === selectedTaskKey() && loopSnapshot()?.error}>
+            <text fg={cockpitColors.warning} wrapMode="word">Loop state unavailable · refresh will retry</text>
+          </Show>
         </box>
 
         <scrollbox
@@ -5584,6 +5657,12 @@ export function ResearchCockpit() {
           }}
         >
           <box paddingTop={1} paddingRight={1} paddingBottom={2}>
+            <For each={Object.values(loopAgentViews()).filter((view) => view.taskID === selectedTaskKey() && view.status === "started")}>
+              {(view) => <box flexDirection="column">
+                <text fg={cockpitColors.primary}>[{view.label}] reasoning {Math.max(0, Math.floor((loopNow() - view.startedAt) / 1000))}s · {view.designID.slice(0, 8)}{view.trialID ? ` / ${view.trialID.slice(0, 8)}` : ""}</text>
+                <text fg={cockpitColors.textMuted} width="100%" wrapMode="word">{view.text}</text>
+              </box>}
+            </For>
             <For each={streamLines()}>
               {(line) =>
                 line.text.startsWith("You: ") ? (

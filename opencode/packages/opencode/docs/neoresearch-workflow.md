@@ -587,3 +587,33 @@ For a new TSF task:
 8. Approve final model selection.
 9. Run Publish Agent / Export Bundle.
 10. Inspect manifest.json, the final report, and model package.
+
+
+### TUI Dual-Loop Progress
+
+The cockpit reads `GET /research/tasks/:taskID/loop-state` for a transactionally
+consistent snapshot of the active cycle, ordered designs/trials, ranking eligibility,
+scoped reflection receipts, memory delivery receipts and recovery position. Reading
+this endpoint never initializes a cycle, reserves training, runs models or flushes
+memory. Task/project authorization is checked before any history is returned.
+
+The panel distinguishes reserved full-training attempts from the task's run-record
+budget and per-design trial limits. Failed full attempts stay charged; failed smoke
+attempts still appear as trials without a full-training charge. Epochs, folds and
+horizons are not counted separately. The deadline comes from the persisted cycle and
+continues counting down while the TUI is closed or the task is paused.
+
+Use `/loop-status` (or the Design / Trial history link) to inspect all designs in the
+current cycle, training changes, earlier best runs, failures, cached/excluded results,
+training/architecture diagnoses and actual memory write statuses. The main panel shows
+the active design, or the last completed design, and its last three trials. Selecting
+a trial expands its details. Current training, training-result finalization, training
+reflection, optimization, architecture reflection and outer planning/design are
+projected from persisted executions and receipts, not historical candidate counts.
+
+Optimizer stage events include design/trial/cycle identity, the validated decision,
+rationale and duration. Scoped reflection streams carry their scope and design/trial
+identity, and the cockpit retains them separately. Live events refresh the snapshot;
+periodic reads and reopening the TUI recover the same state after disconnects. Legacy
+non-dual-loop workflows retain their existing presentation. Configuration and additional
+loop-control actions are a separate implementation phase.

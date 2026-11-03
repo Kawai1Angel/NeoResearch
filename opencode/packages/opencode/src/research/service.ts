@@ -5965,6 +5965,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     })
 
     const writeAutonomousLoopArtifact = Effect.fn("Research.writeAutonomousLoopArtifact")(function* (input: {
+      readonly maxIterations: number
       readonly task: ResearchTask
       readonly iterations: AutonomousIterationResult[]
       readonly stoppedReason: AutonomousLoopStoppedReason
@@ -5979,9 +5980,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         (iteration) =>
           iteration.run.status === "succeeded" && metricValue(iteration.run.metrics, primaryMetricName) === undefined,
       ).length
+      const cycle = yield* db((d) => d.select().from(ResearchCycleTable).where(eq(ResearchCycleTable.active_task, input.task.id)).get())
       const payload = {
         taskID: input.task.id,
         domainID: input.task.domainID,
+        cycleID: cycle?.id ?? null,
         stoppedReason: input.stoppedReason,
         iterationCount: input.iterations.length,
         succeededCount,
@@ -6011,6 +6014,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         kind: "research_autonomous_loop_json",
         uri: `file://${file}`,
         metadata: {
+          cycleID: cycle?.id ?? null, maxIterations: input.maxIterations, trainingUsed: cycle?.iterations ?? null,
           stoppedReason: input.stoppedReason,
           iterationCount: input.iterations.length,
           succeededCount,
@@ -7242,7 +7246,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             user,
             modelRef: effective ? mapToModelRef(effective.config) : undefined,
             onDelta: (delta) =>
-              bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta }),
+              bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta,
+                cycleID: design.cycle_id, designID: design.id,
+                trialID: input.facts.reflectionScope === "training" ? input.facts.trialID : undefined,
+                reflectionScope: input.reflectionScope }),
           })
           const response =
             session ??
@@ -7301,7 +7308,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
                   status: "failed",
                   metadata: {
                     reflectionScope: input.reflectionScope,
-                    designID: design.id,
+                    designID: design.id, cycleID: design.cycle_id,
+                    trialID: input.facts.reflectionScope === "training" ? input.facts.trialID : null,
                     ...errorMetadata(Cause.squash(cause)),
                   },
                 })
@@ -7347,7 +7355,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           agent: "ReflectionAgent",
           stage: "reflection",
           status: "started",
-          metadata: { reflectionScope: "training", designID: input.designID, trialID: trial.id },
+          metadata: { reflectionScope: "training", designID: input.designID, trialID: trial.id, cycleID: evidence.design.cycle_id },
         })
         const reasoning = yield* scopedReflectionReasoning({
           evidence,
@@ -7413,7 +7421,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             reflectionScope: "training",
             designID: input.designID,
             trialID: trial.id,
-            analysisStatus: result.analysisStatus,
+            analysisStatus: result.analysisStatus, cycleID: evidence.design.cycle_id,
+            summary: result.analysis.executionAssessment, llmStatus: result.llm.status,
             memoryWrites: listExperienceWrites(input.taskID).filter((write) => result.memoryWriteIDs?.includes(write.id)),
           },
         })
@@ -7465,7 +7474,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           agent: "ReflectionAgent",
           stage: "reflection",
           status: "started",
-          metadata: { reflectionScope: "architecture", designID: input.designID },
+          metadata: { reflectionScope: "architecture", designID: input.designID, cycleID: evidence.design.cycle_id },
         })
         const reasoning = yield* scopedReflectionReasoning({
           evidence,
@@ -7558,6 +7567,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           stage: "reflection",
           status: "completed",
           metadata: { reflectionScope: "architecture", designID: input.designID, analysisStatus: result.analysisStatus,
+            cycleID: evidence.design.cycle_id, summary: result.analysis.designAssessment, llmStatus: result.llm.status,
             memoryWrites: listExperienceWrites(input.taskID).filter((write) => result.memoryWriteIDs?.includes(write.id)) },
         })
         return result
@@ -7573,7 +7583,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       if (!latest || latest.status !== "completed") throw new Error("Complete the active trial before requesting optimization")
       const trainingReflection = yield* runTrainingReflection({ taskID: task.id, designID: design.id, trialID: latest.id })
       if (latest.optimizer_decision) return OptimizerDecision.parse(latest.optimizer_decision)
-      yield* bus.publish(Event.OptimizerAgentStarted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "started" })
+      const optimizerStartedAt = Date.now()
+      yield* bus.publish(Event.OptimizerAgentStarted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "started",
+        metadata: { cycleID: design.cycle_id, designID: design.id, trialID: latest.id, startedAt: optimizerStartedAt } })
       const comparison = design.best_run_id ? comparisonRecipe(task.id, design.best_run_id) : undefined
       const latestResult = latest.result as unknown as AutonomousIterationResult | null
       const recipe = comparison ?? latestResult?.candidate.candidateSpec
@@ -7611,13 +7623,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             if (!validation.ok) throw new Error(`OptimizerAgent produced an invalid training recipe: ${validation.issues.map((issue) => issue.message).join("; ")}`)
           }
         } catch (error) {
-          yield* bus.publish(Event.OptimizerAgentFailed, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "failed", metadata: { designID: design.id, error: String(error) } })
+          yield* bus.publish(Event.OptimizerAgentFailed, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "failed", metadata: { cycleID: design.cycle_id, designID: design.id, trialID: latest.id, durationMs: Date.now() - optimizerStartedAt, error: String(error) } })
           throw error
         }
       }
       saveOptimizerDecision(latest.id, JSON.parse(JSON.stringify(decision)))
       yield* bus.publish(Event.OptimizerAgentCompleted, { taskID: task.id, agent: "OptimizerAgent", stage: "optimization", status: "completed",
-        metadata: { designID: design.id, trialID: latest.id, decision: JSON.parse(JSON.stringify(decision)) } })
+        metadata: { cycleID: design.cycle_id, designID: design.id, trialID: latest.id, durationMs: Date.now() - optimizerStartedAt, decision: JSON.parse(JSON.stringify(decision)) } })
       return decision
     }))
 

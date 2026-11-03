@@ -2,6 +2,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { Global } from "@opencode-ai/core/global"
+import { loopStateFixture } from "../../fixture/loop-state"
 import { chmod, mkdir, readFile, rm, writeFile } from "fs/promises"
 import path from "path"
 import { CommandProvider, useCommandDialog } from "../../../src/cli/cmd/tui/component/dialog-command"
@@ -6076,4 +6077,97 @@ test("agent streaming renders locally without refetching state or LLM configurat
     expect(counts.get("/research/tasks") ?? 0).toBe(tasksBefore + 1)
     expect(counts.get("/research/llm") ?? 0).toBe(llmBefore)
   } finally { app.renderer.destroy() }
+})
+
+
+test("cockpit loads persisted loop progress on reopen and opens grouped history from the command palette", async () => {
+  const state = loopStateFixture()
+  state.taskID = taskID
+  state.recovery.taskID = taskID
+  let command: CommandDialog | undefined
+  let loopReads = 0
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (requestURL(input).pathname === `/research/tasks/${taskID}/loop-state`) {
+      loopReads++
+      return response(state)
+    }
+    return mockResearchFetch(input, init)
+  }) as typeof globalThis.fetch
+  const app = await testRender(
+    () => (
+      <ResearchCockpitHarness
+        fetch={fetch}
+        onCommand={(value) => {
+          command = value
+        }}
+      />
+    ),
+    { width: 140, height: 52 },
+  )
+  try {
+    const frame = await waitForFrame(app, "Resume at: Training Reflection")
+    expect(frame).toContain("Full training 2/25")
+    expect(frame).toContain("Trial 2")
+    expect(loopReads).toBeGreaterThan(0)
+    command?.trigger("research.loop-status")
+    const history = await waitForFrame(app, "Design / Trial history")
+    expect(history).toContain("trainingStrategy.optimizer.lr")
+    expect(history).toContain("CUDA out of memory")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("cockpit keeps loop budget and prompt visible in a short narrow terminal", async () => {
+  const state = loopStateFixture()
+  state.taskID = taskID
+  state.recovery.taskID = taskID
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) =>
+    requestURL(input).pathname === `/research/tasks/${taskID}/loop-state`
+      ? response(state)
+      : mockResearchFetch(input, init)) as typeof globalThis.fetch
+  const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} />, { width: 80, height: 24 })
+  try {
+    const frame = await waitForFrame(app, "Full training 2/25")
+    expect(frame).toContain("Trial 2")
+    expect(frame).toContain("esc interrupt")
+    expect(frame).toContain("tab agents")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("cockpit consumes scoped OptimizerAgent events and deduplicates its completed result", async () => {
+  const state = loopStateFixture()
+  state.taskID = taskID
+  state.recovery.taskID = taskID
+  const events = createCockpitEventSource()
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) =>
+    requestURL(input).pathname === `/research/tasks/${taskID}/loop-state`
+      ? response(state)
+      : mockResearchFetch(input, init)) as typeof globalThis.fetch
+  const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} events={events.source} />, {
+    width: 140,
+    height: 52,
+  })
+  try {
+    await waitForFrame(app, "Full training 2/25")
+    const metadata = { cycleID: state.cycleID, designID: state.activeDesignID, trialID: state.activeTrialID }
+    events.emit({ type: "research.agent.optimizer.started", properties: { taskID, metadata } })
+    await waitForFrame(app, "[OptimizerAgent] reasoning")
+    const completed = {
+      type: "research.agent.optimizer.completed",
+      properties: {
+        taskID,
+        metadata: { ...metadata, durationMs: 2000, decision: { action: "finish_design", rationale: "no improvement" } },
+      },
+    }
+    events.emit(completed)
+    events.emit(completed)
+    const frame = await waitForFrame(app, "finish_design: no improvement")
+    expect(frame.split("finish_design: no improvement")).toHaveLength(2)
+    expect(frame).toContain("(2s)")
+  } finally {
+    app.renderer.destroy()
+  }
 })

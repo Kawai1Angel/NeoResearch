@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { SessionTable } from "@/session/session.sql"
 import { cycleDigest } from "./cycle"
 import { activeDesign, designTrials } from "./design-store"
-import { trainingReflectionKey } from "./agents/scoped-reflection"
+import { designLoopTrialID, taskLoopPhase, loopStopReason, readLoopProgress } from "./loop-progress"
 import { RESEARCH_MAX_RUNS_SAFETY_LIMIT } from "./defaults"
 import z from "zod"
 import { existsSync } from "node:fs"
@@ -162,10 +162,6 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
               : "resumable"
     const design = activeDesign(taskID)
     const trials = design ? designTrials(design.id) : []
-    const trial = trials.find((entry) => entry.status !== "completed")
-    const latestCompleted = trials.filter((entry) => entry.status === "completed").at(-1)
-    const awaitingTrainingReflection = design?.status === "optimizing" && latestCompleted &&
-      !design.phase_receipts[`${trainingReflectionKey(latestCompleted.id)}.result`]
     const summary =
       recoveryState === "running"
         ? "Research is still running; view the original operation"
@@ -180,8 +176,8 @@ export function resumeState(projectID: string, taskID: ResearchTaskID) {
       eventCursor,
       cycleID: cycle?.id ?? null,
       activeDesignID: design?.id ?? null,
-      activeTrialID: trial?.id ?? null,
-      loopPhase: design ? trial ? "training" : awaitingTrainingReflection ? "training_reflection" : design.status === "optimizing" ? "optimization" : design.status : null,
+      activeTrialID: designLoopTrialID(design, trials, runs),
+      loopPhase: taskLoopPhase(task, cycle, design, trials, runs, loopStopReason(cycle, artifacts)),
       revision: task.state_revision,
       rootSessionID: task.session_id,
       chatSessionID: task.cockpit_chat_session_id,
@@ -319,4 +315,13 @@ export function createResearchCycle(projectID: string, taskID: ResearchTaskID, i
     },
     { behavior: "immediate" },
   )
+}
+
+/** A consistent read of execution progress and recovery; never dispatches work. */
+export function loopState(projectID: string, taskID: ResearchTaskID) {
+  return Database.transaction(() => {
+    const progress = readLoopProgress(projectID, taskID)
+    const recovery = progress ? resumeState(projectID, taskID) : undefined
+    return progress && recovery ? { ...progress, recovery } : undefined
+  })
 }

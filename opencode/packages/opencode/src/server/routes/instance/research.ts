@@ -1,4 +1,5 @@
 import { Effect } from "effect"
+import { LoopStateSchema } from "@/research/loop-state-schema"
 import {
   ResumeStateSchema,
   HistoryPageSchema,
@@ -15,6 +16,7 @@ import {
   createResearchCycle,
   researchHistory,
   resumeState,
+  loopState,
   researchEvents,
   researchTasksForSession,
 } from "@/research/recovery"
@@ -116,6 +118,22 @@ export const ResearchRoutes = lazy(() =>
           if (c.req.valid("query").cursor) return c.json({ message: "Invalid history cursor" }, 400)
           throw error
         }
+      },
+    )
+    .get(
+      "/tasks/:taskID/loop-state",
+      describeRoute({
+        summary: "Read persisted dual-loop progress and recovery",
+        operationId: "research.tasks.loopState",
+        responses: {
+          200: { description: "Read-only design and trial snapshot", content: { "application/json": { schema: resolver(LoopStateSchema) } } },
+          ...errors(404),
+        },
+      }),
+      validator("param", taskParam),
+      (c) => {
+        const state = loopState(Instance.project.id, c.req.valid("param").taskID)
+        return state ? c.json(state) : c.json({ message: "Research task not found in this project" }, 404)
       },
     )
     .get(
