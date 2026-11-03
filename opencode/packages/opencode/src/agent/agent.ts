@@ -439,6 +439,7 @@ export const layer = Layer.effect(
                 webfetch: "allow",
                 experiment_results: "allow",
                 read_task_evidence: "allow",
+                read_experiences: "allow",
                 read_reflection: "allow",
                 read_training_curve: "allow",
               }),

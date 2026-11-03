@@ -1,3 +1,5 @@
+import { ExperiencePurpose, experiencePurpose, inferExperiencePurpose, validateExperiencePurpose, readerPurpose, type ExperienceReader } from "./experience-purpose"
+import { verifyExperienceBinding, type ExperienceWriteBinding } from "./experience-binding"
 import { createHash } from "node:crypto"
 import { createReadStream } from "node:fs"
 import { stat } from "node:fs/promises"
@@ -15,7 +17,7 @@ import { taskExecutionRoot } from "./task-isolation"
 import { ExperienceLibrary, experienceLibraryPath, recallableExperience } from "./experience-library"
 import { ResearchCandidateTable, ResearchMemoryTable, ResearchRunTable, ResearchTaskTable } from "./research.sql"
 import { experienceRepresentation } from "./experience-representation"
-import type { ExperienceQueryIntent } from "./experience-query"
+import { parseExperienceQuery, type ExperienceQueryIntent } from "./experience-query"
 import {
   ResearchMemory,
   ResearchMemoryID,
@@ -241,14 +243,15 @@ export async function captureExperimentFacts(taskID: ResearchTaskID, runIDs: rea
 }
 
 /** Explicit, optional write shared by the Reflection tool and direct-transport fallback. */
-export async function writeExperience(taskID: ResearchTaskID, input: ExperienceDraft) {
+export async function prepareExperience(taskID: ResearchTaskID, input: ExperienceDraft, binding?: ExperienceWriteBinding, options?: { libraryPath?: string }) {
   const task = taskInProject(taskID)
   const draft = ExperienceDraftSchema.parse(input)
-  migrateProjectExperiences()
+  const origin = binding ? await verifyExperienceBinding(taskID, binding) : undefined
   const evidence = [...draft.evidence]
   const inheritedFacts = new Map<string, ExperimentFact>()
-  const library = new ExperienceLibrary(experienceLibraryPath(Instance.directory))
+  const library = new ExperienceLibrary(options?.libraryPath ?? experienceLibraryPath(Instance.directory))
   try {
+    migrateProjectExperiences(library)
     for (const parentID of draft.derivedFrom ?? []) {
       const parentMemory = library.list({ experienceID: parentID, domainID: task.domain_id })[0]
       if (!parentMemory) throw new Error(`Unknown parent experience in this domain: ${parentID}`)
@@ -286,6 +289,18 @@ export async function writeExperience(taskID: ResearchTaskID, input: ExperienceD
         (fact.primaryValue !== undefined || fact.stage === "smoke")))) {
       throw new Error("Experience requires a new independent observation; cached/duplicate attempts or metricless full runs cannot add a new lesson")
     }
+    const purpose = origin?.purpose ?? inferExperiencePurpose(normalized, facts)
+    if (!purpose) throw new Error("Memory purpose is ambiguous; use a committed scoped reflection rather than guessing from prose")
+    validateExperiencePurpose(purpose, normalized, facts, origin)
+    if (origin && draft.evidence.some(ref => [ref.runID, ...(ref.comparisonRunID ? [ref.comparisonRunID] : [])]
+      .some(id => !origin.sourceRunIDs.includes(id) && (!inheritedFacts.has(id) || inheritedFacts.get(id)!.taskID === taskID))))
+      throw new Error("Experience cites runs outside the committed reflection evidence")
+    for (const id of [...(draft.derivedFrom ?? []), ...(draft.evolution?.parentExperienceID ? [draft.evolution.parentExperienceID] : [])]) {
+      const memory = library.list({ experienceID: id, domainID: task.domain_id })[0]
+      const parent = memory && experienceFromMemory(memory)
+      if (!parent || (experiencePurpose(parent) && experiencePurpose(parent) !== purpose) ||
+        !experiencePurpose(parent) && draft.evolution?.parentExperienceID === id) throw new Error("Experience provenance cannot cross memory purposes")
+    }
     const supportDatasetCount = validateExperienceEvidence(normalized, facts)
     if (normalized.claimType === "observation") {
       normalized = { ...normalized, polarity: "inconclusive" }
@@ -315,10 +330,11 @@ export async function writeExperience(taskID: ResearchTaskID, input: ExperienceD
       normalized = { ...grounded, statement: observation, observation, polarity,
         intervention: JSON.stringify(contrasts.map(({ trial, changes }) => ({ runID: trial.runID, changes }))) }
     }
-    const experienceKey = digest({ draft: normalized, facts })
+    const experienceKey = digest({ purpose, draft: normalized, facts })
     const now = Date.now()
     const experience = ResearchExperienceSchema.parse({
       schemaVersion: "research_experience.v1",
+      purpose, origin,
       draft: normalized,
       facts,
       supportDatasetCount,
@@ -330,10 +346,18 @@ export async function writeExperience(taskID: ResearchTaskID, input: ExperienceD
     const memory: ResearchMemory = {
       id: ResearchMemoryID.ascending(), taskID, domainID: task.domain_id,
       fingerprintSummary: facts.find((fact) => fact.taskID === taskID)!.taskFingerprint as JsonRecord,
-      candidateSummary: { role: "experience", experienceKey, experience } as unknown as JsonRecord,
+      candidateSummary: { role: "experience", experienceKey, experienceLegacyKey: digest({ draft: normalized, facts }), experience } as unknown as JsonRecord,
       outcome, lesson: normalized.statement, time: { created: now, updated: now },
     }
-    const result = library.save(memory, { projectID: task.project_id, projectRoot: Instance.directory })
+    return { memory, source: { projectID: task.project_id, projectRoot: Instance.directory }, libraryPath: library.databasePath }
+  } finally { library.close() }
+}
+
+export async function writeExperience(taskID: ResearchTaskID, input: ExperienceDraft, binding?: ExperienceWriteBinding) {
+  const prepared = await prepareExperience(taskID, input, binding)
+  const library = new ExperienceLibrary(prepared.libraryPath)
+  try {
+    const result = library.save(prepared.memory, prepared.source)
     if (result.created) await Bus.publish(Event.MemoryCreated, { memory: result.memory })
     return result
   } finally { library.close() }
@@ -346,6 +370,8 @@ export interface ReadExperiencesOptions {
   includeOriginal?: boolean
   includeHistory?: boolean
   scope?: "task" | "project" | "shared"
+  purpose?: ExperiencePurpose
+  includeUnknown?: boolean
   level?: ExperienceDraft["level"]
   polarity?: ExperienceDraft["polarity"]
   query?: string
@@ -366,6 +392,16 @@ export function readExperiences(taskID: ResearchTaskID, options: ReadExperiences
       limit: options.limit ?? 20,
     })
   } finally { library.close() }
+}
+
+export function experiencePurposeForReader(reader: ExperienceReader, options: ReadExperiencesOptions = {}) {
+  const executionQuestion = options.intent === "execution_error" || options.query && parseExperienceQuery(options.query).intent === "execution_error"
+  return executionQuestion && ["model_designer", "hypoplanner"].includes(reader) ? "optimization" as const : readerPurpose(reader)
+}
+
+export function readExperiencesForRole(taskID: ResearchTaskID, reader: ExperienceReader, options: ReadExperiencesOptions = {}) {
+  return readExperiences(taskID, { ...options, purpose: experiencePurposeForReader(reader, options),
+    includeUnknown: Boolean(options.experienceID && options.includeUnknown) })
 }
 
 /** Preserve task-memory APIs and exports while new experiences live directly in the shared library. */

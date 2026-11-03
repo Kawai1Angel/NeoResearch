@@ -1,3 +1,4 @@
+import { enqueueExperienceWrites, experienceWriteIDs, flushExperienceWrites, listExperienceWrites } from "./experience-outbox"
 import {
   TrainingReflection, ArchitectureReflection, DesignSummary, TrainingReflectionAnalysis, ArchitectureReflectionAnalysis,
   buildTrainingReflection, buildDesignSummary, buildArchitectureReflection, applyArchitectureAnalysis, projectScopedReflection,
@@ -19,7 +20,7 @@ import { readDesignHistory } from "./design-history"
 import { KnowledgeValidationDraftSchema } from "./literature/knowledge-confidence"
 import { confirmKnowledgeExperiment, readReflectionKnowledge, reflectionKnowledgeForPrompt } from "./literature/knowledge-feedback"
 import { DirectExperienceRequestSchema, ExperienceDraftSchema, experienceFactForPrompt, experienceFromMemory, experienceSummaryForPrompt } from "./experience"
-import { captureExperienceContext, readExperiences, taskMemories, writeExperience } from "./experience-store"
+import { captureExperienceContext, readExperiences, readExperiencesForRole, taskMemories, writeExperience } from "./experience-store"
 import { parseExperienceQuery } from "./experience-query"
 import { EXPERIENCE_SEARCH_METHOD } from "./experience-search"
 import { citableTaskEvidence } from "./retrieve/evidence-handoff"
@@ -2429,7 +2430,7 @@ async function generateLLMHypotheses(
         requestedHistory.push({ experienceRequest: args, result: {
           retrieval: { method: args.query?.trim() ? EXPERIENCE_SEARCH_METHOD : "recent",
             queryPlan: args.query?.trim() ? parseExperienceQuery(args.query, args.intent) : undefined },
-          experiences: readExperiences(task.id, { ...args, limit: args.limit ?? 3 })
+          experiences: readExperiencesForRole(task.id, "hypoplanner", { ...args, limit: args.limit ?? 3 })
           .map((memory) => ({ ...experienceSummaryForPrompt(memory),
             ...(args.includeFacts ? { facts: experienceFromMemory(memory)!.facts.map(experienceFactForPrompt) } : {}),
           })) } })
@@ -3513,6 +3514,8 @@ export interface Interface {
   readonly runAutonomousLoop: (input: AutonomousLoopInput) => Effect.Effect<AutonomousLoopResult>
   readonly runOptimizerAgent: (input: { taskID: ResearchTaskID; designID: string }) => Effect.Effect<OptimizerDecision>
   readonly runTrainingReflection: (input: { taskID: ResearchTaskID; designID: string; trialID: string; factsOnly?: boolean }) => Effect.Effect<TrainingReflection>
+  readonly flushExperienceWrites: (taskID: ResearchTaskID) => Effect.Effect<ReturnType<typeof listExperienceWrites>>
+  readonly listExperienceWrites: (taskID: ResearchTaskID) => Effect.Effect<ReturnType<typeof listExperienceWrites>>
   readonly getDesignSummary: (input: { taskID: ResearchTaskID; designID: string }) => Effect.Effect<DesignSummary>
   readonly runArchitectureReflection: (input: { taskID: ResearchTaskID; designID: string; maxIterations?: number; factsOnly?: boolean }) => Effect.Effect<ArchitectureReflection>
   readonly runIntentAgent: (taskID: ResearchTaskID) => Effect.Effect<IntentAgentResult>
@@ -6540,6 +6543,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             proposalContext,
             requestedHistory,
             requestedEvidence,
+            architectureExperiences: readExperiencesForRole(task.id, "model_designer", { scope: "shared", query: selectedHypothesis?.statement, limit: 3 }).map(experienceSummaryForPrompt),
             ...(validationFeedback ? { validationFeedback } : {}),
           }
           const modelDesignerSessionAttempt = yield* requestViaSession({
@@ -7177,55 +7181,112 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               return result ? [TrainingReflection.parse(result)] : []
             })
           : undefined
-      const sourceRunID = input.facts.reflectionScope === "training" ? input.facts.runID
-        : input.facts.designSummary.architectureEvidence.runID
+      const sourceRunID =
+        input.facts.reflectionScope === "training"
+          ? input.facts.runID
+          : input.facts.designSummary.architectureEvidence.runID
       const sourceRun = input.evidence.runs.find((run) => run.id === sourceRunID)
-      const outerComparison = input.reflectionScope === "architecture"
-        ? input.evidence.runs.find((run) => run.id === design.outer_contract?.comparisonRunID) : undefined
-      const user = JSON.stringify({
+      const outerComparison =
+        input.reflectionScope === "architecture"
+          ? input.evidence.runs.find((run) => run.id === design.outer_contract?.comparisonRunID)
+          : undefined
+      const promptInput = {
         agent: "ReflectionAgent",
         reflectionScope: input.reflectionScope,
         facts: input.facts,
         trainingReflections,
         fixedRecipe: design.recipe,
+        experiences: readExperiencesForRole(
+          task.id,
+          input.reflectionScope === "training" ? "training_reflection" : "architecture_reflection",
+          {
+            scope: "shared",
+            query:
+              input.facts.reflectionScope === "training"
+                ? (input.facts.execution.error ?? input.facts.comparison.changedPaths.join(" "))
+                : String(
+                    recordValue(sourceRun?.resourceUsage.hypothesisSnapshot).statement ?? design.recipe.hypothesis ?? "",
+                  ),
+            limit: 3,
+          },
+        ).map(experienceSummaryForPrompt),
         hypothesisSnapshot: sourceRun?.resourceUsage.hypothesisSnapshot ?? null,
         outerContract: input.reflectionScope === "architecture" ? design.outer_contract : undefined,
-        outerComparison: outerComparison ? {
-          runID: outerComparison.id, stage: outerComparison.stage, status: outerComparison.status,
-          metrics: outerComparison.metrics,
-          recipe: input.evidence.candidates.find((candidate) => candidate.id === outerComparison.candidateID)?.candidateSpec,
-        } : undefined,
+        outerComparison: outerComparison
+          ? {
+              runID: outerComparison.id,
+              stage: outerComparison.stage,
+              status: outerComparison.status,
+              metrics: outerComparison.metrics,
+              recipe: input.evidence.candidates.find((candidate) => candidate.id === outerComparison.candidateID)
+                ?.candidateSpec,
+            }
+          : undefined,
         responseSchema: z.toJSONSchema(input.schema),
-      })
+      }
       const reasoning = Effect.gen(function* () {
-        const session = yield* requestViaSession({
-          rootSessionID: task.sessionID,
-          taskID: task.id,
-          agent: input.reflectionScope === "training" ? "research-reflection-training" : "research-reflection-architecture",
-          stageLabel: "ReflectionAgent",
-          user,
-          modelRef: effective ? mapToModelRef(effective.config) : undefined,
-          onDelta: (delta) =>
-            bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta }),
-        })
-        const response =
-          session ??
-          (effective
-            ? yield* abortable((signal) =>
-                withLLMAbortSignal(signal, () =>
-                  requestNeoCastLLM(
-                    effective.config,
-                    effective.apiKey,
-                    input.reflectionScope === "training" ? PROMPT_REFLECTION_TRAINING : PROMPT_REFLECTION_ARCHITECTURE,
-                    user,
+        const requestedExperiences: unknown[] = []
+        for (let round = 0; round < 4; round++) {
+          const previous = designPhaseReceipt<Record<string, unknown>>(design.id, `${input.key}.memory-lookup:${round}`)
+          if (previous) {
+            requestedExperiences.push(previous)
+            continue
+          }
+          const user = JSON.stringify({ ...promptInput, requestedExperiences })
+          const session = yield* requestViaSession({
+            rootSessionID: task.sessionID,
+            taskID: task.id,
+            agent:
+              input.reflectionScope === "training" ? "research-reflection-training" : "research-reflection-architecture",
+            stageLabel: "ReflectionAgent",
+            user,
+            modelRef: effective ? mapToModelRef(effective.config) : undefined,
+            onDelta: (delta) =>
+              bus.publish(Event.ReflectionAgentStreamDelta, { taskID: task.id, agent: "ReflectionAgent", delta }),
+          })
+          const response =
+            session ??
+            (effective
+              ? yield* abortable((signal) =>
+                  withLLMAbortSignal(signal, () =>
+                    requestNeoCastLLM(
+                      effective.config,
+                      effective.apiKey,
+                      input.reflectionScope === "training" ? PROMPT_REFLECTION_TRAINING : PROMPT_REFLECTION_ARCHITECTURE,
+                      user,
+                    ),
                   ),
-                ),
-              )
-            : undefined)
-        if (!response) return { response: undefined, status: "not_configured" as const }
-        const accepted = { analysis: input.schema.parse(extractJsonObject(response.text)), model: effective?.config.model }
-        saveDesignPhaseReceipt(design.id, `${input.key}.reasoning`, accepted)
-        return { response: accepted, status: "used" as const }
+                )
+              : undefined)
+          if (!response) return { response: undefined, status: "not_configured" as const }
+          const parsed = extractJsonObject(response.text)
+          const lookup = DirectExperienceRequestSchema.safeParse(parsed)
+          if (lookup.success) {
+            if (round === 3) throw new Error("Scoped reflection exceeded its memory lookup budget")
+            const request = lookup.data.request
+            const memories = readExperiencesForRole(
+              task.id,
+              input.reflectionScope === "training" ? "training_reflection" : "architecture_reflection",
+              { ...request, limit: Math.min(request.limit ?? 3, 3) },
+            )
+            const result = {
+              request,
+              experiences: memories.map((memory) => ({
+                ...experienceSummaryForPrompt(memory),
+                ...(request.includeFacts && request.experienceID
+                  ? { facts: experienceFromMemory(memory)!.facts.map(experienceFactForPrompt) }
+                  : {}),
+              })),
+            }
+            saveDesignPhaseReceipt(design.id, `${input.key}.memory-lookup:${round}`, result)
+            requestedExperiences.push(result)
+            continue
+          }
+          const accepted = { analysis: input.schema.parse(parsed), model: effective?.config.model }
+          saveDesignPhaseReceipt(design.id, `${input.key}.reasoning`, accepted)
+          return { response: accepted, status: "used" as const }
+        }
+        throw new Error("Scoped reflection did not return a final analysis")
       })
       return yield* withinResearchDeadline(reasoning).pipe(
         Effect.provideService(ResearchDeadline, deadline),
@@ -7274,6 +7335,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         if (completed) {
           if (completed.inputDigest !== fresh.inputDigest)
             throw new Error("Training reflection evidence changed after completion")
+          yield* Effect.promise(() => flushExperienceWrites(input.taskID))
           return TrainingReflection.parse(completed)
         }
         const previous = designPhaseReceipt<TrainingReflection>(input.designID, `${key}.facts`)
@@ -7298,8 +7360,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const interpretation = reasoning.response
           ? TrainingReflectionAnalysis.parse(reasoning.response.analysis)
           : fresh.analysis
+        const binding = { designID: input.designID, reflectionKey: `${key}.result` }
+        const drafts = interpretation.experienceDrafts ?? []
         const result = TrainingReflection.parse({
           ...fresh,
+          memoryWriteIDs: experienceWriteIDs(input.taskID, binding, drafts),
           analysis: {
             ...interpretation,
             limitations: [...new Set([...fresh.analysis.limitations, ...interpretation.limitations])].slice(0, 12),
@@ -7334,7 +7399,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           },
           { designID: input.designID, key: `${key}.artifact` },
         )
-        saveDesignPhaseReceipt(input.designID, `${key}.result`, result)
+        Database.transaction(() => {
+          saveDesignPhaseReceipt(input.designID, `${key}.result`, result)
+          enqueueExperienceWrites(input.taskID, binding, drafts)
+        })
+        yield* Effect.promise(() => flushExperienceWrites(input.taskID))
         yield* bus.publish(Event.ReflectionAgentCompleted, {
           taskID: input.taskID,
           agent: "ReflectionAgent",
@@ -7345,6 +7414,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             designID: input.designID,
             trialID: trial.id,
             analysisStatus: result.analysisStatus,
+            memoryWrites: listExperienceWrites(input.taskID).filter((write) => result.memoryWriteIDs?.includes(write.id)),
           },
         })
         return result
@@ -7381,6 +7451,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         if (completed) {
           if (completed.inputDigest !== summary.inputDigest)
             throw new Error("Architecture reflection evidence changed after completion")
+          yield* Effect.promise(() => flushExperienceWrites(input.taskID))
           return ArchitectureReflection.parse(completed)
         }
         const prior = designPhaseReceipt<DesignSummary>(input.designID, DESIGN_SUMMARY_KEY)
@@ -7404,9 +7475,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           schema: ArchitectureReflectionAnalysis,
           factsOnly: input.factsOnly,
         })
-        const result = reasoning.response
+        const interpretation = reasoning.response
           ? applyArchitectureAnalysis(facts, reasoning.response.analysis, reasoning.response.model)
           : ArchitectureReflection.parse({ ...facts, llm: { status: reasoning.status } })
+        const binding = { designID: input.designID, reflectionKey: `${key}.result` }
+        const drafts = interpretation.analysis.experienceDrafts ?? []
+        const result = ArchitectureReflection.parse({
+          ...interpretation,
+          memoryWriteIDs: experienceWriteIDs(input.taskID, binding, drafts),
+        })
         const projected = projectScopedReflection(evidence, result, input.maxIterations)
         const directory = path.join(
           Instance.directory,
@@ -7470,13 +7547,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             { designID: input.designID, key: `${key}.artifact.${output.kind}` },
           )
         }
-        saveDesignPhaseReceipt(input.designID, `${key}.result`, result, "planning")
+        Database.transaction(() => {
+          saveDesignPhaseReceipt(input.designID, `${key}.result`, result, "planning")
+          enqueueExperienceWrites(input.taskID, binding, drafts)
+        })
+        yield* Effect.promise(() => flushExperienceWrites(input.taskID))
         yield* bus.publish(Event.ReflectionAgentCompleted, {
           taskID: input.taskID,
           agent: "ReflectionAgent",
           stage: "reflection",
           status: "completed",
-          metadata: { reflectionScope: "architecture", designID: input.designID, analysisStatus: result.analysisStatus },
+          metadata: { reflectionScope: "architecture", designID: input.designID, analysisStatus: result.analysisStatus,
+            memoryWrites: listExperienceWrites(input.taskID).filter((write) => result.memoryWriteIDs?.includes(write.id)) },
         })
         return result
       }),
@@ -7512,7 +7594,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           deadlineAt: currentCycle(design.cycle_id).deadline_at,
           remainingTimeSeconds: currentCycle(design.cycle_id).deadline_at === null ? undefined
             : Math.max(0, (currentCycle(design.cycle_id).deadline_at! - Date.now()) / 1000),
-          experiences: readExperiences(task.id, { scope: "shared", query: "optimizer learning rate", intent: "intervention", limit: 3 }).map(experienceSummaryForPrompt),
+          experiences: readExperiencesForRole(task.id, "optimizer", { scope: "shared",
+            query: trainingReflection.execution.error ?? trainingReflection.analysis.nextTrainingQuestions[0] ?? trainingReflection.comparison.changedPaths.join(" "),
+            limit: 3 }).map(experienceSummaryForPrompt),
           responseSchema: z.toJSONSchema(OptimizerDecision) })
         try {
           const session = yield* requestViaSession({ rootSessionID: task.sessionID, taskID: task.id,
@@ -7541,6 +7625,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       const task = yield* getTask(input.taskID)
       if (task.mode !== "autonomous") throw new Error(`Research task is not autonomous: ${task.id}`)
       yield* assertExecutionCheckpoint(task.id)
+      yield* Effect.promise(() => flushExperienceWrites(task.id))
       const positive = (value: number | undefined, fallback: number) => {
         const result = value ?? fallback
         if (!Number.isInteger(result) || result < 1) throw new Error("Dual-loop limits must be positive integers")
@@ -9935,8 +10020,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         const reflection = input.reflectionScope === "training"
           ? yield* runTrainingReflection({ taskID: input.taskID, designID: input.designID, trialID: input.trialID! })
           : yield* runArchitectureReflection({ taskID: input.taskID, designID: input.designID, maxIterations: input.maxIterations })
-        return projectScopedReflection(yield* loadScopedReflectionEvidence({ taskID: input.taskID, designID: input.designID,
+        const projected = projectScopedReflection(yield* loadScopedReflectionEvidence({ taskID: input.taskID, designID: input.designID,
           trialID: input.reflectionScope === "training" ? input.trialID : undefined }), reflection, input.maxIterations)
+        return { ...projected, experienceWriteResults: listExperienceWrites(input.taskID)
+          .filter((write) => reflection.memoryWriteIDs?.includes(write.id))
+          .map((write) => ({ saved: write.status === "applied", id: write.result?.canonicalExperienceID,
+            error: write.status === "applied" ? undefined : write.error ?? `Memory delivery ${write.status}` })) }
       }
       const phaseTask = yield* getTask(input.taskID)
       const phaseDesign = requireDesignPhase(input.taskID, input.designID)
@@ -11242,6 +11331,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
       runAutonomousIteration,
       runAutonomousLoop,
       runOptimizerAgent,
+      flushExperienceWrites: (taskID: ResearchTaskID) => Effect.promise(() => flushExperienceWrites(taskID)),
+      listExperienceWrites: (taskID: ResearchTaskID) => Effect.sync(() => listExperienceWrites(taskID)),
       runTrainingReflection,
       getDesignSummary,
       runArchitectureReflection,

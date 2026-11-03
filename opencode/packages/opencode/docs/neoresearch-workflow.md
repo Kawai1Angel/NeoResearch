@@ -326,11 +326,62 @@ iterations. At expiry, local factual records and an inconclusive design assessme
 are saved without another model call. Model execution whose response was never
 saved can still require a retry after an interrupted request.
 
-This stage adds scoped working reflections and artifacts, not shared-memory writes.
-The only memory purposes are `optimization` and `architecture`; execution failures
-are optimization observations. Existing experience maturity levels and claim types
-remain separate. Purpose-based shared-library storage, retrieval and an outbox for
-deliberate experience writes are subsequent work.
+Scoped reflections may optionally return `experienceDrafts` (at most three); returning
+none saves only the working reflection. Both session and direct modes use the same
+validated delivery path below. The model never claims a successful memory write.
+
+### Shared Memory Purposes and Delivery
+
+The only memory purposes are `optimization` and `architecture`. Execution failures
+belong to optimization observations; `execution` remains a claim type, not a third
+purpose. Existing maturity levels and task/project/shared read scopes are independent.
+New experiences retain their purpose and, for scoped writes, the committed reflection
+origin (`reflectionKey`, design/trial, input digest and permitted source run IDs).
+Purpose is assigned and checked by the writer, not accepted as a free model label.
+Training-only contrasts cannot become architecture memory, and a joint training/design
+change cannot establish an isolated performance claim of either purpose.
+
+The shared SQLite library gains nullable `purpose` and `classification_version` columns
+additively. Historical source JSON, IDs, facts and interpretations are not rewritten.
+Classification is inferred only from factual contracts/interventions or execution
+observations; ambiguous records remain unclassified. Unclassified is an audit state,
+not another purpose. Exact reads remain available, but automatic role retrieval excludes
+these records unless an exact-ID audit explicitly opts into `includeUnknown`.
+
+Role filters run before ranking and limits: OptimizerAgent/training reflection read
+optimization memory; HypoPlanner/ModelDesigner/architecture reflection normally read
+architecture memory. A specific execution-error query from HypoPlanner or ModelDesigner
+can retrieve optimization failure evidence for execution compatibility, not architecture
+attribution. Changing a tool's requested purpose or requesting a known ID does not bypass
+the role filter. Query deduplication, thread continuation and curation merges also
+preserve purpose. OptimizerAgent derives its query from the current failure, training
+question or changed fields rather than a fixed learning-rate query.
+
+Scoped reflections can request up to three bounded `experience_request` lookups,
+including exact-parent facts before continuation/promotion. Query responses are saved
+in versioned stage receipts and both transports consume the same role-filtered results.
+Lookups share the research deadline. No extra training iterations are charged.
+
+Accepted reflection results and draft requests are committed atomically to the research
+database's `research_memory_write` outbox. Preparation verifies that the original
+reflection evidence has not changed, validates permitted run references, purpose and
+parent provenance, then freezes the factual payload. The destination library path is
+pinned when the proposal is enqueued. The shared library commits an idempotency receipt
+with the source entry in its own transaction. Recovery can safely repeat delivery after
+the library commit even when the research DB has not yet recorded success.
+
+Outbox receipts expose `pending`, `prepared`, `applied` or `rejected`. Invalid evidence
+is rejected without blocking the architectural decision; storage failures remain retryable.
+Reopening/resuming the loop retries pending delivery without another model call or
+training attempt. `Research.listExperienceWrites` and `Research.flushExperienceWrites`
+provide status/retry access, and reflection completion events include the relevant write
+receipts. Frozen prepared payloads retain the original observed facts across retries.
+Legacy explicit `write_experience` calls continue to use the validated writer; the
+automatic dual-loop path uses the outbox.
+
+`read_experiences` supports `purpose` and exact-ID `includeUnknown` audit filters.
+The standalone library CLI also accepts `research experiences --purpose optimization`
+or `--purpose architecture`, with `--include-unknown` for deliberate legacy audits.
 
 ### 6. Runner Execution
 

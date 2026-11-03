@@ -1154,6 +1154,8 @@ export const ResearchExperiencesCommand = cmd({
   builder: (yargs: Argv) => yargs
     .option("path", { type: "boolean", describe: "print the shared SQLite library path" })
     .option("domain", { type: "string", describe: "filter by research domain" })
+    .option("purpose", { choices: ["optimization", "architecture"] as const, describe: "filter by evidence-backed memory purpose" })
+    .option("include-unknown", { type: "boolean", default: false, describe: "include unclassified legacy records for audit" })
     .option("level", { choices: ["experiment_fact", "conditional_experience", "validated_principle"] as const })
     .option("polarity", { choices: ["positive", "negative", "mixed", "inconclusive"] as const })
     .option("experience-id", { type: "string", describe: "read one complete experience by ID" })
@@ -1173,7 +1175,7 @@ export const ResearchExperiencesCommand = cmd({
     const library = new ExperienceLibrary()
     try {
       console.log(JSON.stringify({ databasePath: library.databasePath, experiences: library.list({
-        domainID: args.domain, level: args.level, polarity: args.polarity,
+        domainID: args.domain, purpose: args.purpose, includeUnknown: args.includeUnknown, level: args.level, polarity: args.polarity,
         experienceID: args.experienceId, threadID: args.threadId, includeArchived: args.includeArchived, includeOriginal: args.includeOriginal,
         query: args.query, includeBackground: args.includeBackground, intent: args.intent, limit: args.limit,
       }) }, null, 2))

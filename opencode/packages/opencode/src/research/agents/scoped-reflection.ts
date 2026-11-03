@@ -3,13 +3,15 @@ import { isDeepStrictEqual } from "node:util"
 import { digest } from "../digest"
 import { designDigest, checkTrainingTrial } from "../design-contract"
 import { ExperimentConstraints, checkExperimentConstraints } from "../experiment-constraints"
+import { ExperienceDraftSchema } from "../experience"
+import { ExperiencePurpose } from "../experience-purpose"
 import type { ResearchDesign, TrainingTrial } from "../design-store"
 import type { ResearchTask, ResearchRun, ResearchCandidate } from "../schema"
 import type { TrainingCurvePoint } from "../runner-evidence"
 import { summarizeReflectionAgent, type ReflectionAgentResult, type ReflectionLLMAnalysis } from "./reflection-agent"
 
 // Execution failures belong to optimization observations, not a third memory purpose.
-export const ReflectionMemoryPurpose = z.enum(["optimization", "architecture"])
+export const ReflectionMemoryPurpose = ExperiencePurpose
 const text = z.string().trim().min(1)
 const llm = z
   .object({
@@ -23,6 +25,7 @@ export const TrainingReflectionAnalysis = z
     trainingHealthAssessment: text,
     nextTrainingQuestions: z.array(text).max(8),
     limitations: z.array(text).max(12),
+    experienceDrafts: z.array(ExperienceDraftSchema).max(3).optional(),
   })
   .strict()
 export const ArchitectureReflectionAnalysis = z
@@ -34,6 +37,7 @@ export const ArchitectureReflectionAnalysis = z
     trainingConfounders: z.array(text).max(12),
     nextArchitectureQuestions: z.array(text).max(8),
     limitations: z.array(text).max(12),
+    experienceDrafts: z.array(ExperienceDraftSchema).max(3).optional(),
   })
   .strict()
 const curveSeries = z
@@ -90,6 +94,7 @@ export const TrainingReflection = z
     curveSeries: z.array(curveSeries),
     analysis: TrainingReflectionAnalysis,
     analysisStatus: z.enum(["facts_only", "completed"]),
+    memoryWriteIDs: z.array(z.string()).optional(),
     llm,
   })
   .strict()
@@ -161,6 +166,7 @@ export const ArchitectureReflection = z
     designSummary: DesignSummary,
     analysis: ArchitectureReflectionAnalysis,
     analysisStatus: z.enum(["facts_only", "completed"]),
+    memoryWriteIDs: z.array(z.string()).optional(),
     llm,
   })
   .strict()
@@ -592,7 +598,9 @@ export function projectScopedReflection(
     modelDesignReflection: architecture?.analysis.designAssessment ?? "The design remains fixed.",
     nextStepRecommendation:
       questions.join("\n") || "The responsible planner decides the next experiment within the shared budget.",
-    distillableMemory: "Scoped working reflection saved; no shared experience was written in this stage.",
+    distillableMemory: reflection.memoryWriteIDs?.length
+      ? `${reflection.memoryWriteIDs.length} experience proposals were committed to the durable outbox; inspect write receipts for saved/rejected/pending status.`
+      : "Scoped working reflection saved; no shared experience was proposed.",
   }
   const contrast = training?.comparison ?? architecture!.designSummary.architectureEvidence
   const attributable = training

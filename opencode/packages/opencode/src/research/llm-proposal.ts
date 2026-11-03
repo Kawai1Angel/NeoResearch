@@ -420,6 +420,7 @@ export function buildUserPrompt(input: {
   readonly dataAnalysisMarkdown?: string
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
+  readonly architectureExperiences?: readonly unknown[]
   readonly requestedHistory?: readonly unknown[]
   readonly requestedEvidence?: readonly unknown[]
   readonly validationFeedback?: {
@@ -446,6 +447,7 @@ export function buildUserPrompt(input: {
       budget: input.task.budget,
       taskSpec: designTaskSpec(input.task.taskSpec),
     },
+    architectureExperiences: input.architectureExperiences ?? [],
     taskFingerprint: {
       selectedHypothesis: fingerprint.selectedHypothesis ?? null,
       modelCapabilities: MODEL_CAPABILITIES,
@@ -904,6 +906,7 @@ export async function proposeLLMCandidate(input: {
   readonly dataAnalysisMarkdown?: string
   readonly hypoPlanMarkdown?: string
   readonly previousReflectionMarkdown?: string
+  readonly architectureExperiences?: readonly unknown[]
   readonly requestedHistory?: readonly unknown[]
   readonly requestedEvidence?: readonly unknown[]
   readonly validationFeedback?: Parameters<typeof buildUserPrompt>[0]["validationFeedback"]
@@ -946,6 +949,7 @@ export async function proposeLLMCandidate(input: {
     hypoPlanMarkdown: input.hypoPlanMarkdown,
     previousReflectionMarkdown: input.previousReflectionMarkdown,
     validationFeedback: input.validationFeedback,
+    architectureExperiences: input.architectureExperiences,
     requestedHistory: input.requestedHistory,
     requestedEvidence: input.requestedEvidence,
   }

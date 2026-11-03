@@ -1,5 +1,6 @@
+import { agentExperienceReader } from "../research/experience-purpose"
 import { readDesignHistory } from "../research/design-history"
-import { taskMemories } from "../research/experience-store"
+import { taskMemories, readExperiencesForRole } from "../research/experience-store"
 import { readReflectionHistory } from "../research/reflection-context"
 import { extractTrainingCurve } from "../research/runner-evidence"
 export { extractTrainingCurve } from "../research/runner-evidence"
@@ -298,7 +299,8 @@ export const ReadMemoryLessonsTool = Tool.define(
         const recentLimit = Math.min(10, Math.max(1, Math.floor(args.recentLimit ?? 2)))
         const includeBest = args.includeBest !== false
 
-        const memories = taskMemories(taskID).sort((a, b) => b.time.created - a.time.created)
+        const reader = agentExperienceReader(ctx.agent)
+        const memories = (reader ? readExperiencesForRole(taskID, reader, { scope: "task", limit: 100 }) : taskMemories(taskID)).sort((a, b) => b.time.created - a.time.created)
 
         const recentLessons = memories.slice(0, recentLimit).map((m) => m.lesson)
 

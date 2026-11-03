@@ -124,6 +124,10 @@ export function optimizerFixture() {
     invalidTrainingReflection: false,
     forceArchitectureSupport: false,
     hangTrainingReflection: false,
+    proposeOptimizationMemory: false,
+    proposeArchitectureMemory: false,
+    crossScopeArchitectureMemory: false,
+    requestTrainingExperienceID: "",
     interrupt: false,
     invalidDesign: false,
     hangOptimizer: false,
@@ -131,6 +135,18 @@ export function optimizerFixture() {
   }
   const inputs = { training: [] as any[], architecture: [] as any[], optimizer: [] as any[], planner: [] as any[] }
   const order: string[] = []
+  const memoryDraft = (runID: string, comparisonRunID?: string) => ({
+    level: "experiment_fact",
+    polarity: "inconclusive",
+    claimType: comparisonRunID ? "performance" : "observation",
+    statement: "A scoped observed training or architecture result.",
+    conditions: ["Current fixed evaluation protocol"],
+    intervention: "The declared intervention",
+    observation: "Use the authoritative run metric",
+    boundaries: ["Current observed conditions"],
+    unknowns: ["Cross-dataset transfer"],
+    evidence: [{ runID, ...(comparisonRunID ? { comparisonRunID } : {}), relation: "supports" }],
+  })
   globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body))
     const system: string = body.messages[0].content
@@ -180,6 +196,25 @@ export function optimizerFixture() {
         ...(calls.invalidTrainingReflection
           ? { hypothesisAssessment: { status: "supported", reason: "invalid cross-scope verdict" } }
           : {}),
+        ...(calls.proposeOptimizationMemory
+          ? {
+              experienceDrafts: [
+                memoryDraft(
+                  inputs.training.at(-1)!.facts.runID,
+                  inputs.training.at(-1)!.facts.comparison.eligible
+                    ? inputs.training.at(-1)!.facts.comparison.runID
+                    : undefined,
+                ),
+              ],
+            }
+          : {}),
+      }
+      if (calls.requestTrainingExperienceID) {
+        result = {
+          status: "experience_request",
+          request: { scope: "shared", experienceID: calls.requestTrainingExperienceID, includeFacts: true },
+        }
+        calls.requestTrainingExperienceID = ""
       }
     } else if (system.startsWith("You are ReflectionAgent in architecture mode")) {
       if (calls.interruptArchitectureReflection) throw new Error("simulated architecture reflection interruption")
@@ -195,6 +230,20 @@ export function optimizerFixture() {
         trainingConfounders: [],
         nextArchitectureQuestions: ["Choose a matched architecture comparison."],
         limitations: ["One dataset does not establish universal transferability."],
+        ...(calls.proposeArchitectureMemory
+          ? {
+              experienceDrafts: [
+                (() => {
+                  const summary = inputs.architecture.at(-1)!.facts.designSummary
+                  const evidence = summary.architectureEvidence
+                  const tuned = summary.trials.at(-1)
+                  return calls.crossScopeArchitectureMemory
+                    ? memoryDraft(tuned.runID, summary.trials[0].runID)
+                    : memoryDraft(evidence.runID, evidence.status === "eligible" ? evidence.comparisonRunID : undefined)
+                })(),
+              ],
+            }
+          : {}),
       }
     } else if (system.startsWith("You are the NeoResearch HypoPlanner")) {
       calls.planner++

@@ -58,6 +58,7 @@ export type {
 } from "./agents/reflection-agent"
 export type { PublishAgentResult } from "./agents/publish-agent"
 export { TrainingReflection, ArchitectureReflection, DesignSummary, ReflectionMemoryPurpose } from "./agents/scoped-reflection"
+export { ExperiencePurpose } from "./experience-purpose"
 export * as Research from "."
 
 export { buildExecutionContract, validateCandidateAgainstHypothesis, verifyExecutionRecords } from "./execution-contract"

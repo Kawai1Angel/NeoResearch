@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util"
 import type { ResearchMemory } from "./schema"
 import { experienceRepresentation } from "./experience-representation"
 import { EXPERIENCE_QUERY_INTENTS } from "./experience-query"
+import { ExperiencePurpose, ExperienceOrigin } from "./experience-purpose"
 import { ExperienceEvolutionSchema, compactExperienceOrganization, organizeExperienceThread, type ExperienceOrganization } from "./experience-evolution"
 
 const text = z.string().trim().min(1).max(4000)
@@ -20,6 +21,8 @@ export const DirectExperienceRequestSchema = z.object({
     includeOriginal: z.boolean().optional(),
     includeHistory: z.boolean().optional(),
     scope: z.enum(["shared", "project", "task"]).optional(),
+    purpose: ExperiencePurpose.optional(),
+    includeUnknown: z.boolean().optional(),
     level: ExperienceLevel.optional(),
     polarity: ExperiencePolarity.optional(),
     query: z.string().optional(),
@@ -107,6 +110,8 @@ export type ExperimentFact = z.infer<typeof ExperimentFactSchema>
 export const ResearchExperienceSchema = z
   .object({
     schemaVersion: z.literal("research_experience.v1"),
+    purpose: ExperiencePurpose.optional(),
+    origin: ExperienceOrigin.optional(),
     draft: ExperienceDraftSchema,
     facts: z.array(ExperimentFactSchema).min(1),
     supportDatasetCount: z.number().int().nonnegative(),
@@ -211,6 +216,8 @@ export function experiencePromptRecord(memory: ResearchMemory) {
     canonicalExperienceID: (memory.candidateSummary.experienceOrganization as unknown as ExperienceOrganization | undefined)?.threadID ?? memory.id,
     sourceEntryID: memory.id,
     sourceTaskID: memory.taskID,
+    purpose: memory.candidateSummary.experiencePurpose ?? null,
+    purposeClassification: memory.candidateSummary.experiencePurposeClassification,
     source: memory.candidateSummary.experienceSource,
     retrievalMatch: memory.candidateSummary.experienceRetrieval,
     curation: memory.candidateSummary.experienceCuration,

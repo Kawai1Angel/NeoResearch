@@ -9,6 +9,7 @@ import type {
   ResearchCandidateID,
   ResearchHypothesisID,
   ResearchMemoryID,
+  ResearchMemory,
   ResearchRunID,
   ResearchTaskID,
 } from "./schema"
@@ -335,3 +336,17 @@ export const ResearchTrainingTrialTable = sqliteTable("research_training_trial",
   optimizer_decision: text({ mode: "json" }).$type<JsonRecord>(),
   ...Timestamps,
 }, (table) => [uniqueIndex("research_training_trial_position_idx").on(table.design_id, table.trial_index)])
+
+export const ResearchMemoryWriteTable = sqliteTable("research_memory_write", {
+  id: text().primaryKey(),
+  task_id: text().$type<ResearchTaskID>().notNull().references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+  binding: text({ mode: "json" }).notNull().$type<import("./experience-binding").ExperienceWriteBinding>(),
+  draft: text({ mode: "json" }).notNull().$type<import("./experience").ExperienceDraft>(),
+  request_digest: text().notNull(),
+  library_path: text().notNull(),
+  payload: text({ mode: "json" }).$type<{ memory: ResearchMemory; source: { projectID: string; projectRoot: string } }>(),
+  status: text().notNull().default("pending"),
+  result: text({ mode: "json" }).$type<{ sourceEntryID: string; canonicalExperienceID: string; revision: number }>(),
+  error: text(),
+  ...Timestamps,
+}, (table) => [index("research_memory_write_task_idx").on(table.task_id, table.status)])

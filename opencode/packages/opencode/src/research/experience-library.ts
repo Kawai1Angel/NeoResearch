@@ -1,3 +1,4 @@
+import { ExperiencePurpose, experiencePurpose, validateExperiencePurpose } from "./experience-purpose"
 import path from "node:path"
 import { existsSync, mkdirSync } from "node:fs"
 import { isDeepStrictEqual } from "node:util"
@@ -34,7 +35,7 @@ export function experienceLibraryPath(directory = process.cwd()) {
   return path.join(Global.Path.home, ".neo-research", "experience.db")
 }
 
-export type ExperienceSource = { projectID: string; projectRoot: string }
+export type ExperienceSource = { projectID: string; projectRoot: string; writeKey?: string; writeDigest?: string }
 export type ExperienceLibraryQuery = {
   experienceID?: string
   threadID?: string
@@ -44,6 +45,8 @@ export type ExperienceLibraryQuery = {
   projectID?: string
   taskID?: string
   domainID?: string
+  purpose?: ExperiencePurpose
+  includeUnknown?: boolean
   level?: ExperienceDraft["level"]
   polarity?: ExperienceDraft["polarity"]
   query?: string
@@ -97,6 +100,43 @@ export class ExperienceLibrary {
         source_digest TEXT NOT NULL, review_json TEXT NOT NULL, time_reviewed INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS research_experience_thread_idx ON research_experience_organization(thread_id);`)
+    this.db.exec("BEGIN IMMEDIATE")
+    try {
+      const columns = this.db.prepare("PRAGMA table_info(research_experience)").all() as { name: string }[]
+      if (!columns.some((column) => column.name === "purpose"))
+        this.db.exec("ALTER TABLE research_experience ADD COLUMN purpose TEXT")
+      if (!columns.some((column) => column.name === "classification_version"))
+        this.db.exec("ALTER TABLE research_experience ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 0")
+      this.db
+        .exec(`CREATE INDEX IF NOT EXISTS research_experience_purpose_idx ON research_experience(domain_id,purpose);
+      CREATE TABLE IF NOT EXISTS research_experience_write_receipt (
+        write_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL, project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL, source_entry_id TEXT NOT NULL, time_created INTEGER NOT NULL
+      );`)
+      const pending = this.db
+        .prepare("SELECT id,memory_json FROM research_experience WHERE classification_version=0")
+        .all() as { id: string; memory_json: string }[]
+      if (pending.length) {
+        for (const row of pending) {
+          let purpose: ExperiencePurpose | undefined
+          try {
+            const experience = experienceFromMemory(JSON.parse(row.memory_json))
+            purpose = experience ? experiencePurpose(experience) : undefined
+          } catch {}
+          this.db
+            .prepare("UPDATE research_experience SET purpose=?,classification_version=1 WHERE id=?")
+            .run(purpose ?? null, row.id)
+        }
+        // Preserve existing canonical identities while separating purpose-aware memberships.
+        // Rebuild only derived views; source JSON and historical revisions stay immutable.
+        this.rebuildOrganizations()
+      }
+      this.db.exec("COMMIT")
+    } catch (error) {
+      this.db.exec("ROLLBACK")
+      this.db.close()
+      throw error
+    }
   }
 
   close() { this.db.close() }
@@ -113,7 +153,11 @@ export class ExperienceLibrary {
     const organization = this.db.prepare("SELECT t.thread_id,t.revision,t.organization_json FROM research_experience_organization o JOIN research_experience_thread t ON t.thread_id=o.thread_id WHERE o.experience_id=?").get(memory.id) as { thread_id: string; revision: number; organization_json: string } | null
     const key = organization ? `${organization.thread_id}:${organization.revision}:${experienceSourceDigest(organization.organization_json)}` : ""
     if (organization && !this.organizations.has(key)) this.organizations.set(key, JSON.parse(organization.organization_json))
+    const experience = experienceFromMemory(memory)
+    const purpose = experience ? experiencePurpose(experience) : undefined
     return { ...memory, candidateSummary: { ...memory.candidateSummary,
+      experiencePurpose: purpose ?? null,
+      experiencePurposeClassification: purpose ? "classified" : "unknown_from_legacy_evidence",
       experienceSource: { projectID: row.project_id, projectRoot: row.project_root },
       ...(organization ? { experienceOrganization: this.organizations.get(key) } : {}),
     } as JsonRecord }
@@ -141,7 +185,7 @@ export class ExperienceLibrary {
       const entry = byID.get(id)
       const claim = entry && evolutionOf(entry)?.claim
       if (entry && claim && !["merged", "quarantined"].includes(entry.review?.status ?? "")) {
-        const key = experienceClaimKey(entry.domainID, claim)
+        const key = JSON.stringify([experiencePurpose(entry.experience) ?? null, experienceClaimKey(entry.domainID, claim)])
         if (!exactClaims.has(key)) exactClaims.set(key, entry)
       }
     }
@@ -157,7 +201,7 @@ export class ExperienceLibrary {
       const claim = evolutionOf(root)?.claim
       if (claim) {
         // Only exact structured hypotheses may merge automatically; prose similarity is not identity.
-        const key = experienceClaimKey(root.domainID, claim)
+        const key = JSON.stringify([experiencePurpose(root.experience) ?? null, experienceClaimKey(root.domainID, claim)])
         const existing = exactClaims.get(key)
         if (existing) root = existing
         else exactClaims.set(key, root)
@@ -221,6 +265,7 @@ export class ExperienceLibrary {
           const targetReview = updates.get(review.canonicalExperienceID!) ?? this.review(review.canonicalExperienceID!)
           if (targetReview && ["merged", "quarantined"].includes(targetReview.status)) throw new Error("Merge target must remain active")
           const other = experienceFromMemory(Schema.decodeUnknownSync(ResearchMemory)(JSON.parse(target.memory_json)))!
+          if (experiencePurpose(experience) !== experiencePurpose(other)) throw new Error("Experience merges must preserve memory purpose")
           const sortedFacts = (facts: typeof experience.facts) => [...facts].sort((a, b) => a.runID.localeCompare(b.runID))
           if (experienceRepresentation(other).evidenceKey !== experienceRepresentation(experience).evidenceKey ||
             !isDeepStrictEqual(sortedFacts(other.facts), sortedFacts(experience.facts)))
@@ -261,10 +306,32 @@ export class ExperienceLibrary {
       sourceEntryID: memory.id, experienceCreated: created && previousRevision === 0, appended: created && previousRevision > 0 }
   }
 
+  private replayWrite(memory: ResearchMemory, source: ExperienceSource) {
+    if (!source.writeKey) return
+    const receipt = this.db.prepare("SELECT * FROM research_experience_write_receipt WHERE write_key=?").get(source.writeKey) as
+      { request_digest: string; project_id: string; task_id: string; source_entry_id: string } | null
+    if (!receipt) return
+    if (receipt.request_digest !== source.writeDigest || receipt.project_id !== source.projectID || receipt.task_id !== memory.taskID)
+      throw new Error("Memory write idempotency key was reused with different input")
+    const row = this.db.prepare("SELECT * FROM research_experience WHERE id=?").get(receipt.source_entry_id) as Parameters<ExperienceLibrary["decode"]>[0] | null
+    if (!row) throw new Error("Memory write receipt lost its source entry")
+    return this.writeResult(this.decode(row), false)
+  }
+
+  private recordWrite(memory: ResearchMemory, source: ExperienceSource) {
+    if (source.writeKey) this.db.prepare("INSERT INTO research_experience_write_receipt VALUES(?,?,?,?,?,?)")
+      .run(source.writeKey, source.writeDigest!, source.projectID, memory.taskID, memory.id, Date.now())
+  }
+
   save(memory: ResearchMemory, source: ExperienceSource) {
     const experience = recallableExperience(memory)
     const key = memory.candidateSummary.experienceKey
     if (!experience || typeof key !== "string") throw new Error("Only validated structured experience can enter the experience library")
+    const purpose = experiencePurpose(experience)
+    if (experience.purpose) validateExperiencePurpose(experience.purpose, experience.draft, experience.facts, experience.origin)
+    if (source.writeKey && !source.writeDigest) throw new Error("Idempotent memory writes require a request digest")
+    const replay = this.replayWrite(memory, source)
+    if (replay) return replay
     const parentID = evolutionOf({ id: memory.id, domainID: memory.domainID, time: memory.time, experience })?.parentExperienceID
     if (parentID) {
       if (["merged", "quarantined"].includes(this.review(parentID)?.status ?? ""))
@@ -272,6 +339,8 @@ export class ExperienceLibrary {
       const row = this.db.prepare("SELECT domain_id,memory_json FROM research_experience WHERE id=?").get(parentID) as { domain_id: string; memory_json: string } | null
       if (!row || row.domain_id !== memory.domainID || parentID === memory.id || !recallableExperience(JSON.parse(row.memory_json)))
         throw new Error("Experience continuation requires an existing parent in the same domain")
+      const parent = experienceFromMemory(JSON.parse(row.memory_json))!
+      if (experiencePurpose(parent) !== purpose) throw new Error("Experience continuation must preserve memory purpose")
       this.ensureOrganizations()
       const organization = this.db.prepare("SELECT t.organization_json FROM research_experience_organization o JOIN research_experience_thread t ON t.thread_id=o.thread_id WHERE o.experience_id=?").get(parentID) as { organization_json: string } | null
       if (!organization || JSON.parse(organization.organization_json).conditionalExperience.status !== "explicit_hypothesis")
@@ -279,10 +348,28 @@ export class ExperienceLibrary {
     }
     this.db.exec("BEGIN IMMEDIATE")
     try {
-      const duplicate = this.db.prepare("SELECT * FROM research_experience WHERE project_id=? AND task_id=? AND experience_key=?")
+      const replay = this.replayWrite(memory, source)
+      if (replay) { this.db.exec("COMMIT"); return replay }
+      if (parentID) {
+        const parentRow = this.db.prepare("SELECT memory_json FROM research_experience WHERE id=?").get(parentID) as { memory_json: string } | null
+        const parent = parentRow && experienceFromMemory(JSON.parse(parentRow.memory_json))
+        if (!parent || experiencePurpose(parent) !== purpose || ["merged", "quarantined"].includes(this.review(parentID)?.status ?? ""))
+          throw new Error("Experience parent purpose or active state changed before commit")
+      }
+      let duplicate = this.db.prepare("SELECT * FROM research_experience WHERE project_id=? AND task_id=? AND experience_key=?")
         .get(source.projectID, memory.taskID, key) as Parameters<ExperienceLibrary["decode"]>[0] | null
+      const legacyKey = memory.candidateSummary.experienceLegacyKey
+      if (!duplicate && typeof legacyKey === "string") {
+        const legacy = this.db.prepare("SELECT * FROM research_experience WHERE project_id=? AND task_id=? AND experience_key=?")
+          .get(source.projectID, memory.taskID, legacyKey) as typeof duplicate
+        const previous = legacy && experienceFromMemory(this.decode(legacy))
+        if (legacy && previous && experiencePurpose(previous) === purpose) duplicate = legacy
+      }
       if (duplicate) {
         const memory = this.decode(duplicate)
+        const previous = experienceFromMemory(memory)
+        if (!previous || experiencePurpose(previous) !== purpose) throw new Error("Experience key already belongs to another memory purpose")
+        this.recordWrite(memory, source)
         this.db.exec("COMMIT")
         return this.writeResult(memory, false)
       }
@@ -290,15 +377,16 @@ export class ExperienceLibrary {
       const existing = this.db.prepare("SELECT id FROM research_experience WHERE id=?").get(memory.id)
       if (existing) throw new Error(`Conflicting experience ID in shared library: ${memory.id}`)
       this.db.prepare(`INSERT INTO research_experience
-        (id,project_id,project_root,task_id,domain_id,level,polarity,experience_key,memory_json,time_created,time_updated)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(memory.id, source.projectID, source.projectRoot, memory.taskID,
+        (id,project_id,project_root,task_id,domain_id,level,polarity,experience_key,memory_json,time_created,time_updated,purpose,classification_version)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)`).run(memory.id, source.projectID, source.projectRoot, memory.taskID,
           memory.domainID, experience.draft.level, experience.draft.polarity, key, JSON.stringify(memory),
-          memory.time.created, memory.time.updated)
+          memory.time.created, memory.time.updated, purpose ?? null)
       this.rebuildOrganizations()
       const result = this.decode({ memory_json: JSON.stringify(memory), project_id: source.projectID, project_root: source.projectRoot })
       const threadID = (result.candidateSummary.experienceOrganization as unknown as ExperienceOrganization).threadID
       const revisions = this.db.prepare("SELECT revision FROM research_experience_thread_version WHERE thread_id=? ORDER BY revision DESC LIMIT 2")
         .all(threadID) as { revision: number }[]
+      this.recordWrite(result, source)
       this.db.exec("COMMIT")
       return this.writeResult(result, true, revisions[1]?.revision ?? 0)
     } catch (error) {
@@ -339,6 +427,8 @@ export class ExperienceLibrary {
         const memory = options.includeHistory ? { ...decoded, candidateSummary: { ...decoded.candidateSummary,
           experienceHistory: this.history(decoded.id) } as unknown as JsonRecord } : decoded
         const experience = recallableExperience(memory)
+        const purpose = experience ? experiencePurpose(experience) : undefined
+        if (options.purpose && purpose !== options.purpose && !(options.includeUnknown && !purpose)) return []
         if (options.level && experience?.draft.level !== options.level || options.polarity && experience?.draft.polarity !== options.polarity) return []
         return experience ? [{ memory, experience }] : []
       } catch { return [] }
