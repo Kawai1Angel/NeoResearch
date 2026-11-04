@@ -1,5 +1,6 @@
 import z from "zod"
 import { ResumeStateSchema } from "./recovery-schema"
+import { SavedLoopControlSchema } from "./loop-control-schema"
 
 export const LoopPhase = z.enum([
   "design",
@@ -66,6 +67,7 @@ export const LoopProgressSchema = z.object({
   taskID: z.string(),
   observedAt: z.number(),
   stoppedReason: z.string().nullable(),
+  control: SavedLoopControlSchema.nullable().optional(),
   cycleID: z.string().nullable(),
   phase: LoopPhase.nullable(),
   activeDesignID: z.string().nullable(),

@@ -1,7 +1,7 @@
 import { InputRenderable, RGBA, ScrollBoxRenderable, TextAttributes } from "@opentui/core"
 import { useTheme, selectedForeground } from "@tui/context/theme"
 import { entries, filter, flatMap, groupBy, pipe } from "remeda"
-import { batch, createEffect, createMemo, For, Show, type JSX, on } from "solid-js"
+import { batch, createEffect, createMemo, For, Show, type JSX, on, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import * as fuzzysort from "fuzzysort"
@@ -78,7 +78,20 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     ),
   )
 
-  let input: InputRenderable
+  let input: InputRenderable | undefined
+  let disposed = false
+  let focusTimer: ReturnType<typeof setTimeout> | undefined
+  let moveTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    disposed = true
+    // Solid defers removed nodes' destruction to nextTick. Release the native
+    // input now, while its renderer is still alive, so delayed blur is safe.
+    input?.destroy()
+    input = undefined
+    scroll = undefined
+    clearTimeout(focusTimer)
+    clearTimeout(moveTimer)
+  })
 
   const filtered = createMemo(() => {
     if (props.skipFilter) return props.options.filter((x) => x.disabled !== true)
@@ -144,7 +157,9 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
 
   createEffect(
     on([() => store.filter, () => props.current], ([filter, current]) => {
-      setTimeout(() => {
+      clearTimeout(moveTimer)
+      moveTimer = setTimeout(() => {
+        if (disposed) return
         if (filter.length > 0) {
           moveTo(0, true)
         } else if (current) {
@@ -264,7 +279,9 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
             ref={(r) => {
               input = r
               input.traits = { status: "FILTER" }
-              setTimeout(() => {
+              clearTimeout(focusTimer)
+              focusTimer = setTimeout(() => {
+                if (disposed) return
                 if (!input) return
                 if (input.isDestroyed) return
                 input.focus()

@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test"
-import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { afterAll, describe, expect, test } from "bun:test"
+import { cleanupPythonVersions, installPythonVersion } from "../../fixture/python-version"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -55,11 +56,8 @@ import {
 async function createNeoCastRunnerRoot(version = "Python 3.12.0") {
   const root = await mkdtemp(path.join(tmpdir(), "research-cockpit-runner-"))
   await mkdir(path.join(root, "py"), { recursive: true })
-  await mkdir(path.join(root, ".neo-cast", "runtime", ".venv", "bin"), { recursive: true })
   await writeFile(path.join(root, "py", "validate.py"), "# smoke runner placeholder\n", "utf8")
-  const pythonPath = path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
-  await writeFile(pythonPath, `#!/bin/sh\necho '${version}'\n`, "utf8")
-  await chmod(pythonPath, 0o755)
+  await installPythonVersion(root, version)
   return root
 }
 
@@ -1057,7 +1055,7 @@ describe("research cockpit data helpers", () => {
     expect(validateTsfCsvTaskInput("")).toEqual(["Enter a CSV dataset path."])
     expect(validateTsfCsvTaskInput("/tmp/missing.txt")).toContain("Dataset path must point to a .csv file.")
     expect(validateTsfCsvTaskInput("/tmp/missing.csv horizon=abc context=0 time=bad")).toEqual([
-      "Dataset file does not exist: /tmp/missing.csv",
+      `Dataset file does not exist: ${path.resolve("/tmp/missing.csv")}`,
       "horizon must be a positive integer list.",
       "context must be a positive integer.",
       "time must be a positive duration like 30s, 5m, or 1h.",
@@ -1471,6 +1469,9 @@ describe("research cockpit data helpers", () => {
 
   test("formats artifact targets for cockpit display", () => {
     expect(researchCockpitArtifactTarget(artifact({ id: "file", uri: "file:///tmp/report.md" }))).toBe("/tmp/report.md")
+    expect(researchCockpitArtifactTarget({ uri: "file:///C:/Research/a%20b.md" })).toBe("C:/Research/a b.md")
+    expect(researchCockpitArtifactTarget({ uri: "file://server/share/a%20b.md" })).toBe("//server/share/a b.md")
+    expect(() => researchCockpitArtifactTarget({ uri: "file:///tmp/a%2Fb.md" })).toThrow("encoded path separator")
     expect(researchCockpitArtifactTarget(artifact({ id: "remote", uri: "https://example.com/report.md" }))).toBe(
       "https://example.com/report.md",
     )
@@ -1880,3 +1881,5 @@ describe("research cockpit data helpers", () => {
     expect(shouldRefreshResearchCockpitOnEvent({ type: "message.part.updated" })).toBe(false)
   })
 })
+
+afterAll(cleanupPythonVersions)

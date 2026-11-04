@@ -3,7 +3,7 @@ import type { ResearchOperation } from "@/research/operation"
 export function isResearchOperation(path: string, method?: string) {
   return (
     method === "POST" &&
-    /^\/research\/tasks\/[^/]+\/(resume|pipeline|autonomous\/(loop|iterate)|profile|prepare-dataset|intent\/(answer|modify)|export|baselines|candidates\/[^/]+\/(execute-run|seed-sweep|prepare-run))$/.test(
+    /^\/research\/tasks\/[^/]+\/(resume|loop-control|pipeline|autonomous\/(loop|iterate)|profile|prepare-dataset|intent\/(answer|modify)|export|baselines|candidates\/[^/]+\/(execute-run|seed-sweep|prepare-run))$/.test(
       path,
     )
   )

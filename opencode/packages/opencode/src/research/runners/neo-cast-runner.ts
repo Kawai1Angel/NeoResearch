@@ -1,3 +1,4 @@
+import { neoCastRuntimePython } from "./runtime-python"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
 import z from "zod"
@@ -129,7 +130,7 @@ function commandEnvironment(runnerRoot: string | undefined, projectRoot: string)
 }
 
 function projectRuntimePython(runnerRoot: string | undefined) {
-  return runnerRoot === undefined ? undefined : path.join(runnerRoot, ".neo-cast", "runtime", ".venv", "bin", "python")
+  return runnerRoot === undefined ? undefined : neoCastRuntimePython(runnerRoot)
 }
 
 function resolvePythonExecutable(runtime: NeoCastRuntime, runnerRoot: string | undefined) {

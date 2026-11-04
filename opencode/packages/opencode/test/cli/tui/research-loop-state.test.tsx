@@ -4,6 +4,7 @@ import { testRender } from "@opentui/solid"
 import { ResearchLoopPanel } from "../../../src/cli/cmd/tui/component/research-loop-panel"
 import {
   loopBudgetLines,
+  loopControlAvailability,
   loopRecoveryLine,
   loopWorkflow,
   updateLoopAgentViews,
@@ -11,6 +12,36 @@ import {
 import { loopStateFixture } from "../../fixture/loop-state"
 
 const colors = { text: "#eeeeee", textMuted: "#999999", primary: "#ff9900", success: "#00ff00", warning: "#ffff00" }
+
+test("loop controls respect ownership, recovery, deadlines and per-action training requirements", () => {
+  const state = loopStateFixture()
+  state.budget.deadlineAt = Date.now() + 60000
+  expect(loopControlAvailability(state, "trial", false, true).enabled).toBe(true)
+  expect(loopControlAvailability(state, "design", false, true).enabled).toBe(true)
+  expect(loopControlAvailability(state, "finish-design", false, false).enabled).toBe(true)
+  expect(loopControlAvailability(state, "trial", true, true).enabled).toBe(false)
+  expect(loopControlAvailability(state, "trial", false, false).enabled).toBe(false)
+  state.recovery.recoveryState = "needs_reconciliation"
+  expect(loopControlAvailability(state, "finish-design", false, true).enabled).toBe(false)
+  state.recovery.recoveryState = "resumable"
+  state.designs[0]!.trials[1]!.status = "pending"
+  expect(loopControlAvailability(state, "finish-design", false, true).enabled).toBe(false)
+  state.budget.deadlineAt = Date.now() - 1
+  expect(loopControlAvailability(state, "trial", false, true).reason).toContain("expired")
+  state.budget.deadlineAt = null
+  state.budget.trainingUsed = state.budget.trainingLimit!
+  expect(loopControlAvailability(state, "design", false, true).reason).toContain("exhausted")
+})
+
+test("reopening a bounded operation shows its saved scope and cannot switch to a different control", () => {
+  const state = loopStateFixture()
+  state.budget.deadlineAt = null
+  state.control = { action: "trial", cycleID: state.cycleID!, designID: state.activeDesignID, completedTrialsBefore: 1, status: "active" }
+  expect(loopControlAvailability(state, "design", false, true).reason).toContain("saved loop control")
+  expect(loopControlAvailability(state, "trial", false, true).enabled).toBe(true)
+  state.control.status = "paused"
+  expect(loopRecoveryLine(state)).toContain("Paused after Trial")
+})
 
 test("budget labels separate reserved full attempts, task run records and an absolute deadline", () => {
   const state = loopStateFixture()

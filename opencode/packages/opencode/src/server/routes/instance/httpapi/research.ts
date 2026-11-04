@@ -31,6 +31,8 @@ export const ResearchPaths = {
   taskAutonomousIterate: `${root}/tasks/:taskID/autonomous/iterate`,
   taskAutonomousLoop: `${root}/tasks/:taskID/autonomous/loop`,
   taskLoopState: `${root}/tasks/:taskID/loop-state`,
+  taskLoopConfiguration: `${root}/tasks/:taskID/loop-config`,
+  taskLoopControl: `${root}/tasks/:taskID/loop-control`,
   taskCandidates: `${root}/tasks/:taskID/candidates`,
   taskCandidatePrepareRun: `${root}/tasks/:taskID/candidates/:candidateID/prepare-run`,
   taskCandidateExecuteRun: `${root}/tasks/:taskID/candidates/:candidateID/execute-run`,

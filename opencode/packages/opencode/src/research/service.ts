@@ -1,3 +1,4 @@
+import { beginLoopControl, bindLoopControl, endLoopControl, LoopControlError } from "./loop-control"
 import { enqueueExperienceWrites, experienceWriteIDs, flushExperienceWrites, listExperienceWrites } from "./experience-outbox"
 import {
   TrainingReflection, ArchitectureReflection, DesignSummary, TrainingReflectionAnalysis, ArchitectureReflectionAnalysis,
@@ -281,6 +282,8 @@ export type AutonomousLoopStoppedReason =
   | "crash_streak_exceeded"
   | "no_new_candidate"
   | "planner_stopped"
+  | "trial_completed"
+  | "design_completed"
 
 export interface AutonomousLoopResult {
   readonly iterations: AutonomousIterationResult[]
@@ -383,6 +386,7 @@ export const PipelineBlockedError = NamedError.create(
       "reflection_requested_human_review",
       "runner_not_configured",
       "execution_contract_violation",
+      "loop_control_paused",
     ]),
     missingFields: z.array(z.string()).optional(),
     clarifyingQuestions: z.array(z.string()).optional(),
@@ -7653,6 +7657,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
         minRelativeImprovement: loopPolicyValue(input.minRelativeImprovement, task, "minRelativeImprovement", "minImprovement") ?? 0,
         maxCrashStreak: loopPolicyInteger(input.maxCrashStreak, task, "maxCrashStreak") ?? 3,
       })
+      let control = beginLoopControl(task.id, cycle.id, input.executionScope, input.expectedDesignID)
       const policy = cycle.policy
       const maxIterations = policy.maxIterations ?? NAS_DEFAULT_MAX_ITERATIONS
       const metricName = objectiveMetricName(task.objective)
@@ -7684,13 +7689,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
           yield* runArchitectureReflection({ taskID: task.id, designID: design.id, maxIterations, factsOnly })
           finishDesign(design.id, reason)
         }
-        return yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason, skipReflection: true })
+        const result = yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason, skipReflection: true })
+        endLoopControl(task.id, control, "stopped")
+        return result
+      })
+      const pause = (reason: "trial_completed" | "design_completed") => Effect.gen(function* () {
+        const result = yield* finishAutonomousLoop({ task, iterations, maxIterations, stoppedReason: reason, skipReflection: true })
+        endLoopControl(task.id, control, "paused")
+        yield* updateTaskStatus({ taskID: task.id, status: "paused" })
+        return result
       })
       return yield* Effect.gen(function* () {
         while (true) {
           const state = currentCycle(cycle.id)
           const design = activeDesign(task.id)
           if (design && design.cycle_id !== cycle.id) throw new Error("Active design belongs to a different research cycle")
+          if (design && control) control = bindLoopControl(task.id, control, design.id)
           const trials = design ? designTrials(design.id) : []
           const pending = trials.find((trial) => trial.status !== "completed")
           const runs = (yield* listRuns(task.id)).filter((run) => run.resourceUsage.cycleID === cycle.id)
@@ -7711,12 +7725,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
             if (policy.targetMetricValue !== undefined && metrics.bestMetric !== undefined &&
                 (direction === "minimize" ? metrics.bestMetric <= policy.targetMetricValue : metrics.bestMetric >= policy.targetMetricValue)) return yield* finish("target_reached")
           }
+          if (control?.action === "trial" && iterations.length > control.completedTrialsBefore)
+            return yield* pause("trial_completed")
           if (design && !pending) {
             const latest = trials[trials.length - 1]!
             if (design.status === "optimizing") {
               const duplicate = (latest.result as unknown as AutonomousIterationResult | null)?.run.resourceUsage.duplicateExperiment === true
-              const bounded = design.reference || duplicate || trials.length >= (policy.maxTrialsPerDesign ?? 3) || design.no_improve >= (policy.maxNoImprovePerDesign ?? 2)
-              const decision = bounded ? { action: "finish_design" as const, rationale: design.reference ? "Reference initialization completed" : duplicate ? "Duplicate experiment" : "Inner-loop stopping limit reached" }
+              const bounded = control?.action === "finish-design" || design.reference || duplicate || trials.length >= (policy.maxTrialsPerDesign ?? 3) || design.no_improve >= (policy.maxNoImprovePerDesign ?? 2)
+              const decision = bounded ? { action: "finish_design" as const, rationale: control?.action === "finish-design" ? "User finished this fixed Design" : design.reference ? "Reference initialization completed" : duplicate ? "Duplicate experiment" : "Inner-loop stopping limit reached" }
                 : yield* runOptimizerAgent({ taskID: task.id, designID: design.id })
               if (decision.action === "tune") {
                 const trial = appendTrainingTrial(design.id, latest.id, decision.trainingStrategy, decision.rationale, design.best_run_id ?? undefined)
@@ -7727,6 +7743,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               setDesignPhase(design.id, "reflecting", decision.rationale)
             }
             const architectureReflection = yield* runArchitectureReflection({ taskID: task.id, maxIterations, designID: design.id })
+            if (control) return yield* pause("design_completed")
             const initialization = yield* getReferenceBaselineInitialization(yield* getTask(task.id))
             if (initialization && !initialization.completed) return yield* finish("seed_failed")
             const current = yield* getTask(task.id)
@@ -7780,6 +7797,8 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
     })
 
     const runAutonomousLoop = logPhaseMethod("runAutonomousLoop", Effect.fn("Research.runAutonomousLoop")(function* (input: AutonomousLoopInput) {
+      if (input.executionScope && ((input.stage ?? "full") !== "full" || (yield* getTask(input.taskID)).domainID !== "tsf"))
+        throw new LoopControlError({ message: "Bounded loop controls require full-stage TSF execution." })
       if ((input.stage ?? "full") === "full" && (yield* getTask(input.taskID)).domainID === "tsf")
         return yield* runDualLoopSearch(input)
       const iterations: AutonomousIterationResult[] = []
@@ -11059,6 +11078,10 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Session.Service | 
               maxCrashStreak: input.maxCrashStreak ?? 5,
               explorationRate: input.explorationRate,
             })
+            if (["trial_completed", "design_completed"].includes(result.loop.stoppedReason)) {
+              yield* updateTaskStatus({ taskID: input.taskID, status: "paused" })
+              throw new PipelineBlockedError({ taskID: input.taskID, reason: "loop_control_paused" })
+            }
             yield* markWorkflowPhase("searching")
             return result
           })

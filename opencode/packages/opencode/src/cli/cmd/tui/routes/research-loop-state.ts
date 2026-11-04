@@ -1,4 +1,44 @@
 import type { LoopProgress, LoopState } from "@/research/loop-state-schema"
+import type { LoopControlAction } from "@/research/loop-control-schema"
+
+export function loopControlAvailability(
+  state: LoopState | undefined,
+  action: LoopControlAction,
+  busy: boolean,
+  runnerReady: boolean,
+) {
+  const blocked = (reason: string) => ({ enabled: false, reason })
+  if (!state) return blocked("Loop state is unavailable. Refresh before running a control.")
+  if (busy || state.recovery.activeOperation)
+    return blocked("An operation is active. Wait for it to finish or use Abort.")
+  if (state.recovery.recoveryState !== "resumable") return blocked(state.recovery.summary)
+  if (state.control?.status === "active" && state.control.action !== action)
+    return blocked("Use /resume to finish the saved loop control first.")
+  const design = state.designs.find((item) => item.id === state.activeDesignID)
+  if (design?.status === "planning" && state.control?.status !== "active")
+    return blocked("The inner loop has finished. Use /resume to continue outer planning.")
+  if (action === "finish-design") {
+    if (!design || design.trials.some((trial) => trial.status !== "completed"))
+      return blocked("Finish or recover the current Trial before ending this Design.")
+    return {
+      enabled: true,
+      reason: "Select the best model and run Architecture Reflection; no new training or outer planning.",
+    }
+  }
+  if (!runnerReady) return blocked("Configure and prepare the runner before starting training.")
+  if (state.budget.deadlineAt !== null && state.budget.deadlineAt <= Date.now())
+    return blocked("The cycle deadline has expired.")
+  if (state.budget.trainingLimit !== null && state.budget.trainingUsed >= state.budget.trainingLimit)
+    return blocked("The shared full-training budget is exhausted. Use /append for a new cycle.")
+  if (action === "design" && !design) return blocked("Start a Trial to create a fixed Design first.")
+  return {
+    enabled: true,
+    reason:
+      action === "trial"
+        ? "Complete one Trial and its Training Reflection, then pause."
+        : "Optimize this Design and run Architecture Reflection, then pause before outer planning.",
+  }
+}
 
 export const loopPhaseLabel = (phase: LoopProgress["phase"]) =>
   phase === null
@@ -46,7 +86,13 @@ export function loopRecoveryLine(state: LoopState) {
     .join(" · ")
   if (recovery.recoveryState === "running") return `Running: ${position || recovery.currentPhase}`
   if (recovery.recoveryState === "completed") return "Research complete · results retained"
-  return `Resume at: ${position || recovery.currentPhase}`
+  const prefix =
+    state.control?.status === "paused"
+      ? state.control.action === "trial"
+        ? "Paused after Trial"
+        : "Paused after Design"
+      : "Resume at"
+  return `${prefix}: ${position || recovery.currentPhase}`
 }
 
 type WorkflowItem = { label: string; displayLabel?: string; detail?: string; status: "done" | "active" | "todo" }

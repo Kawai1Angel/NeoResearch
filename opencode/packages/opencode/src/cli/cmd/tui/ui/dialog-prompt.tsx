@@ -1,7 +1,7 @@
 import { TextareaRenderable, TextAttributes } from "@opentui/core"
 import { useTheme } from "../context/theme"
 import { useDialog, type DialogContext } from "./dialog"
-import { Show, createEffect, onMount, type JSX } from "solid-js"
+import { Show, createEffect, onCleanup, onMount, type JSX } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import { Spinner } from "../component/spinner"
 
@@ -20,7 +20,19 @@ export type DialogPromptProps = {
 export function DialogPrompt(props: DialogPromptProps) {
   const dialog = useDialog()
   const { theme } = useTheme()
-  let textarea: TextareaRenderable
+  let textarea: TextareaRenderable | undefined
+  let disposed = false
+  let focusTimer: ReturnType<typeof setTimeout> | undefined
+  let changeTimer: ReturnType<typeof setTimeout> | undefined
+  let submitTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    disposed = true
+    textarea?.destroy()
+    textarea = undefined
+    clearTimeout(focusTimer)
+    clearTimeout(changeTimer)
+    clearTimeout(submitTimer)
+  })
 
   useKeyboard((evt) => {
     if (props.busy) {
@@ -29,19 +41,19 @@ export function DialogPrompt(props: DialogPromptProps) {
       evt.stopPropagation()
       return
     }
-    if (evt.name === "return") {
-      props.onConfirm?.(textarea.plainText)
-    }
+    // The textarea's submit binding handles Enter once. Calling onConfirm here
+    // as well can replace/destroy the dialog while native input is dispatching.
   })
 
   onMount(() => {
     dialog.setSize("medium")
-    setTimeout(() => {
+    focusTimer = setTimeout(() => {
+      if (disposed) return
       if (!textarea || textarea.isDestroyed) return
       if (props.busy) return
       textarea.focus()
     }, 1)
-    textarea.gotoLineEnd()
+    textarea?.gotoLineEnd()
   })
 
   createEffect(() => {
@@ -74,13 +86,24 @@ export function DialogPrompt(props: DialogPromptProps) {
         {props.description}
         <textarea
           onSubmit={() => {
-            if (props.busy) return
-            props.onConfirm?.(textarea.plainText)
+            if (props.busy || !textarea || submitTimer) return
+            const value = textarea.plainText
+            submitTimer = setTimeout(() => {
+              submitTimer = undefined
+              if (!disposed && !props.busy) props.onConfirm?.(value)
+            }, 0)
           }}
           height={3}
           onContentChange={() => {
-            if (props.busy) return
-            props.onChange?.(textarea.plainText)
+            if (props.busy || !textarea) return
+            const value = textarea.plainText
+            clearTimeout(changeTimer)
+            // Validation can change layout or replace the dialog. Let the
+            // native edit-buffer callback finish before applying those updates.
+            changeTimer = setTimeout(() => {
+              changeTimer = undefined
+              if (!disposed && !props.busy) props.onChange?.(value)
+            }, 0)
           }}
           keyBindings={props.busy ? [] : [{ name: "return", action: "submit" }]}
           ref={(val: TextareaRenderable) => {

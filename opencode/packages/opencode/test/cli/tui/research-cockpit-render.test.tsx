@@ -1,9 +1,10 @@
 /** @jsxImportSource @opentui/solid */
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { Global } from "@opencode-ai/core/global"
 import { loopStateFixture } from "../../fixture/loop-state"
-import { chmod, mkdir, readFile, rm, writeFile } from "fs/promises"
+import { cleanupPythonVersions, installPythonVersion } from "../../fixture/python-version"
+import { mkdir, readFile, rm, writeFile } from "fs/promises"
 import path from "path"
 import { CommandProvider, useCommandDialog } from "../../../src/cli/cmd/tui/component/dialog-command"
 import { KeybindProvider } from "../../../src/cli/cmd/tui/context/keybind"
@@ -52,10 +53,7 @@ const onboardingPath = path.join(Global.Path.data, "onboarded.json")
 async function prepareNeoCastRunnerRoot(root: string) {
   await mkdir(path.join(root, "py"), { recursive: true })
   await writeFile(path.join(root, "py", "validate.py"), "# smoke runner placeholder\n", "utf8")
-  await mkdir(path.join(root, ".neo-cast", "runtime", ".venv", "bin"), { recursive: true })
-  const pythonPath = path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
-  await writeFile(pythonPath, "#!/bin/sh\necho Python 3.12.0\n", "utf8")
-  await chmod(pythonPath, 0o755)
+  await installPythonVersion(root)
 }
 
 beforeAll(async () => {
@@ -1437,7 +1435,8 @@ describe("ResearchCockpit render", () => {
     })
 
     try {
-      const frame = await waitForFrame(app, "research cand=1/1 runs=1 ok=1")
+      const frame = await waitForFrame(app, "128,000 (research est.")
+      expect(frame).toContain("research cand=1/1 runs=1 ok=1")
       expect(frame).toMatch(/~[0-9,]+ \/ 128,000 \(research est\. \$0\.\d{4}\)/)
       expect(frame).not.toContain("chat-only")
     } finally {
@@ -2302,7 +2301,7 @@ describe("ResearchCockpit render", () => {
             taskSpec: {
               runtime: {
                 bridgeOnly: false,
-                neoCastProjectRoot: "/tmp/neo-cast-research",
+                neoCastProjectRoot: path.resolve("/tmp/neo-cast-research"),
               },
             },
             objective: {},
@@ -2356,7 +2355,7 @@ describe("ResearchCockpit render", () => {
           interactionMode: "companion",
           taskSpec: {
             runtime: {
-              neoCastProjectRoot: "/tmp/neo-cast-research",
+              neoCastProjectRoot: path.resolve("/tmp/neo-cast-research"),
             },
             metadata: {
               interactionMode: "companion",
@@ -2382,7 +2381,7 @@ describe("ResearchCockpit render", () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
-    const workspace = path.join("/tmp", `neo-research-create-runner-${Date.now()}`)
+    const workspace = path.resolve("/tmp", `neo-research-create-runner-${Date.now()}`)
     const packageRoot = path.join(workspace, "opencode", "packages", "opencode")
     const runnerRoot = path.join(workspace, "neo_cast")
     await mkdir(packageRoot, { recursive: true })
@@ -3542,7 +3541,7 @@ describe("ResearchCockpit render", () => {
         taskSpec: {
           runtime: {
             bridgeOnly: false,
-            neoCastProjectRoot: "/tmp/neo-cast-research",
+            neoCastProjectRoot: path.resolve("/tmp/neo-cast-research"),
           },
         },
       })
@@ -3622,7 +3621,7 @@ describe("ResearchCockpit render", () => {
           },
           runtime: {
             bridgeOnly: false,
-            neoCastProjectRoot: "/tmp/neo-cast-research",
+            neoCastProjectRoot: path.resolve("/tmp/neo-cast-research"),
           },
         },
       })
@@ -3772,7 +3771,7 @@ describe("ResearchCockpit render", () => {
           },
           runtime: {
             bridgeOnly: false,
-            neoCastProjectRoot: "/tmp/neo-cast-research",
+            neoCastProjectRoot: path.resolve("/tmp/neo-cast-research"),
           },
         },
       })
@@ -4563,7 +4562,7 @@ describe("ResearchCockpit render", () => {
           taskSpec: {
             contextLength: 96,
             predictionLengths: [24],
-            runtime: { bridgeOnly: false, neoCastProjectRoot: "/tmp/neo-cast-research" },
+            runtime: { bridgeOnly: false, neoCastProjectRoot: path.resolve("/tmp/neo-cast-research") },
           },
         },
       ])
@@ -5115,7 +5114,7 @@ describe("ResearchCockpit render", () => {
     } finally {
       finish()
       app.renderer.destroy()
-      await rm(projectRoot, { recursive: true, force: true })
+      await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
     }
   })
 
@@ -5321,7 +5320,7 @@ describe("ResearchCockpit render", () => {
     await mkdir(Global.Path.state, { recursive: true })
     await writeFile(path.join(Global.Path.state, "kv.json"), "{}")
 
-    const workspace = path.join("/tmp", `neo-research-workspace-${Date.now()}`)
+    const workspace = path.resolve("/tmp", `neo-research-workspace-${Date.now()}`)
     const opencodeRoot = path.join(workspace, "opencode")
     const runnerRoot = path.join(workspace, "neo_cast")
     await mkdir(opencodeRoot, { recursive: true })
@@ -5455,7 +5454,7 @@ describe("ResearchCockpit render", () => {
 
       expect(frame).toContain("Set runner root before runs.")
       expect(frame).toContain("Missing py/validate.py")
-      expect(frame).toContain(".../neo_research_for_tsf")
+      expect(frame).toContain("neo-cast-no-script")
       expect(frame).not.toContain("Neo-Cast smoke runner is missing:")
       expect(frame).not.toContain("Set taskSpec.runtime.neoCastProjectRoot")
     } finally {
@@ -6171,3 +6170,98 @@ test("cockpit consumes scoped OptimizerAgent events and deduplicates its complet
     app.renderer.destroy()
   }
 })
+
+for (const action of ["trial", "design", "finish-design"] as const) {
+  test(`cockpit ${action} control submits its saved Design and revision through the durable operation route`, async () => {
+    const state = loopStateFixture()
+    state.taskID = taskID
+    state.recovery.taskID = taskID
+    state.budget.deadlineAt = Date.now() + 600_000
+    const posts: Array<{ path: string; body: any }> = []
+    let command: CommandDialog | undefined
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestURL(input).pathname
+      if (path === `/research/tasks/${taskID}/loop-state`) return response(state)
+      if (requestMethod(input, init) === "POST") {
+        posts.push({ path, body: await requestJson(input, init) })
+        if (path.endsWith("/loop-control")) return response({ iterations: [], stoppedReason: action === "trial" ? "trial_completed" : "design_completed" })
+      }
+      return mockResearchFetch(input, init)
+    }) as typeof globalThis.fetch
+    const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} onCommand={(value) => { command = value }} />, { width: 140, height: 52 })
+    try {
+      await waitForFrame(app, "/finish-design")
+      command?.trigger(`research.loop-${action}`)
+      await waitForFrame(app, action === "trial" ? "trial completed" : "design completed")
+      expect(posts).toEqual([{ path: `/research/tasks/${taskID}/loop-control`, body: { action, expectedDesignID: state.activeDesignID, expectedRevision: state.recovery.revision } }])
+    } finally { app.renderer.destroy() }
+  })
+}
+
+test("cockpit loop configuration edits an unapplied draft and saves typed limits without launching training", async () => {
+  let command: CommandDialog | undefined
+  const changes: any[] = []
+  const config = { taskID, revision: 17, cycleID: null, locked: false, lockReason: null, configuration: {
+    maxIterations: 25, maxTrialsPerDesign: 3, maxNoImprovePerDesign: 2, maxNoImprove: 7, maxCrashStreak: 3,
+    maxRuns: 200, timeBudgetSeconds: null, targetMetricValue: null, minRelativeImprovement: 0,
+  } }
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = requestURL(input).pathname
+    if (path === `/research/tasks/${taskID}/loop-config`) {
+      if (requestMethod(input, init) === "PATCH") changes.push(await requestJson(input, init))
+      return response(config)
+    }
+    return mockResearchFetch(input, init)
+  }) as typeof globalThis.fetch
+  const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} onCommand={(value) => { command = value }} />, { width: 140, height: 52 })
+  try {
+    await waitForFrame(app, "Neo-Cast Autonomous TSF")
+    command?.trigger("research.loop-config")
+    await waitForFrame(app, "Loop configuration")
+    await Bun.sleep(10)
+    app.mockInput.pressEnter()
+    await waitForFrame(app, "Shared across all Designs.")
+    await Bun.sleep(10)
+    app.mockInput.pressBackspace()
+    app.mockInput.pressBackspace()
+    await app.mockInput.typeText("8")
+    app.mockInput.pressEnter()
+    await waitForFrame(app, "Loop configuration")
+    expect(changes).toHaveLength(0)
+    await Bun.sleep(10)
+    await app.mockInput.typeText("Save configuration")
+    await app.renderOnce()
+    app.mockInput.pressEnter()
+    await waitForFrame(app, "Loop configuration saved")
+    expect(changes).toEqual([{ expectedRevision: 17, configuration: { ...config.configuration, maxIterations: 8 } }])
+  } finally { app.renderer.destroy() }
+})
+
+test("cockpit fixed loop configuration displays its policy and blocks editing", async () => {
+  let command: CommandDialog | undefined
+  let writes = 0
+  const config = { taskID, revision: 17, cycleID: "cycle-fixed", locked: true, lockReason: "This cycle's policy is fixed. Use /append.", configuration: {
+    maxIterations: 25, maxTrialsPerDesign: 3, maxNoImprovePerDesign: 2, maxNoImprove: 7, maxCrashStreak: 3,
+    maxRuns: 200, timeBudgetSeconds: 600, targetMetricValue: null, minRelativeImprovement: 0,
+  } }
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = requestURL(input).pathname
+    if (path === `/research/tasks/${taskID}/loop-config`) {
+      if (requestMethod(input, init) !== undefined && requestMethod(input, init) !== "GET") writes++
+      return response(config)
+    }
+    return mockResearchFetch(input, init)
+  }) as typeof globalThis.fetch
+  const app = await testRender(() => <ResearchCockpitHarness fetch={fetch} onCommand={(value) => { command = value }} />, { width: 140, height: 52 })
+  try {
+    await waitForFrame(app, "Neo-Cast Autonomous TSF")
+    command?.trigger("research.loop-config")
+    const frame = await waitForFrame(app, "Loop configuration (fixed)")
+    expect(frame).toContain("This cycle's policy is fixed")
+    expect(frame).not.toContain("Save configuration")
+    app.mockInput.pressEnter()
+    expect(writes).toBe(0)
+  } finally { app.renderer.destroy() }
+})
+
+afterAll(cleanupPythonVersions)

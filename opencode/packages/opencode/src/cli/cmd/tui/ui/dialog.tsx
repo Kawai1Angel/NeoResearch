@@ -1,5 +1,5 @@
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { batch, createContext, Show, useContext, type JSX, type ParentProps } from "solid-js"
+import { batch, createContext, onCleanup, Show, useContext, type JSX, type ParentProps } from "solid-js"
 import { useTheme } from "@tui/context/theme"
 import { MouseButton, Renderable, RGBA } from "@opentui/core"
 import { createStore } from "solid-js/store"
@@ -91,8 +91,18 @@ function init() {
   })
 
   let focus: Renderable | null
+  let disposed = false
+  let focusTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    disposed = true
+    focus = null
+    clearTimeout(focusTimer)
+    for (const item of store.stack) item.onClose?.()
+  })
   function refocus() {
-    setTimeout(() => {
+    clearTimeout(focusTimer)
+    focusTimer = setTimeout(() => {
+      if (disposed) return
       if (!focus) return
       if (focus.isDestroyed) return
       function find(item: Renderable) {
@@ -110,6 +120,7 @@ function init() {
 
   return {
     clear() {
+      if (disposed) return
       for (const item of store.stack) {
         if (item.onClose) item.onClose()
       }
@@ -120,6 +131,10 @@ function init() {
       refocus()
     },
     replace(input: any, onClose?: () => void) {
+      if (disposed) {
+        onClose?.()
+        return
+      }
       if (store.stack.length === 0) {
         focus = renderer.currentFocusedRenderable
         focus?.blur()

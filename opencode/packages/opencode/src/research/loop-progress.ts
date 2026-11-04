@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util"
+import { savedLoopControl } from "./loop-control"
 import { Database, and, asc, eq } from "@/storage"
 import {
   ResearchTaskTable,
@@ -298,6 +299,7 @@ export function readLoopProgress(projectID: string, taskID: ResearchTaskID): Loo
       taskID,
       observedAt: now,
       stoppedReason,
+      control: savedLoopControl(task.task_spec)?.cycleID === cycle?.id ? savedLoopControl(task.task_spec)! : null,
       cycleID: cycle?.id ?? null,
       phase: taskLoopPhase(
         task,

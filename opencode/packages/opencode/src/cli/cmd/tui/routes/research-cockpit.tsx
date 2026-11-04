@@ -1,7 +1,9 @@
+import { LoopConfigurationStateSchema, type LoopControlAction } from "@/research/loop-control-schema"
+import { openLoopConfiguration } from "../component/dialog-loop-configuration"
 import { createResearchReads, createResearchRefresh } from "./research-refresh"
 import { LoopStateSchema } from "@/research/loop-state-schema"
 import { ResearchLoopPanel } from "../component/research-loop-panel"
-import { loopBudgetLines, loopWorkflow, updateLoopAgentViews, type LoopAgentView } from "./research-loop-state"
+import { loopBudgetLines, loopWorkflow, loopControlAvailability, updateLoopAgentViews, type LoopAgentView } from "./research-loop-state"
 import { DialogResearchResults } from "@tui/component/dialog-research-results"
 import { useKV } from "@tui/context/kv"
 import { DialogResearchHistory } from "@tui/component/dialog-research-history"
@@ -1074,7 +1076,7 @@ function splitSlashSummary(prefix: string, summary: string) {
 
 function runnerIssueDetailLines(status: ResearchCockpitRunnerStatus) {
   if (status.ready) return []
-  if (status.reason === "missing_runner_script") return ["Missing py/validate.py"]
+  if (status.reason === "missing_runner_script") return ["Missing py/validate.py", `Root: ${compactTailPath(status.root ?? "")}`]
   if (status.reason === "missing_root" || status.reason === "missing_runtime") return ["Set runner root in taskSpec.runtime."]
   if (status.reason === "missing_root_path") return [`Root not found: ${compactTailPath(status.root ?? "")}`]
   if (status.reason === "missing_python") return ["Initialize Neo-Cast runtime Python."]
@@ -1209,6 +1211,7 @@ function InteractionModeDialog(props: {
 }
 
 export function ResearchCockpit() {
+  let disposed = false
   let promptInput: TextareaRenderable | undefined
   let focusTimer: ReturnType<typeof setTimeout> | undefined
   const sdk = useSDK()
@@ -1418,7 +1421,9 @@ export function ResearchCockpit() {
     void showResearchCockpitOnboarding()
   })
   onCleanup(() => {
+    disposed = true
     requestPreferences.delete(sdk)
+    promptInput = undefined // Async prompt continuations must not touch a freed native textarea.
     if (focusTimer) clearTimeout(focusTimer)
     stopActiveApiTimer()
     activeActionAbort?.abort("detached")
@@ -1663,6 +1668,70 @@ export function ResearchCockpit() {
       </Show>
     </scrollbox>
   </box>)
+  async function showLoopConfiguration() {
+    const taskID = selectedTask()?.id
+    if (!taskID) return
+    try {
+      const state = LoopConfigurationStateSchema.parse(
+        await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/loop-config`),
+      )
+      if (disposed || selectedTask()?.id !== taskID) return
+      openLoopConfiguration(dialog, state, async (configuration) => {
+        if (disposed || selectedTask()?.id !== taskID)
+          throw new Error("Selected task changed. Reopen loop configuration.")
+        await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/loop-config`, {
+          method: "PATCH",
+          body: JSON.stringify({ expectedRevision: state.revision, configuration }),
+        })
+        if (disposed || selectedTask()?.id !== taskID) return
+        requestRefresh()
+        void refetchLoopSnapshot()
+        appendCockpitNotice(
+          "loop-config",
+          "Loop configuration saved. Shared training and Run-record budgets are separate.",
+        )
+      })
+    } catch (cause) {
+      if (!disposed && selectedTask()?.id === taskID) appendCockpitNotice("loop-config", formatError(cause))
+    }
+  }
+  const controlAvailability = (action: LoopControlAction) =>
+    loopControlAvailability(loopState(), action, Boolean(busy()), runnerReady())
+  async function runLoopControl(action: LoopControlAction) {
+    const taskID = selectedTask()?.id
+    if (!taskID) return
+    const availability = controlAvailability(action)
+    if (!availability.enabled) {
+      appendCockpitNotice("loop-control", availability.reason)
+      return
+    }
+    dialog.clear()
+    if (!intentConfirmed()) {
+      await confirmIntentCheckpoint()
+      return
+    }
+    const expectedDesignID = loopState()?.activeDesignID ?? null
+    await runAction(`loop-${action}`, async (signal) => {
+      const fresh = LoopStateSchema.parse(
+        await researchRequest(sdk, `/research/tasks/${encodeURIComponent(taskID)}/loop-state`, { signal }),
+      )
+      if (fresh.activeDesignID !== expectedDesignID)
+        throw new Error("The selected Design changed. Refresh before running a control.")
+      const current = loopControlAvailability(fresh, action, false, runnerReady())
+      if (!current.enabled) throw new Error(current.reason)
+      const result = await researchRequest<ResearchCockpitLoopResult>(
+        sdk,
+        `/research/tasks/${encodeURIComponent(taskID)}/loop-control`,
+        {
+          method: "POST",
+          signal,
+          body: JSON.stringify({ action, expectedDesignID, expectedRevision: fresh.recovery.revision }),
+        },
+      )
+      void refetchLoopSnapshot()
+      return formatResearchCockpitLoop(result)
+    })
+  }
   const [historyEvents, setHistoryEvents] = createSignal<Array<{ sequence: number; summary: string }>>([])
   createEffect(() => {
     const taskID = selectedTaskKey()
@@ -2744,7 +2813,7 @@ export function ResearchCockpit() {
   ) {
     const actionTaskID = selectedTask()?.id
     const run = async () => {
-      if (actionTaskID !== selectedTask()?.id) return
+      if (disposed || actionTaskID !== selectedTask()?.id) return
       const abortController = new AbortController()
       activeActionAbort = abortController
       setBusyStartedAt(options.startedAt)
@@ -3747,7 +3816,7 @@ export function ResearchCockpit() {
     if (name === "help") {
       appendCockpitNotice(
         "help",
-        "Commands: /history, /resume, /append, /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export, /abort, /home",
+        "Commands: /history, /resume, /append, /loop-status, /loop-config, /trial, /optimize, /finish-design, /new, /dataset, /run, /loop, /task, /candidate, /runner, /mode, /seed, /export, /abort, /home",
       )
       return
     }
@@ -3808,6 +3877,10 @@ export function ResearchCockpit() {
     if (name === "history") { dialog.replace(() => <DialogResearchHistory />); return }
     if (name === "append") { await appendResearch(); return }
     if (name === "loop-status") { showLoopHistory(); return }
+    if (name === "loop-config") { await showLoopConfiguration(); return }
+    if (name === "trial") { await runLoopControl("trial"); return }
+    if (name === "optimize") { await runLoopControl("design"); return }
+    if (name === "finish-design") { await runLoopControl("finish-design"); return }
     if (name === "resume") { await resumeResearch(); return }
     if (name === "task") {
       if (arg(0) === "next") {
@@ -4076,6 +4149,7 @@ export function ResearchCockpit() {
   }
 
   async function submitPrompt() {
+    if (disposed) return
     const value = promptInput?.plainText.trim()
     if (!value) {
       if (await confirmCurrentActionProposal()) {
@@ -4238,6 +4312,12 @@ export function ResearchCockpit() {
   command.register(() => [
     { title: "Research history", value: "research.history", category: "Research", slash: { name: "history" }, onSelect: () => dialog.replace(() => <DialogResearchHistory />) },
     { title: "Extend research (set new cycle budget)", value: "research.append", category: "Research", slash: { name: "append" }, onSelect: () => void appendResearch() },
+    { title: "Configure dual-loop budgets and stopping limits", value: "research.loop-config", category: "Research", slash: { name: "loop-config" }, enabled: selectedTask()?.domainID === "tsf" && selectedTask()?.mode === "autonomous", onSelect: () => void showLoopConfiguration() },
+    ...([
+      ["trial", "Run one Trial, then pause", "trial"],
+      ["design", "Optimize current Design, then pause", "optimize"],
+      ["finish-design", "Finish current Design without further tuning", "finish-design"],
+    ] as const).map(([action, title, name]) => ({ title, description: controlAvailability(action).reason, value: `research.loop-${action}`, category: "Research", slash: { name }, enabled: controlAvailability(action).enabled, onSelect: () => void runLoopControl(action) })),
     { title: "View Design / Trial history and loop budgets", value: "research.loop-status", category: "Research", slash: { name: "loop-status" }, onSelect: showLoopHistory },
     { title: recovery()?.recoveryState === "running" ? "View running operation" : "Resume research / View recovery status", value: "research.resume", category: "Research", slash: { name: "resume" }, onSelect: () => void resumeResearch() },
     {
@@ -5135,7 +5215,8 @@ export function ResearchCockpit() {
           event.action === "chat-status" ||
           event.action === "chat-stream" ||
           event.action === "action-proposal" ||
-          event.action === "shortcut",
+          event.action === "shortcut" ||
+          event.action.startsWith("loop-"),
         )
         .map((event) => ({ id: event.id, kind: "action" as const, event })),
       ...errorEvents()
@@ -5635,7 +5716,14 @@ export function ResearchCockpit() {
           </box>
           <Show when={loopState()}>{(state) => <box flexDirection="column" gap={0}>
             <ResearchLoopPanel state={state()} now={loopNow()} colors={cockpitColors} compact minimal={dimensions().height < 36} onOpenHistory={showLoopHistory} />
-            <text fg={cockpitColors.primary} onMouseUp={showLoopHistory}>/loop-status · Design / Trial history</text>
+            <box flexDirection="row" gap={2} flexWrap="wrap">
+              <text fg={cockpitColors.primary} onMouseUp={showLoopHistory}>/loop-status</text>
+              <text fg={cockpitColors.primary} onMouseUp={() => void showLoopConfiguration()}>/loop-config</text>
+              <For each={[["trial", "/trial"], ["design", "/optimize"], ["finish-design", "/finish-design"]] as const}>
+                {([action, label]) => <text fg={controlAvailability(action).enabled ? cockpitColors.primary : cockpitColors.textMuted}
+                  onMouseUp={() => void runLoopControl(action)}>{label}</text>}
+              </For>
+            </box>
           </box>}</Show>
           <Show when={loopSnapshot()?.taskID === selectedTaskKey() && loopSnapshot()?.error}>
             <text fg={cockpitColors.warning} wrapMode="word">Loop state unavailable · refresh will retry</text>
@@ -5817,7 +5905,7 @@ export function ResearchCockpit() {
               },
             }}
           >
-            <box gap={1}>
+            <box gap={0}>
               <text fg={cockpitColors.text} attributes={TextAttributes.BOLD} width="100%" overflow="hidden" wrapMode="none">
                 {taskLabel()}
               </text>
@@ -5828,6 +5916,19 @@ export function ResearchCockpit() {
                 </text>
                 <text fg={cockpitColors.textMuted}>{taskSummary()}</text>
               </box>
+
+              <Show when={validChampion()}>
+                {(item) => (
+                  <box gap={0} paddingTop={1}>
+                    <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
+                      Champion
+                    </text>
+                    <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
+                    <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
+                    <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
+                  </box>
+                )}
+              </Show>
 
               <box gap={0} paddingTop={1}>
                 <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
@@ -5995,19 +6096,6 @@ export function ResearchCockpit() {
                   )}
                 </For>
               </box>
-
-              <Show when={validChampion()}>
-                {(item) => (
-                  <box gap={0} paddingTop={1}>
-                    <text fg={cockpitColors.text} attributes={TextAttributes.BOLD}>
-                      Champion
-                    </text>
-                    <text fg={cockpitColors.textMuted}>candidate {shortID(item().candidateID)}</text>
-                    <text fg={cockpitColors.success}>metric={item().primaryMetric.toPrecision(4)}</text>
-                    <text fg={cockpitColors.success}>utility={item().utility.toPrecision(4)}</text>
-                  </box>
-                )}
-              </Show>
             </box>
           </scrollbox>
 

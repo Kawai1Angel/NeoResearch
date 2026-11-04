@@ -534,6 +534,8 @@ export class AutonomousIterationInput extends Schema.Class<AutonomousIterationIn
 
 export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("ResearchAutonomousLoopInput")({
   taskID: ResearchTaskID,
+  executionScope: Schema.optional(Schema.Literals(["trial", "design", "finish-design"])),
+  expectedDesignID: Schema.optional(Schema.NullOr(Schema.String)),
   stage: Schema.optional(ExecutableRunStage),
   description: Schema.optional(Schema.String),
   maxIterations: Schema.optional(Schema.Number),
