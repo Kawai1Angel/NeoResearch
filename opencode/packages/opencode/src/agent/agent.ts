@@ -20,6 +20,9 @@ import PROMPT_RESEARCH_HYPO_PLANNER_ZERO from "./prompt/research-hypo-planner-ze
 import PROMPT_RESEARCH_HYPO_PLANNER from "./prompt/research-hypo-planner.txt"
 import PROMPT_RESEARCH_REFLECTION from "./prompt/research-reflection.txt"
 import PROMPT_RESEARCH_MODEL_DESIGNER from "./prompt/research-model-designer.txt"
+import PROMPT_RESEARCH_OPTIMIZER from "./prompt/research-optimizer.txt"
+import PROMPT_RESEARCH_REFLECTION_TRAINING from "./prompt/research-reflection-training.txt"
+import PROMPT_RESEARCH_REFLECTION_ARCHITECTURE from "./prompt/research-reflection-architecture.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@opencode-ai/core/global"
@@ -394,6 +397,30 @@ export const layer = Layer.effect(
             ),
             prompt: PROMPT_RESEARCH_REFLECTION,
           },
+          "research-optimizer": {
+            name: "research-optimizer",
+            description: "OptimizerAgent — fixed-design inner-loop training optimization.",
+            mode: "primary",
+            options: {},
+            native: true,
+            hidden: true,
+            permission: Permission.merge(defaults, Permission.fromConfig({ "*": "deny" }), user),
+            prompt: PROMPT_RESEARCH_OPTIMIZER,
+          },
+          "research-reflection-training": {
+            name: "research-reflection-training",
+            description: "ReflectionAgent — fixed-design trial diagnosis.",
+            mode: "primary", options: {}, native: true, hidden: true,
+            permission: Permission.merge(defaults, user, Permission.fromConfig({ "*": "deny" })),
+            prompt: PROMPT_RESEARCH_REFLECTION_TRAINING,
+          },
+          "research-reflection-architecture": {
+            name: "research-reflection-architecture",
+            description: "ReflectionAgent — completed-design architectural evidence assessment.",
+            mode: "primary", options: {}, native: true, hidden: true,
+            permission: Permission.merge(defaults, user, Permission.fromConfig({ "*": "deny" })),
+            prompt: PROMPT_RESEARCH_REFLECTION_ARCHITECTURE,
+          },
           "research-model-designer": {
             name: "research-model-designer",
             description: "NeoResearch autonomous loop — TSF candidate design stage. Invoked programmatically.",
@@ -412,6 +439,7 @@ export const layer = Layer.effect(
                 webfetch: "allow",
                 experiment_results: "allow",
                 read_task_evidence: "allow",
+                read_experiences: "allow",
                 read_reflection: "allow",
                 read_training_curve: "allow",
               }),

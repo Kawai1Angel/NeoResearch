@@ -1,3 +1,4 @@
+import { experiencePurpose } from "./experience-purpose"
 import { createHash } from "node:crypto"
 import z from "zod"
 import type { ResearchExperience } from "./experience"
@@ -72,6 +73,7 @@ export function experienceThreadRoot(entry: ExperienceEntry, entries: Map<string
     if (!parentID) return current
     const parent = entries.get(parentID)
     if (!parent || parent.domainID !== entry.domainID) throw new Error("Experience continuation requires an existing parent in the same domain")
+    if (experiencePurpose(current.experience) !== experiencePurpose(parent.experience)) throw new Error("Experience thread purpose changed")
     current = parent
   }
 }

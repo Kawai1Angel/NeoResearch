@@ -1,3 +1,4 @@
+import { neoCastRuntimePython } from "@/research/runners/runtime-python"
 import { taskExecutionRoot } from "@/research/task-isolation"
 import {
   NAS_DEFAULT_MAX_ITERATIONS,
@@ -711,8 +712,14 @@ function modelDesignerIteration(input: Pick<ResearchCockpitWorkflowInput, "task"
   return `iteration ${iteration}/${maxIterations}`
 }
 
-export function researchCockpitArtifactTarget(artifact: ResearchCockpitArtifact) {
-  return artifact.uri.startsWith("file://") ? artifact.uri.slice("file://".length) : artifact.uri
+export function researchCockpitArtifactTarget(artifact: Pick<ResearchCockpitArtifact, "uri">) {
+  if (!artifact.uri.startsWith("file:")) return artifact.uri
+  const url = new URL(artifact.uri)
+  // Artifact paths belong to the server's OS, which can differ from the TUI's.
+  if (/%2f|%5c/i.test(url.pathname)) throw new Error("Artifact URI contains an encoded path separator")
+  const pathname = decodeURIComponent(url.pathname)
+  if (url.hostname) return `//${url.hostname}${pathname}`
+  return /^\/[a-z]:\//i.test(pathname) ? pathname.slice(1) : pathname
 }
 
 export function formatResearchCockpitArtifactMetadata(artifact: ResearchCockpitArtifact) {
@@ -1533,10 +1540,6 @@ function parsePythonVersion(raw: string) {
 function isSupportedPythonVersion(raw: string) {
   const version = parsePythonVersion(raw)
   return version !== undefined && (version.major > 3 || (version.major === 3 && version.minor >= 10))
-}
-
-function neoCastRuntimePython(root: string) {
-  return path.join(root, ".neo-cast", "runtime", ".venv", "bin", "python")
 }
 
 function optionalNumberArray(value: unknown) {

@@ -1,7 +1,7 @@
 import { DialogResearchHistory } from "@tui/component/dialog-research-history"
 import { TextareaRenderable, TextAttributes, type KeyEvent } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
-import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { useLocal } from "@tui/context/local"
 import { DialogProvider as ProviderAuthDialog } from "@tui/component/dialog-provider"
@@ -60,6 +60,25 @@ function useOptionalLocal() {
 export function Home() {
   let input: TextareaRenderable | undefined
   let promptedForApiKey = false
+  let disposed = false
+  let changeTimer: ReturnType<typeof setTimeout> | undefined
+  const timers = new Set<ReturnType<typeof setTimeout>>()
+  function defer(action: () => void) {
+    if (disposed) return
+    const timer = setTimeout(() => {
+      timers.delete(timer)
+      if (!disposed) action()
+    }, 0)
+    timers.add(timer)
+  }
+  onCleanup(() => {
+    disposed = true
+    input?.destroy()
+    input = undefined
+    clearTimeout(changeTimer)
+    for (const timer of timers) clearTimeout(timer)
+    timers.clear()
+  })
   const command = useCommandDialog()
   const dialog = useDialog()
   const route = useRoute()
@@ -115,8 +134,7 @@ export function Home() {
       duration: 4000,
     })
   }
-  const submitGoal = () => {
-    const researchGoal = input?.plainText.trim()
+  const submitGoal = (researchGoal: string) => {
     if (researchGoal) {
       if (researchGoal.startsWith("/")) {
         if (!runVisibleSlashInput(researchGoal)) runSlashInput(researchGoal)
@@ -136,9 +154,12 @@ export function Home() {
   }
 
   function selectSlashOption(option: SlashOption) {
-    option.onSelect?.()
-    input?.clear()
-    setInputValue("")
+    // Navigation can destroy the textarea. Finish the native key callback first.
+    defer(() => {
+      input?.clear()
+      setInputValue("")
+      option.onSelect?.()
+    })
   }
 
   function runVisibleSlashInput(value: string) {
@@ -206,10 +227,10 @@ export function Home() {
     if (promptedForApiKey) return
     if (!needsApiKey()) return
     promptedForApiKey = true
-    setTimeout(() => {
+    defer(() => {
       if (!needsApiKey()) return
       if (!openProviderDialog()) showApiKeyHelp()
-    }, 0)
+    })
   })
 
   command.register(() => [
@@ -317,9 +338,18 @@ export function Home() {
                 minHeight={1}
                 maxHeight={3}
                 keyBindings={[{ name: "return", action: "submit" }]}
-                onSubmit={submitGoal}
+                onSubmit={() => {
+                  const value = input?.plainText.trim() ?? ""
+                  defer(() => submitGoal(value))
+                }}
                 onKeyDown={handleSlashKeyDown}
-                onContentChange={() => setInputValue(input?.plainText ?? "")}
+                onContentChange={() => {
+                  const value = input?.plainText ?? ""
+                  clearTimeout(changeTimer)
+                  changeTimer = setTimeout(() => {
+                    if (!disposed) setInputValue(value)
+                  }, 0)
+                }}
                 ref={(value: TextareaRenderable) => {
                   input = value
                 }}

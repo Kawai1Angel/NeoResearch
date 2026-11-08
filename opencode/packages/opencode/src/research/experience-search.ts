@@ -6,6 +6,7 @@ import { matchExperienceQuery, type ExperienceCondition } from "./experience-mat
 import path from "node:path"
 import { fieldValue } from "./experiment-constraints"
 import { normalizedRecipePath } from "./recipe-naming"
+import { experiencePurpose } from "./experience-purpose"
 
 export const EXPERIENCE_SEARCH_METHOD = "intent_grounded_bm25_v3"
 
@@ -117,7 +118,7 @@ export function rankExperiences(entries: Entry[], query?: string, options: Searc
     const counts = new Map<string, number>()
     for (const field of fields) for (const term of field.terms) counts.set(term, (counts.get(term) ?? 0) + field.weight)
     if (options.includeBackground) for (const term of background) counts.set(term, (counts.get(term) ?? 0) + 0.05)
-    return { memory, view, fields, relevance, match, counts, length: [...counts.values()].reduce((sum, count) => sum + count, 0),
+    return { memory, purpose: experiencePurpose(experience), view, fields, relevance, match, counts, length: [...counts.values()].reduce((sum, count) => sum + count, 0),
       matchedFactual, focalMatches: terms.filter(term => focal.has(term)),
       backgroundMatches: terms.filter(term => background.has(term)) }
   })
@@ -141,9 +142,10 @@ export function rankExperiences(entries: Entry[], query?: string, options: Searc
     const organization = entry.memory.candidateSummary.experienceOrganization as { threadID?: string; conditionalExperience?: { status: string } } | undefined
     const key = options.deduplicate === false ? entry.memory.id :
       organization?.conditionalExperience?.status === "explicit_hypothesis" ? organization.threadID! : entry.view.evidenceKey
-    const group = groups.get(key) ?? []
+    const purposeKey = JSON.stringify([entry.purpose ?? null, key])
+    const group = groups.get(purposeKey) ?? []
     group.push(entry)
-    groups.set(key, group)
+    groups.set(purposeKey, group)
   }
   return [...groups.values()].map(([entry, ...alternatives]) => ({ ...entry!.memory,
     candidateSummary: { ...entry!.memory.candidateSummary, experienceRetrieval: {

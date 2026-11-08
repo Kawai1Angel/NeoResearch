@@ -228,6 +228,161 @@ Companion mode also has post-NAS checkpoints:
 - experiment_budget_extended: decide whether to extend the iteration budget.
 - final_model_selection: confirm the champion or accept current results.
 
+### Fixed-Design Inner Optimization
+
+Full TSF searches persist an outer architecture design and its inner training trials.
+HypoPlanner and ModelDesigner select a hypothesis and materialize a design once.
+OptimizerAgent then uses same-design validation results, training curves and experience
+ to propose complete training configurations. Preprocessing, structural dimensions,
+branches, output heads, evaluation protocol and seed stay fixed. Compatible loss,
+optimizer, learning rate, weight decay, scheduler, clipping, batch size and bounded
+training duration may change. Every trial starts with newly initialized weights.
+
+`maxTrialsPerDesign` defaults to 3, including the initial trial;
+`maxNoImprovePerDesign` defaults to 2. Both may be supplied to the loop/pipeline API
+or under `budget.loop`. Setting `maxTrialsPerDesign=1` disables iterative optimization.
+The selected reference baseline is evaluated once before discovery begins.
+
+The two loops share `maxIterations` (default 25). A full execution reserves one
+iteration transactionally before dispatch, including failed attempts. Reopening a
+search preserves consumed iterations and elapsed time. Verified cache hits refund
+the reservation and do not create independent evidence or advance plateau counters.
+Smoke checks do not consume full-training iterations and remain bounded by failure
+and resource limits. Inner stopping returns to the outer planner; global plateau,
+target and resource limits stop the research search.
+
+The `research_design` and `research_training_trial` tables retain immutable recipes,
+trial contracts, execution links, optimizer decisions and the best eligible full run.
+Initial architecture comparisons keep the hypothesis contract. Later tuning trials
+have their own named same-design comparisons; both contracts remain in run facts.
+Tuning gains cannot be attributed to architecture changes.
+
+Failed smoke and full attempts can also return to OptimizerAgent for a bounded
+training-only repair. If no valid full control exists, the repair uses an
+exploratory contract that pins the proposed training strategy and records its
+failed source run (`repair_run_id`). It cannot establish a performance contrast.
+Once a valid full result exists, subsequent tuning uses that design's best valid
+full result as its control, even when the immediately preceding smoke failed.
+
+`timeBudgetSeconds` binds a durable absolute `deadline_at` when the search first
+starts (or when an existing cycle is upgraded). Queue waits, model reasoning,
+runner initialization, smoke and full execution all share this deadline. The
+runner process tree and direct LLM requests are canceled at expiry; final local
+result persistence may finish afterward. Restarting the application preserves
+the deadline, so downtime also uses the remaining wall-clock budget. Expired
+queued workers cannot dispatch; unknown running owners still require reconciliation.
+
+Design-scoped Reflection and HypoPlanner checkpoint accepted reasoning, artifacts
+and final results in `phase_receipts`. Reflection completion advances the design
+to planning in the same transaction. Applying a HypoPlanner plan, saving its
+result and closing the design are also atomic. Recovery reuses committed results
+without another model call, repeated plan application or duplicate artifact rows.
+An interrupted request that never produced a saved response may need to be sent
+again; remote model execution itself cannot be guaranteed exactly once.
+
+Recovery exposes `activeDesignID`, `activeTrialID` and `loopPhase`. A terminal linked
+run is replayed without launching training again or charging the budget twice.
+Unconfirmed running processes and queued runs without a persisted plan require
+reconciliation. Before the first full attempt, failed implementation repair may
+create a new outer design while retaining the rejected design and smoke evidence.
+
+### Scoped Reflection in the Dual Loop
+
+In a full dual-loop TSF search, each completed trial, including failed smoke/full attempts, has
+a `TrainingReflection` before OptimizerAgent decides the next training intervention.
+It captures exact execution evidence, the named same-design training control or
+failed repair source, comparison eligibility and separate phase/fold/horizon curve
+summaries. Its interpretation is limited to training diagnosis and questions for
+OptimizerAgent; it cannot return an architecture verdict or change a recipe.
+
+When inner optimization finishes, `DesignSummary` records all trial outcomes and
+the best eligible complete model separately from `architectureEvidence`. Architecture
+evidence uses the original outer-contract trial and its named control, with matched
+data, evaluation, training configuration and evaluated seed. The best tuned trial
+is never substituted into that architectural comparison. Joint architecture/training
+changes, failures, duplicate/cache results, smoke results and unmatched evaluations
+cannot establish an isolated architecture effect.
+
+`ArchitectureReflection` interprets that completed-design summary plus its training
+reflections, then hands the summary and assessment to HypoPlanner. The coordinator
+forces an inconclusive hypothesis assessment when architecture evidence is ineligible,
+even if the model claims support. Both modes are invoked as ReflectionAgent with
+separate prompts and strict output schemas; their sessions have no tool permissions.
+
+The service exposes `runTrainingReflection`, `getDesignSummary` and
+`runArchitectureReflection`. Existing `runReflectionAgent` callers can pass
+`designID` and `reflectionScope=training|architecture` (plus `trialID` for training).
+Design-scoped calls default to architecture mode. Calls without a design retain
+the legacy task-level API. Legacy report fields remain available alongside the
+typed results, with architectural change lists restricted to the named outer comparison.
+
+Versioned `training-reflection:<trialID>:v2` and
+`architecture-reflection:<designID>:v2` receipts retain facts, accepted reasoning,
+artifact receipts and final results. `design-summary:v2` retains the design summary.
+Old unscoped reflection receipts are preserved and do not satisfy these new stages.
+Recovery reports `training_reflection` when a terminal trial awaits its diagnosis.
+Both reasoning modes share the durable deadline and do not charge extra training
+iterations. At expiry, local factual records and an inconclusive design assessment
+are saved without another model call. Model execution whose response was never
+saved can still require a retry after an interrupted request.
+
+Scoped reflections may optionally return `experienceDrafts` (at most three); returning
+none saves only the working reflection. Both session and direct modes use the same
+validated delivery path below. The model never claims a successful memory write.
+
+### Shared Memory Purposes and Delivery
+
+The only memory purposes are `optimization` and `architecture`. Execution failures
+belong to optimization observations; `execution` remains a claim type, not a third
+purpose. Existing maturity levels and task/project/shared read scopes are independent.
+New experiences retain their purpose and, for scoped writes, the committed reflection
+origin (`reflectionKey`, design/trial, input digest and permitted source run IDs).
+Purpose is assigned and checked by the writer, not accepted as a free model label.
+Training-only contrasts cannot become architecture memory, and a joint training/design
+change cannot establish an isolated performance claim of either purpose.
+
+The shared SQLite library gains nullable `purpose` and `classification_version` columns
+additively. Historical source JSON, IDs, facts and interpretations are not rewritten.
+Classification is inferred only from factual contracts/interventions or execution
+observations; ambiguous records remain unclassified. Unclassified is an audit state,
+not another purpose. Exact reads remain available, but automatic role retrieval excludes
+these records unless an exact-ID audit explicitly opts into `includeUnknown`.
+
+Role filters run before ranking and limits: OptimizerAgent/training reflection read
+optimization memory; HypoPlanner/ModelDesigner/architecture reflection normally read
+architecture memory. A specific execution-error query from HypoPlanner or ModelDesigner
+can retrieve optimization failure evidence for execution compatibility, not architecture
+attribution. Changing a tool's requested purpose or requesting a known ID does not bypass
+the role filter. Query deduplication, thread continuation and curation merges also
+preserve purpose. OptimizerAgent derives its query from the current failure, training
+question or changed fields rather than a fixed learning-rate query.
+
+Scoped reflections can request up to three bounded `experience_request` lookups,
+including exact-parent facts before continuation/promotion. Query responses are saved
+in versioned stage receipts and both transports consume the same role-filtered results.
+Lookups share the research deadline. No extra training iterations are charged.
+
+Accepted reflection results and draft requests are committed atomically to the research
+database's `research_memory_write` outbox. Preparation verifies that the original
+reflection evidence has not changed, validates permitted run references, purpose and
+parent provenance, then freezes the factual payload. The destination library path is
+pinned when the proposal is enqueued. The shared library commits an idempotency receipt
+with the source entry in its own transaction. Recovery can safely repeat delivery after
+the library commit even when the research DB has not yet recorded success.
+
+Outbox receipts expose `pending`, `prepared`, `applied` or `rejected`. Invalid evidence
+is rejected without blocking the architectural decision; storage failures remain retryable.
+Reopening/resuming the loop retries pending delivery without another model call or
+training attempt. `Research.listExperienceWrites` and `Research.flushExperienceWrites`
+provide status/retry access, and reflection completion events include the relevant write
+receipts. Frozen prepared payloads retain the original observed facts across retries.
+Legacy explicit `write_experience` calls continue to use the validated writer; the
+automatic dual-loop path uses the outbox.
+
+`read_experiences` supports `purpose` and exact-ID `includeUnknown` audit filters.
+The standalone library CLI also accepts `research experiences --purpose optimization`
+or `--purpose architecture`, with `--include-unknown` for deliberate legacy audits.
+
 ### 6. Runner Execution
 
 The domain builds TSF run plans for Neo-Cast execution.
@@ -432,3 +587,33 @@ For a new TSF task:
 8. Approve final model selection.
 9. Run Publish Agent / Export Bundle.
 10. Inspect manifest.json, the final report, and model package.
+
+
+### TUI Dual-Loop Progress
+
+The cockpit reads `GET /research/tasks/:taskID/loop-state` for a transactionally
+consistent snapshot of the active cycle, ordered designs/trials, ranking eligibility,
+scoped reflection receipts, memory delivery receipts and recovery position. Reading
+this endpoint never initializes a cycle, reserves training, runs models or flushes
+memory. Task/project authorization is checked before any history is returned.
+
+The panel distinguishes reserved full-training attempts from the task's run-record
+budget and per-design trial limits. Failed full attempts stay charged; failed smoke
+attempts still appear as trials without a full-training charge. Epochs, folds and
+horizons are not counted separately. The deadline comes from the persisted cycle and
+continues counting down while the TUI is closed or the task is paused.
+
+Use `/loop-status` (or the Design / Trial history link) to inspect all designs in the
+current cycle, training changes, earlier best runs, failures, cached/excluded results,
+training/architecture diagnoses and actual memory write statuses. The main panel shows
+the active design, or the last completed design, and its last three trials. Selecting
+a trial expands its details. Current training, training-result finalization, training
+reflection, optimization, architecture reflection and outer planning/design are
+projected from persisted executions and receipts, not historical candidate counts.
+
+Optimizer stage events include design/trial/cycle identity, the validated decision,
+rationale and duration. Scoped reflection streams carry their scope and design/trial
+identity, and the cockpit retains them separately. Live events refresh the snapshot;
+periodic reads and reopening the TUI recover the same state after disconnects. Legacy
+non-dual-loop workflows retain their existing presentation. Configuration and additional
+loop-control actions are a separate implementation phase.

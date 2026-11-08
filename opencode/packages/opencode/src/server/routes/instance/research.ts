@@ -1,4 +1,7 @@
 import { Effect } from "effect"
+import { LoopStateSchema } from "@/research/loop-state-schema"
+import { LoopConfigurationStateSchema, UpdateLoopConfigurationSchema, LoopControlInputSchema } from "@/research/loop-control-schema"
+import { loopConfiguration, updateLoopConfiguration, savedLoopControl } from "@/research/loop-control"
 import {
   ResumeStateSchema,
   HistoryPageSchema,
@@ -15,6 +18,7 @@ import {
   createResearchCycle,
   researchHistory,
   resumeState,
+  loopState,
   researchEvents,
   researchTasksForSession,
 } from "@/research/recovery"
@@ -60,8 +64,69 @@ const researchManagerTraceSchema = z
   })
   .array()
 
+const autonomousLoopResultSchema = z.object({
+  iterations: z
+    .object({
+      candidate: Research.ResearchCandidate.zod,
+      seededCandidates: Research.ResearchCandidate.zod.array(),
+      approvals: Research.ResearchApproval.zod.array(),
+      run: Research.ResearchRun.zod,
+      runPlan: Research.DomainRunPlan,
+      managerTrace: researchManagerTraceSchema,
+      selectionArtifact: Research.ResearchArtifact.zod,
+    })
+    .array(),
+  stoppedReason: z.enum([
+    "max_iterations",
+    "budget_exhausted",
+    "approval_required",
+    "seed_failed",
+    "target_reached",
+    "plateau",
+    "time_budget_exhausted",
+    "crash_streak_exceeded",
+    "no_new_candidate",
+    "planner_stopped",
+    "trial_completed",
+    "design_completed",
+  ]),
+  artifact: Research.ResearchArtifact.zod,
+})
+
 export const ResearchRoutes = lazy(() =>
   new Hono()
+    .get("/tasks/:taskID/loop-config", describeRoute({
+      summary: "Read dual-loop configuration and policy lock",
+      operationId: "research.tasks.loopConfiguration",
+      responses: { 200: { description: "Loop configuration", content: { "application/json": { schema: resolver(LoopConfigurationStateSchema) } } }, ...errors(404) },
+    }), validator("param", taskParam), (c) => {
+      const state = loopConfiguration(Instance.project.id, c.req.valid("param").taskID)
+      return state ? c.json(state) : c.json({ message: "Research task not found" }, 404)
+    })
+    .patch("/tasks/:taskID/loop-config", describeRoute({
+      summary: "Configure a dual loop before its policy is fixed",
+      operationId: "research.tasks.updateLoopConfiguration",
+      responses: { 200: { description: "Saved loop configuration", content: { "application/json": { schema: resolver(LoopConfigurationStateSchema) } } }, ...errors(400, 404, 409) },
+    }), validator("param", taskParam), validator("json", UpdateLoopConfigurationSchema), (c) => {
+      const result = updateLoopConfiguration(Instance.project.id, c.req.valid("param").taskID, c.req.valid("json"))
+      return c.json(result.body, result.status)
+    })
+    .post("/tasks/:taskID/loop-control", describeRoute({
+      summary: "Run one Trial, optimize one Design, or finish its inner loop",
+      operationId: "research.tasks.loopControl",
+      responses: { 200: { description: "Bounded loop result", content: { "application/json": { schema: resolver(autonomousLoopResultSchema) } } }, 202: { description: "Durable operation receipt", content: { "application/json": { schema: resolver(OperationReceiptSchema) } } }, ...errors(400, 404, 409) },
+    }), validator("param", taskParam), validator("json", LoopControlInputSchema), async (c) => {
+      const { taskID } = c.req.valid("param"), input = c.req.valid("json")
+      const state = resumeState(Instance.project.id, taskID)
+      if (!state) return c.json({ message: "Research task not found" }, 404)
+      const previous = c.req.header("idempotency-key") && ResearchOperations.request(Instance.project.id, taskID, c.req.header("idempotency-key")!)
+      if (!previous && (state.revision !== input.expectedRevision || state.activeDesignID !== input.expectedDesignID))
+        return c.json({ name: "ResearchLoopControlConflict", state }, 409)
+      return jsonRequest("ResearchRoutes.tasks.loopControl", c, function* () {
+        const svc = yield* Research.Service
+        return yield* svc.runAutonomousLoop({ taskID, executionScope: input.action, expectedDesignID: input.expectedDesignID })
+      }, input.expectedRevision)
+    })
     .post("/tasks/:taskID/cycles", validator("param", taskParam), validator("json", CycleInput), (c) => {
       const result = createResearchCycle(Instance.project.id, c.req.valid("param").taskID, c.req.valid("json"))
       return c.json(result.body, result.status)
@@ -116,6 +181,22 @@ export const ResearchRoutes = lazy(() =>
           if (c.req.valid("query").cursor) return c.json({ message: "Invalid history cursor" }, 400)
           throw error
         }
+      },
+    )
+    .get(
+      "/tasks/:taskID/loop-state",
+      describeRoute({
+        summary: "Read persisted dual-loop progress and recovery",
+        operationId: "research.tasks.loopState",
+        responses: {
+          200: { description: "Read-only design and trial snapshot", content: { "application/json": { schema: resolver(LoopStateSchema) } } },
+          ...errors(404),
+        },
+      }),
+      validator("param", taskParam),
+      (c) => {
+        const state = loopState(Instance.project.id, c.req.valid("param").taskID)
+        return state ? c.json(state) : c.json({ message: "Research task not found in this project" }, 404)
       },
     )
     .get(
@@ -216,7 +297,13 @@ export const ResearchRoutes = lazy(() =>
             return runRequest(
               "ResearchRoutes.tasks.resume",
               c,
-              Research.Service.use((svc) => svc.runFullPipeline({ taskID })).pipe(
+              Research.Service.use((svc) => Effect.gen(function* () {
+                const task = yield* svc.getTask(taskID)
+                const control = savedLoopControl(task.taskSpec)
+                return control?.status === "active" && control.cycleID === state.cycleID
+                  ? yield* svc.runAutonomousLoop({ taskID })
+                  : yield* svc.runFullPipeline({ taskID })
+              })).pipe(
                 Effect.onInterrupt(() =>
                   Research.Service.use((svc) =>
                     Effect.gen(function* () {
@@ -876,6 +963,8 @@ export const ResearchRoutes = lazy(() =>
           maxNoImprove: z.number().int().min(0).optional(),
           timeBudgetSeconds: z.number().positive().optional(),
           maxCrashStreak: z.number().int().min(0).optional(),
+          maxTrialsPerDesign: z.number().int().min(1).max(1000).optional(),
+          maxNoImprovePerDesign: z.number().int().min(1).max(1000).optional(),
           explorationRate: z.number().min(0).max(1).optional(),
           outputDir: z.string().optional(),
           forceDatasetPreparation: z.boolean().optional(),
@@ -950,32 +1039,7 @@ export const ResearchRoutes = lazy(() =>
             content: {
               "application/json": {
                 schema: resolver(
-                  z.object({
-                    iterations: z
-                      .object({
-                        candidate: Research.ResearchCandidate.zod,
-                        seededCandidates: Research.ResearchCandidate.zod.array(),
-                        approvals: Research.ResearchApproval.zod.array(),
-                        run: Research.ResearchRun.zod,
-                        runPlan: Research.DomainRunPlan,
-                        managerTrace: researchManagerTraceSchema,
-                        selectionArtifact: Research.ResearchArtifact.zod,
-                      })
-                      .array(),
-                    stoppedReason: z.enum([
-                      "max_iterations",
-                      "budget_exhausted",
-                      "approval_required",
-                      "seed_failed",
-                      "target_reached",
-                      "plateau",
-                      "time_budget_exhausted",
-                      "crash_streak_exceeded",
-                      "no_new_candidate",
-                      "planner_stopped",
-                    ]),
-                    artifact: Research.ResearchArtifact.zod,
-                  }),
+                  autonomousLoopResultSchema,
                 ),
               },
             },
@@ -995,6 +1059,8 @@ export const ResearchRoutes = lazy(() =>
           maxNoImprove: z.number().int().min(0).optional(),
           timeBudgetSeconds: z.number().positive().optional(),
           maxCrashStreak: z.number().int().min(0).optional(),
+          maxTrialsPerDesign: z.number().int().min(1).max(1000).optional(),
+          maxNoImprovePerDesign: z.number().int().min(1).max(1000).optional(),
           explorationRate: z.number().min(0).max(1).optional(),
         }),
       ),

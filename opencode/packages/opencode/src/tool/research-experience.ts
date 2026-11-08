@@ -1,3 +1,4 @@
+import { agentExperienceReader, ExperiencePurpose } from "@/research/experience-purpose"
 import { Effect, Schema } from "effect"
 import { ZodOverride } from "@/util/effect-zod"
 import * as Tool from "./tool"
@@ -10,7 +11,7 @@ import {
   experienceSummaryForPrompt,
   type ExperienceDraft,
 } from "@/research/experience"
-import { readExperiences, writeExperience } from "@/research/experience-store"
+import { readExperiences, readExperiencesForRole, experiencePurposeForReader, writeExperience } from "@/research/experience-store"
 import { Instance } from "@/project/instance"
 import { EXPERIENCE_SEARCH_METHOD } from "@/research/experience-search"
 import { EXPERIENCE_QUERY_INTENTS, parseExperienceQuery } from "@/research/experience-query"
@@ -84,6 +85,8 @@ const ReadParameters = Schema.Struct({
   scope: Schema.optional(Schema.Literals(["task", "project", "shared"])).annotate({
     description: "shared (default) reads the same domain across projects; project restricts to this project; task restricts to this task.",
   }),
+  purpose: Schema.optional(Schema.Literals(ExperiencePurpose.options)).annotate({ description: "optimization or architecture. Agent defaults are enforced by its research role." }),
+  includeUnknown: Schema.optional(Schema.Boolean).annotate({ description: "With an exact experienceID, opt in to legacy records whose purpose cannot be inferred. These are audit evidence, not automatic guidance." }),
   level: Schema.optional(Schema.Literals(["experiment_fact", "conditional_experience", "validated_principle"])),
   polarity: Schema.optional(Schema.Literals(["positive", "negative", "mixed", "inconclusive"])),
   query: Schema.optional(Schema.String).annotate({
@@ -122,7 +125,8 @@ export const ReadExperiencesTool = Tool.define(
         const limit = Number.isFinite(args.limit) ? Math.max(1, Math.min(50, Math.floor(args.limit!)))
           : ctx.agent === "research-reflection" ? 3 : 12
         const scope = args.scope ?? (ctx.agent === "research-reflection" && !args.experienceID ? "task" : "shared")
-        const memories = readExperiences(taskID, { ...args, scope, limit })
+        const reader = agentExperienceReader(ctx.agent)
+        const memories = reader ? readExperiencesForRole(taskID, reader, { ...args, scope, limit }) : readExperiences(taskID, { ...args, scope, limit })
         const records: Record<string, unknown>[] = memories.map((memory) => ({
           ...(!args.includeFacts ? experienceSummaryForPrompt(memory) : experiencePromptRecord(memory)),
           relationship: memory.taskID === taskID ? "same_task"
@@ -166,6 +170,7 @@ export const ReadExperiencesTool = Tool.define(
             available: true,
             experiences,
             retrieval: { method: args.query?.trim() ? EXPERIENCE_SEARCH_METHOD : "recent", scope,
+              purpose: reader ? experiencePurposeForReader(reader, args) : args.purpose ?? null,
               query: args.query ?? null, returnedCount: experiences.length,
               queryPlan: args.query?.trim() ? parseExperienceQuery(args.query, args.intent) : undefined,
               includeBackground: args.includeBackground ?? false,

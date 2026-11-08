@@ -73,6 +73,41 @@ Keyboard hints:
 | `tab agents` | Switch or inspect agent entrypoints. |
 | `ctrl+p commands` | Open the command palette. |
 
+## Dual-loop configuration and controls
+
+Use `/loop-config` (also available in the command palette) to edit the shared full-training limit,
+Trials per Design, local and global no-improvement limits, Run-record limit, global deadline,
+target metric, minimum relative improvement, and consecutive crash limit. Changes stay in a draft
+until **Save configuration**. The full-training limit accepts 1–200 attempts. Optional deadline and
+target fields accept `none`.
+
+Configuration is editable before a cycle starts. Once bound, the dialog shows the effective policy
+and its lock reason. An explicit `/append` creates a new budgeted cycle and unlocks its configuration
+before execution. Reopening the TUI, resuming, and stepping through Trials preserve the current
+cycle's counters and absolute deadline. Time spent paused still counts toward that deadline.
+
+| Command | Boundary |
+| --- | --- |
+| `/trial` | Run at most one additional Trial and its Training Reflection, then pause. It can create the initial fixed Design. |
+| `/optimize` | Continue the current fixed Design's inner loop, select its best model, and run Architecture Reflection. Pause before HypoPlanner. |
+| `/finish-design` | Finish the current Design without additional tuning or training. Requires all its Trials to be finalized; runs Architecture Reflection and pauses before HypoPlanner. |
+| `/resume` | Recover an interrupted bounded control at its saved boundary, or continue outer planning after a completed control. |
+| `/loop-status` | Inspect Design → Trial history, scoped reflections, budgets, and the saved pause point. |
+| `/abort` | Interrupt the active operation; reconcile its original execution before retrying if its final state is unknown. |
+
+The controls are disabled while work is active, recovery requires reconciliation, or prerequisites
+are missing. A stale Design selection or task revision is rejected by the server. Repeated requests
+with the same idempotency key return the existing operation receipt.
+
+Full-training reservations and Run records are separate budgets: a reserved full attempt uses one
+shared training slot; smoke/full Run records also count toward the task's safety limit. CV folds,
+schedulers, and execution recovery do not create a fresh training budget. The global stopping
+conditions still apply to every bounded control.
+
+The backing endpoints are `GET/PATCH /research/tasks/:taskID/loop-config` and
+`POST /research/tasks/:taskID/loop-control`. Configuration writes require `expectedRevision`;
+controls require `action`, `expectedRevision`, and `expectedDesignID` (nullable for an initial Trial).
+
 ## Right Sidebar
 
 The sidebar is the main place to assess whether execution can continue.

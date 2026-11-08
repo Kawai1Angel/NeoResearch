@@ -52,6 +52,10 @@ export class ResearchAgentStreamDelta extends Schema.Class<ResearchAgentStreamDe
   taskID: ResearchTaskID,
   agent: Schema.String,
   delta: Schema.String,
+  cycleID: Schema.optional(Schema.String),
+  designID: Schema.optional(Schema.String),
+  trialID: Schema.optional(Schema.String),
+  reflectionScope: Schema.optional(Schema.Literals(["training", "architecture"])),
 }) {}
 
 export class ResearchLLMCallPath extends Schema.Class<ResearchLLMCallPath>("ResearchLLMCallPath")({
@@ -150,6 +154,9 @@ export const Event = {
   HypoPlannerAgentCompleted: BusEvent.define("research.agent.hypoPlanner.completed", ResearchAgentStageChanged),
   HypoPlannerAgentFailed: BusEvent.define("research.agent.hypoPlanner.failed", ResearchAgentStageChanged),
   NASAgentStarted: BusEvent.define("research.agent.nas.started", ResearchAgentStageChanged),
+  OptimizerAgentStarted: BusEvent.define("research.agent.optimizer.started", ResearchAgentStageChanged),
+  OptimizerAgentCompleted: BusEvent.define("research.agent.optimizer.completed", ResearchAgentStageChanged),
+  OptimizerAgentFailed: BusEvent.define("research.agent.optimizer.failed", ResearchAgentStageChanged),
   NASIterationCompleted: BusEvent.define("research.agent.nas.iteration.completed", ResearchAgentStageChanged),
   NASAgentCompleted: BusEvent.define("research.agent.nas.completed", ResearchAgentStageChanged),
   NASAgentFailed: BusEvent.define("research.agent.nas.failed", ResearchAgentStageChanged),

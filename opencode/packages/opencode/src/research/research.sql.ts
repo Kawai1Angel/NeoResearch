@@ -9,6 +9,7 @@ import type {
   ResearchCandidateID,
   ResearchHypothesisID,
   ResearchMemoryID,
+  ResearchMemory,
   ResearchRunID,
   ResearchTaskID,
 } from "./schema"
@@ -265,6 +266,7 @@ export const ResearchCycleTable = sqliteTable("research_cycle", {
   iterations: integer().notNull().default(0),
   crash_streak: integer().notNull().default(0),
   elapsed_ms: integer().notNull().default(0),
+  deadline_at: integer(),
   input_digest: text().notNull(),
 })
 
@@ -299,3 +301,52 @@ export const ResearchRunnerLockTable = sqliteTable("research_runner_lock", {
     .notNull()
     .references(() => ResearchRunTable.id, { onDelete: "cascade" }),
 })
+
+export const ResearchDesignTable = sqliteTable("research_design", {
+  id: text().primaryKey(),
+  task_id: text().$type<ResearchTaskID>().notNull().references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+  cycle_id: text().notNull().references(() => ResearchCycleTable.id, { onDelete: "cascade" }),
+  hypothesis_id: text(),
+  active_task: text().unique(),
+  design_digest: text().notNull(),
+  recipe: text({ mode: "json" }).notNull().$type<JsonRecord>(),
+  outer_contract: text({ mode: "json" }).$type<import("./experiment-constraints").ExperimentConstraints>(),
+  reference: integer({ mode: "boolean" }).notNull().default(false),
+  status: text().notNull().default("optimizing"),
+  stop_reason: text(),
+  best_run_id: text().$type<ResearchRunID>(),
+  best_metric: real(),
+  no_improve: integer().notNull().default(0),
+  phase_receipts: text({ mode: "json" }).notNull().default({}).$type<Record<string, JsonRecord>>(),
+  ...Timestamps,
+}, (table) => [index("research_design_cycle_idx").on(table.cycle_id)])
+
+export const ResearchTrainingTrialTable = sqliteTable("research_training_trial", {
+  id: text().primaryKey(),
+  design_id: text().notNull().references(() => ResearchDesignTable.id, { onDelete: "cascade" }),
+  trial_index: integer().notNull(),
+  candidate_id: text().$type<ResearchCandidateID>().notNull().unique().references(() => ResearchCandidateTable.id, { onDelete: "cascade" }),
+  contract: text({ mode: "json" }).$type<import("./experiment-constraints").ExperimentConstraints>(),
+  repair_run_id: text().$type<ResearchRunID>(),
+  smoke_run_id: text().$type<ResearchRunID>(),
+  full_run_id: text().$type<ResearchRunID>(),
+  charged: integer({ mode: "boolean" }).notNull().default(false),
+  status: text().notNull().default("pending"),
+  result: text({ mode: "json" }).$type<JsonRecord>(),
+  optimizer_decision: text({ mode: "json" }).$type<JsonRecord>(),
+  ...Timestamps,
+}, (table) => [uniqueIndex("research_training_trial_position_idx").on(table.design_id, table.trial_index)])
+
+export const ResearchMemoryWriteTable = sqliteTable("research_memory_write", {
+  id: text().primaryKey(),
+  task_id: text().$type<ResearchTaskID>().notNull().references(() => ResearchTaskTable.id, { onDelete: "cascade" }),
+  binding: text({ mode: "json" }).notNull().$type<import("./experience-binding").ExperienceWriteBinding>(),
+  draft: text({ mode: "json" }).notNull().$type<import("./experience").ExperienceDraft>(),
+  request_digest: text().notNull(),
+  library_path: text().notNull(),
+  payload: text({ mode: "json" }).$type<{ memory: ResearchMemory; source: { projectID: string; projectRoot: string } }>(),
+  status: text().notNull().default("pending"),
+  result: text({ mode: "json" }).$type<{ sourceEntryID: string; canonicalExperienceID: string; revision: number }>(),
+  error: text(),
+  ...Timestamps,
+}, (table) => [index("research_memory_write_task_idx").on(table.task_id, table.status)])

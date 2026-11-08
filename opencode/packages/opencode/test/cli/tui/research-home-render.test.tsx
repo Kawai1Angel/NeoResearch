@@ -440,7 +440,7 @@ describe("NeoResearch home launcher", () => {
     try {
       await waitForFrame(app, HOME_READY_TEXT)
       await app.mockInput.typeText("/")
-      await app.renderOnce()
+      await waitForFrame(app, "Commands")
       const frame = app.captureCharFrame()
 
       expect(frame).toContain("Commands")
@@ -460,7 +460,7 @@ describe("NeoResearch home launcher", () => {
     try {
       await waitForFrame(app, HOME_READY_TEXT)
       await app.mockInput.typeText("/")
-      await app.renderOnce()
+      await waitForFrame(app, "Commands")
       const frame = app.captureCharFrame()
       const commandLine = frameLine(frame, (line) => line.includes("Commands"))
       const lines = frame.split("\n")
@@ -481,7 +481,7 @@ describe("NeoResearch home launcher", () => {
     try {
       await waitForFrame(app, HOME_READY_TEXT)
       await app.mockInput.typeText("/")
-      await app.renderOnce()
+      await waitForFrame(app, "Commands")
       app.mockInput.pressEnter()
       await waitForFrame(app, "NeoResearch Cockpit")
 
@@ -504,11 +504,13 @@ describe("NeoResearch home launcher", () => {
     try {
       await waitForFrame(app, HOME_READY_TEXT)
       await app.mockInput.typeText("/")
-      await app.renderOnce()
+      await waitForFrame(app, "Commands")
       app.mockInput.pressKey("ARROW_DOWN")
       app.mockInput.pressKey("ARROW_DOWN")
       app.mockInput.pressEnter()
-      await app.renderOnce()
+      for (let attempt = 0; attempt < 40 && !toast?.currentToast?.message.includes("doctor"); attempt++) {
+        await Bun.sleep(10)
+      }
 
       expect(route?.data.type).toBe("home")
       expect(toast?.currentToast?.message).toContain("doctor")

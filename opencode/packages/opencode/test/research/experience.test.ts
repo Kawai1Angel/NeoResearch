@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, test } from "bun:test"
 import { Database as SQLite } from "bun:sqlite"
 import { Effect, Layer } from "effect"
 import { readFile, writeFile } from "node:fs/promises"
@@ -22,13 +22,24 @@ import { migrateProjectExperiences, readExperiences, writeExperience } from "../
 import { ExperienceLibrary, experienceLibraryPath } from "../../src/research/experience-library"
 import { groundedExperienceInterpretation, experienceSourceDigest } from "../../src/research/experience-curation"
 import { SessionID, MessageID } from "../../src/session/schema"
-import { provideTmpdirInstance } from "../fixture/fixture"
+import { provideTmpdirInstance, tmpdir } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
 import { testEffect } from "../lib/effect"
 import { Database, eq } from "../../src/storage"
 import { ResearchMemoryTable, ResearchTaskTable } from "../../src/research/research.sql"
 
-afterEach(resetDatabase)
+const originalExperiencePath = process.env.NEO_RESEARCH_EXPERIENCE_DB
+let isolatedLibrary: Awaited<ReturnType<typeof tmpdir>> | undefined
+beforeEach(async () => {
+  isolatedLibrary = await tmpdir()
+  process.env.NEO_RESEARCH_EXPERIENCE_DB = path.join(isolatedLibrary.path, "experience.db")
+})
+afterEach(async () => {
+  await resetDatabase()
+  if (originalExperiencePath === undefined) delete process.env.NEO_RESEARCH_EXPERIENCE_DB
+  else process.env.NEO_RESEARCH_EXPERIENCE_DB = originalExperiencePath
+  await isolatedLibrary?.[Symbol.asyncDispose]()
+})
 const it = testEffect(CrossSpawnSpawner.defaultLayer)
 const layer = Layer.mergeAll(Research.defaultLayer, Agent.defaultLayer, Truncate.defaultLayer)
 
@@ -275,7 +286,7 @@ it.live("explicit claims evolve through the real writer across datasets without 
   }).pipe(Effect.provide(layer)), { git: true, config: { formatter: false, lsp: false } }), 30_000)
 
 it.live(
-  "Reflection writes are optional, grounded, idempotent and available to HypoPlanner across tasks",
+  "Reflection writes are optional, grounded, idempotent and available to OptimizerAgent across tasks",
   () =>
     provideTmpdirInstance(
       (directory) =>
@@ -337,14 +348,17 @@ it.live(
             experience.facts[0]!.dataset,
           )
           expect(experience.facts[0]!.proposedModel).toEqual(a.candidate.candidateSpec)
-          const found = JSON.parse((yield* reader.execute({}, context(b.task, "research-hypo-planner"))).output)
+          const planning = JSON.parse((yield* reader.execute({}, context(b.task, "research-hypo-planner"))).output)
+          expect(planning.experiences).toEqual([])
+          const found = JSON.parse((yield* reader.execute({}, context(b.task, "research-optimizer"))).output)
           expect(found.experiences).toHaveLength(1)
+          expect(found.experiences[0].purpose).toBe("optimization")
           expect(found.experiences[0]).toMatchObject({
             id: saved.experience.id,
             relationship: "same_domain",
             polarity: "negative",
           })
-          const searched = JSON.parse((yield* reader.execute({ scope: "shared", query: "learning rate intervention", limit: 1 }, context(b.task, "research-hypo-planner"))).output)
+          const searched = JSON.parse((yield* reader.execute({ scope: "shared", query: "learning rate intervention", limit: 1 }, context(b.task, "research-optimizer"))).output)
           expect(searched.experiences[0].id).toBe(saved.experience.id)
           expect(searched.experiences[0].facts).toBeUndefined()
           expect(searched.experiences[0].sourceRuns[0].runID).toBe(a.run.id)
@@ -414,7 +428,8 @@ it.live(
           const large = JSON.parse((yield* writer.execute({ ...draft(a.run.id),
             conditions: Array.from({ length: 20 }, (_, index) => `Oversized scope ${index}: ` + "q".repeat(3900)),
           }, context(a.task, "research-reflection"))).output)
-          const largeRead = yield* reader.execute({ experienceID: large.experience.id }, context(b.task, "research-hypo-planner"))
+          expect(large.saved, JSON.stringify(large)).toBe(true)
+          const largeRead = yield* reader.execute({ experienceID: large.experience.id }, context(b.task, "research-optimizer"))
           const largeResult = JSON.parse(largeRead.output)
           expect(largeRead.metadata).toMatchObject({ truncated: false })
           expect(largeResult.experiences[0]).toMatchObject({ id: large.experience.id, summaryOmitted: true,
@@ -425,7 +440,7 @@ it.live(
               conditions: Array.from({ length: 8 }, (_, index) => `budgetprobe ${suffix} ${index}: ` + "q".repeat(2800)),
             }, context(a.task, "research-reflection"))).metadata.saved).toBe(true)
           }
-          const batch = yield* reader.execute({ scope: "shared", limit: 50 }, context(b.task, "research-hypo-planner"))
+          const batch = yield* reader.execute({ scope: "shared", limit: 50 }, context(b.task, "research-optimizer"))
           const batchResult = JSON.parse(batch.output)
           expect(batch.metadata).toMatchObject({ truncated: false })
           expect(Buffer.byteLength(batch.output, "utf8")).toBeLessThan(45_000)
@@ -500,7 +515,7 @@ it.live("experience is directly readable and refinable across projects with inde
 
       const reader = yield* (yield* ReadExperiencesTool).init()
       const context = { sessionID: SessionID.make(target.task.sessionID!), messageID: MessageID.make("msg_shared_experience"),
-        agent: "research-hypo-planner", abort: AbortSignal.any([]), messages: [], metadata: () => Effect.void, ask: () => Effect.void }
+        agent: "research-optimizer", abort: AbortSignal.any([]), messages: [], metadata: () => Effect.void, ask: () => Effect.void }
       const output = JSON.parse((yield* reader.execute({ includeFacts: true }, context)).output)
       expect(output.experiences[0]).toMatchObject({ id: source.memory.id, relationship: "cross_project",
         source: { projectID: source.task.projectID } })
@@ -553,7 +568,7 @@ it.live("existing structured memory migrates idempotently while legacy summaries
   }).pipe(Effect.provide(layer)), { git: true, config: { formatter: false, lsp: false } }), 30_000)
 
 it.live(
-  "direct Reflection saves only requested experiences and direct HypoPlanner receives their evidence",
+  "direct Reflection saves requested optimization experience while direct HypoPlanner filters it by purpose",
   () =>
     provideTmpdirInstance(
       (directory) =>
@@ -640,8 +655,8 @@ it.live(
             expect(plannerInput!.experiences).toBeUndefined()
             expect(plannerInput!.historyAccess.tool).toBe("experiment_results")
             expect(plannerReads).toBe(2)
-            expect(plannerInput!.requestedHistory[0].result.experiences[0].sourceRuns.some((run: { runID: string }) => run.runID === source.run.id)).toBe(true)
-            expect(plannerInput!.requestedHistory[0].result.experiences[0].facts[0].dataset.contentHash).toBeDefined()
+            expect(plannerInput!.requestedHistory[0].result.experiences).toEqual([])
+            expect(experienceFromMemory((yield* svc.listMemory(source.task.id))[0]!)!.purpose).toBe("optimization")
             writes = [draft("rrun_unknown")]
             const rejected = yield* svc.runReflectionAgent({ taskID: source.task.id, stoppedReason: "max_iterations" })
             expect(rejected.llm.status).toBe("used")

@@ -54,6 +54,7 @@ const researchWork = new Set([
   "ResearchRoutes.tasks.pipeline",
   "ResearchRoutes.tasks.autonomousLoop",
   "ResearchRoutes.tasks.autonomousIterate",
+  "ResearchRoutes.tasks.loopControl",
   "ResearchRoutes.tasks.profile",
   "ResearchRoutes.tasks.prepareDataset",
   "ResearchRoutes.tasks.answerIntent",
@@ -82,6 +83,7 @@ export async function jsonRequest<C extends Context, A, E>(
   name: string,
   c: C,
   effect: (c: C) => Effect.gen.Return<A, E, AppEnv>,
+  expectedRevision?: number,
 ) {
   const taskID = c.req.param("taskID")
   if (taskID && researchWork.has(name)) {
@@ -123,6 +125,7 @@ export async function jsonRequest<C extends Context, A, E>(
         "ResearchRoutes.tasks.pipeline",
         "ResearchRoutes.tasks.autonomousLoop",
         "ResearchRoutes.tasks.autonomousIterate",
+        "ResearchRoutes.tasks.loopControl",
       ].includes(name) &&
       (state?.recoveryState === "blocked" || state?.recoveryState === "completed")
     )
@@ -134,6 +137,7 @@ export async function jsonRequest<C extends Context, A, E>(
       (signal) => runRequest(name, c, work, signal),
       requestKey,
       requestDigest,
+      expectedRevision,
     )
     if (started.resumed && c.req.header("prefer") === "respond-async") return c.json(started.operation, 202)
     if (!started.started && !started.resumed)

@@ -8,6 +8,7 @@ export function researchErrorStatus(name: string): 400 | 500 {
     "ResearchCandidateValidationError",
     "ResearchBudgetExceededError",
     "ResearchApprovalRequiredError",
+    "ResearchLoopControlError",
   ].includes(name) ? 400 : 500
 }
 

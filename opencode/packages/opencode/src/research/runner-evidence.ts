@@ -42,6 +42,7 @@ export function buildExperimentResultEvidence(input: {
   readonly independentEvidence?: boolean
   readonly executionVerified?: boolean
   readonly hypothesisSnapshot?: Record<string, unknown>
+  readonly trainingTrial?: Record<string, unknown>
   readonly comparisonSpec?: Record<string, unknown>
   readonly evaluationEvidence?: unknown
 }) {
@@ -51,7 +52,8 @@ export function buildExperimentResultEvidence(input: {
   const missingMetric = !duplicate && input.status === "succeeded" && input.stage === "full" && value === undefined
   return {
     metricValidity: complete ? "observed" : duplicate ? "duplicate" : "inconclusive",
-    attribution: assessAttribution({ executionVerified: input.executionVerified === true, proposedModel: input.candidateSpec, hypothesisSnapshot: input.hypothesisSnapshot }, input.comparisonSpec ? { proposedModel: input.comparisonSpec } : undefined),
+    attribution: assessAttribution({ executionVerified: input.executionVerified === true, proposedModel: input.candidateSpec, hypothesisSnapshot: input.hypothesisSnapshot, trainingTrial: input.trainingTrial }, input.comparisonSpec ? { proposedModel: input.comparisonSpec } : undefined),
+    ...(input.trainingTrial ? { trainingTrial: input.trainingTrial } : {}),
     metrics: complete ? input.metrics : {},
     evaluationEvidence: input.evaluationEvidence,
     runID: input.runID,

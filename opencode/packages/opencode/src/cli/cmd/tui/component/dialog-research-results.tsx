@@ -1,5 +1,5 @@
 import { createResource, onCleanup } from "solid-js"
-import { fileURLToPath } from "node:url"
+import { researchCockpitArtifactTarget } from "../routes/research-cockpit-data"
 import { DialogSelect } from "@tui/ui/dialog-select"
 import { useDialog } from "@tui/ui/dialog"
 import { useSDK } from "@tui/context/sdk"
@@ -50,7 +50,7 @@ export function DialogResearchResults(props: { taskID: string }) {
         if (artifact.uri.startsWith("file:") && /\.(md|json|txt|log|jsonl)$/i.test(artifact.uri)) {
           try {
             const content = await read<{ type: string; content: string }>(
-              `/file/content?path=${encodeURIComponent(fileURLToPath(artifact.uri))}`,
+              `/file/content?path=${encodeURIComponent(researchCockpitArtifactTarget(artifact))}`,
             )
             if (content.type === "text") text = content.content.slice(0, 64_000)
           } catch (error) {

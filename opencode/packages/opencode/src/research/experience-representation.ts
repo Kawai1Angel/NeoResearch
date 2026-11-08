@@ -28,7 +28,7 @@ export function experienceRepresentation(experience: ResearchExperience) {
     actual: fact.executedModel,
   }))
   const interventions = facts.flatMap(fact => {
-    const parsed = ExperimentConstraints.safeParse(fact.hypothesisSnapshot?.experimentContract)
+    const parsed = ExperimentConstraints.safeParse(fact.trainingTrial?.contract ?? fact.hypothesisSnapshot?.experimentContract)
     if (!parsed.success || parsed.data.mode !== "controlled") return []
     const comparison = facts.find(other => other.runID === parsed.data.comparisonRunID)
     const attribution = assessAttribution(fact, comparison)

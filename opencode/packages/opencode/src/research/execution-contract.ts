@@ -1,7 +1,9 @@
 import { checkExperimentConstraints } from "./experiment-constraints"
 import { comparisonRecipe, hypothesisConstraints } from "./comparison-run"
 import { candidateMechanisms } from "./model-capabilities"
-import { createHash } from "crypto"
+import { canonicalize, digest } from "./digest"
+export { canonicalize, digest } from "./digest"
+import { resolveTrialContract, trialConstraintIssues } from "./design-store"
 import type { HypothesisObject } from "./agents/hypo-planner-agent"
 import type { ResearchCandidate, ResearchTask, JsonRecord } from "./schema"
 
@@ -15,23 +17,6 @@ export interface ContractMismatch {
   repairHint?: string
 }
 
-// Sorted object keys, preserved array order, UTF-8, ECMAScript JSON number encoding.
-export function canonicalize(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`
-  if (value !== null && typeof value === "object") {
-    const obj = value as Record<string, unknown>
-    return `{${Object.keys(obj)
-      .filter((key) => obj[key] !== undefined)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalize(obj[key])}`)
-      .join(",")}}`
-  }
-  if (typeof value === "number" && !Number.isFinite(value)) throw new Error("Non-finite contract number")
-  return JSON.stringify(value)
-}
-export function digest(value: unknown) {
-  return createHash("sha256").update(canonicalize(value), "utf8").digest("hex")
-}
 export interface ExecutedModelManifest {
   event: "executed_model_manifest"
   schema_version: "executed_model_manifest.v1"
@@ -65,7 +50,7 @@ export function buildExecutionContract(
     hypothesis_id: candidate.hypothesisID ?? null,
     candidate_id: candidate.id,
     candidate_spec_sha256: digest(payload),
-    experiment_constraints_sha256: digest(hypothesisConstraints(task.id, candidate.hypothesisID)),
+    experiment_constraints_sha256: digest(resolveTrialContract(candidate)?.contract ?? hypothesisConstraints(task.id, candidate.hypothesisID)),
     expected: {
       input_length: task.taskSpec.contextLength,
       head_input_width: spec.representation?.latentDim ?? Math.min(Number(task.taskSpec.contextLength), 64),
@@ -103,7 +88,11 @@ export function validateCandidateAgainstHypothesis(
   const mismatches: ContractMismatch[] = []
   const add = (path: string, expected: unknown, actual: unknown) =>
     mismatches.push({ path, expected, actual: actual ?? null, source: "hypothesis_candidate_gate" })
-  if (hypothesis.experimentContract) mismatches.push(...checkExperimentConstraints(hypothesis.experimentContract, spec, comparisonRecipe(candidate.taskID, hypothesis.experimentContract.comparisonRunID)))
+  const trial = resolveTrialContract(candidate)
+  const constraints = trial?.contract ?? hypothesis.experimentContract
+  if (trial?.trial.contract) {
+    mismatches.push(...trialConstraintIssues(candidate, comparisonRecipe(candidate.taskID, trial.trial.contract.comparisonRunID))!)
+  } else if (constraints) mismatches.push(...checkExperimentConstraints(constraints, spec, comparisonRecipe(candidate.taskID, constraints.comparisonRunID)))
   const mechanisms = candidateMechanisms(spec)
   for (const required of hypothesis.requiredMechanisms ?? [])
     if (!mechanisms.includes(required)) add(`requiredMechanisms.${required}`, true, false)

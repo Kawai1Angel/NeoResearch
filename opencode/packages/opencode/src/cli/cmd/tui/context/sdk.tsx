@@ -20,6 +20,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
   }) => {
     const abort = new AbortController()
     let sse: AbortController | undefined
+    let unsubscribe: (() => void) | undefined
 
     function createSDK() {
       return createOpencodeClient({
@@ -44,6 +45,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     const maxRetryDelay = 30000
 
     const flush = () => {
+      if (abort.signal.aborted) return
       if (queue.length === 0) return
       const events = queue
       queue = []
@@ -52,12 +54,14 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       // Batch all event emissions so all store updates result in a single render
       batch(() => {
         for (const event of events) {
+          if (abort.signal.aborted) break
           emitter.emit("event", event)
         }
       })
     }
 
     const handleEvent = (event: GlobalEvent) => {
+      if (abort.signal.aborted) return
       queue.push(event)
       const elapsed = Date.now() - last
 
@@ -108,16 +112,21 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       })().catch(() => {})
     }
 
-    onMount(async () => {
+    onMount(() => {
       if (props.events) {
-        const unsub = await props.events.subscribe(handleEvent)
-        onCleanup(unsub)
-
-        if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
-          // Start syncing workspaces, it's important to do this after
-          // we've started listening to events
-          await sdk.sync.start().catch(() => {})
-        }
+        void props.events
+          .subscribe(handleEvent)
+          .then(async (unsub) => {
+            // Register cleanup synchronously below: onCleanup after await has no
+            // Solid owner, and a late subscription can otherwise outlive the UI.
+            if (abort.signal.aborted) {
+              unsub()
+              return
+            }
+            unsubscribe = unsub
+            if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) await sdk.sync.start().catch(() => {})
+          })
+          .catch(() => {})
       } else {
         startSSE()
       }
@@ -126,6 +135,9 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     onCleanup(() => {
       abort.abort()
       sse?.abort()
+      unsubscribe?.()
+      unsubscribe = undefined
+      queue = []
       if (timer) clearTimeout(timer)
     })
 

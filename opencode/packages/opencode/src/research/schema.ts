@@ -143,7 +143,7 @@ export const CandidateApprovalStatus = Schema.Literals(["pending", "approved", "
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type CandidateApprovalStatus = Schema.Schema.Type<typeof CandidateApprovalStatus>
 
-export const CandidateGenerator = Schema.Literals(["llm", "heuristic", "mutation", "human"])
+export const CandidateGenerator = Schema.Literals(["llm", "heuristic", "mutation", "human", "optimizer"])
   .annotate({ identifier: "ResearchCandidateGenerator" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type CandidateGenerator = Schema.Schema.Type<typeof CandidateGenerator>
@@ -534,6 +534,8 @@ export class AutonomousIterationInput extends Schema.Class<AutonomousIterationIn
 
 export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("ResearchAutonomousLoopInput")({
   taskID: ResearchTaskID,
+  executionScope: Schema.optional(Schema.Literals(["trial", "design", "finish-design"])),
+  expectedDesignID: Schema.optional(Schema.NullOr(Schema.String)),
   stage: Schema.optional(ExecutableRunStage),
   description: Schema.optional(Schema.String),
   maxIterations: Schema.optional(Schema.Number),
@@ -543,6 +545,8 @@ export class AutonomousLoopInput extends Schema.Class<AutonomousLoopInput>("Rese
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
   explorationRate: Schema.optional(Schema.Number),
+  maxTrialsPerDesign: Schema.optional(Schema.Number),
+  maxNoImprovePerDesign: Schema.optional(Schema.Number),
 }) {
   static readonly zod = zod(this)
 }
@@ -557,6 +561,9 @@ export class VerifierAgentRunInput extends Schema.Class<VerifierAgentRunInput>("
 
 export class ReflectionAgentInput extends Schema.Class<ReflectionAgentInput>("ResearchReflectionAgentInput")({
   taskID: ResearchTaskID,
+  designID: Schema.optional(Schema.String),
+  reflectionScope: Schema.optional(Schema.Literals(["training", "architecture"])),
+  trialID: Schema.optional(Schema.String),
   outputDir: Schema.optional(Schema.String),
   stoppedReason: Schema.optional(Schema.String),
   maxIterations: Schema.optional(Schema.Number),
@@ -575,6 +582,8 @@ export class RunFullPipelineInput extends Schema.Class<RunFullPipelineInput>("Re
   timeBudgetSeconds: Schema.optional(Schema.Number),
   maxCrashStreak: Schema.optional(Schema.Number),
   explorationRate: Schema.optional(Schema.Number),
+  maxTrialsPerDesign: Schema.optional(Schema.Number),
+  maxNoImprovePerDesign: Schema.optional(Schema.Number),
   outputDir: Schema.optional(Schema.String),
   forceDatasetPreparation: Schema.optional(Schema.Boolean),
 }) {
