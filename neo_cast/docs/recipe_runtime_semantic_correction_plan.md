@@ -11,18 +11,18 @@
 
 - B1-01 / B1-02: CLI, data contract, physicalization, training configuration, factory and export rejection of non-empty future/static configuration with fixed error code `UNSUPPORTED_COVARIATE`.(b) Keep old blank fields compatible;`used_known_future_covariates` is no longer generated.observed-past export inference does not need to provide empty future arrays.
 - B1-04: for five categories of action scheme read strict `oneOf` differentiated by `type`; Error locating to JSON path of the selected branch. The results of the high-level ModelRecipe compilation and direct `resolve_recipe` calls were verified at a lower level.
-- B1-05: Python registry, training entrance and OpenCode domain unified head-distribution-loss combination of point/quantile/Gaussian; Quantile levels must be orderly, unique and consistent with the loss, and no point is allowed to predict a multi-digit broadcast.
+- B1-05: Python registry, training entrance and NeoResearch domain unified head-distribution-loss combination of point/quantile/Gaussian; Quantile levels must be orderly, unique and consistent with the loss, and no point is allowed to predict a multi-digit broadcast.
 - B1-06: seasonal mutation uses legitimate moving-overage decomposition; Before sending back by schema and registry, remove old action fields while switching to fusion, and sync embedding white.
 - B1-07 (part): Adding illegal parameters, complete output matrix, gradient of quantile/Gaussian parameters, verification, rejection of future/static, input sensitivity and export input testing.
 
 The remaining items have been completed for subsequent implementation:
 
-- B1-03 / B1-07: delete invalid fields such as cross-horizon sharing, old feature switches, base_head, fill_policy, graph_type and global dropout; Python/OpenCode strictly verify sync. Adds all backbone/embedding/preprocessing/fusion/head structures, input gradients, configuration variance tests and accelerator simultaneous testing.
+- B1-03 / B1-07: delete invalid fields such as cross-horizon sharing, old feature switches, base_head, fill_policy, graph_type and global dropout; Python/NeoResearch strictly verify sync. Adds all backbone/embedding/preprocessing/fusion/head structures, input gradients, configuration variance tests and accelerator simultaneous testing.
 - B2: Channel-by-channel stand-alone linear, module dropout, per-variable affine norm, visible last-value setting, ordered fusion four gate/residual combinations; Mask saves train/val/ref-test/export before materialization, overwrites train/val/ref-test/export and refills and contracts scaler in CVFold.
 - B3: Freeze [v2 contract] (recipe_runtime_v2_contract.md), encoder output `[B,C,min(T,64)]`, five categories of genuine parameterization head exclusive final horizon projection;varate attention, double loaded hybrid, trend branch and train-only/static/learned graph are connected. Manifest contains actual parameter maps digest, head parameters, dropout, sharet, gate and exact source/digest.
 - Compatibility: checkpoint/metadata with `runtime_semantics_revision=2`; Export checked versions and parameter maps, and the old model is subject to retrainment. CV protocol incorporates semantic versions to avoid mixing old or new synonyms.
 - B4: Use the scheme B:SSM proxy to officially change name `gated_depthwise_conv`, and TimesNet to change light path `timesnet_lite` and mark `paper_derived`. Completed [ETTh1 with budget Sanity Comparison] (recipe_runtime_v2_sanity.md). Full SSM, complete TimesNet, cross-configuration horizon sharing is an optional follow-up to the original scheme and this time it is not claimed.
-- Validation: `npm test` passed (71 Node tests and the Python wrapper), all 180 Python tests passed, and 78 relevant OpenCode tests plus typecheck passed. New tests cover independent export round trips, old-checkpoint rejection, fold-specific graph/imputation isolation, and train/val/ref-test paths using materialized missing masks.
+- Validation: `npm test` passed (71 Node tests and the Python wrapper), all 180 Python tests passed, and 78 relevant NeoResearch tests plus typecheck passed. New tests cover independent export round trips, old-checkpoint rejection, fold-specific graph/imputation isolation, and train/val/ref-test paths using materialized missing masks.
 - Expanded inspection: `bun test test/research` failed as 326 passed, 2 failed. Two fixes that do not belong to this recipe/runtime: `hypothesis-evidence-tools.test.ts` fixture does not create `quantitative.json`; The `service.test.ts` plateau test expects the 25 wheel, while currently returns the 7 round. The behaviour of these functions has not been modified to accommodate the old assertion.
 
 The following sections retain the original problem analysis, candidate options and acceptance requirements; The final selection is based on the v2 contract and the above performance record.`temporal/shared` is retained and expressly stated in relation to the computational equivalence of `feature_mlp`, prohibiting its attribution as an independent mechanism.
@@ -175,7 +175,7 @@ Synchronize changes:
 - `py/registry/action_specs.py`
 - `src/llm.js`
 - `src/reflect.js`
-- OpenCode TSF domain schema and ModelDesigner programt
+- NeoResearch TSF domain schema and ModelDesigner programt
 - Example recipe and usage instructions
 
 #### B1-04: use discriminated scheme
@@ -254,7 +254,7 @@ It is proposed to add:
 
 - `py/tests/test_recipe_semantics.py`
 - `py/tests/test_recipe_action_sensitivity.py`
-- Action-space sync test on Node/OpenCode
+- Action-space sync test on Node/NeoResearch
 
 ### 4.3 Batch 1 completion threshold
 
@@ -589,7 +589,7 @@ Until completion of the contract, the system continued to maintain "one model fo
 | `py/execution_contract.py` | 1–4 | Upgrade from class to structure/capacity verification |
 | `py/search/mutate.py` | 1 | Authentication after valid attachment and generation |
 | `src/llm.js`,`src/reflect.js` | 1–4 | sync action space with runtime |
-| OpenCode TSF domain/agents | 1–4 | Synchronization of synonyms for proposal, transect and refile |
+| NeoResearch TSF domain/agents | 1–4 | Synchronization of synonyms for proposal, transect and refile |
 | `py/tests/`,`test/` | 1–4 | Structure, sensitivity, gradient, end-to-end test |
 
 ## 9. Test Policy

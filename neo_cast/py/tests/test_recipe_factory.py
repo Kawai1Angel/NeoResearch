@@ -477,7 +477,7 @@ class RecipeFactoryTest(unittest.TestCase):
         self.assertIn("embedding.type='patch' requires d_model", errors)
         self.assertIn("backbone.type='transformer' requires n_heads", errors)
 
-    def test_recipe_schema_accepts_opencode_fusion_parameters(self) -> None:
+    def test_recipe_schema_accepts_neoresearch_fusion_parameters(self) -> None:
         for fusion in (
             {"type": "variate_attention",},
             {"type": "temporal_then_feature", "gate": True, "residual": True},

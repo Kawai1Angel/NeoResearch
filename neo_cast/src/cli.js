@@ -335,6 +335,7 @@ function registerReleaseLineage(projectRoot, row, options = {}) {
 async function runPythonScript(args, options = {}) {
   const projectRoot = fs.realpathSync(options.projectRoot || process.cwd());
   const pythonCommand = options.pythonCommand
+    || process.env.NEO_CAST_PYTHON
     || (runtimeReady(projectRoot) ? getRuntimePaths(projectRoot).pythonPath : "python3");
   try {
     const result = await runPythonCommand(projectRoot, args, {

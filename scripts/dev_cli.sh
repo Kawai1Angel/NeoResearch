@@ -7,9 +7,9 @@ source "$ROOT/scripts/common.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/dev_cli.sh [opencode-cli-args...]
+Usage: scripts/dev_cli.sh [neoresearch-cli-args...]
 
-Run the source NeoResearch/OpenCode CLI with local Neo-Cast environment variables.
+Run the NeoResearch CLI from source with local Neo-Cast environment variables.
 
 Examples:
   scripts/dev_cli.sh research --help
@@ -27,7 +27,7 @@ load_env_local "$ROOT"
 export_local_dev_environment "$ROOT"
 ensure_local_dev_dirs
 
-cd "$ROOT/opencode/packages/opencode"
+cd "$ROOT/neoresearch/packages/neoresearch"
 bun_bin="$(bun_path_for_root "$ROOT")" || {
   print_fail "bun runtime not found; install Bun before running the source CLI"
   exit 1

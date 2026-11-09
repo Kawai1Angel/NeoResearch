@@ -75,8 +75,8 @@ else
 fi
 
 print_step "Project paths"
-check_path "opencode root" "$ROOT/opencode"
-check_path "opencode CLI entry" "$ROOT/opencode/packages/opencode/src/index.ts"
+check_path "neoresearch root" "$ROOT/neoresearch"
+check_path "neoresearch CLI entry" "$ROOT/neoresearch/packages/neoresearch/src/index.ts"
 check_path "Neo-Cast root" "$NEO_CAST_ROOT_RESOLVED"
 check_path "Neo-Cast smoke runner" "$NEO_CAST_ROOT_RESOLVED/scripts/neo_research_tsf_e2e.sh"
 check_path "Neo-Cast recipe example" "$NEO_CAST_ROOT_RESOLVED/py/schemas/recipe.example.json"
@@ -93,10 +93,10 @@ check_path "XDG cache home" "$XDG_CACHE_HOME"
 check_path "XDG state home" "$XDG_STATE_HOME"
 
 print_step "Workspace dependencies"
-if [[ -d "$ROOT/opencode/node_modules" ]]; then
-  print_ok "opencode/node_modules exists"
+if [[ -d "$ROOT/neoresearch/node_modules" ]]; then
+  print_ok "neoresearch/node_modules exists"
 else
-  print_fail "opencode/node_modules missing; run scripts/bootstrap_local_dev.sh"
+  print_fail "neoresearch/node_modules missing; run scripts/bootstrap_local_dev.sh"
   failures=$((failures + 1))
 fi
 

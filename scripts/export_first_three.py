@@ -103,7 +103,9 @@ def main():
     out.mkdir(parents=True)
     started = now()
     print(started, "Snapshotting completed tasks and shared libraries", flush=True)
-    db = readonly(root / ".neo-research/runtime/xdg/data/neo-research/opencode-local.db")
+    data_dir = root / ".neo-research/runtime/xdg/data/neo-research"
+    database = data_dir / "neoresearch-local.db"
+    db = readonly(database if database.exists() else data_dir / "opencode-local.db")
     db.execute("BEGIN")
     ids = list(TASKS.values())
     marks = ",".join("?" for _ in ids)
@@ -137,7 +139,7 @@ def main():
 
     print(now(), "Copying current code, data, source papers and retained artifacts", flush=True)
     for child in root.iterdir():
-        if child.name in SKIP_DIRS | {".neo-research", ".neo-cast", "dataset", "opencode.json"} or child.name.startswith(".env"):
+        if child.name in SKIP_DIRS | {".neo-research", ".neo-cast", "dataset", "neoresearch.json", "opencode.json"} or child.name.startswith(".env"):
             continue
         if child.name == "neo_cast":
             for entry in child.iterdir():
@@ -147,13 +149,14 @@ def main():
         else:
             copy_tree(child, out / child.name)
     # Provider wiring is useful; authentication is supplied by the receiving user.
-    config = json.loads((root / "opencode.json").read_text())
+    config_path = root / "neoresearch.json"
+    config = json.loads((config_path if config_path.exists() else root / "opencode.json").read_text())
     for provider in config.get("provider", {}).values():
         options = provider.get("options", {})
         for key in list(options):
             if any(term in key.lower() for term in ("apikey", "token", "password", "secret")):
                 options[key] = "{env:DEEPSEEK_API_KEY}" if key == "apiKey" else ""
-    dump(out / "opencode.json", config)
+    dump(out / "neoresearch.json", config)
     for dataset in TASKS:
         copy_tree(root / "dataset" / (dataset + ".csv"), out / "dataset" / (dataset + ".csv"))
     runtime = Path("neo_cast/.neo-cast")
@@ -272,7 +275,7 @@ Install Bun, Node.js, and Python, and configure dependencies and keys for the ne
 
 ```bash
 python3 scripts/initialize_export.py
-cd opencode && bun install --frozen-lockfile && cd ..
+cd neoresearch && bun install --frozen-lockfile && cd ..
 cd neo_cast && npm ci && node bin/neo-cast.js init-runtime && cd ..
 bash scripts/reuse_export.sh research experiences --path
 bash scripts/reuse_export.sh research experiences --domain tsf --limit 5

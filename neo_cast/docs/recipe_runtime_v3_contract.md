@@ -20,7 +20,7 @@ Executable examples: `py/schemas/recipe_{diagonal_ssm,timesblock_encoder,mamba}.
 
 `py/recipe_identity.py` is authoritative. Architecture identity excludes explanatory text and training settings; experiment identity includes dataset contents, time splits, training settings, seeds, precision, backend, and runtime code digest. Only known equivalent configurations are normalized; behavioral similarity is not mathematical equivalence.
 
-Full training and CV check SQLite before training. Transactional reservations, lease heartbeats, and owner tokens prevent concurrent duplicates and stale writes. Completed records are reused only after artifact hashes and the current execution contract pass validation. Failed, expired, or corrupted results may retry. Duplicates are not independent evidence, add no runner result row, and do not advance plateau counters. Node/OpenCode stops after three consecutive duplicates with `no_new_candidate`.
+Full training and CV check SQLite before training. Transactional reservations, lease heartbeats, and owner tokens prevent concurrent duplicates and stale writes. Completed records are reused only after artifact hashes and the current execution contract pass validation. Failed, expired, or corrupted results may retry. Duplicates are not independent evidence, add no runner result row, and do not advance plateau counters. Node/NeoResearch stops after three consecutive duplicates with `no_new_candidate`.
 
 Smoke runs are not reused. V3 smoke saves `behavior_probe.json` with fixed-input output/input-gradient summaries, weight digests, device, and precision. This diagnostic does not affect caching or automatic equivalence merging.
 
@@ -45,6 +45,6 @@ References and pinned versions: `py/factory/encoders/PROVENANCE.md`.
 
 - `neo_cast/npm test`: passed (71 Node tests and the complete Python unittest wrapper). A later targeted run of new CLI deduplication and autonomous-loop tests passed all 16 tests.
 - `tests.test_recipe_v3`: 16 passed, including three standalone export reloads, reference-formula comparisons, and concurrent reservation. `tests.test_training_identity_v3` checks reuse of identical configurations, retraining for changed seeds, and independent cross-H parameters.
-- OpenCode `bun run typecheck`: passed.
-- OpenCode `bun test test/research`: 328 passed, 2 failed, matching preexisting failures: hypothesis-evidence-tools lacks quantitative.json; service default plateau expects 25 but gets 7. These are not counted as passing. An additional targeted service test confirms cached results are not independent metric evidence.
+- NeoResearch `bun run typecheck`: passed.
+- NeoResearch `bun test test/research`: 328 passed, 2 failed, matching preexisting failures: hypothesis-evidence-tools lacks quantitative.json; service default plateau expects 25 but gets 7. These are not counted as passing. An additional targeted service test confirms cached results are not independent metric evidence.
 - `git diff --check`: passed. These results do not cover the CUDA backend, paper benchmarks, or composition topology search.

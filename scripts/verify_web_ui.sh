@@ -33,17 +33,17 @@ LOG_FILE="$ARTIFACT_DIR/web-dev-server.log"
 
 mkdir -p "$ARTIFACT_DIR"
 
-export VITE_OPENCODE_SERVER_HOST="${VITE_OPENCODE_SERVER_HOST:-127.0.0.1}"
-export VITE_OPENCODE_SERVER_PORT="${VITE_OPENCODE_SERVER_PORT:-4096}"
+export VITE_NEORESEARCH_SERVER_HOST="${VITE_NEORESEARCH_SERVER_HOST:-127.0.0.1}"
+export VITE_NEORESEARCH_SERVER_PORT="${VITE_NEORESEARCH_SERVER_PORT:-4096}"
 
 print_step "Starting Web Dashboard verification server"
 if [[ "${NEO_RESEARCH_VERIFY_BUILT_UI:-0}" == "1" ]]; then
-  [[ -f "$ROOT/opencode/packages/app/dist/index.html" ]] || {
-    print_fail "Web Dashboard build missing; run bun run build in opencode/packages/app"
+  [[ -f "$ROOT/neoresearch/packages/app/dist/index.html" ]] || {
+    print_fail "Web Dashboard build missing; run bun run build in neoresearch/packages/app"
     exit 1
   }
   (
-    cd "$ROOT/opencode/packages/app"
+    cd "$ROOT/neoresearch/packages/app"
     exec node node_modules/vite/bin/vite.js preview --host 127.0.0.1 --port "$PORT" --strictPort
   ) >"$LOG_FILE" 2>&1 &
 else
@@ -80,7 +80,7 @@ if [[ "$ready" -ne 1 ]]; then
 fi
 
 print_step "Running Playwright Web Dashboard checks"
-cd "$ROOT/opencode/packages/app"
+cd "$ROOT/neoresearch/packages/app"
 run_bun "$ROOT" e2e/verify-web-dashboard.ts "$BASE_URL" "$ARTIFACT_DIR"
 
 print_ok "Web Dashboard UI verification completed"

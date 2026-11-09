@@ -2,13 +2,13 @@
 
 Status: stages A/B/C implemented; direct remains the default until real-provider/PDF integration acceptance. Optional stage three is not implemented.
 
-Scope: Research pipeline, session tools, and Research Cockpit TUI in opencode/packages/opencode.
+Scope: Research pipeline, session tools, and Research Cockpit TUI in neoresearch/packages/neoresearch.
 
 Prerequisite: [RetrieveAgent to HypoPlanner evidence bridge](./retrieve_hypoplanner_bridge_implementation_plan.md).
 
 ## 1. Goals and Boundaries
 
-Integrate the Literature phase of DataAnalysisAgent -> LiteratureAgent -> HypoPlanner with an OpenCode child session so the TUI displays retrieval, paper processing, evidence assembly, and failure/fallback states. Tools are auditable execution entrypoints; authoritative KnowledgeCard and TaskEvidenceBundle validation rules remain unchanged.
+Integrate the Literature phase of DataAnalysisAgent -> LiteratureAgent -> HypoPlanner with an NeoResearch child session so the TUI displays retrieval, paper processing, evidence assembly, and failure/fallback states. Tools are auditable execution entrypoints; authoritative KnowledgeCard and TaskEvidenceBundle validation rules remain unchanged.
 
 Acceptance requirements:
 
@@ -156,7 +156,7 @@ Acceptance: DataAnalysis -> LiteratureAgent -> HypoPlanner order; visible child-
 | TUI | Event order, node states, paper progress, replay, task switching, duplicate events, long-stream bounds |
 | E2E | Companion checkpoint followed by DataAnalysis -> Literature -> HypoPlanner with literature and data-only paths |
 
-Run package-scoped Bun tests and bun typecheck in opencode/packages/opencode; do not run npm test at the opencode root. Retain direct fallback until real-task caching, recovery, and replay pass. No database/artifact schema change is required for this plan; evaluate migration/versioning separately if optional stage-three state is persisted.
+Run package-scoped Bun tests and bun typecheck in neoresearch/packages/neoresearch; do not run npm test at the neoresearch root. Retain direct fallback until real-task caching, recovery, and replay pass. No database/artifact schema change is required for this plan; evaluate migration/versioning separately if optional stage-three state is persisted.
 
 ## 8. Implementation and Validation Record
 
@@ -168,9 +168,9 @@ share one Promise. Cancellation/timeouts stop at the next progress boundary; an 
 Enable with runtime.literatureSessionTools=true in taskSpec. Direct remains the default;
 fallback is allowed without an available model or before tools start. Started work reconciles the original Promise and persisted results.
 Tools expose no task/path/force arguments. Optional process/finalize is not implemented.
-See [Literature README](../../opencode/packages/opencode/src/research/literature/README.md) for user instructions and event envelopes.
+See [Literature README](../../neoresearch/packages/neoresearch/src/research/literature/README.md) for user instructions and event envelopes.
 
-Validation commands (Bun commands run in opencode/packages/opencode):
+Validation commands (Bun commands run in neoresearch/packages/neoresearch):
 
 ```bash
 bun run typecheck

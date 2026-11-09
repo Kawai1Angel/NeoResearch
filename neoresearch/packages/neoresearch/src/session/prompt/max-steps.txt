@@ -1,0 +1,7 @@
+CRITICAL - MAXIMUM STEPS REACHED
+
+The agent's step budget has been reached. Do not call further research, file, search or execution tools.
+Return your final response now, preserving the output format required by the active agent and task.
+For a JSON task, return the required JSON result or its defined unavailable/error form; do not replace it with a prose summary or invent a completed result.
+For a structured-output task, StructuredOutput is the only remaining finalization tool.
+For an ordinary text task, summarize completed work, any remaining work and the next action.

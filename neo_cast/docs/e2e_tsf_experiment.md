@@ -1,11 +1,11 @@
 # NeoResearch TSF E2E Experiment Path
 
-This document is the acceptance path for running the OpenCode TSF domain bridge
+This document is the acceptance path for running the NeoResearch TSF domain bridge
 against the local Neo-Cast Python runtime in this directory.
 
 ## Runtime Contract
 
-OpenCode TSF run plans use `taskSpec.runtime` to locate Neo-Cast:
+NeoResearch TSF run plans use `taskSpec.runtime` to locate Neo-Cast:
 
 ```json
 {
@@ -20,15 +20,15 @@ OpenCode TSF run plans use `taskSpec.runtime` to locate Neo-Cast:
 }
 ```
 
-The OpenCode TSF domain currently renders Neo-Cast recipe payloads and executes:
+The NeoResearch TSF domain currently renders Neo-Cast recipe payloads and executes:
 
 - `smoke`: `python3 py/validate.py smoke --candidate-path .neo-cast/current_candidate.json --resolved-path .neo-cast/resolved_candidate.json --artifacts-dir .neo-cast/artifacts`
 - `full`, `baseline`, `low_fidelity`: `python3 py/runner.py run --description <description>`
 - `ref_test`: `python3 py/runner.py ref-test`
 - `blind_test`: `python3 py/runner.py blind-test`
 
-OpenCode writes the candidate payload before execution. The local E2E script does
-the same write explicitly so the path can be audited without running OpenCode.
+NeoResearch writes the candidate payload before execution. The local E2E script does
+the same write explicitly so the path can be audited without running NeoResearch.
 
 ## Local Acceptance Script
 
@@ -126,16 +126,16 @@ Important files:
 - `.neo-cast/artifacts/run_<run_id>/eval_report.md`: exported report.
 - `.neo-cast/artifacts/run_<run_id>/ref_test_metrics.json`: local ref-test metrics after promotion.
 
-OpenCode records `artifact_ready` directories as `runner_artifact` refs. The
+NeoResearch records `artifact_ready` directories as `runner_artifact` refs. The
 actual files remain in the Neo-Cast artifact directory above.
 
-## OpenCode Path
+## NeoResearch Path
 
 Create a TSF task with the Neo-Cast root set to this directory:
 
 ```bash
-cd opencode
-bun run packages/opencode/src/index.ts research create \
+cd neoresearch
+bun run packages/neoresearch/src/index.ts research create \
   --mode review \
   --title "NeoResearch TSF E2E" \
   --neo-cast-root /path/to/NeoResearch/neo_cast
@@ -144,17 +144,17 @@ bun run packages/opencode/src/index.ts research create \
 Then seed baselines, approve one if required, and run:
 
 ```bash
-bun run packages/opencode/src/index.ts research seed <taskID>
-bun run packages/opencode/src/index.ts research run <taskID> <candidateID> --stage smoke
-bun run packages/opencode/src/index.ts research run <taskID> <candidateID> --stage full
-bun run packages/opencode/src/index.ts research seed-sweep <taskID> <candidateID> --stage smoke --seeds 3,5,7
+bun run packages/neoresearch/src/index.ts research seed <taskID>
+bun run packages/neoresearch/src/index.ts research run <taskID> <candidateID> --stage smoke
+bun run packages/neoresearch/src/index.ts research run <taskID> <candidateID> --stage full
+bun run packages/neoresearch/src/index.ts research seed-sweep <taskID> <candidateID> --stage smoke --seeds 3,5,7
 ```
 
-Request and approve `ref_test` before executing it through OpenCode:
+Request and approve `ref_test` before executing it through NeoResearch:
 
 ```bash
-bun run packages/opencode/src/index.ts research request-ref-test <taskID> <candidateID>
-bun run packages/opencode/src/index.ts research run <taskID> <candidateID> --stage ref_test
+bun run packages/neoresearch/src/index.ts research request-ref-test <taskID> <candidateID>
+bun run packages/neoresearch/src/index.ts research run <taskID> <candidateID> --stage ref_test
 ```
 
 ## Minimal Verification

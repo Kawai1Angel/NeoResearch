@@ -25,7 +25,7 @@ load_env_local "$ROOT"
 export_local_dev_environment "$ROOT"
 ensure_local_dev_dirs
 
-cd "$ROOT/opencode/packages/app"
+cd "$ROOT/neoresearch/packages/app"
 bun_bin="$(bun_path_for_root "$ROOT")" || {
   print_fail "bun runtime not found; install Bun before running the Web Dashboard"
   exit 1
