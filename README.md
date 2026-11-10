@@ -1,20 +1,18 @@
-# NeoResearch
+# <img src="assets/neoresearch-logo.png" alt="" width="64" align="middle"> NeoResearch
 
-<img src="assets/neoresearch-logo.png" alt="NeoResearch logo" width="220">
-
-NeoResearch uses an expert-inspired dual-loop workflow to autonomously discover lightweight, domain-specific models for time series forecasting. It combines a literature-augmented outer loop for architecture discovery with an evidence-driven inner loop for training optimization. Hierarchical experience memory links literature findings to experimental outcomes and preserves lessons for reuse across forecasting tasks. Architecture-level experience guides model design in the outer loop, while optimization-level experience guides training and hyperparameter tuning in the inner loop.
+NeoResearch uses a general-purpose large language model (LLM) as an autonomous researcher to discover lightweight, domain-specific models for time series forecasting. Its expert-inspired dual-loop workflow couples literature-guided architecture discovery with evidence-guided training optimization through experimental feedback. Hierarchical experience memory consolidates conditional lessons at the architecture and optimization levels to guide their respective loops within and across forecasting tasks.
 
 **Paper** · NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery · **arXiv link pending**
 
 ## Overview
 
-![NeoResearch workflow showing the literature-guided outer loop, evidence-guided inner loop, and shared experience memory](assets/neoresearch-workflow.png)
+<img src="assets/neoresearch-workflow.png" alt="NeoResearch workflow showing literature-guided architecture discovery, evidence-guided training optimization, and hierarchical experience memory" width="100%">
 
-*Figure 2 from the NeoResearch paper.*
+### Key Features
 
-- **Literature-guided architecture discovery.** In the outer loop, LLM agents extract modeling mechanisms, empirical evidence, and applicability conditions from scientific papers they find on the web. They combine these findings with task evidence and lessons from past experiments to propose testable architecture hypotheses.
-- **Evidence-driven training optimization.** The inner loop holds the architecture fixed and uses validation results and convergence diagnostics to refine training settings and tune hyperparameters. These results guide further tuning or a return to the outer loop to revise the architecture.
-- **Hierarchical experience memory.** The outer loop uses architecture-level records of hypotheses and design revisions to decide which designs to test or adapt. The inner loop uses optimization-level records of past training configurations, tuning outcomes, and convergence patterns to choose training settings and hyperparameters. Both levels retain the conditions under which findings apply.
+- **Literature-guided architecture discovery.** Turns modeling mechanisms from scientific literature into testable architectural hypotheses for the target forecasting task.
+- **Evidence-guided training optimization.** Uses experimental feedback on a fixed design to decide whether to refine training or revisit the architectural hypothesis.
+- **Hierarchical experience memory.** Accumulates architecture-level experience to guide the outer loop and optimization-level experience to guide the inner loop, both within and across forecasting tasks.
 
 ## Getting Started
 
@@ -44,7 +42,7 @@ In the TUI, configure an LLM provider, create a task from your CSV dataset, and 
 
 In the paper's reference-initialized Alpha setting, NeoResearch achieved the lowest held-out error in 19 of 20 MSE and MAE comparisons across ten forecasting datasets.
 
-[![Table 1 from the NeoResearch paper showing MSE and MAE for NeoResearch and the baselines across ten datasets](assets/neoresearch-benchmark-results.png)](assets/neoresearch-benchmark-results.png)
+[<img src="assets/neoresearch-benchmark-results.png" alt="Table 1 from the NeoResearch paper showing MSE and MAE for NeoResearch and the baselines across ten datasets" width="100%">](assets/neoresearch-benchmark-results.png)
 
 Section 4.3 of the paper examines the contributions of the two research loops, literature extraction, and hierarchical experience memory.
 
