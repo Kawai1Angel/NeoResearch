@@ -1,11 +1,11 @@
 # LiteratureAgent Phase HypoPlanner Mission Evidence Bridge Implementation Program
 
-Rule additions (2026-09-27, pending implementation and acceptance): sections 5.2 and 5.7 add card-type completeness and mechanism-role gates, aligned with the [knowledge-card rules](../../opencode/packages/opencode/src/research/literature/README.md). The implementation progress below does not mean these additions are implemented.
+Rule additions (2026-09-27, pending implementation and acceptance): sections 5.2 and 5.7 add card-type completeness and mechanism-role gates, aligned with the [knowledge-card rules](../../neoresearch/packages/neoresearch/src/research/literature/README.md). The implementation progress below does not mean these additions are implemented.
 
 Progress achieved (2026-09-21): Bridge functionality, durability, recovery path and offline acceptance have been achieved; The following established failures continue to occur with respect to the full-base testing.
 The original design and acceptance requirements are retained below without the complete training/publishing line being marked as green.
 
-| Execute Waves | Completed content | Acceptance location (relative to `opencode/packages/opencode/`) |
+| Execute Waves | Completed content | Acceptance location (relative to `neoresearch/packages/neoresearch/`) |
 | --- | --- | --- |
 | Wave 1 | Rigorous evidence compacts, semantic binding, applicability, coverage/diversity/budget, conflict and exclusion of audits | `test/research/retrieve/task-evidence-builder.test.ts` |
 | Wave 2 | deterministic/direct LLM Reference Validation, Illegal Batch Back, Markdown/YAML response | `test/research/hypo-planner-agent.test.ts` |
@@ -559,7 +559,7 @@ No PDF, no candidate and LiteratureAgent failed as a gap, not an anomaly for the
 Add:
 
 ```text
-opencode/packages/opencode/src/research/retrieve/
+neoresearch/packages/neoresearch/src/research/retrieve/
 ├── task-evidence-builder.ts
 ├── card-intent-binder.ts
 ├── applicability-matcher.ts
@@ -973,7 +973,7 @@ Extension `hypo-planner-agent.test.ts`:
 ### 11.6 recommended command
 
 ```bash
-cd opencode/packages/opencode
+cd neoresearch/packages/neoresearch
 bun test test/research/retrieve
 bun test test/research/literature
 bun test test/research/hypo-planner-agent.test.ts

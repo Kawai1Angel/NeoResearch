@@ -6,9 +6,9 @@
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `NEO_TSF_BLIND_TEST_TOKEN` | Yes | Bearer token accepted by the sidecar on `POST /score`. The OpenCode/runner caller uses the same value as `NEO_TSF_BLIND_TEST_TOKEN`. |
+| `NEO_TSF_BLIND_TEST_TOKEN` | Yes | Bearer token accepted by the sidecar on `POST /score`. The NeoResearch/runner caller uses the same value as `NEO_TSF_BLIND_TEST_TOKEN`. |
 | `NEO_TSF_BLIND_AUDIT_LOG` | No | JSONL audit destination. Defaults to `.neo-cast/blind_test_audit.jsonl` relative to the sidecar process. Use a private, append-only path in deployment. |
-| `NEO_TSF_BLIND_QUERY_LIMIT` | No | Positive integer accepted-query limit per `task_id`. Empty, zero, and negative values mean no sidecar-local limit. OpenCode governance may enforce an earlier limit as well. |
+| `NEO_TSF_BLIND_QUERY_LIMIT` | No | Positive integer accepted-query limit per `task_id`. Empty, zero, and negative values mean no sidecar-local limit. NeoResearch governance may enforce an earlier limit as well. |
 | `NEO_TSF_BLIND_TEST_URL` | Runner only | URL used by `prepare_tsf.query_blind_test`, usually `http://127.0.0.1:8765/score` from the runner host or a private service URL. |
 
 ## Start Command
@@ -41,17 +41,17 @@ curl -s \
   http://127.0.0.1:8765/score
 ```
 
-## OpenCode Blind Gate Flow
+## NeoResearch Blind Gate Flow
 
-1. OpenCode creates or prepares a `blind_test` stage run only after the governance approval gate is satisfied.
-2. OpenCode governance enforces `budget.governance.blindTestQueryLimit` before the run is queued. When exhausted, it raises a budget error and creates a budget approval record.
+1. NeoResearch creates or prepares a `blind_test` stage run only after the governance approval gate is satisfied.
+2. NeoResearch governance enforces `budget.governance.blindTestQueryLimit` before the run is queued. When exhausted, it raises a budget error and creates a budget approval record.
 3. The Neo-Cast runner executes `python3 neo_cast/py/runner.py blind-test --run-id <run_id>`.
 4. `runner.py` freezes the selected artifact directory, creates an opaque `promotion_token`, and calls `prepare_tsf.query_blind_test`.
 5. `query_blind_test` posts `artifact_uri`, `task_id`, and `promotion_token` to `NEO_TSF_BLIND_TEST_URL` with bearer auth.
 6. The sidecar validates the token, checks its own per-task query limit, scores with private data, writes an audit JSONL record, and returns numeric `blind_test_*` metrics.
 7. The runner writes `blind_test_metrics.json` for the governed run artifact. Hidden labels, private scorer internals, and audit logs stay outside the agent workspace.
 
-OpenCode service tests already cover the approval requirement and blind query-limit budget behavior in `opencode/packages/opencode/test/research/service.test.ts`.
+NeoResearch service tests already cover the approval requirement and blind query-limit budget behavior in `neoresearch/packages/neoresearch/test/research/service.test.ts`.
 
 ## Audit Contract
 
@@ -82,5 +82,5 @@ Audit records intentionally store metric names only. They must not store metric 
 - Mount hidden blind data and private scoring code only into the sidecar runtime.
 - Keep `NEO_TSF_BLIND_AUDIT_LOG` in a privileged store. The agent may receive opaque references or final approved metrics, never the raw audit log.
 - Use network policy or loopback binding so only the runner/governance service can reach `POST /score`.
-- Rotate bearer tokens through a secret manager and treat every `request_id` as an audit correlation key across OpenCode approval, runner execution, and sidecar audit.
-- Keep query limits in both places: OpenCode governance for workflow-level budget enforcement, and sidecar `NEO_TSF_BLIND_QUERY_LIMIT` as a privileged backstop.
+- Rotate bearer tokens through a secret manager and treat every `request_id` as an audit correlation key across NeoResearch approval, runner execution, and sidecar audit.
+- Keep query limits in both places: NeoResearch governance for workflow-level budget enforcement, and sidecar `NEO_TSF_BLIND_QUERY_LIMIT` as a privileged backstop.

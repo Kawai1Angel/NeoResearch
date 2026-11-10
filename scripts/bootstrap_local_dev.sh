@@ -13,7 +13,7 @@ Prepare the NeoResearch source tree for local development.
 
 Options:
   --dry-run       Print checks and planned actions without writing files or installing dependencies.
-  --skip-install  Do not run bun install even when opencode/node_modules is missing.
+  --skip-install  Do not run bun install even when neoresearch/node_modules is missing.
   -h, --help      Show this help.
 USAGE
 }
@@ -66,9 +66,9 @@ else
 fi
 
 print_step "Checking project directories"
-[[ -d "$ROOT/opencode" ]] || { print_fail "missing opencode directory"; exit 1; }
+[[ -d "$ROOT/neoresearch" ]] || { print_fail "missing neoresearch directory"; exit 1; }
 [[ -d "$NEO_CAST_ROOT_RESOLVED" ]] || { print_fail "missing Neo-Cast root: $NEO_CAST_ROOT_RESOLVED"; exit 1; }
-print_ok "opencode directory found"
+print_ok "neoresearch directory found"
 print_ok "Neo-Cast root: $NEO_CAST_ROOT_RESOLVED"
 
 print_step "Checking Python runtime dependencies"
@@ -96,20 +96,20 @@ else
   print_ok "created runtime and artifact directories"
 fi
 
-print_step "Checking opencode workspace dependencies"
+print_step "Checking neoresearch workspace dependencies"
 if [[ "$skip_install" -eq 1 || "$dry_run" -eq 1 ]]; then
-  if [[ -d "$ROOT/opencode/node_modules" ]]; then
-    print_ok "opencode/node_modules exists"
+  if [[ -d "$ROOT/neoresearch/node_modules" ]]; then
+    print_ok "neoresearch/node_modules exists"
   else
-    print_warn "opencode/node_modules missing; run bun install in opencode or rerun without --skip-install"
+    print_warn "neoresearch/node_modules missing; run bun install in neoresearch or rerun without --skip-install"
   fi
 else
-  if [[ -d "$ROOT/opencode/node_modules" ]]; then
-    print_step "Refreshing opencode workspace dependencies"
+  if [[ -d "$ROOT/neoresearch/node_modules" ]]; then
+    print_step "Refreshing neoresearch workspace dependencies"
   else
-    print_step "Running bun install in opencode"
+    print_step "Running bun install in neoresearch"
   fi
-  (cd "$ROOT/opencode" && run_bun "$ROOT" install)
+  (cd "$ROOT/neoresearch" && run_bun "$ROOT" install)
 fi
 
 print_step "Bootstrap summary"

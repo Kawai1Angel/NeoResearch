@@ -26,7 +26,7 @@ ARTIFACT_DIR="$ROOT/.neo-research/artifacts/ui"
 mkdir -p "$ARTIFACT_DIR"
 
 print_step "Running TUI cockpit helper/render tests"
-cd "$ROOT/opencode/packages/opencode"
+cd "$ROOT/neoresearch/packages/neoresearch"
 run_bun "$ROOT" test \
   test/cli/tui/research-cockpit-data.test.ts \
   test/cli/tui/research-cockpit-render.test.tsx \

@@ -20,4 +20,4 @@ verify-ui:
 
 smoke:
 	./scripts/smoke_tsf.sh
-	cd opencode/packages/opencode && bun test test/research/e2e-autonomous-loop.test.ts --timeout 120000
+	cd neoresearch/packages/neoresearch && bun test test/research/e2e-autonomous-loop.test.ts --timeout 120000

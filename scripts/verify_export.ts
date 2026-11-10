@@ -1,10 +1,10 @@
 /** Offline integration check against the actual readers and retrieval index. */
 import path from "node:path"
 import { Database } from "bun:sqlite"
-import { ExperienceLibrary, experienceLibraryPath } from "../opencode/packages/opencode/src/research/experience-library"
-import { KnowledgeV2Store } from "../opencode/packages/opencode/src/research/literature/knowledge-v2-store"
-import { buildLocalIndex } from "../opencode/packages/opencode/src/research/retrieve/local-index-builder"
-import { validateKnowledgeCardSeal } from "../opencode/packages/opencode/src/research/literature/knowledge-v2-validator"
+import { ExperienceLibrary, experienceLibraryPath } from "../neoresearch/packages/neoresearch/src/research/experience-library"
+import { KnowledgeV2Store } from "../neoresearch/packages/neoresearch/src/research/literature/knowledge-v2-store"
+import { buildLocalIndex } from "../neoresearch/packages/neoresearch/src/research/retrieve/local-index-builder"
+import { validateKnowledgeCardSeal } from "../neoresearch/packages/neoresearch/src/research/literature/knowledge-v2-validator"
 
 const root = path.resolve(process.argv[2] ?? path.join(import.meta.dir, ".."))
 const expected = await Bun.file(path.join(root, "exports/manifest.json")).json()

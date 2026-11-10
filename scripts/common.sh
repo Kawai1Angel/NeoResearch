@@ -40,9 +40,9 @@ bun_path_for_root() {
 
   if [[ -n "$root" ]]; then
     for candidate in \
-      "$root/opencode/node_modules/.bin/bun" \
-      "$root/opencode/packages/opencode/node_modules/.bin/bun" \
-      "$root/opencode/packages/app/node_modules/.bin/bun"; do
+      "$root/neoresearch/node_modules/.bin/bun" \
+      "$root/neoresearch/packages/neoresearch/node_modules/.bin/bun" \
+      "$root/neoresearch/packages/app/node_modules/.bin/bun"; do
       if [[ -x "$candidate" ]]; then
         printf '%s\n' "$candidate"
         return 0

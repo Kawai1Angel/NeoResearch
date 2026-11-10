@@ -686,7 +686,7 @@ The system naturally evolves in the direction of small and steady. While maintai
 | Arguments best | Minimum number of parameters |
 | Integrated best | Utility highest rating |
 
-> **Implementation progress:** OpenCode Research Service adds candidate-level multi-seed summaries, 95% CI half-widths, and Pareto Frontier calculations to `research_report_markdown`. Pareto compares the primary metric mean with costs such as `resourceUsage.wallClockSec`. Results appear in Markdown's `Experiment Analysis` and artifact metadata (`evaluatedRunCount`, `multiSeedCandidateCount`, `paretoFrontierCount`), with summaries in Web Dashboard and TUI Cockpit. Candidate execution supports `seed-sweep` using `taskSpec.evaluation.seeds` or explicit seeds, recording each seed in the runner payload and `resourceUsage.seed` through the shared Web/TUI/CLI/HTTP interface. Probabilistic forecasting supports `forecastMode=probabilistic`, primary metrics `val_avg_pinball` / `val_avg_crps_approx`, and quantile-head pinball/approximate-CRPS/interval-coverage-and-width evaluation and reports. `blind_test` has OpenCode stage, approval, query-limit, CLI/Web/TUI, and Neo-Cast sidecar HTTP contracts. Independently deployable `py/blind_test_sidecar.py` supports bearer tokens, query limits, and private audit JSONL. Actual private-data integration and long-term deployment remain Milestone 5 work.
+> **Implementation progress:** NeoResearch Research Service adds candidate-level multi-seed summaries, 95% CI half-widths, and Pareto Frontier calculations to `research_report_markdown`. Pareto compares the primary metric mean with costs such as `resourceUsage.wallClockSec`. Results appear in Markdown's `Experiment Analysis` and artifact metadata (`evaluatedRunCount`, `multiSeedCandidateCount`, `paretoFrontierCount`), with summaries in Web Dashboard and TUI Cockpit. Candidate execution supports `seed-sweep` using `taskSpec.evaluation.seeds` or explicit seeds, recording each seed in the runner payload and `resourceUsage.seed` through the shared Web/TUI/CLI/HTTP interface. Probabilistic forecasting supports `forecastMode=probabilistic`, primary metrics `val_avg_pinball` / `val_avg_crps_approx`, and quantile-head pinball/approximate-CRPS/interval-coverage-and-width evaluation and reports. `blind_test` has NeoResearch stage, approval, query-limit, CLI/Web/TUI, and Neo-Cast sidecar HTTP contracts. Independently deployable `py/blind_test_sidecar.py` supports bearer tokens, query limits, and private audit JSONL. Actual private-data integration and long-term deployment remain Milestone 5 work.
 
 > **Utility achieves calibration:** Current export will produce `Utility Ranking`, using the current campaign (if not best metrology) as reference to calculate anachronism gas and deduct parameters, delays, multi-seed squares and code complexity penalties; The result is written in Markdown and Artificial Metadata (`utilityCandidateCount`). Current Utility is first used for sorting and auditing, without directly overwhelming the Champion promotion policy.
 
@@ -707,7 +707,7 @@ In order for acceptance rules and Utility to be truly enforceable, the following
   Failures include: non-zero exit, OOM, NaN indicators, mismatches of interfaces and timeout killings.
 
 - `std_seed_val`
-  Defined as the standard difference of `val_avg_mse` on the agreed lid set for the same candidate; The current OpenCode export has been able to do averages/standard deviations/best/worst summary for the same candidate many times, and runner can generate these runs automatically through `seed-sweep` as agreed.
+  Defined as the standard difference of `val_avg_mse` on the agreed lid set for the same candidate; The current NeoResearch export has been able to do averages/standard deviations/best/worst summary for the same candidate many times, and runner can generate these runs automatically through `seed-sweep` as agreed.
 
 - `params_M`
   `params_M` is the total number of bindle parameters if multiple horizon bundle (one model per horizon) is currently achieved;
@@ -1937,7 +1937,7 @@ Delivery:
 **Target:** Candidates are upgraded from "model family + parameter" to "modular action combination", starting with controllable small model structure autonomous design capability
 
 Delivery:
-- [x] Introduction of an action registry: creating / embedding / backbone / fusion / head / trainer (OpenCode domain registry + Neo-Cast Python action categories)
+- [x] Introduction of an action registry: creating / embedding / backbone / fusion / head / trainer (NeoResearch domain registry + Neo-Cast Python action categories)
 - [x] Fulfill `build_model(candidate_recipe)` by recapitulating PyTorch models (`neo_cast/py/factory/build_model.py`)
 - [x] Supports CandidateRecipe DSL configuration changes (L1/L2 code change mode)
 - [x] Proposal Engine v1 + recipe config search
@@ -1955,7 +1955,7 @@ Delivery:
 
 Delivery:
 - [x] Registry Composition Search(L2)
-- [x] ModelSpec / PatchBundle / Lineage complete (Neo-Cast export description set `model_spec.json` and `patch_bundle.json`; OpenCode report written to Candidate Lineage root/edge and metadata)
+- [x] ModelSpec / PatchBundle / Lineage complete (Neo-Cast export description set `model_spec.json` and `patch_bundle.json`; NeoResearch report written to Candidate Lineage root/edge and metadata)
 - [x] Accessing `instance_norm`, `series_decomposition`, `seasonal_differencing`, `missing_mask`, `sample_reweighting`
 - [x] Embedding access to `none`, `patch`, `multiscale_patch`, `invert`, `frequency`, `calendar`
 - [x] Backbone access to `linear`, `mlp`, `rnn`, `dlinear`, `tcn`, `nbeats`, `timesnet`, `ssm`, `mixer`, `transformer`
@@ -1995,15 +1995,15 @@ Delivery:
 **Target:** The research process is officially controlled and credible at the scientific level
 
 Delivery:
-- [ ] The realization of external blind test services (private labelling segregation, independent sidecar, formal query restrictions and auditing); OpenCode `blind_test` status, approval date, query-limit Gate, CLI/Web/TUI access, API status expression, Neo-Cast Runner HTTP deployment template and `py/blind_test_sidecar.py` deployable service templates are currently completed; Not yet connected to real private blind data and long run deployment)
+- [ ] The realization of external blind test services (private labelling segregation, independent sidecar, formal query restrictions and auditing); NeoResearch `blind_test` status, approval date, query-limit Gate, CLI/Web/TUI access, API status expression, Neo-Cast Runner HTTP deployment template and `py/blind_test_sidecar.py` deployable service templates are currently completed; Not yet connected to real private blind data and long run deployment)
 - [x] Achieve basic research audit log + approval stream (candidate/ref_test/shadow_holdout/budget/protocol/domain_action)
-- [x] Supports the probability prediction task type (OpenCode `TSFTaskSpec.forecastMode=probabilistic` optional `val_avg_pinball`/`val_avg_crps_approx`); Neo-Cast Runner for quantile head output pinball, CRS approximation, central interval coverage/width and displayed in the report report)
+- [x] Supports the probability prediction task type (NeoResearch `TSFTaskSpec.forecastMode=probabilistic` optional `val_avg_pinball`/`val_avg_crps_approx`); Neo-Cast Runner for quantile head output pinball, CRS approximation, central interval coverage/width and displayed in the report report)
 - [x] Automatic generation of complete studies (task/candidate/run/champion/memory + multi-seed/Pareto/Utility analysis)
 
 ### Milestone 6 (P2 Extension)
 
 - [ ] Template Patch (L3 code change mode)
-- [x] Distillation mode complete support (recipe scheme / action registry / OpenCode runner payload / Neo-Cast track loss supported `loss.base=distillation`, `supervised_weight`, `teacher_weight`, teacher policy)
+- [x] Distillation mode complete support (recipe scheme / action registry / NeoResearch runner payload / Neo-Cast track loss supported `loss.base=distillation`, `supervised_weight`, `teacher_weight`, teacher policy)
 - [ ] Multi-mission migration
 
 ### Recommended division of research and development

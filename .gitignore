@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+/neoresearch.json
 /opencode.json
 .neo-research/
 .neo-cast/

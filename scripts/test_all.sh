@@ -9,7 +9,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/test_all.sh [--quick]
 
-Run the NeoResearch local verification suite across opencode and neo_cast.
+Run the NeoResearch local verification suite across neoresearch and neo_cast.
 
 Options:
   --quick     Run the targeted Research OS and Neo-Cast tests used for local alpha checks.
@@ -40,8 +40,8 @@ load_env_local "$ROOT"
 export_local_dev_environment "$ROOT"
 ensure_local_dev_dirs
 
-print_step "OpenCode Research OS targeted tests"
-(cd "$ROOT/opencode/packages/opencode" && run_bun "$ROOT" test \
+print_step "NeoResearch Research OS targeted tests"
+(cd "$ROOT/neoresearch/packages/neoresearch" && run_bun "$ROOT" test \
   test/research/domain-registry.test.ts \
   test/research/runtime.test.ts \
   test/research/tsf-domain.test.ts \
@@ -52,14 +52,14 @@ print_step "OpenCode Research OS targeted tests"
   test/cli/tui/research-cockpit-render.test.tsx \
   --timeout 30000)
 
-print_step "OpenCode package typecheck"
-(cd "$ROOT/opencode/packages/opencode" && npm run typecheck)
+print_step "NeoResearch package typecheck"
+(cd "$ROOT/neoresearch/packages/neoresearch" && npm run typecheck)
 
 print_step "Web Dashboard helper tests"
-(cd "$ROOT/opencode/packages/app" && run_bun "$ROOT" test --preload ./happydom.ts src/pages/research-dashboard-data.test.ts --timeout 30000)
+(cd "$ROOT/neoresearch/packages/app" && run_bun "$ROOT" test --preload ./happydom.ts src/pages/research-dashboard-data.test.ts --timeout 30000)
 
 print_step "App typecheck"
-(cd "$ROOT/opencode/packages/app" && npm run typecheck)
+(cd "$ROOT/neoresearch/packages/app" && npm run typecheck)
 
 print_step "Neo-Cast Python tests"
 python_bin="$(neo_cast_python_for_root "$ROOT")"

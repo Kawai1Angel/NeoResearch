@@ -795,7 +795,7 @@ This product was first used for manual inspection and subsequent module developm
 It is proposed to add:
 
 ```text
-opencode/packages/opencode/src/research/retrieve/
+neoresearch/packages/neoresearch/src/research/retrieve/
 ├── contract.ts
 ├── retrieve-agent.ts
 ├── quantitative-report-reader.ts
@@ -828,7 +828,7 @@ neo_cast/literature_knowledge/
 └── retrieve_result.schema.json
 ```
 
-Existing `opencode/.../research/literature/` is maintained as thesis understanding and KnowledgeCard module. RetrieveAgent pass.
+Existing `neoresearch/.../research/literature/` is maintained as thesis understanding and KnowledgeCard module. RetrieveAgent pass.
 `literature-bridge.ts` calls it and does not copy its resolution, validation or storage logic.
 
 ## 12. Index and Run Recoverability
