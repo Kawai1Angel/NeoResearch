@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a746e">
+  <title>NeoResearch · Autonomous Time Series Model Discovery</title>
+  <meta name="description" content="NeoResearch uses an LLM as an autonomous researcher to discover lightweight, domain-specific forecasting models through literature-guided discovery, experimental feedback, and hierarchical experience memory.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery">
+  <meta property="og:description" content="From scientific literature to specialized forecasting models. An expert-inspired dual-loop workflow with hierarchical experience memory.">
+  <meta property="og:image" content="assets/figures/framework.webp">
+  <meta property="og:image:alt" content="NeoResearch dual-loop research workflow and hierarchical experience memory">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="citation_title" content="NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery">
+  <meta name="citation_author" content="Ze Guo">
+  <meta name="citation_author" content="Mingyue Cheng">
+  <meta name="citation_author" content="Xiaoyu Tao">
+  <meta name="citation_author" content="Shuo Yu">
+  <meta name="citation_author" content="Shangtong Ye">
+  <meta name="citation_publication_date" content="2026">
+  <link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script src="assets/script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-paper" viewBox="0 0 24 24"><path d="M14 3H6v18h12V7l-4-4Z"/><path d="M14 3v5h4M9 12h6M9 16h6"/></symbol>
+    <symbol id="icon-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5m8-10 5 5-5 5M14 4l-4 16"/></symbol>
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-quote" viewBox="0 0 24 24"><path d="M10 6H4v7h5c0 3-2 5-5 5m16-12h-6v7h5c0 3-2 5-5 5"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/></symbol>
+    <symbol id="icon-expand" viewBox="0 0 24 24"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"/></symbol>
+    <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5m8 0h6"/></symbol>
+  </svg>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#top" aria-label="NeoResearch home"><img src="assets/mark.svg" alt="" width="34" height="34"><span>NeoResearch</span></a>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav" aria-label="Open navigation"><span></span><span></span><span></span></button>
+      <nav id="primary-nav" class="nav-links" aria-label="Primary navigation">
+        <a href="#abstract">Abstract</a><a href="#method">Method</a><a href="#memory">Memory</a><a href="#results">Results</a><a href="#analysis">Analysis</a><a href="#code">Code</a><a href="#citation">BibTeX</a>
+      </nav>
+      <a class="header-code" href="https://github.com/Kawai1Angel/NeoResearch" target="_blank" rel="noopener noreferrer" aria-label="NeoResearch on GitHub"><svg class="icon" aria-hidden="true"><use href="#icon-code"/></svg><span>GitHub</span><span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="top" class="hero" aria-labelledby="page-title">
+      <div class="container">
+        <p class="eyebrow hero-eyebrow"><span class="status-dot"></span> Autonomous research for time series</p>
+        <h1 id="page-title">Neo<span>Research</span></h1>
+        <p class="subtitle">Literature- and Experience-Guided<br>Autonomous Time Series Model Discovery</p>
+        <p class="authors"><a href="mailto:gz1504921411@mail.ustc.edu.cn">Ze Guo</a><span>·</span><a href="mailto:mycheng@ustc.edu.cn">Mingyue Cheng</a><span>·</span><a href="mailto:txytiny@mail.ustc.edu.cn">Xiaoyu Tao</a><span>·</span><a href="mailto:yu12345@mail.ustc.edu.cn">Shuo Yu</a><span>·</span><a href="mailto:yst18349635@mail.ustc.edu.cn">Shangtong Ye</a></p>
+        <p class="affiliation">State Key Laboratory of Cognitive Intelligence<br>University of Science and Technology of China</p>
+        <div class="button-row" aria-label="Project resources">
+          <a class="button primary" href="NeoResearch_arXivs.pdf" target="_blank" rel="noopener"><svg class="icon" aria-hidden="true"><use href="#icon-paper"/></svg>Paper PDF<span aria-hidden="true">↗</span></a>
+          <a class="button" href="https://github.com/Kawai1Angel/NeoResearch" target="_blank" rel="noopener noreferrer"><svg class="icon" aria-hidden="true"><use href="#icon-code"/></svg>Code</a>
+          <a class="button" href="#code"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>Quick start</a>
+          <a class="button" href="#citation"><svg class="icon" aria-hidden="true"><use href="#icon-quote"/></svg>BibTeX</a>
+        </div>
+        <p class="hero-takeaway">An LLM researcher. Task-specific models. Experience that carries forward.</p>
+      </div>
+    </section>
+
+    <section class="teaser" aria-label="NeoResearch framework overview">
+      <div class="wide-container">
+        <figure class="paper-figure main-figure">
+          <div class="figure-heading"><span><span class="tiny-dot"></span> The research workflow</span><span>Figure 2</span></div>
+          <a class="figure-link" href="assets/figures/framework.webp" data-figure="NeoResearch framework · Figure 2"><img src="assets/figures/framework.webp" alt="NeoResearch takes time-series data and domain knowledge through literature-guided architecture discovery and evidence-guided training optimization. Architecture-level and optimization-level memory guide both loops, producing lightweight models and reusable insights." width="1530" height="741" fetchpriority="high"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg> Enlarge</span></a>
+          <figcaption><strong>From scientific evidence to specialized forecasters.</strong> The outer loop proposes and revises architectures; the inner loop optimizes training. Hierarchical memory connects literature, hypotheses, experiments, and conditional lessons.<a href="assets/figures/framework.pdf" target="_blank" rel="noopener">Figure PDF ↗</a></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <div class="summary-strip" aria-label="Research at a glance">
+      <div class="container stats-grid">
+        <div><strong>2</strong><span>coordinated research loops</span></div>
+        <div><strong>10</strong><span>real-world datasets</span></div>
+        <div><strong>18</strong><span>comparison methods</span></div>
+        <div><strong>19<span class="stat-unit">/20</span></strong><span>best dataset–metric results</span></div>
+        <div><strong>≤10<span class="stat-unit">M</span></strong><span>parameters per candidate</span></div>
+      </div>
+    </div>
+
+    <section class="section" id="abstract" aria-labelledby="abstract-title">
+      <div class="container narrow">
+        <div class="section-heading centered"><p class="eyebrow">Abstract</p><h2 id="abstract-title">Turning knowledge into<br>testable model designs.</h2></div>
+        <div class="prose abstract-copy">
+          <p>Developing effective forecasting models for diverse time-series domains requires substantial expert knowledge, evidence from scientific literature on the web, and iterative experimentation. However, translating this knowledge and research experience into model designs requires preserving source context and testing applicability under task-specific assumptions. In this paper, we propose <strong>NeoResearch</strong>, a literature- and experience-guided autonomous research framework that leverages large language models (LLMs) as researchers to discover lightweight, domain-specific forecasting models.</p>
+          <p>Specifically, NeoResearch establishes an expert-inspired dual-loop research workflow, coupling hypothesis-driven architecture exploration with iterative training and hyperparameter optimization through experimental feedback. To enable knowledge-grounded discovery, the agent autonomously mines scientific literature from the Web, extracting modeling mechanisms, empirical evidence, and applicability conditions to formulate task-grounded, testable architecture hypotheses. Furthermore, a hierarchical experience memory links literature findings to experimental outcomes and consolidates conditional lessons, guiding architecture discovery and training optimization while supporting reuse across forecasting tasks. Experiments on ten datasets show competitive performance and support dual loops, literature extraction, and memory reuse.</p>
+        </div>
+        <div class="keyword-row"><span>Time series forecasting</span><span>Autonomous research</span><span>Cross-domain memory transfer</span></div>
+      </div>
+    </section>
+
+    <section class="section soft" aria-labelledby="motivation-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">The research perspective</p><h2 id="motivation-title">Discover a model. Retain the experience.</h2><p class="lead">A general-purpose LLM organizes the research. The discovered lightweight model performs numerical forecasting independently of the LLM.</p></div>
+        <div class="motivation-layout">
+          <div class="research-questions">
+            <article><span class="question-number">01</span><div><h3>What should we build?</h3><p>Connect temporal dynamics and variable relationships to modeling mechanisms and their evidence in scientific literature.</p></div></article>
+            <article><span class="question-number">02</span><div><h3>Refine training or revise the design?</h3><p>Use validation errors and convergence diagnostics to decide whether a candidate needs better optimization or a new architectural hypothesis.</p></div></article>
+            <article><span class="question-number">03</span><div><h3>What carries over to the next task?</h3><p>Retain what changed, under which conditions, and with what outcome. Reassess applicability when experience is reused.</p></div></article>
+          </div>
+          <figure class="paper-figure compact-figure">
+            <a class="figure-link" href="assets/figures/research-paradigm.webp" data-figure="An LLM as a researcher · Figure 1"><img src="assets/figures/research-paradigm.webp" alt="Comparison between an LLM as a forecasting component and an LLM researcher that discovers models and retains scientific knowledge, experience, and modeling assets." width="732" height="561" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg></span></a>
+            <figcaption><strong>An LLM as a researcher.</strong> Each investigation produces a forecaster and reusable research resources. <a href="assets/figures/research-paradigm.pdf" target="_blank" rel="noopener">Figure 1 ↗</a></figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="method" aria-labelledby="method-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">Method</p><h2 id="method-title">Two loops. One evidence-driven workflow.</h2><p class="lead">Literature motivates hypotheses. Experiments test them. Reflection determines the next step.</p></div>
+        <div class="workflow-steps">
+          <article><span class="step-number">01</span><h3>Profile &amp; retrieve</h3><p>Analyze the target data. Retrieve literature, mechanisms, source evidence, and relevant prior experience.</p><span class="step-label">Task-grounded evidence</span></article>
+          <article><span class="step-number">02</span><h3>Hypothesize &amp; build</h3><p>Form a testable architectural hypothesis and translate it into a structured, executable model recipe.</p><span class="step-label">Literature-guided discovery</span></article>
+          <article><span class="step-number">03</span><h3>Train &amp; validate</h3><p>Refine training for the fixed design using validation metrics, convergence curves, and error analysis.</p><span class="step-label">Evidence-guided optimization</span></article>
+          <article><span class="step-number">04</span><h3>Reflect &amp; revise</h3><p>Assess the mechanism, revise its applicability, and consolidate conditional lessons for future research.</p><span class="step-label">Persistent research memory</span></article>
+        </div>
+        <div class="loop-grid">
+          <article class="loop-panel outer-loop"><p class="panel-label"><span class="tiny-dot"></span> Outer loop</p><h3>Literature-guided<br>architecture discovery</h3><p>Choose preprocessing, temporal backbones, variable interactions, and module compositions. Preserve the source, expected effect, applicability conditions, and observations that would challenge each hypothesis.</p><div class="panel-foot">Experimental feedback → refine or replace the design</div></article>
+          <article class="loop-panel inner-loop"><p class="panel-label"><span class="tiny-dot"></span> Inner loop</p><h3>Evidence-guided<br>training optimization</h3><p>Keep the design fixed while adjusting learning rates, batch sizes, regularization, scheduling, and training loss. Return the best validated model with diagnostics and a complete experiment history.</p><div class="panel-foot">Validation and convergence → tune or return to discovery</div></article>
+        </div>
+        <div class="method-note"><svg class="icon" aria-hidden="true"><use href="#icon-paper"/></svg><p><strong>Traceable by construction.</strong> Structured recipes and persistent state link hypotheses, designs, runs, and model artifacts. Validation MSE selects candidates; test data are excluded from research decisions.</p></div>
+      </div>
+    </section>
+
+    <section class="section soft" id="memory" aria-labelledby="memory-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">Hierarchical experience memory</p><h2 id="memory-title">Research that informs the next investigation.</h2><p class="lead">Preserve evidence and conditions alongside outcomes, so prior findings can be tested and revised on a new task.</p></div>
+        <div class="memory-grid">
+          <article><div class="memory-icon" aria-hidden="true">A</div><h3>Architecture-level memory</h3><p>Mechanisms, hypotheses, designs, architecture revisions, and experimental outcomes guide what to build and which assumptions to test.</p><ul><li>Effective designs and applicability conditions</li><li>Failed interventions and possible causes</li><li>Unresolved or conflicting explanations</li></ul></article>
+          <article><div class="memory-icon optimization-icon" aria-hidden="true">O</div><h3>Optimization-level memory</h3><p>Training configurations, tuning outcomes, and convergence patterns guide how to train a candidate and when to revisit the design.</p><ul><li>Effective strategies and measured gains</li><li>Low-gain trials and training instability</li><li>Diagnostics linked to the executed recipe</li></ul></article>
+        </div>
+        <div class="memory-flow" aria-label="Memory consolidation process"><span>Literature &amp; task evidence</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg><span>Hypotheses &amp; experiments</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg><span>Conditional lessons</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg><span>Target-task validation</span></div>
+        <figure class="paper-figure">
+          <a class="figure-link" href="assets/figures/memory-accumulation.webp" data-figure="Memory structure and accumulation · Figure 5"><img src="assets/figures/memory-accumulation.webp" alt="MSE and MAE across ETTh1, MOPEX, NP, and PJM as source tasks accumulate. Full structured memory outperforms raw memory and no memory at every nonzero checkpoint, with a temporary reversal on MOPEX." width="1530" height="489" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg> Enlarge</span></a>
+          <figcaption><strong>Structured memory supports cross-task reuse.</strong> Sources accumulate in order: GEF-L, Windy, BE, and FR. More sources do not guarantee monotonic gains; transferred findings are reassessed on the target task.<a href="assets/figures/memory-accumulation.pdf" target="_blank" rel="noopener">Figure 5 ↗</a></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="results" aria-labelledby="results-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">Benchmark results</p><h2 id="results-title">Specialized models across ten datasets.</h2><p class="lead">Electricity markets, energy systems, and hydrology. Compared with 16 forecasting baselines and two automated model-development methods.</p></div>
+        <div class="results-layout">
+          <div class="results-summary"><span class="result-tag">Reference-initialized Alpha setting</span><p class="big-result">19<span>/20</span></p><h3>lowest held-out errors</h3><p>Best MSE on <strong>9 of 10</strong> datasets and best MAE on <strong>all 10</strong>. Each comparison uses the strongest baseline for that dataset and metric.</p><div class="result-caveat"><strong>The exception: Windy MSE.</strong> DLinear and DeepAR achieve lower MSE. NeoResearch has the lowest MAE on Windy.</div><p class="protocol-note">Up to 25 research iterations · ≤10M parameters per candidate · validation-based selection · held-out testing</p></div>
+          <div class="chart-panel">
+            <div class="chart-heading"><div><p class="eyebrow">Against the best baseline</p><h3 id="chart-title">Relative MSE reduction</h3></div><div class="metric-switch" role="group" aria-label="Chart error metric"><button type="button" data-metric="mse" aria-pressed="true">MSE</button><button type="button" data-metric="mae" aria-pressed="false">MAE</button></div></div>
+            <div class="bar-chart" id="benchmark-chart" role="img" aria-label="Relative MSE reduction against the strongest baseline on each dataset; exact values are provided in the table below.">
+              <div class="bar-row"><span>ETTh1</span><div class="bar-track"><i class="bar-fill" style="width:9.785%"></i></div><span class="bar-value">+1.8%</span></div>
+              <div class="bar-row"><span>GEF-L</span><div class="bar-track"><i class="bar-fill" style="width:9.850%"></i></div><span class="bar-value">+1.8%</span></div>
+              <div class="bar-row negative"><span>Windy</span><div class="bar-track"><i class="bar-fill" style="width:26.985%"></i></div><span class="bar-value">−4.9%</span></div>
+              <div class="bar-row"><span>Sunny</span><div class="bar-track"><i class="bar-fill" style="width:5.344%"></i></div><span class="bar-value">+1.0%</span></div>
+              <div class="bar-row"><span>MOPEX</span><div class="bar-track"><i class="bar-fill" style="width:84.861%"></i></div><span class="bar-value">+15.3%</span></div>
+              <div class="bar-row"><span>BE</span><div class="bar-track"><i class="bar-fill" style="width:22.360%"></i></div><span class="bar-value">+4.0%</span></div>
+              <div class="bar-row"><span>DE</span><div class="bar-track"><i class="bar-fill" style="width:8.164%"></i></div><span class="bar-value">+1.5%</span></div>
+              <div class="bar-row"><span>FR</span><div class="bar-track"><i class="bar-fill" style="width:10.192%"></i></div><span class="bar-value">+1.8%</span></div>
+              <div class="bar-row"><span>NP</span><div class="bar-track"><i class="bar-fill" style="width:42.802%"></i></div><span class="bar-value">+7.7%</span></div>
+              <div class="bar-row"><span>PJM</span><div class="bar-track"><i class="bar-fill" style="width:70.101%"></i></div><span class="bar-value">+12.6%</span></div>
+            </div>
+            <p class="chart-note">Reduction = 100 × (best baseline − NeoResearch) / best baseline. A positive value means lower error. Bar lengths share a fixed 18% scale across both metrics.</p>
+          </div>
+        </div>
+        <div class="table-title"><h3>Comparison with the strongest baseline</h3><span>MSE / MAE ↓ · lower is better</span></div>
+        <div class="table-scroll" role="region" aria-label="Benchmark results, scroll horizontally for all metrics" tabindex="0">
+          <table class="results-table"><caption class="sr-only">Results from Table 1 of the NeoResearch manuscript. The best baseline is selected separately for each dataset and metric.</caption><thead><tr><th rowspan="2" scope="col">Dataset</th><th colspan="3" scope="colgroup">Mean squared error ↓</th><th colspan="3" scope="colgroup">Mean absolute error ↓</th></tr><tr><th scope="col">Best baseline</th><th scope="col" class="ours">NeoResearch</th><th scope="col">Reduction</th><th scope="col">Best baseline</th><th scope="col" class="ours">NeoResearch</th><th scope="col">Reduction</th></tr></thead><tbody id="results-body">
+            <tr><th scope="row">ETTh1</th><td>0.1022<span class="baseline-name">iTransformer</span></td><td class="ours">0.1004</td><td class="gain">+1.8%</td><td>0.2436<span class="baseline-name">iTransformer</span></td><td class="ours">0.2434</td><td class="gain">+0.1%</td></tr>
+            <tr><th scope="row">GEF-L</th><td>0.3384<span class="baseline-name">AIDE</span></td><td class="ours">0.3324</td><td class="gain">+1.8%</td><td>0.4119<span class="baseline-name">AIDE</span></td><td class="ours">0.4114</td><td class="gain">+0.1%</td></tr>
+            <tr><th scope="row">Windy</th><td>1.2785<span class="baseline-name">DLinear</span></td><td class="ours">1.3406</td><td class="loss">−4.9%</td><td>0.7946<span class="baseline-name">ARIMA</span></td><td class="ours">0.7867</td><td class="gain">+1.0%</td></tr>
+            <tr><th scope="row">Sunny</th><td>0.3119<span class="baseline-name">DLinear</span></td><td class="ours">0.3089</td><td class="gain">+1.0%</td><td>0.3598<span class="baseline-name">TimeMixer</span></td><td class="ours">0.3552</td><td class="gain">+1.3%</td></tr>
+            <tr><th scope="row">MOPEX</th><td>1.1581<span class="baseline-name">MTGNN</span></td><td class="ours">0.9812</td><td class="gain">+15.3%</td><td>0.6094<span class="baseline-name">GNN</span></td><td class="ours">0.5443</td><td class="gain">+10.7%</td></tr>
+            <tr><th scope="row">BE</th><td>1.4386<span class="baseline-name">AIDE</span></td><td class="ours">1.3807</td><td class="gain">+4.0%</td><td>0.4764<span class="baseline-name">AIDE</span></td><td class="ours">0.4637</td><td class="gain">+2.7%</td></tr>
+            <tr><th scope="row">DE</th><td>0.8030<span class="baseline-name">DeepAR</span></td><td class="ours">0.7912</td><td class="gain">+1.5%</td><td>0.6018<span class="baseline-name">DeepAR</span></td><td class="ours">0.5948</td><td class="gain">+1.2%</td></tr>
+            <tr><th scope="row">FR</th><td>5.1838<span class="baseline-name">TimeXer</span></td><td class="ours">5.0887</td><td class="gain">+1.8%</td><td>0.7262<span class="baseline-name">AIDE</span></td><td class="ours">0.6675</td><td class="gain">+8.1%</td></tr>
+            <tr><th scope="row">NP</th><td>0.3842<span class="baseline-name">TimeMixer</span></td><td class="ours">0.3546</td><td class="gain">+7.7%</td><td>0.3786<span class="baseline-name">PatchTST</span></td><td class="ours">0.3618</td><td class="gain">+4.4%</td></tr>
+            <tr><th scope="row">PJM</th><td>0.2116<span class="baseline-name">Optuna-TPE</span></td><td class="ours">0.1849</td><td class="gain">+12.6%</td><td>0.3269<span class="baseline-name">Optuna-TPE</span></td><td class="ours">0.3093</td><td class="gain">+5.4%</td></tr>
+          </tbody></table>
+        </div>
+        <p class="table-note">Values are reproduced from the manuscript. The best baseline can differ between MSE and MAE. EPF datasets (BE, DE, FR, NP, PJM) use a 168→24 horizon; the remaining tasks use 96→96. All covariates are observed-past inputs.</p>
+        <details class="full-results"><summary>Explore the complete 18-method comparison <span aria-hidden="true">+</span></summary><figure class="paper-figure"><a class="figure-link" href="assets/figures/benchmark-table.webp" data-figure="Complete benchmark results · Table 1"><img src="assets/figures/benchmark-table.webp" alt="Full Table 1 comparing NeoResearch with ARIMA, Prophet, GNN, MTGNN, RNN, LSTM, DeepAR, Mamba, S-Mamba, DLinear, TimeMixer, ConvTimeNet, TimesNet, PatchTST, iTransformer, TimeXer, AIDE, and Optuna-TPE on ten datasets." width="1530" height="564" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg> Enlarge</span></a><figcaption><strong>Complete benchmark suite.</strong> The first 16 methods are forecasting baselines; AIDE and Optuna-TPE are automated model-development comparisons.<a href="assets/figures/benchmark-table.pdf" target="_blank" rel="noopener">Table PDF ↗</a></figcaption></figure></details>
+      </div>
+    </section>
+
+    <section class="section soft" id="analysis" aria-labelledby="analysis-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">Analysis &amp; ablations</p><h2 id="analysis-title">What makes discovery effective?</h2><p class="lead">The paper examines the research loops, structured literature extraction, memory, and the models they produce.</p></div>
+        <div class="findings-grid">
+          <article><span class="finding-index">01 / Dual loops</span><h3>Discovery and optimization work together.</h3><p>Removing either loop increases MSE and MAE across all ten tasks. Architecture exploration benefits from training feedback; training benefits from revisiting the design.</p><a class="text-link" href="NeoResearch_arXivs.pdf#page=6" target="_blank" rel="noopener">Table 2 · dual-loop ablation <span aria-hidden="true">↗</span></a></article>
+          <article><span class="finding-index">02 / Literature</span><h3>Extract mechanisms, evidence, and conditions.</h3><p>Structured extraction outperforms direct source-text access and excluding literature on all four evaluated tasks. Source evidence becomes a testable hypothesis.</p><a class="text-link" href="NeoResearch_arXivs.pdf#page=6" target="_blank" rel="noopener">Table 4 · knowledge extraction <span aria-hidden="true">↗</span></a></article>
+          <article><span class="finding-index">03 / Experience</span><h3>Both levels of memory contribute.</h3><p>Removing architecture-level memory, optimization-level memory, or both worsens forecasting. Useful experience includes failed interventions and unresolved explanations.</p><a class="text-link" href="NeoResearch_arXivs.pdf#page=6" target="_blank" rel="noopener">Table 3 · hierarchical memory <span aria-hidden="true">↗</span></a></article>
+        </div>
+        <div class="analysis-figures">
+          <figure class="paper-figure"><a class="figure-link" href="assets/figures/discovered-models.webp" data-figure="Discovered forecasting architectures · Figure 6"><img src="assets/figures/discovered-models.webp" alt="Four discovered architectures: ETTh1 uses gated mixing and a temporal MLP; MOPEX uses Mamba with no instance normalization; NP uses patch MLP, mixing, and trend; PJM uses decomposition and N-BEATS with residual correction." width="741" height="525" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg></span></a><figcaption><strong>Task-specific architectures.</strong> Discovered models differ in preprocessing, variable interaction, backbone, and readout.<a href="assets/figures/discovered-models.pdf" target="_blank" rel="noopener">Figure 6 ↗</a></figcaption></figure>
+          <div class="stacked-figures">
+            <figure class="paper-figure"><a class="figure-link" href="assets/figures/resource-reuse.webp" data-figure="Cross-task resource reuse · Figure 3"><img src="assets/figures/resource-reuse.webp" alt="Cross-task resource ablations on ETTh1, MOPEX, NP, and PJM show that restricting reuse of knowledge, experience, or model assets increases error." width="738" height="258" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg></span></a><figcaption><strong>Cross-task resources.</strong> Knowledge, experience, and reusable designs support subsequent discovery.<a href="assets/figures/resource-reuse.pdf" target="_blank" rel="noopener">Figure 3 ↗</a></figcaption></figure>
+            <figure class="paper-figure"><a class="figure-link" href="assets/figures/research-modes.webp" data-figure="Research modes · Figure 4"><img src="assets/figures/research-modes.webp" alt="Reference-initialized autonomous Alpha achieves lower MSE and MAE than human-machine cooperation and cold-start Zero on four evaluated tasks." width="738" height="258" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg></span></a><figcaption><strong>Research modes.</strong> Reference-initialized autonomous Alpha leads HMC and Zero on the four evaluated tasks.<a href="assets/figures/research-modes.pdf" target="_blank" rel="noopener">Figure 4 ↗</a></figcaption></figure>
+          </div>
+        </div>
+        <div class="analysis-note"><strong>More research does not always mean better forecasts.</strong> Budget sensitivity and memory accumulation show non-monotonic outcomes on some tasks. The workflow relies on validation-based selection and reassesses transferred findings. <a href="NeoResearch_arXivs.pdf#page=7" target="_blank" rel="noopener">See the exploration study ↗</a></div>
+        <details class="full-results exploration-details"><summary>Explore research budgets and candidate quality <span aria-hidden="true">+</span></summary><div class="exploration-grid"><figure class="paper-figure"><a class="figure-link" href="assets/figures/research-budget.webp" data-figure="Research-budget sensitivity · Figure 7"><img src="assets/figures/research-budget.webp" alt="MSE and MAE for maximum research budgets of 15, 20, 25, and 30 iterations. PJM benefits most consistently; other datasets have non-monotonic outcomes." width="738" height="264" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg></span></a><figcaption><strong>Budget sensitivity.</strong> Each point is a separate investigation with its own maximum budget; longer research does not guarantee a better returned model.<a href="assets/figures/research-budget.pdf" target="_blank" rel="noopener">Figure 7 ↗</a></figcaption></figure><figure class="paper-figure"><a class="figure-link" href="assets/figures/candidate-quality.webp" data-figure="Quality of discovered candidates · Figure 8"><img src="assets/figures/candidate-quality.webp" alt="Shares of discovered candidates better than the reference: MSE 53%, 36%, 59%, and 50%; MAE 30%, 30%, 54%, and 49% for ETTh1, MOPEX, NP, and PJM, respectively." width="738" height="282" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg></span></a><figcaption><strong>Candidate quality.</strong> Every evaluated pool contains models that improve on the reference. NP has the largest share under both metrics.<a href="assets/figures/candidate-quality.pdf" target="_blank" rel="noopener">Figure 8 ↗</a></figcaption></figure></div></details>
+      </div>
+    </section>
+
+    <section class="section" id="case-study" aria-labelledby="case-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">Case study · MOPEX streamflow</p><h2 id="case-title">When experiments revise the hypothesis.</h2><p class="lead">Distribution shift suggests normalization may help. Controlled experiments reveal that preserving level and scale is more useful for this task.</p></div>
+        <div class="case-timeline">
+          <article><span class="case-step">01 / Initial hypothesis</span><h3>Normalized Mamba</h3><p>Reuse a compact temporal backbone for persistent runoff dynamics.</p><div class="case-metric"><span>CV MSE</span><strong>0.701954</strong></div></article>
+          <article><span class="case-step">02 / Controlled revision</span><h3>Remove normalization</h3><p>Keep other settings fixed. Lower CV spread supports a consistent gain.</p><div class="case-metric"><span>CV MSE</span><strong>0.596769</strong></div></article>
+          <article><span class="case-step">03 / Further experiment</span><h3>Test channel mixing</h3><p>Mean error improves, but inconsistent fold-level gains keep attribution uncertain.</p><div class="case-metric"><span>CV MSE</span><strong>0.588419</strong></div></article>
+        </div>
+        <figure class="paper-figure"><a class="figure-link" href="assets/figures/mopex-case-study.webp" data-figure="MOPEX research trajectory · Figure 9"><img src="assets/figures/mopex-case-study.webp" alt="MOPEX research trajectory linking data profiling, literature mechanisms, prior memory, three controlled architecture experiments, reflection, and the final reusable Mamba forecasting model." width="1530" height="645" loading="lazy"><span class="zoom-hint"><svg class="icon" aria-hidden="true"><use href="#icon-expand"/></svg> Enlarge</span></a><figcaption><strong>Evidence revises applicability.</strong> The selected forecaster reaches held-out test MSE 0.981216 and MAE 0.544346 after validation-based selection. Memory retains the model, the normalization finding, and uncertainty about mixing.<a href="assets/figures/mopex-case-study.pdf" target="_blank" rel="noopener">Figure 9 ↗</a></figcaption></figure>
+      </div>
+    </section>
+
+    <section class="section code-section" id="code" aria-labelledby="code-title">
+      <div class="container">
+        <div class="code-layout">
+          <div class="code-intro"><p class="eyebrow">Open source</p><h2 id="code-title">Start your next<br>forecasting investigation.</h2><p>Set up NeoResearch from source, connect an LLM provider, and create a forecasting task from your CSV data.</p><a class="button primary" href="https://github.com/Kawai1Angel/NeoResearch" target="_blank" rel="noopener noreferrer"><svg class="icon" aria-hidden="true"><use href="#icon-code"/></svg>Explore the repository <span aria-hidden="true">↗</span></a><p class="requirements">Linux or macOS · Node.js 20+ · Bun 1.3.13<br>Python 3.10+ · <a href="https://docs.astral.sh/uv/" target="_blank" rel="noopener noreferrer">uv</a></p></div>
+          <div class="terminal"><div class="terminal-heading"><span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Set up from source</span><button type="button" class="copy-button terminal-copy" data-copy="setup-commands" aria-label="Copy installation commands"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span>Copy</span></button></div><pre><code id="setup-commands">git clone https://github.com/Kawai1Angel/NeoResearch.git
+cd NeoResearch
+
+# Install and initialize the runtime
+make setup
+(cd neo_cast &amp;&amp; npm install &amp;&amp; node bin/neo-cast.js init-runtime)
+
+# Check the environment and start the CLI
+make doctor
+make dev-cli</code></pre><div class="terminal-foot"><span class="tiny-dot"></span> Configure a provider → create a task → start research</div></div>
+        </div>
+        <div class="repo-grid"><a href="https://github.com/Kawai1Angel/NeoResearch/tree/main/neoresearch" target="_blank" rel="noopener noreferrer"><span class="repo-path">neoresearch/ <span aria-hidden="true">↗</span></span><h3>Research orchestration</h3><p>CLI, TUI Cockpit, web dashboard, and autonomous research workflow.</p></a><a href="https://github.com/Kawai1Angel/NeoResearch/tree/main/neo_cast" target="_blank" rel="noopener noreferrer"><span class="repo-path">neo_cast/ <span aria-hidden="true">↗</span></span><h3>Forecasting runtime</h3><p>Dataset preparation, model recipes, training, evaluation, and model export.</p></a><a href="https://github.com/Kawai1Angel/NeoResearch/tree/main/scripts" target="_blank" rel="noopener noreferrer"><span class="repo-path">scripts/ <span aria-hidden="true">↗</span></span><h3>Development tools</h3><p>Local setup, environment checks, development, and project verification.</p></a></div>
+        <p class="interaction-note"><strong>Choose how to collaborate.</strong> Socratic clarifies requirements up front, then researches autonomously. Companion pauses for your approval at key stages. <a href="https://github.com/Kawai1Angel/NeoResearch#readme" target="_blank" rel="noopener noreferrer">Read the getting-started guide ↗</a></p>
+      </div>
+    </section>
+
+    <section class="section" id="citation" aria-labelledby="citation-title">
+      <div class="container narrow"><div class="section-heading centered"><p class="eyebrow">Citation</p><h2 id="citation-title">Build on this research.</h2><p class="lead">If NeoResearch is useful to your work, please cite the manuscript.</p></div><div class="citation-toolbar"><a class="text-link" href="assets/citation.bib" download="NeoResearch.bib">Download BibTeX <span aria-hidden="true">↓</span></a><button class="copy-button" type="button" data-copy="bibtex"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span>Copy BibTeX</span></button></div><div class="citation-card"><pre><code id="bibtex">@misc{guo2026neoresearch,
+  title  = {NeoResearch: Literature- and Experience-Guided
+            Autonomous Time Series Model Discovery},
+  author = {Guo, Ze and Cheng, Mingyue and Tao, Xiaoyu
+            and Yu, Shuo and Ye, Shangtong},
+  year   = {2026},
+  note   = {Research manuscript},
+  url    = {https://github.com/Kawai1Angel/NeoResearch}
+}</code></pre></div><p class="citation-note">Citation metadata follows the manuscript included with this project.</p></div>
+    </section>
+  </main>
+
+  <footer class="site-footer"><div class="container"><div><a class="brand" href="#top"><img src="assets/mark.svg" alt="" width="30" height="30"><span>NeoResearch</span></a><p>Literature. Experiments. Cumulative experience.</p><p class="footer-credit">Layout inspired by <a href="https://forever-pan.github.io/CastFlow/" target="_blank" rel="noopener noreferrer">CastFlow</a>.</p></div><div class="footer-links"><a href="NeoResearch_arXivs.pdf" target="_blank" rel="noopener">Paper PDF ↗</a><a href="https://github.com/Kawai1Angel/NeoResearch" target="_blank" rel="noopener noreferrer">GitHub ↗</a><a href="mailto:mycheng@ustc.edu.cn">Contact ↗</a><a href="#top">Back to top ↑</a></div></div></footer>
+  <dialog class="figure-dialog" aria-labelledby="figure-dialog-title"><div class="dialog-toolbar"><h2 id="figure-dialog-title">Figure preview</h2><div><a class="dialog-original" href="assets/figures/framework.webp" target="_blank" rel="noopener">Original ↗</a><button type="button" class="dialog-close" aria-label="Close figure preview">Close <span aria-hidden="true">×</span></button></div></div><div class="dialog-content"><img alt=""></div></dialog>
+  <div id="copy-status" class="copy-status" role="status" aria-live="polite"></div>
+</body>
+</html>
