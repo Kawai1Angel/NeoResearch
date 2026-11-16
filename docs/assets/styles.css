@@ -154,6 +154,35 @@ figcaption a:hover { text-decoration: underline; }
 .method-note .icon { margin-top: 2px; color: #72929b; }
 .method-note p { margin: 0; color: #5f6e76; font-size: 12px; line-height: 1.8; }
 
+/* Literature augmentation */
+.literature-section { border-top: 1px solid #e3ecef; background: linear-gradient(180deg, #f6f9fc, #fff); }
+.literature-layout { display: grid; grid-template-columns: 1.05fr 1fr; gap: 52px; align-items: center; }
+.literature-steps { margin: 0; padding: 0; list-style: none; }
+.literature-steps li { display: flex; gap: 18px; padding-block: 22px; }
+.literature-steps li + li { border-top: 1px solid #dfe8ec; }
+.literature-step-number { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 30px; height: 30px; margin-top: 3px; border: 1px solid #d4e2ed; border-radius: 7px; background: #edf4fa; color: #426b8d; font-size: 10px; font-weight: 650; }
+.literature-steps h3 { font-size: 18px; }
+.literature-steps p { margin-bottom: 0; color: var(--muted); font-size: 13px; line-height: 1.9; }
+.literature-record { margin: 0; overflow: hidden; border: 1px solid #d4e3e9; border-radius: 10px; background: #fff; box-shadow: var(--shadow); }
+.literature-record-heading { display: flex; align-items: center; gap: 9px; padding: 17px 22px; border-bottom: 1px solid #dfe9ed; background: #f1f6fa; color: #3e6179; font-size: 12px; font-weight: 650; }
+.literature-record-heading .icon { width: 17px; height: 17px; }
+.literature-record-label { margin-left: auto; color: #5e7282; font-size: 8px; font-weight: 500; white-space: nowrap; }
+.literature-record dl { margin: 0; padding: 4px 24px; }
+.literature-record dl > div { padding-block: 16px; }
+.literature-record dl > div + div { border-top: 1px solid #e6edef; }
+.literature-record dt { margin-bottom: 5px; color: #41697b; font-size: 11px; font-weight: 650; }
+.literature-record dd { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.literature-record figcaption { display: flex; align-items: flex-start; gap: 8px; padding: 14px 24px; font-size: 10px; }
+.literature-record figcaption .tiny-dot { flex-shrink: 0; width: 5px; height: 5px; margin-top: 6px; }
+.literature-feedback { display: grid; grid-template-columns: 1.05fr 1fr; gap: 52px; margin-top: 34px; padding-top: 29px; border-top: 1px solid #dce7eb; }
+.literature-feedback .eyebrow { margin-bottom: 10px; font-size: 9px; }
+.literature-feedback h3 { font-size: 19px; }
+.literature-feedback p { margin-bottom: 0; color: var(--muted); font-size: 12px; line-height: 1.9; }
+.literature-evidence { padding: 19px 22px; border: 1px solid #d9e7e3; border-radius: 8px; background: #f3f9f6; }
+.literature-evidence > strong { font-size: 13px; }
+.literature-evidence p { margin-top: 7px; font-size: 11px; }
+.literature-evidence .text-link { display: inline-block; margin-top: 12px; font-size: 10px; }
+
 /* Hierarchical experience */
 .memory-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
 .memory-grid article { position: relative; padding: 29px 31px; border: 1px solid #dce7e8; border-radius: 10px; background: white; }
@@ -321,7 +350,7 @@ figcaption a:hover { text-decoration: underline; }
   .section-heading { margin-bottom: 32px; }
   .lead { font-size: 15px; }
   .header-inner { min-height: 60px; }
-  .nav-links { gap: 15px; }
+  .nav-links { gap: 12px; }
   .nav-links a { font-size: 10px; padding-block: 22px; }
   .brand { gap: 6px; font-size: 16px; }
   .brand img { width: 29px; height: 29px; }
@@ -343,6 +372,13 @@ figcaption a:hover { text-decoration: underline; }
   .loop-panel { padding: 23px 23px 0; }
   .loop-panel h3 { font-size: 22px; }
   .panel-foot { margin-inline: -23px; padding-inline: 23px; }
+  .literature-layout, .literature-feedback { gap: 25px; }
+  .literature-steps li { gap: 12px; padding-block: 18px; }
+  .literature-steps h3 { font-size: 16px; }
+  .literature-record-heading { flex-wrap: wrap; padding-inline: 18px; }
+  .literature-record-label { display: none; }
+  .literature-record dl { padding-inline: 18px; }
+  .literature-record figcaption { padding-inline: 18px; }
   .memory-grid { gap: 18px; }
   .memory-grid article { padding: 23px; }
   .memory-grid h3 { font-size: 18px; }
@@ -442,6 +478,15 @@ figcaption a:hover { text-decoration: underline; }
   .loop-panel > p:not(.panel-label) { font-size: 13px; }
   .method-note { gap: 9px; padding: 13px; }
   .method-note p { font-size: 11px; }
+  .literature-layout, .literature-feedback { grid-template-columns: 1fr; gap: 23px; }
+  .literature-steps h3 { font-size: 17px; }
+  .literature-steps li { gap: 14px; }
+  .literature-record-heading { padding: 16px 20px; }
+  .literature-record-label { display: inline; }
+  .literature-record dl { padding-inline: 20px; }
+  .literature-record figcaption { padding-inline: 20px; }
+  .literature-feedback { margin-top: 27px; padding-top: 24px; }
+  .literature-evidence { padding: 19px 20px; }
   .memory-grid article { padding: 24px; }
   .memory-flow { display: grid; grid-template-columns: 1fr 20px 1fr; gap: 12px; padding-block: 23px; text-align: center; font-size: 9px; }
   .memory-flow .icon:nth-of-type(2) { display: none; }

@@ -40,7 +40,7 @@
       <a class="brand" href="#top" aria-label="NeoResearch home"><img src="assets/mark.svg" alt="" width="34" height="34"><span>NeoResearch</span></a>
       <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav" aria-label="Open navigation"><span></span><span></span><span></span></button>
       <nav id="primary-nav" class="nav-links" aria-label="Primary navigation">
-        <a href="#abstract">Abstract</a><a href="#method">Method</a><a href="#memory">Memory</a><a href="#results">Results</a><a href="#analysis">Analysis</a><a href="#code">Code</a><a href="#citation">BibTeX</a>
+        <a href="#abstract">Abstract</a><a href="#method">Method</a><a href="#literature">Literature</a><a href="#memory">Memory</a><a href="#results">Results</a><a href="#analysis">Analysis</a><a href="#code">Code</a><a href="#citation">BibTeX</a>
       </nav>
       <a class="header-code" href="https://github.com/Kawai1Angel/NeoResearch" target="_blank" rel="noopener noreferrer" aria-label="NeoResearch on GitHub"><svg class="icon" aria-hidden="true"><use href="#icon-code"/></svg><span>GitHub</span><span aria-hidden="true">↗</span></a>
     </div>
@@ -126,6 +126,30 @@
           <article class="loop-panel inner-loop"><p class="panel-label"><span class="tiny-dot"></span> Inner loop</p><h3>Evidence-guided<br>training optimization</h3><p>Keep the design fixed while adjusting learning rates, batch sizes, regularization, scheduling, and training loss. Return the best validated model with diagnostics and a complete experiment history.</p><div class="panel-foot">Validation and convergence → tune or return to discovery</div></article>
         </div>
         <div class="method-note"><svg class="icon" aria-hidden="true"><use href="#icon-paper"/></svg><p><strong>Traceable by construction.</strong> Structured recipes and persistent state link hypotheses, designs, runs, and model artifacts. Validation MSE selects candidates; test data are excluded from research decisions.</p></div>
+      </div>
+    </section>
+
+    <section class="section literature-section" id="literature" aria-labelledby="literature-title">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow">Literature augmentation</p><h2 id="literature-title">Scientific literature, grounded in the target task.</h2><p class="lead">Retrieve scientific papers and extract mechanisms, empirical evidence, and applicability conditions to formulate testable architecture hypotheses.</p></div>
+        <div class="literature-layout">
+          <ol class="literature-steps">
+            <li><span class="literature-step-number" aria-hidden="true">01</span><div><h3>Retrieve from task evidence</h3><p>Data diagnostics, domain knowledge, and the forecasting objective guide autonomous literature retrieval. Temporal dynamics and variable relationships help identify relevant modeling mechanisms.</p></div></li>
+            <li><span class="literature-step-number" aria-hidden="true">02</span><div><h3>Extract knowledge with its context</h3><p>Preserve source passages, reported experimental outcomes, and their original settings. Record each mechanism’s assumptions, applicability conditions, and limitations alongside the evidence.</p></div></li>
+            <li><span class="literature-step-number" aria-hidden="true">03</span><div><h3>Form a testable architectural hypothesis</h3><p>Check literature assumptions against the target data. Specify the proposed mechanism, its expected effect, the conditions for its use, and observations that would challenge the explanation.</p></div></li>
+          </ol>
+          <figure class="literature-record">
+            <div class="literature-record-heading"><svg class="icon" aria-hidden="true"><use href="#icon-paper"/></svg><span>Structured literature record</span><span class="literature-record-label">Source-grounded</span></div>
+            <dl>
+              <div><dt>Source &amp; context</dt><dd>Original paper, supporting passage, and experimental setting.</dd></div>
+              <div><dt>Modeling mechanism</dt><dd>How a preprocessing, temporal, or variable-interaction component is expected to work.</dd></div>
+              <div><dt>Empirical evidence</dt><dd>Reported outcomes and the conditions under which they were observed.</dd></div>
+              <div><dt>Applicability &amp; limitations</dt><dd>Assumptions and constraints to assess against the target data and forecasting objective.</dd></div>
+            </dl>
+            <figcaption><span class="tiny-dot" aria-hidden="true"></span><span>Source evidence stays linked to the hypothesis and subsequent experiments.</span></figcaption>
+          </figure>
+        </div>
+        <div class="literature-feedback"><div><p class="eyebrow">Close the evidence loop</p><h3>Let experiments reassess applicability.</h3><p>Validation results and controlled comparisons test the design rationale. Unresolved outcomes can prompt further diagnostics or literature retrieval, and new evidence can revise the hypothesis.</p></div><div class="literature-evidence"><strong>Structured extraction matters.</strong><p>Full NeoResearch outperforms direct source-text access and excluding literature on all four evaluated tasks: ETTh1, MOPEX, NP, and PJM.</p><a class="text-link" href="NeoResearch_arXivs.pdf#page=6" target="_blank" rel="noopener">Table 4 · knowledge extraction ablation <span aria-hidden="true">↗</span></a></div></div>
       </div>
     </section>
 
