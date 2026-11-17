@@ -59,6 +59,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; fo
 .header-inner { position: relative; display: flex; align-items: center; gap: 28px; width: min(100% - 64px, 1200px); min-height: 67px; margin-inline: auto; }
 .brand { display: inline-flex; align-items: center; gap: 9px; flex-shrink: 0; color: var(--ink); font-size: 18px; font-weight: 750; letter-spacing: -.04em; }
 .brand img { flex-shrink: 0; }
+.site-header .brand img { width: 48px; height: 48px; object-fit: contain; }
 .nav-links { display: flex; justify-content: center; align-items: center; gap: 25px; margin-inline: auto; }
 .nav-links a { position: relative; padding-block: 23px; color: #617580; font-size: 12px; font-weight: 550; transition: color .15s ease; }
 .nav-links a::after { position: absolute; right: 0; bottom: 14px; left: 0; height: 2px; content: ""; background: var(--teal); transform: scaleX(0); transition: transform .18s ease; }
