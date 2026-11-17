@@ -5,7 +5,7 @@
 NeoResearch uses a general-purpose large language model (LLM) as an autonomous researcher to discover lightweight, domain-specific models for time series forecasting. Its expert-inspired dual-loop workflow couples literature-guided architecture discovery with evidence-guided training optimization through experimental feedback. Hierarchical experience memory consolidates conditional lessons at the architecture and optimization levels to guide their respective loops within and across forecasting tasks.
 
 **Paper** · NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery · 
-[**arXiv**](https://arxiv.org/abs/2611.18235)
+[**arXiv**](https://arxiv.org/abs/2611.18235) · 
 [**Project Page**](https://kawai1angel.github.io/NeoResearch/)
 
 ## Overview
@@ -63,4 +63,3 @@ make test       # Run project verification
 make dev-web    # Start the web development environment
 ```
 
-See the [research workflow](neoresearch/packages/neoresearch/docs/neoresearch-workflow.md), [CLI guide](neoresearch/packages/neoresearch/README.md), and [Neo-Cast usage guide](neo_cast/USAGE.md) for details.
