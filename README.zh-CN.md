@@ -4,7 +4,9 @@
 
 NeoResearch 以通用大语言模型（LLM）作为自主研究员，发现面向特定领域的轻量级时间序列预测模型。其受专家研究过程启发的双循环工作流，通过实验反馈，将文献引导的架构发现与证据驱动的训练优化相结合。分层经验记忆在架构和优化两个层面归纳带有适用条件的经验，为各自的研究循环提供指导，并支持同一预测任务内及跨任务的经验复用。
 
-**论文** · NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery · [arXiv:2611.18235](https://arxiv.org/abs/2611.18235)
+**论文** · NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery
+[**arXiv**](https://arxiv.org/abs/2611.18235)
+[**主页**](https://kawai1angel.github.io/NeoResearch/)
 
 ## 概览
 
@@ -38,7 +40,7 @@ make dev-cli
 在终端交互界面（TUI）中配置 LLM 服务提供商，使用 CSV 数据集创建任务，然后启动研究流程。根据任务需要选择交互模式。
 
 - **Socratic（苏格拉底式）**：先澄清任务需求，再自主开展研究。
-- **Companion（协作式）**：在关键阶段暂停，等待用户批准后继续。
+- **Companion（认知伴随式）**：在关键阶段暂停，等待用户批准后继续。
 
 ## 基准测试结果
 
@@ -61,4 +63,3 @@ make test       # 运行项目验证
 make dev-web    # 启动 Web 开发环境
 ```
 
-更多信息请参阅[研究工作流](neoresearch/packages/neoresearch/docs/neoresearch-workflow.md)、[CLI 使用指南](neoresearch/packages/neoresearch/README.md)和 [Neo-Cast 使用指南](neo_cast/USAGE.md)。
