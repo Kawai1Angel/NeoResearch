@@ -4,8 +4,8 @@
 
 NeoResearch 以通用大语言模型（LLM）作为自主研究员，发现面向特定领域的轻量级时间序列预测模型。其受专家研究过程启发的双循环工作流，通过实验反馈，将文献引导的架构发现与证据驱动的训练优化相结合。分层经验记忆在架构和优化两个层面归纳带有适用条件的经验，为各自的研究循环提供指导，并支持同一预测任务内及跨任务的经验复用。
 
-**论文** · NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery
-[**arXiv**](https://arxiv.org/abs/2611.18235)
+**论文** · NeoResearch: Literature- and Experience-Guided Autonomous Time Series Model Discovery · 
+[**arXiv**](https://arxiv.org/abs/2611.18235) · 
 [**主页**](https://kawai1angel.github.io/NeoResearch/)
 
 ## 概览
